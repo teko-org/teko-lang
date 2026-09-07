@@ -259,7 +259,9 @@ i64 tk_field_use(i64 left, i64 fi, i64 line, uptr fl) {
         tk_file = fl;
         if (tk_lam_escapes(v))
             err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
-        tk_check_field_store(fty, v, line, fl);
+        v = tk_field_store_val(fty, v, line, fl);
+        tk_line = line;
+        tk_file = fl;
         return tk_os_mark(tk_call2(tk_stn(fty), addr, v), fty);
     }
     i64 di = tk_deleg_row(fty);
@@ -304,17 +306,37 @@ void tk_loose_refuse(i64 mi, uptr m, i64 line, uptr fl) {
 // reaches it -- checked here instead, at the PARSE-TIME call site, where
 // `mt_fn_at(mi)` is in hand; `tk_pty_of` (teko_struct.tk), not the pass-time
 // `tk_ty_of`, is what a node's type is called at this point in the parse.
-void tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl) {
+//
+// It also CONVERTS, C# §10.2.3, so it hands the argument list back: an integer
+// on a parameter of float type is wrapped in the cast that lowers to `scvtf`
+// (teko_typeof.tk's `tk_num_widen`) and spliced into the list where it stood,
+// the same shape `tk_deleg_check_call_args` (teko_deleg.tk) already splices a
+// wrapped function name into.
+i64 tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl) {
     i64 d = decl_find(mt_fn_at(mi));
-    if (d < 0) return;
+    if (d < 0) return args;
+    i64 head = args;
+    i64 prev = 0;
     i64 a = args;
     i64 i = 1;                                    // parameter 0 is the receiver
     loop {
         if (a == 0) break;
-        tk_check_compat(tk_decl_param_ty(d, i), tk_pty_of(a), a, line, fl);
-        a = nd_next(a);
+        i64 nxt = nd_next(a);
+        i64 pt = tk_decl_param_ty(d, i);
+        i64 at = tk_pty_of(a);
+        tk_check_compat(pt, at, a, line, fl);
+        i64 fixed = tk_num_widen(pt, at, a);
+        if (fixed != a) {
+            set_nd_next(fixed, nxt);
+            if (prev == 0) head = fixed;
+            else set_nd_next(prev, fixed);
+            a = fixed;
+        }
+        prev = a;
+        a = nxt;
         i = i + 1;
     }
+    return head;
 }
 
 // `p.m(...)` once the method is known: a plain one is a direct call to the
@@ -337,7 +359,9 @@ i64 tk_emit_call(i64 left, i64 mi, i64 args, i64 na, i64 line, uptr fl) {
     } else {
         if (!tk_pure(left))
             err_at2(fl, line, "teko: a virtual call needs a name or a field on the left", mt_name_at(mi));
-        tk_vcall_args_check(mi, args, line, fl);
+        args = tk_vcall_args_check(mi, args, line, fl);
+        tk_line = line;
+        tk_file = fl;
         i64 vt = tk_call("ld64", tk_clone(left));
         i64 fnp = tk_call("ld64", tk_bin(K_ADD, vt, tk_int((TK_VT_FIXED + slot) * 8)));
         r = tk_callp_ret(mt_ret_at(mi),

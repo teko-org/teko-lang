@@ -598,6 +598,43 @@ void tk_ops_emit(i64 n, i64 r, i64 args, i64 line, uptr fl) {
     tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
 }
 
+// C# §12.4.5's binary numeric promotion, the half `mc` does not have: a binary
+// with one FLOAT operand and one integer converts the integer, whichever side
+// it is on, so `1 + 2.5` and `2.5 + 1` are both three point five. Without it
+// the core reads the integer's eight bytes as a mantissa: `res_binary`
+// (mc/src/gen_resolve.mc) recomputes the expression's type from the LEFT
+// operand once it is resolved, so converting the left is what makes the site
+// itself a float one, and converting the right is what keeps a site that
+// already was one from mixing a register in.
+//
+// Only the operators C# promotes for are asked -- `+ - * /` and the six
+// comparisons. A shift and the bitwise trio take no float in C# at all, and
+// `%` has no float instruction on this backend (`<float>`'s own FI_ table has
+// add, sub, mul, div and compare, no remainder), so a `%` promoted here would
+// only move the failure; all of them are left to behave as they did.
+//
+// This runs on a node whose OPERANDS have already been visited, so a nested
+// binary is settled first and `1 + 2 + 2.5` converts the whole `1 + 2` rather
+// than one of its literals -- C#'s own order, where the integer arithmetic
+// happens and its result converts. It is idempotent: the second visit sees two
+// float operands and does nothing.
+i64 tk_ops_promotes(i64 op) {
+    if (op == K_ADD || op == K_SUB || op == K_MUL || op == K_DIV) return 1;
+    return cmp_cond(op) >= 0;
+}
+
+void tk_ops_promote(i64 n) {
+    if (!tk_ops_promotes(nd_op(n))) return;
+    i64 ta = tk_ty_of(nd_a(n));
+    i64 tb = tk_ty_of(nd_b(n));
+    if (ta >= 0 && type_kind(ta) == TK_FLOAT) {
+        set_nd_b(n, tk_num_widen(ta, tb, nd_b(n)));
+        return;
+    }
+    if (tb >= 0 && type_kind(tb) == TK_FLOAT)
+        set_nd_a(n, tk_num_widen(tb, ta, nd_a(n)));
+}
+
 // One node of the walk. A binary whose two operands are both of core types is
 // left exactly as it is -- the core owns it -- and that is the whole of the
 // no-op guarantee for a program that declares no operator. So is one where no
@@ -607,6 +644,7 @@ void tk_ops_emit(i64 n, i64 r, i64 args, i64 line, uptr fl) {
 void tk_ops_binary(i64 n) {
     tk_ops_operand(nd_a(n));
     tk_ops_operand(nd_b(n));
+    tk_ops_promote(n);
     i64 a = nd_a(n);
     i64 b = nd_b(n);
     i64 ta = tk_ty_of(a);

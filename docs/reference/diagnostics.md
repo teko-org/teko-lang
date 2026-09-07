@@ -31,10 +31,16 @@ entry says what completes it.
 - `"teko: type not taught yet"` — the word in type position is reserved for a construct
   this version does not implement.
 - `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: the only implicit
-  reference conversions are derived-to-base and class-to-interface, and a value of float
-  type (`f64`, `f32`) never lands in a slot of another kind — an argument, an overload's
-  parameter, an assignment, an initializer or a `return`
-  ([parameters.md](parameters.md#what-a-literal-converts-to)).
+  reference conversions are derived-to-base and class-to-interface, the only implicit
+  numeric one is an integer into a float ([types.md](types.md#f32-and-f64)), and nothing
+  narrows back. A value of float type (`f64`, `f32`) never lands in a slot of another
+  kind, and `null` — whose type is `uptr` — never lands in a numeric one. Both hold in
+  every slot: an argument (of a free function, a method, a virtual call, an interface
+  call), an overload's parameter, an element of a `params` list, an assignment, an
+  initializer, a field store and a `return`
+  ([parameters.md](parameters.md#what-a-literal-converts-to)). `i64 n = 2.5;` and
+  `solo(null)` against a single `i64 solo(i64)` are the two shortest forms of it, both
+  written out in [types.md](types.md#f32-and-f64).
 - `"teko: field of type void"` — a field has a type; `void` is a return type only.
 - `"teko: duplicate field"` — two fields of one type share a name.
 - `"teko: an array field size is an integer literal"` — `T items[N]` takes a literal or a

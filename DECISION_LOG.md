@@ -401,10 +401,115 @@ the `--dump-ast` of all 45 fixtures is byte-identical to the one before the chan
 and it is a reference, C#'s rule: `tk_ov_args_fit` lets it land on a parameter that is a
 row of the type table or a raw `uptr`, and on no integer, in every round; before, the
 exact round read it as an integer literal and `held(null)` with both `held(Cell)` and
-`held(i64)` declared was `held(i64)`.
+`held(i64)` declared was `held(i64)`. It lands on a `struct` as readily as on a `class`,
+which C# does not allow: a struct value in teko IS a pointer to the allocation
+([`docs/reference/types.md`](docs/reference/types.md) § `struct`), so `hold(null)` with
+`hold(Vec)` and `hold(Cell)` both declared is ambiguous by design and not by oversight.
 
-Two gaps are left standing, both older than this and neither a float in an integer slot: an
-integer literal does NOT convert to a float parameter (the rounds refuse it, and a call of a
-name declared once accepts it and passes the integer's own bits, unconverted), and a binary
-mixing the two takes the type of its LEFT operand, which is the core's own rule — `2 * 1.5`
-is an `i64` site and `1.5 * 2.0` an `f64` one.
+The two gaps this entry left standing — an integer literal that does not convert to a
+float parameter, and a binary mixing the two taking the type of its LEFT operand — are
+closed by **D33**.
+
+
+### D33 · An integer converts to a float slot; nothing narrows back (2026-09-07)
+C# §10.2.3's implicit numeric conversion, in every slot teko has one. An integer — a
+literal, a local, a parameter, a field, of any integer KIND the core or a module
+registered, `i32` included — written where an `f64` or an `f32` is declared becomes that
+float. `tk_is_int_ty` (teko_typeof.tk) answers by ID, not by `type_kind`: a class, an
+interface and `ref`/`out`/`params` all register `TK_INT` too (teko_struct.tk's,
+teko_access.tk's and teko_ref.tk's own `type_new`), and every core type answers `TK_INT`
+from `type_kind` regardless — `TY_VOID` and `TY_UPTR` included, neither a number — so the
+kind alone cannot tell an integer from a reference. `i32` is the one integer id outside the
+core's five raw ones (`TY_U8`..`TY_I64`): `core_types_init()` registers it before any
+module's `user_init()` runs (`hooks.md` § "the id a registration returns"), so it always
+answers exactly `TY_MAX`, deterministically, before a class or an interface of the
+program's own claims the ids after it. The core converts
+none of them: `walk_narrow` (mc/src/gen_walk.mc) answers 0 for `TK_FLOAT`, so the eight
+bytes of the integer reached the slot and were read as a mantissa — `f64 y = 1` was zero,
+`p.w = 4` was zero, `g(3)` against `f64 g(f64)` was zero, and `1 + 2.5` was neither three
+point five nor a refusal. The one surface form that lowers to `scvtf` is the cast, so the
+conversion IS a cast, written by the compiler where the source did not have to: `tk_cast`
+([`teko_array.tk`](teko_array.tk)) through the one helper `tk_num_widen`
+([`teko_typeof.tk`](teko_typeof.tk)). Zero new intrinsics, zero new passes, nothing
+changed in `mc` (D2, D21).
+
+**The nine slots**, each in the module that owns it: a variable initializer, an assignment
+and a `return` ([`teko_rc.tk`](teko_rc.tk)); an argument of a free or method call (same
+file), of a virtual call ([`teko_expr.tk`](teko_expr.tk)) and of an interface call
+([`teko_iface.tk`](teko_iface.tk)); an element of a `params f64[]`
+([`teko_params.tk`](teko_params.tk)); a field store ([`teko_typeof.tk`](teko_typeof.tk),
+shared by the two parse-time sites that build one); and a binary mixing the two
+([`teko_ops.tk`](teko_ops.tk)). The helper hands the node BACK and the caller splices it,
+because an argument is a link of a sibling list and an operand is a child — the shape
+`tk_deleg_coerce` ([`teko_deleg.tk`](teko_deleg.tk)) already had.
+
+**The binary converts the integer operand whichever side it stands on.** `res_binary`
+(mc/src/gen_resolve.mc) recomputes the expression's type from the LEFT operand once it is
+resolved, so converting the left is what makes the site a float one and converting the
+right is what keeps a site that already was one from mixing a register in: `1 + 2.5` and
+`2.5 + 1` are both three point five, which supersedes D32's "the type of the LEFT
+operand". Only the operators C# promotes for are asked — `+ - * /` and the six
+comparisons. A shift and the bitwise trio take no float in C# at all, and `%` has no float
+instruction on this backend (`<float>` has add, sub, mul, div and compare, and `2.5 % 7`
+is already `mc: no float remainder`), so promoting either would only move the failure.
+
+**Nothing narrows back**, and the refusal is the wording every mismatched value already
+gets, `teko: a value of type f64 does not convert to i64`. `null` joins it: it is a
+reference (D32) and a number is not, so a numeric slot refuses it —
+`teko: a value of type uptr does not convert to i64` — where before `solo(null)` against a
+single `solo(i64)` compiled and passed a pointer-width zero. Both verdicts live in
+`tk_check_scalar_compat`, the half of the compatibility check that needs no row of the type
+table, which is what lets the FIELD store share them: its own check reads its value through
+`tk_struct_of_expr`, which answers about objects only, and the two scalar cases had never
+been asked there at all.
+
+**`params f64[]` takes an integer element** at the LOOSE stage of the expanded round, C#
+§12.6.4 over §10.2.3: a list is applicable in expanded form when every element of the tail
+converts. Asking it at `loose` only is what keeps D30's tie-break — the strict stage runs
+first, so `f(1)` is still `params i64[]`, while `f(1, 1.5)` fails every strict candidate
+and lands on `params f64[]` with the `1` converted. The ORDINARY overload rounds are not
+widened: `f(3)` with `f(f64)` and `f(uptr)` declared still reads
+`teko: no overload of f matches these arguments`, since a better-conversion rule (§12.6.4.4)
+is a decision of its own; a name declared once always converts.
+[`docs/reference/not-yet.md`](docs/reference/not-yet.md) § *Numeric conversions* carries
+that and the five other gaps measured here, `f32`→`f64` among them.
+
+**A NEGATIVE `i32` widened to a float is wrong on `aarch64`, and it is `mc`'s own defect,
+not taught here.** `tests/primitives_float.tk` was rewritten again to add `i32` at the four
+of the nine slots it can reach as a source (`i32` never converts an ARRAY element or a
+`params f64[]` one, since neither of those declares an `i32` element in this crumb) —
+caught mid-review, before `i32` reached `tk_is_int_ty` at all, a POSITIVE `i32` widens
+correctly on every target, and a NEGATIVE one does too on `x86_64`
+(`lib/machine_x86_64_float.mc`'s `fx_cast` special-cases only `TY_U64`/`TY_UPTR` and signs
+everything else), but not on `aarch64`: `lib/machine_arm64_float.mc`'s `fa_cast` chooses
+`ucvtf` over `scvtf` for any integer source that is not the exact id `TY_I64`, so a sign-
+extended `i32` register reads as a huge positive double. Reproduced on `bea5ccce`, BEFORE
+this fix, through an explicit `(f64) d` cast on a negative `i32` local — `i32` never reached
+an IMPLICIT float slot before `tk_is_int_ty` learned its id, but the explicit cast already
+took the same broken lowering, so the defect is `mc`'s own and older than this crumb (D2): a
+minimal pure-`mc` reproducer is reported upstream, not patched here, and the fixture proves
+only what is true on every target — a positive `i32` and, in an integer-only slot, a
+negative one.
+
+**The parse-time table of locals becomes a scope.** `tk_slv`
+([`teko_struct.tk`](teko_struct.tk)) grew ever-forward over the whole unit, so a name
+declared in one function answered for a name spelled the same in the next: an `f64 s` local
+typed the `i64 s` PARAMETER of another function, and a virtual call passing it was refused
+for a conversion nobody wrote — measured on `b60a4635`, before this change, so the defect is
+older than it. The two questions are separated instead of merged: the rows stay append-only
+for the one PASS that reads them with every scope already closed
+(`tk_pm_arg_ty`, [`teko_params.tk`](teko_params.tk)), and a stack of indices beside them,
+cut at the same `}` `tk_local` is, is what the parser asks. A parameter is in no scope table
+at parse time, so the honest answer for it is -1, "not known here", which every caller
+already treats as "refuse nothing".
+
+**A refusal still has no harness.** `tests/` holds programs that compile and run, judged by
+`// expect-exit`, and there is no `// expect-refuse:` form; the two refusals above are
+documented with a `// no-run` fence in
+[`docs/reference/diagnostics.md`](docs/reference/diagnostics.md) and
+[`docs/reference/types.md`](docs/reference/types.md), and the harness is a crumb of its own.
+
+Proof: 45/45 fixtures at their `expect-exit`, `FIXPOINT OK`, `mc limits` verdict ok with
+`passes` still 15/30 and `intrin` still 8/16, and `--dump-ast` byte-identical on 44 of the
+45 — the one that moves is `tests/primitives_float.tk`, rewritten here to cover the nine
+slots with values that only come out right if the conversion happened.

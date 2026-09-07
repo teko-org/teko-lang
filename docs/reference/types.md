@@ -108,6 +108,60 @@ i64 main() {
 }
 ```
 
+**An integer converts to a float; a float does not convert back.** That is C#'s own
+direction, and it holds in every slot: a variable initializer, an assignment, a `return`,
+an argument (of a free function, a method, a virtual call, an interface call), an element
+of a `params f64[]`, a field store, and a binary mixing the two — where the integer
+operand is converted whichever side it stands on, so `1 + 2.5` and `2.5 + 1` are both
+three point five. The conversion is a cast the compiler writes for you, and it rounds the
+way C#'s `long` to `double` does: an `f64` carries 53 bits of precision, so every integer up
+to 2^53 in magnitude arrives exact and a larger one lands on the nearest representable
+double.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+f64 twice(f64 x) { return x + x; }
+
+i64 main() {
+    f64 y = 1;                                   // an initializer
+    y = 5;                                       // an assignment
+    if (twice(3) != 6.0) return 1;               // an argument
+    if (1 + 2.5 != 3.5) return 2;                // the integer on the left
+    if (2.5 + 1 != 3.5) return 3;                // ...and on the right
+    return (i64) (y + 37);
+}
+```
+
+The other direction is refused where it is written, because C# narrows nothing without a
+cast spelled out. It reads `teko: a value of type f64 does not convert to i64`
+([diagnostics.md](diagnostics.md)) — and `(i64) x` is the cast that says you meant it.
+
+```teko
+// no-run
+i64 main() {
+    i64 n = 2.5;                                 // teko: a value of type f64 does not convert to i64
+    return n;
+}
+```
+
+`null` is a reference and a number is not, so it does not land in a numeric slot either —
+`teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
+carries.
+
+```teko
+// no-run
+i64 solo(i64 a) { return a; }
+
+i64 main() {
+    return solo(null);                           // teko: a value of type uptr does not convert to i64
+}
+```
+
+Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
+slot is neither converted nor refused ([not-yet.md](not-yet.md)).
+
 ### `ptr`, `uptr` and `str`
 
 Memory is read and written by explicit width — `ld8`/`ld16`/`ld32`/`ld64` and

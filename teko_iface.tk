@@ -59,9 +59,11 @@ void tk_check_type_use_from(i64 si, i64 proj, i64 line, uptr fl);
 i64 tk_trait_find(uptr name);
 
 // higiene 2, item 1: an itab call's own arguments against the interface
-// member's declared parameter types (teko_typeof.tk, included after this
+// member's declared parameter types, and C# §10.2.3's widening of an integer
+// argument into a parameter of float type (teko_typeof.tk, included after this
 // file)
 void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl);
+i64 tk_num_widen(i64 tty, i64 ety, i64 e);
 
 // §58 DI1: a service lifetime names a CLASS, never an interface -- checked
 // here, before this name is looked up as a base at all (`teko_di.tk`, included
@@ -262,16 +264,35 @@ i64 tk_ifslot(i64 si, i64 j) {
 // signature is required, by conformance, to match `k`'s exactly (`im_sig`),
 // so the declared parameter list is the same check a concrete implementer's
 // own would give, without knowing which one answers at run time.
-void tk_ifargs_check(i64 k, i64 args, i64 line, uptr fl) {
+//
+// It also CONVERTS, and so hands the argument list back: an integer on a
+// parameter of float type is wrapped in the cast that lowers to `scvtf`
+// and spliced into the list where it stood (teko_expr.tk's
+// `tk_vcall_args_check` does the same for the vtable path).
+i64 tk_ifargs_check(i64 k, i64 args, i64 line, uptr fl) {
     i64 p = im_prs_at(k);
     if (p != 0) p = nd_next(p);
+    i64 head = args;
+    i64 prev = 0;
     i64 a = args;
     loop {
         if (a == 0 || p == 0) break;
-        tk_check_compat(tk_param_ty(p), tk_pty_of(a), a, line, fl);
-        a = nd_next(a);
+        i64 nxt = nd_next(a);
+        i64 pt = tk_param_ty(p);
+        i64 at = tk_pty_of(a);
+        tk_check_compat(pt, at, a, line, fl);
+        i64 fixed = tk_num_widen(pt, at, a);
+        if (fixed != a) {
+            set_nd_next(fixed, nxt);
+            if (prev == 0) head = fixed;
+            else set_nd_next(prev, fixed);
+            a = fixed;
+        }
+        prev = a;
+        a = nxt;
         p = nd_next(p);
     }
+    return head;
 }
 
 // the indirect call an interface member is: the object's word 0 is its vtable,
@@ -286,7 +307,9 @@ i64 tk_itab_emit(i64 left, i64 si, i64 j, i64 args, uptr m, i64 line, uptr fl) {
         err_at2(fl, line, "teko: an interface call needs a name or a field on the left", m);
     tk_line = line;
     tk_file = fl;
-    tk_ifargs_check(sr_m0_at(si) + j, args, line, fl);
+    args = tk_ifargs_check(sr_m0_at(si) + j, args, line, fl);
+    tk_line = line;
+    tk_file = fl;
     i64 vt = tk_call("ld64", tk_clone(left));
     i64 mt = tk_call2("tk_itab", vt, tk_int(si));
     i64 fnp = tk_call("ld64", tk_bin(K_ADD, mt, tk_int(tk_ifslot(si, j) * 8)));

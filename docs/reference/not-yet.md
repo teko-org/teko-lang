@@ -29,6 +29,20 @@ Nothing here is a promise about a later version; what is designed and not built 
 Interfaces have no covariance and no contravariance, and a `struct` has no reference count
 of its own ([memory.md](memory.md)).
 
+## Numeric conversions
+
+An integer converts to a float in every slot that has one, and nothing narrows back
+([types.md](types.md#f32-and-f64)). What is still missing around it:
+
+| written | what happens |
+|---|---|
+| `f64 d = s;` with an `f32` `s` | neither converted nor refused: the four bytes are read as eight, so the value is wrong. The two float widths convert to each other in neither direction |
+| `7 % 2.5` | the remainder is not promoted — the integer operand stays one, and the float's bit pattern is read as an integer. `2.5 % 7` is `mc: no float remainder`, the backend having no float remainder instruction at all |
+| `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
+| an integer argument at a **virtual** or an **interface** call, written as a bare **parameter** name (`a.by(n)` inside `g(i64 n)`) | not converted: those two are shaped at parse time and a parameter carries no type the parser can read, so the argument passes its own bits |
+| `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |
+| a NEGATIVE `i32` widened to `f64`/`f32`, on `aarch64` | wrong: `mc`'s bundled `lib/machine_arm64_float.mc` converts unsigned (`ucvtf`) for any integer source that is not the exact id `TY_I64`, so a sign-extended `i32` register reads as a huge positive double. Correct on `x86_64`, and correct on `aarch64` too for a NON-negative `i32` or for `i32` staying in an integer-only slot. `mc`'s own defect (D2), reported upstream |
+
 ## Generics and delegates
 
 | written | message |
@@ -83,9 +97,9 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 | `params` over anything but a `T[]` (`params xs`, `params i64 xs`) | ``teko: `params` names an array type: write `params T[] xs``` |
 | `params` with `ref`/`out`, with a default, or on an `extern` | ``teko: a `params` list is not `ref` or `out```, ``teko: a `params` list has no default``, ``teko: an `extern` symbol takes no `params` list`` |
 | `params` outside parameter position | ``teko: `params` declares a parameter list, nothing else`` |
-| an argument that does not convert to the element type | `teko: a value of type X does not convert to T` — identity or derives/implements, and an integer literal into any integer of the core; there is no implicit numeric conversion |
+| an argument that does not convert to the element type | `teko: a value of type X does not convert to T` — identity or derives/implements, an integer literal into any integer of the core, and an integer into a float ([types.md](types.md#f32-and-f64)) |
 | two `params` lists of one name that a site cannot tell apart (`params u8[]` and `params u64[]` at `f(1)`) | `teko: more than one overload of X matches these arguments` |
-| a tail no `params` list of the name takes (`params i64[]` and `params f64[]` at `f(1, 1.5)`) | `teko: no overload of X matches these arguments` |
+| an integer argument on an **overloaded** name where no signature has an integer at that position (`f(f64)` beside `f(uptr)`, at `f(3)`) | `teko: no overload of X matches these arguments` — the rounds do not search for the conversion; a name declared **once** converts |
 | two overloads differing only by `ref`/`out` | ``teko: two overloads differ only by `ref`/`out``` |
 | a `ref` **parameter** repassed to an **overloaded** name | `teko: the type of argument N of X is not known here` |
 | `f(out i64 a)` declaring the variable at the call site | not taught: declare it first |

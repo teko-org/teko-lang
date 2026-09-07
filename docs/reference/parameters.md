@@ -110,14 +110,23 @@ recursive call is an ordinary site.
 
 An **integer** literal carries no type of its own: it lands on any of the core's integers,
 and on `i64` before the others, which is what makes `pick(1)` with both `pick(i64)` and
-`pick(u8)` in reach `pick(i64)`.
+`pick(u8)` in reach `pick(i64)`. It also **converts to a float** — C#'s own implicit
+numeric conversion ([types.md](types.md#f32-and-f64)) — so a parameter declared `f64`
+takes `g(3)` and reads three point zero, and so does every other integer value, not only
+a literal.
+
+Among **overloads** the integer signature wins outright: `f(1)` with both `f(i64)` and
+`f(f64)` declared is `f(i64)`, and `f(1)` with both `params i64[]` and `params f64[]` is
+the `i64` list. A float list takes the site only when the integer one cannot —
+`f(1, 1.5)` is `params f64[]`, with the `1` converted. Where no signature of an
+overloaded name has an integer at that position, the conversion is not searched for yet
+([not-yet.md](not-yet.md)); a name declared **once** always converts.
 
 A **float** literal does carry one. `1.5` is an `f64` exactly as C# reads it, so only an
 `f64` parameter takes it — in the exact round and in every round after it, whatever the
-declaration order. There is no implicit conversion from a float to an integer, so a value
-of float type in an integer slot is refused, `teko: a value of type f64 does not convert
-to i64`, and it is refused the same way when the name is declared once and no overload is
-searched at all. It holds for an expression as much as for a literal: a local of float
+declaration order. Nothing narrows back, so a value of float type in an integer slot is
+refused, `teko: a value of type f64 does not convert to i64`, and it is refused the same
+way when the name is declared once and no overload is searched at all. It holds for an expression as much as for a literal: a local of float
 type, a call whose return type is `f64`, and a binary whose left operand is a float all
 pick the float signature — `near` in the sample below.
 

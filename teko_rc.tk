@@ -163,7 +163,12 @@ i64 tk_rc_releases(i64 base) {
 void tk_rc_var(i64 n) {
     if (nd_val(n) != 0) return;                  // `C tbl[4]`: references, not one object
     i64 e = nd_a(n);
-    if (e != 0) tk_check_compat(nd_type(n), tk_ty_of(e), e, nd_line(n), nd_file(n));
+    if (e != 0) {
+        i64 ety = tk_ty_of(e);
+        tk_check_compat(nd_type(n), ety, e, nd_line(n), nd_file(n));
+        e = tk_num_widen(nd_type(n), ety, e);     // `f64 y = 1;` is one point zero
+        set_nd_a(n, e);
+    }
     if (!tk_is_counted(nd_type(n))) return;
     if (e == 0) e = tk_int(0);
     else if (tk_rc_own(e)) return;
@@ -181,7 +186,9 @@ void tk_rc_var(i64 n) {
 void tk_rc_assign(i64 n) {
     i64 li = tk_rc_index(nd_name(n));
     if (li < 0) return;
-    tk_check_compat(sc_ty_at(li), tk_ty_of(nd_a(n)), nd_a(n), nd_line(n), nd_file(n));
+    i64 aty = tk_ty_of(nd_a(n));
+    tk_check_compat(sc_ty_at(li), aty, nd_a(n), nd_line(n), nd_file(n));
+    set_nd_a(n, tk_num_widen(sc_ty_at(li), aty, nd_a(n)));   // `y = 5;` on an `f64 y`
     if (!tk_is_counted(sc_ty_at(li))) return;
     tk_rc_at(n);
     i64 dest = tk_addr(nd_name(n));
@@ -207,7 +214,12 @@ void tk_rc_assign(i64 n) {
 // after it would never run.
 void tk_rc_return(i64 n, i64 p0) {
     i64 e = nd_a(n);
-    if (e != 0) tk_check_compat(tk_rc_ret, tk_ty_of(e), e, nd_line(n), nd_file(n));
+    if (e != 0) {
+        i64 ety = tk_ty_of(e);
+        tk_check_compat(tk_rc_ret, ety, e, nd_line(n), nd_file(n));
+        e = tk_num_widen(tk_rc_ret, ety, e);      // `return 7;` from an `f64` function
+        set_nd_a(n, e);
+    }
     i64 parked = tk_nparked > p0;
     i64 needinc = 0;
     if (e != 0 && tk_is_counted(tk_rc_ret)) needinc = !tk_rc_own(e);
@@ -330,15 +342,33 @@ void tk_rc_park(i64 n) {
 // which is also why a virtual or an interface call (`callp`, never a name
 // `decl_find` would know) is not this walk's to check: teko_typeof.tk's own
 // deferred/direct emission is where those are caught instead.
+//
+// It also CONVERTS: an integer argument on a parameter of float type is
+// wrapped in the cast that lowers to `scvtf` (teko_typeof.tk's
+// `tk_num_widen`, C# §10.2.3) and spliced into the list where it stood, so
+// `g(3)` against `f64 g(f64)` passes three point zero and not the bit pattern
+// of the integer three.
 void tk_rc_call_args(i64 n) {
     i64 d = decl_find(nd_name(n));
     if (d < 0) return;
+    i64 prev = 0;
     i64 a = nd_a(n);
     i64 i = 0;
     loop {
         if (a == 0) break;
-        tk_check_compat(tk_decl_param_ty(d, i), tk_ty_of(a), a, nd_line(n), nd_file(n));
-        a = nd_next(a);
+        i64 nxt = nd_next(a);
+        i64 pt = tk_decl_param_ty(d, i);
+        i64 at = tk_ty_of(a);
+        tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
+        i64 fixed = tk_num_widen(pt, at, a);
+        if (fixed != a) {
+            set_nd_next(fixed, nxt);
+            if (prev == 0) set_nd_a(n, fixed);
+            else set_nd_next(prev, fixed);
+            a = fixed;
+        }
+        prev = a;
+        a = nxt;
         i = i + 1;
     }
 }
