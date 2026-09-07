@@ -282,3 +282,23 @@ A link to a repository **directory** is the one shape the generator does not map
 resolves a `.md` of the site to its page, any other repository FILE to `edit_url`, and a
 section directory to that section's index, leaving everything else as written and reporting
 it. So a page that means the fixture directory names it by URL, not as `../../tests/`.
+
+### D29 · The pin rises to 0.15.18 (2026-09-07)
+`MC_VERSION` moves from `0.15.13` to `0.15.18` (`minicompiler/mc` PRs #44-#50): a comparison
+benchmark and its docs, `M48` C1/C2 (package `[[permission]]`/`[tools]` and six sandbox
+primitives), an HTTP soak workflow, and `M44` step 4 (`mc install`, the slim compiler
+flavour). None of it touches the base grammar this repository teaches over.
+
+One break, found by the baseline build against the new release before the pin moved:
+`lex_set_libs` gained a second parameter, `hintfn` (`src/lex.mc`, landed in PR #50 — `mc
+install`'s slim-compiler diagnostic asks the hint only when the compiler carries no
+bundle at all). `core_teko.mc`'s call site — built with `<mc/core_bundle>`, so `bopen_fn`
+is never 0 — now passes `0`; the hint is dead code for a compiler that always carries a
+bundle. `docs/reference/hooks.md` at the `v0.15.18` tag still shows the old one-argument
+signature — a doc lag on `mc`'s side, reported upstream, not patched here (D2).
+
+Baseline (mc 0.15.18, `MC_VERSION` still reading `0.15.13`): 45/45 fixtures, `FIXPOINT OK`
+(`teko1.o == teko2.o` on the first turn, `--dump-asm` diff empty), `mc limits` verdict ok,
+`scripts/check-docs.sh` 63 samples / 277 links / 349 diagnostics. Only then was
+`MC_VERSION` written and the literal `0.15.13` mentions (`CONTRIBUTING.md`,
+`docs/guide/00-getting-started.md`, `.github/workflows/site.yml`) raised to `0.15.18`.
