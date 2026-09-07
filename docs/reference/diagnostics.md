@@ -31,7 +31,10 @@ entry says what completes it.
 - `"teko: type not taught yet"` — the word in type position is reserved for a construct
   this version does not implement.
 - `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: the only implicit
-  reference conversions are derived-to-base and class-to-interface.
+  reference conversions are derived-to-base and class-to-interface, and a value of float
+  type (`f64`, `f32`) never lands in a slot of another kind — an argument, an overload's
+  parameter, an assignment, an initializer or a `return`
+  ([parameters.md](parameters.md#what-a-literal-converts-to)).
 - `"teko: field of type void"` — a field has a type; `void` is a return type only.
 - `"teko: duplicate field"` — two fields of one type share a name.
 - `"teko: an array field size is an integer literal"` — `T items[N]` takes a literal or a
