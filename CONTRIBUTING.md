@@ -1,68 +1,117 @@
-# Contributing to Teko
+# Contributing to teko
 
-Thanks for your interest! Teko is a young, fast-moving project with a few **non-negotiable invariants**. Read this before opening a PR — a change that violates them will be rejected regardless of how good it otherwise is.
+Teko is a language taught to the [`mc`](https://github.com/minicompiler/mc) compiler via
+hook modules. This guide covers the workflow for working on the language port.
 
-## The invariants
+## Prerequisites
 
-### 1. Native is the sole engine (ruling 2026-07-13, #524)
+- **`mc` toolchain**: pinned version in `MC_VERSION` (one line, e.g., `0.15.13`).
+  Download from [releases](https://github.com/minicompiler/mc/releases); verify the SHA256.
+  ```sh
+  mc --version          # must match MC_VERSION
+  ```
+- **Platform**: Linux/macOS/Windows x86_64/aarch64 (the five legs the CI tests).
+- **No external libc:** the runtime (`lib/rt.tk`) uses only syscalls and the ABI — no FFI
+  dependencies beyond the host C library.
 
-**Teko-only source:** the compiler's canonical source is Teko (`src/**/*.tks`), and the C23 bootstrap files (`src/**/*.{c,h}` except the runtime) are archived at tag `0.0.1.3-bootstrap`. All new work is written in Teko only; do NOT extend the frozen C bootstrap. The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam for native binaries. CI seeds from the latest released `teko` binary.
-
-**Seed-fallback (owner ruling 2026-07-24):** the invariant is that the released seed builds the PR's base lineage, not necessarily any given PR's tip. A wave is never blocked by a seed capability gap: `scripts/build_with_seed_fallback.sh` first tries the seed directly on the tip (the common case, zero extra cost); only if that fails does it engage the **staged bootstrap ladder**, an iterative walk — *while the compiler in hand cannot build the tip, find the NEWEST first-parent ancestor it CAN build, build that, and climb onto the resulting compiler* — bounded by a stage cap and a no-progress guard. Every CI lane that builds gen1 from the released seed goes through this script, so a genuine language/codegen capability jump introduced by a PR never needs an intermediate version cut.
-
-The rung is **discovered by probing, never assumed**: a fixed guess (the merge-base with the base branch) lands on the wrong side of the jump whenever a wagon ADDS a capability and then DELETES the corpus that did without it — its own head then requires the newer compiler, while the previous generation dies on it. The buildable rung is the wagon that already has the capability but not yet the corpus depending on it, and only a probe finds that commit. Two further invariants, each learned from a real failure: `TK_RT_DIR` is **pinned per stage** (the compiler otherwise resolves `teko_rt.{h,c}` relative to its own binary and mixes runtime eras), and each probe's output lives **inside the probed worktree** (same reason). A push directly to `main` is exempt by construction: `main`'s own merge-base with itself is itself, so a seed that fails there is a real regression, not a capability gap the fallback can bridge.
-
-### 2. Native verification gate
-
-Every validated change must pass the native gate (`teko test .` with coverage). Regression examples in `examples/` encode expected exit codes for native execution.
-
-### 3. Verify native build + the self-host fixpoint
-
-Before marking work done:
+## Building locally
 
 ```sh
-./bin/teko build . -o /tmp/gen1      # self-hosted engine gen-1
-./bin/teko test .                     # run the full test gate (native) with coverage enforced
+# Derive your platform's config from teko.toml (set [target] os/arch)
+sed -e 's/^os   = .*/os   = "linux"/' -e 's/^arch = .*/arch = "x86_64"/' \
+    teko.toml >mc.host.toml
+
+# Build the taught compiler
+mc build . --config mc.host.toml
+
+# Run the fixtures (45 programs, each with // expect-exit: N oracle)
+for src in tests/*.tk; do
+  n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
+  sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
+      mc.host.toml >"mc.$n.toml"
+  ./build/teko build . --config "mc.$n.toml" --entry-only && "./build/$n"
+  echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
+done
 ```
 
-The generated C output (gen-2 from gen-1 rebuilt) must match gen-1 exactly (fixpoint). See [docs/BUILDING.md](docs/BUILDING.md) §5.
+## Fixpoint (self-hosting proof)
 
-### 4. Law-first design
+The fixed point proves the taught compiler reproduces itself:
 
-Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO_CONSTITUTION.md) (M.0–M.5) and the rulings in [TEKO_LEGISLATION.md](TEKO_LEGISLATION.md) — not by taste. If your change needs a new design decision, open an issue describing the tension and which law each option satisfies; don't bury the decision inside a PR.
+```sh
+sh scripts/bootstrap.sh --os linux --arch x86_64
+# Output: teko0 (mc stock) → teko1 → teko2 → teko3 over mc_teko.tk
+# Green means: teko2.o ≡ teko3.o (byte-identical), --dump-asm identical,
+#              teko1 compiles and runs all 45 fixtures with correct exit codes.
+```
 
-## Branch and PR mechanics
+Runs on five native legs in CI (`ngen.yml`, `fixpoint` job).
 
-- **Wave dev model (remodel).** Development proceeds in **waves**, one per `0.X` version. Each wave has **one umbrella PR** (branch `remodel/<slug>`, base `main`) that carries the version bump and aggregates the wave. Every feature/fix is a **sub-PR based on the umbrella**, never on `main`, and you **never commit directly to `main`**. Each sub-PR is drained CLEAN (all checks green) into the umbrella. Before the umbrella merges, two passes run **pre-launch**: the **W15 quality sweep** (#234 verifier + #231 lint) and the **doc-sync** (this coherence pass). The umbrella → `main` merge (strict All-Green gate) is what ships the `0.X.0.0-beta` version. Every wave gets its own W15 sweep and doc-sync, until LTS.
-- Outside a wave (a hotfix or tooling change on `main`), base the PR on `main` directly.
-- Use **Conventional Commits** (`feat(parser): …`, `fix(checker): …`, `docs: …`, `chore: …`).
-- Keep PRs focused: one feature/fix per PR, with its tests and regression examples included.
+## Documentation
 
-## Tests
+`docs/README.md` is the map. A change to public behavior updates the matching
+`docs/guide/`, `docs/reference/` or `docs/specs/` page in the same PR — the gate below
+checks that every fenced ` ```teko ` example actually compiles and, with
+`// expect-exit: N`, runs with that exit code.
 
-- Compiler tests are Teko functions annotated `#test`, in files ending `.tkt`, run by `teko test .`.
-- `teko build` runs the test gate before codegen and enforces the coverage floors in `teko.tkp` — a PR that drops coverage below the floor will not build.
-- New language features need a regression example under `examples/regressions/<name>/` (a `.tkp` + sources whose exit code proves the behavior), verified natively.
+```sh
+sh scripts/check-docs.sh
+```
 
-## Style
+## What a PR must contain
 
-- Write self-explanatory code; avoid cryptic mnemonic abbreviations.
-- Teko style laws (enforced by the grammar itself in several cases): the only loop is `loop { … }` (no `while`/`for`); never `match` on a bool — use `if`/`else`; casts go `bool → numeric`, never `T → bool` (use `x != 0`).
-- **Comments = doc-comments only (ruling 2026-07-04, W15-from-now).** Every comment on a function, type, or member is a `/** … */` doc-comment attached to the declaration. Do NOT write inline comments (`// …` mid-body or trailing). If a line genuinely needs explaining, that is the signal to extract a well-named function instead of annotating it. This applies to **new code AND any code you touch** — a changed function's old inline comments are cleaned as part of the change, not left behind.
-- **Flatten; no "Hadouken" code (same ruling).** No deep-nested pyramids (`if { if { if … } }`, nested `match` arms). Flatten with early returns / guard clauses / continues. Where flattening is impossible, **extract a function/method** to cut cyclomatic complexity and keep functions short and single-purpose (and files from growing unbounded). New and touched code both land in this shape — we apply the W15 quality standard as-you-go so the final sweep is only verification.
+- **Green `mc build ngen && run`**: all 45 fixtures compile and execute with correct exit codes
+  on your platform.
+- **Fixpoint closure** (if touching modules in `mc_teko.tk`): `teko1 == teko2 == teko3` byte-identical
+  objects, matching `--dump-asm`.
+- **Fixtures with `// expect-exit: N`**: every new test carries its oracle. No test runs without one.
+- **Docs gate green** (if touching `docs/**`, `README.md` or `CONTRIBUTING.md`): `sh scripts/check-docs.sh`.
+- **No changes to mc's core** (`minicompiler/mc src/`). Teko only teaches new modules; the base
+  grammar, lexer, and type system of mc are off-limits.
+- **No new intrinsics or hardcoded backend logic.** Every function has surface code (`exp fn` in `.tk`).
+  If a feature "wants" special handling in the backend, that's a fork: record it in `DECISION_LOG.md` and ask the owner.
 
-## Versioning
+## Code style for `.tk` hook modules
 
-The version is `MAJOR.MINOR.PATCH.BUILD-<stage>`, held verbatim in `teko.tkp` (the single source of truth — the embedded `teko --version` and the release tag both read it). The `<stage>` tracks the remodel: **`alpha`** (`0.0.1.x`, pre-remodel) → **`beta`** (the `0.X` remodel/backlog waves, one coherent subset each) → stable at **`1.0.0.0` = LTS**, once the backlog is empty. When the integrator merges a **code** change, they bump the 4th field (`BUILD`) by 1 in the PR; a `MAJOR`/`MINOR`/`PATCH` bump resets `BUILD` to 0. No Action detects the increment — the manifest carries it. Docs/config-only merges do not bump `teko.tkp` (no new release). A `teko.tkp` version change auto-tags and publishes a prerelease; during a wave, each sub-PR merge mints an intermediate `0.X.0.N-beta` seed that the umbrella dogfoods (progressive self-hosting).
+- **Short, clear.** No doc-comments longer than the code they document.
+- **No inline `//` comments.** Inline commentary is banned — the code speaks for itself, or the design
+  lives in `docs/specs/` or `docs/history/design/`.
+- **Error messages: compiler style.** `file:line:column: "short cause"` (e.g., `teko: unsupported (os,arch)`).
+  No lengthy explanations or references to docs.
+- **Refused features carry `teko:` prefix:** v0.1.0 does not support `Func<>`, `params T[]`, `T[][]`,
+  nested `namespace`, float in `params`, `when` on the last `_` arm. Any of these triggers `teko: <cause short>`.
 
-## Reporting issues
+## Decisions and forks
 
-Use the issue templates. For suspected compiler bugs, the most valuable artifact is a **minimal `.tks` reproducer** plus the observed native behavior vs. what you expected (exit code, panic/error output).
+**Default: follow C# semantics.** Teko's surface mirrors mc's `[compiler]` modules, which themselves
+mirror C# grammar and behavior (where applicable).
 
-## Security
+**Open forks** (design decisions not yet decided, or tensions between laws):
+1. Check `DECISION_LOG.md` (D211 onward; D1–D210 in `docs/history/decision-log-legacy.md`).
+2. Check `docs/history/design/port-teko-mc.md` and `docs/history/handoff-2026-09.md` (the
+   laws), and `docs/specs/` for anything already designed.
+3. If genuinely open, record the fork in `DECISION_LOG.md` and ask the owner, with the fork
+   statement and context. Do not implement competing designs.
 
-Please report suspected vulnerabilities privately — see [SECURITY.md](SECURITY.md).
+## Reporting mc-side defects
 
-## License of contributions
+If `mc` itself has a bug or limitation affecting teko's port:
+1. Verify the issue on `minicompiler/mc` head.
+2. Open an issue on the mc repo with reproducible steps.
+3. Link from teko's PR or DECISION_LOG until resolved.
+4. Do not work around mc bugs in teko code; fix the root cause in mc.
 
-Teko is dual-licensed under Apache-2.0 OR MIT. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion is dual-licensed the same way, without additional terms or conditions.
+## CI and workflows
+
+- **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen` and all 45 fixtures.
+- **`fixpoint` job**: teko0→teko1→teko2→teko3, object comparison and ASM diff, all 45 fixtures via teko1.
+- **`docs` job**: `sh scripts/check-docs.sh` against `docs/**`.
+- **Squash merge only.** The ruleset `main` requires fast-forward or squash; merge commits are blocked.
+- **No legacy workflows.** The retired standalone compiler's own CI configuration
+  (`pr.yml`, release cycles) is history, not run.
+
+---
+
+For the full operational guide (superseded page by page as `docs/internals/` fills in),
+see `docs/history/handoff-2026-09.md`. For design decisions and the port rationale, see
+`docs/history/design/port-teko-mc.md` and `DECISION_LOG.md`.
