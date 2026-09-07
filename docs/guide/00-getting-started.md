@@ -14,7 +14,7 @@ The version is [`MC_VERSION`](../../MC_VERSION), one line, and it is the only on
 to build this tree.
 
 ```sh
-version=$(cat MC_VERSION)                          # 0.15.18
+version=$(cat MC_VERSION)                          # 0.15.22
 name="mc-$version-macos-arm64"                     # or linux-x86_64, linux-arm64, windows-x86_64, windows-arm64
 base="https://github.com/minicompiler/mc/releases/download/v$version"
 curl -fsSLO "$base/$name.tar.gz"

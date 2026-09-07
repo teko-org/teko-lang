@@ -54,7 +54,8 @@ None of these is teko's to write, and each changes what teko can promise.
 | the registry's **R3** — classifying on `[package].language = "teko"`, or on a `[deps] teko` when the key is absent | the key is written into `mc.toml` today and ignored; R3 is what makes it mean something |
 | **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool. Until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
 | **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | teko declares `[deps] stdlib` instead of relying on what the release binary bundles |
-| **a closed hook API, with a deprecation policy** | the pin can move without a survey of every module. This is the one that decides whether a 1.0 is maintainable at all |
+| **the hook API frozen at 1.0.0, with a deprecation policy** — a package taught in a `1.x` teko validates on any `1.y` `mc`. Until it lands, the registry's validator compiles `check` with the same `mc` release it itself pins, and a hook API break between the validator's release and a package's own tag forces a re-tag, not a silent re-validation (D35) | the pin can move without a survey of every module. This is the one that decides whether a 1.0 is maintainable at all |
+| **`[package].mc`, the minimum `mc` release a package reads as its own floor** | today a package names no minimum, so a tag validated once can start failing under a newer validator's `mc` for a reason the package's own `mc.toml` says nothing about (the fork this pin closes, D35). A floor `mc` itself checks before it builds is what lets a package say "I need at least this hook surface" instead of the registry silently rebuilding on whatever release happens to run |
 
 The last one is worth stating plainly. Everything teko is, is hooks: fifteen passes, fourteen
 `syntax` registrations, a `source_claim`, an `on_source`, a `syntax_param`, a `syntax_type`.
