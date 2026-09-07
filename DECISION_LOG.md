@@ -127,9 +127,11 @@ every other library evolves on its own version line.
 ### D16 · How a consumer uses teko (2026-09-07)
 A consumer pins `[deps] teko = "x.y.z"` and names the taught compiler in its own build:
 `[compiler] modules = ["<teko/teko.tk>", "user.mc"]`, so its `mc` builds teko locally,
-nailed by the tree hash. The registry validates the package by building the taught compiler
-from `[package].modules` and the package's `[deps]` **first**, in a sandbox with no network,
-and compiling the `check` units with it (D26). Installing the compiler as a tool
+nailed by the tree hash. Once the registry's toolchain support lands (mc's R2/R3, agreed
+2026-09-07), it validates a teko package by building the taught compiler from
+`[package].modules` and the package's `[deps]` **first**, in a sandbox with no network, and
+compiling the `check` units with it (D26); until then the validator compiles `check` with
+the stock `mc`, which is why `teko`'s own unit, `mc_teko.tk`, is written in core syntax. Installing the compiler as a tool
 (`mc tool install`) is the road that opens once `mc` ships it; until then the
 `[compiler] modules` road is the one that runs, and it stays valid afterwards.
 
@@ -201,9 +203,11 @@ worth restating.
 There is one integrated index, not a teko one beside an mc one: `pkg.minicompiler.dev` is
 its canonical host, `pkg.teko-lang.org` an alias host serving the same bytes, and a
 read-only `/mcp` endpoint answers over the same rows. A teko package **is** an mc package
-plus `[package].toolchain = "teko"`, a key `mc` ignores and the registry classifies on:
-for a package carrying it the registry builds the taught compiler from `[package].modules`
-and the package's `[deps]` first, then compiles the `check` units with it. Three shapes —
+plus `[package].toolchain = "teko"`, a key `mc` ignores and the registry will classify on
+once its support lands (mc's R3): for a package carrying it the registry will build the
+taught compiler from `[package].modules` and the package's `[deps]` first (mc's R2), then
+compile the `check` units with it. Neither is live yet; the key is written now so the first
+publication does not change the manifest again. Three shapes —
 `teko`, the compiler; `teko_std`, the library, versioned in lockstep with it; and every
 other library on its own line over `[deps] teko_std`. The closure rule is `mc`'s: a
 package reaches its own files, the libraries the binary ships and its declared `[deps]`,
