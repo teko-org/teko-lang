@@ -1,5 +1,5 @@
 #!/bin/sh
-# measure.sh BINARY CONFIG [DIR] -- the S1m register (docs/design/
+# measure.sh BINARY CONFIG [DIR] -- the S1m register (docs/history/design/
 # plano-ngen-entrega4.md §64(f)): given the taught compiler's own binary,
 # print the size it landed at, its sections, and `mc limits` for the same
 # project/config, so a crumb that changes the parts a compiler is built
