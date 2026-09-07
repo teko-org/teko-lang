@@ -10,6 +10,8 @@ looking up a construct must never find a plan described as if it worked.
 | [packages.md](packages.md) | one integrated registry with `mc`, what makes a package a teko package, and how a consumer pins the compiler and the library |
 | [self-hosting.md](self-hosting.md) | the single unit, and why the criterion is the object rather than the executable |
 | [dependency-injection.md](dependency-injection.md) | the DI model as decided, including the parts that are not built |
+| [datetime.md](datetime.md) | `DateTime` and `TimeSpan`: the tick, the members a primitive gets, and the one piece blocked on a clock in `mc`'s `<sys>` |
+| [decimal.md](decimal.md) | `decimal`: C#'s 128-bit exact base-ten number, as a sixteen-byte primitive that moves by address |
 | [params-typed.md](params-typed.md) | `params T[]`, the typed variadic list — **built**, the reference describes it; the page is kept for the steps still open and for what the flip measured |
 | [small-ints.md](small-ints.md) | `i8`, `i16`, `i128` and `u128` — the integers C# has and teko does not, and the `tk_is_int_ty` predicate they change |
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
