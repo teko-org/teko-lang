@@ -10,7 +10,7 @@ description: The standing design-partner protocol for teko-lang (owner decree 20
 ## The protocol (in order)
 
 ### 1. Research history FIRST — never re-ask the ruled
-Before questioning the owner or recording anything, sweep the record: issue comments (the ruling trail lives there), `DECISION_LOG.md`, `TEKO_MASTER_PLAN.md` header rulings, `docs/design/*.md`, and recent PR bodies. If a point was already ruled, cite it and move on — re-asking settled questions is a protocol violation. *(Lesson: fmt vertical alignment was re-asked 5+ times across sessions before being hard-recorded in #372. Never again.)*
+Before questioning the owner or recording anything, sweep the record: issue comments (the ruling trail lives there), `DECISION_LOG.md`, `TEKO_MASTER_PLAN.md` header rulings, `docs/history/design/*.md`, and recent PR bodies. If a point was already ruled, cite it and move on — re-asking settled questions is a protocol violation. *(Lesson: fmt vertical alignment was re-asked 5+ times across sessions before being hard-recorded in #372. Never again.)*
 
 ### 2. Run the counter-argument round BEFORE the stamp
 When the owner proposes a design/ruling:
