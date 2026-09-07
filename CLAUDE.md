@@ -1,118 +1,87 @@
-# Instruções permanentes — teko-lang
+# Working instructions — teko-lang
 
-## Idioma (REGRA DURA, persistente)
-O dono (schivei) **NÃO fala inglês**. **TODA** comunicação no chat é em **PT-BR**,
-sempre. A conversa com o dono é PT-BR; código, commits, docs públicas (`docs/**`,
-`README.md`, `CONTRIBUTING.md`) e nomes técnicos seguem a convenção do repo (inglês).
+## What this repository is
 
-## Como perguntar (REGRA DURA)
-**NUNCA usar quiz/menu de opções (ferramenta AskUserQuestion).** Toda pergunta é em
-prosa curta, PT-BR. Quando o dono estiver respondendo outras coisas, **espere** —
-não empilhe perguntas.
+**Teko is a language taught to [`mc`](https://github.com/minicompiler/mc)**, not a
+compiler of its own. The whole language lives at the root as hook modules — 31 `teko_*.tk`
+modules plus `lib/rt.tk`, driven by `core_teko.mc` and `user.mc` — and `mc` is **pinned by
+`MC_VERSION`**: download exactly that release, no other one runs. `mc.toml` is the package
+manifest (`[package]` only); `teko.toml` is the build config
+(`mc build . --config teko.toml`).
 
-## Protocolo de fork (decisão, owner-gate, ambiguidade) — REGRA DURA
-Antes de parar com dúvida, **TER CERTEZA** que não está já deliberado:
-1. **Checar se já está deliberado** — buscar em `DECISION_LOG.md` (D211+ nesta raiz;
-   D1–D210 em `docs/history/decision-log-legacy.md`), `docs/history/design/port-teko-mc.md`,
-   `docs/history/handoff-2026-09.md`, `docs/history/design/pr-org-ngen.md`.
-2. **Mais recente vence** — aplicar a decisão mais recente por data/ID.
-3. **Só HALT em fork real** — parar e notificar o dono **apenas** quando NÃO existe
-   deliberação, enunciando o fork curto e claro.
+## Language (hard rule)
 
-## O que é o repo
-**Teko** é uma linguagem **ensinada ao `mc`** (minicompiler.dev, `minicompiler/mc`), não
-um compilador próprio. O port é a raiz do repositório: 31 módulos `.tk` do pacote `teko`
-+ `lib/rt.tk`, dirigidos por `core_teko.mc`/`user.mc`. **`mc` é pinado por `MC_VERSION`**
-— baixe a release exata daquela versão, nenhuma outra roda.
+The owner reads Portuguese only. **Chat with him is PT-BR, always.** **Everything that
+lands in this repository is English** — documentation, code comments, commit messages, PR
+bodies, workflow comments; `sh scripts/check-docs.sh` fails on Portuguese in tracked
+sources. **Never use a quiz or a menu of options (the AskUserQuestion tool): ask in short
+prose.** When the owner is answering something else, wait — do not stack questions.
 
-O compilador standalone anterior foi **retirado e removido da árvore**
-(`DECISION_LOG.md` D211/D212); seu registro fica em `docs/history/` (o
-`decision-log-legacy.md`, o antigo `HANDOFF.md` e os planos de design), nunca reescrito.
-Todo trabalho novo vive no port.
+## Fork protocol
 
-## Onde estão as docs
+Before halting on a design question, be sure it is not already decided:
 
-`docs/README.md` é o mapa: `guide/` (task-oriented), `reference/` (por lookup), `specs/`
-(desenhado, não implementado), `internals/` (como o port é construído — hoje um ponteiro
-para `docs/history/handoff-2026-09.md`, reescrito por assunto conforme os planos avançam)
-e `history/` (registro congelado — o compilador antigo, `DECISION_LOG.md` D1-D210, os
-planos de design). `sh scripts/check-docs.sh` prova a árvore: links resolvem, nenhuma
-página viva cita caminho do compilador antigo, todo exemplo `teko` compilado tem oráculo,
-e todo diagnóstico `teko: …` do fonte está listado em `docs/reference/diagnostics.md`.
+1. Search `DECISION_LOG.md`, then `docs/specs/` and `docs/reference/`.
+2. **The newest ruling wins** — a later entry supersedes an earlier one on the same point.
+3. **Halt only on a genuinely open fork**, stating it short and clear. Default otherwise:
+   follow C#, or the market when C# has no form, and record the choice in the log.
 
-## Como buildar e validar localmente
+## Process in force
+
+- **One agent at a time**, on its own branch and its own worktree — never the main
+  checkout. Branch prefixes: `ngen/**`, `feat/**`, `fix/**`, `docs/**`, `verify/**`.
+  Commit and push per commit; never run `git config user.*`.
+- **Scout → implementer → independent verifier → PR.** The scout checks the task against
+  the current tree (are the citations right? is it already landed? are the dependencies
+  satisfied?); the implementer runs only if the scout says it is needed, carrying the
+  scout's findings; the verifier re-proves the result without trusting the implementer's
+  word.
+- **A PR squash-merges into `main` with CI green** — the five `ngen` legs, the five
+  `fixpoint` legs, `docs`, and the aggregator `mc build ngen && run` — and with **every
+  Copilot review finding resolved** before the merge.
+- A dispatch that started wrong is killed and re-dispatched clean, never patched in
+  flight.
+
+## Code laws
+
+- **Zero changes to mc's core.** A defect on mc's side is reported to `minicompiler/mc`
+  with a minimal, pure-mc reproducer; it is never worked around here.
+- **Zero new intrinsics.** Every function has surface code; `mc limits` is the budget a
+  construct has to fit in. A construct that "wants" backend magic is a fork.
+- **Every fixture carries `// expect-exit: N`.** No oracle, no fixture.
+- **Refusals say `teko: <short cause>`** — compiler style, no prose, no references.
+- **`--dump-ast` is identical when a change does not change accepted code.** That is the
+  proof a refactor is a no-op.
+- **No workarounds:** find the root cause.
+
+## Local recipe
 
 ```sh
-# 1. Ter o mc de MC_VERSION no PATH
-cat MC_VERSION        # => x.y.z
-mc --version          # => precisa dizer x.y.z
-
-# 2. Derive o config do host (a partir de teko.toml)
-sed -e "s#^os   =.*#os   = \"linux\"#" -e "s#^arch =.*#arch = \"x86_64\"#" \
-    teko.toml >mc.host.toml
-
-# 3. Build e run dos testes
-mc build . --config mc.host.toml   # => constrói o compilador ensinado
-for t in tests/*.tk; do
-  n=$(basename "$t" .tk)
-  w=$(grep -m1 '// expect-exit:' "$t" | sed 's/.*expect-exit: *//')
+sed -e 's/^os   = .*/os   = "macos"/' -e 's/^arch = .*/arch = "aarch64"/' \
+    teko.toml >mc.macos.toml
+mc build . --config mc.macos.toml
+for src in tests/*.tk; do
+  n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
   sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
-      mc.host.toml >"mc.$n.toml"
-  ./build/teko build . --config "mc.$n.toml" --entry-only && ./build/$n
+      mc.macos.toml >"mc.$n.toml"
+  ./build/teko build . --config "mc.$n.toml" --entry-only && "./build/$n"
   echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
 done
-
-# 4. Fixpoint (teko0→teko1→teko2→teko3)
-sh scripts/bootstrap.sh --os linux --arch x86_64
-# Se printa "FIXPOINT OK", o compilador se reproduz.
-
-# 5. Gate das docs
+sh scripts/bootstrap.sh --os macos --arch aarch64   # prints FIXPOINT OK
 sh scripts/check-docs.sh
 ```
 
-## Gates do CI obrigatório na org
+`MC_VERSION` is raised only after that whole recipe is green locally on the new mc.
 
-| check | o que prova |
-|---|---|
-| `ngen (<os>/<arch>)` ×5 | cada perna (linux×2, macos/aarch64, windows×2) no runner nativo; `mc --host` asserido; 45 fixtures compiladas e executadas com exit code correto |
-| `mc build ngen && run` | agregador que o ruleset exige; falha se qualquer perna falhar |
-| `fixpoint (<os>/<arch>)` ×5 | teko0→teko1→teko2→teko3 sobre `mc_teko.tk`; `cmp` dos objetos byte-idêntico; `--dump-asm` idêntico; teko1 roda as 45 fixtures |
-| `docs` | `sh scripts/check-docs.sh` sobre `docs/**` |
-| `Branch policy gate`, `Analyze (actions)` | inalterados (CodeQL sem C/C++) |
+## Where things live
 
-## Leis de código do port
+`docs/README.md` is the map: `guide/` (task-oriented), `reference/` (by lookup), `specs/`
+(designed, not built), `internals/` (how the port is built), `history/` (a pointer to the
+private `teko-org/teko-history`). `DECISION_LOG.md` holds the decisions in force. The
+channel with the mc session is outside this repository — decisions that affect mc, and
+questions only mc can answer, go through the mc project's own notices file.
 
-- **Zero mudança em `src/` do mc.** O `mc` é a base; teko ensina só o delta.
-- **Zero intrínseco novo.** Toda função tem código próprio (`exp fn`, não hardcoded no backend).
-  Se um construto "pede" intrínseco, é fork — parar e perguntar.
-- **Toda fixture tem `// expect-exit: N`.** Sem oráculo não roda nem no CI.
-- **Recusas com `teko: <causa curta>`.** Mensagem de erro padrão compilador: `arquivo:linha:coluna: "causa"`.
-  Nada de história, referências ou explicação de design.
-- **`--dump-ast` idêntico quando o crumb não muda código aceito.** Prova de no-op.
-- **Superfície fora da v0.1.0 (recusada com mensagem, não implementada em silêncio):** `Func<>`/`Action<>`,
-  multicast, `params T[]`, `T[][]`, `namespace` aninhado, DI genérica, float em `params`, `when` no `_` final.
-- **Doc pública em inglês (`docs/**`, `README.md`, `CONTRIBUTING.md`); PT-BR só em
-  `CLAUDE.md`, `DECISION_LOG.md` e `docs/history/`.**
-- **Coordenação:** o coordenador não manda mensagem a agente em voo (`SendMessage` indisponível); errou →
-  kill e re-dispatch limpo, nunca remendo em voo.
+## Versioning
 
-## Processo (uma passada scout → implementer)
-
-Quando um crumb chega: (1) **SCOUT** verifica contra a raiz atual — as citações estão
-certas? A superfície já está landada? As deps satisfeitas? Há drift? (2) **IMPLEMENTER**
-só se scout disser PRECISA ou INCERTO, COM os achados do scout.
-
-**Um agente por branch/worktree isolado.** Nunca compartilhe o checkout principal. Push
-frequente na branch do agente; PR contra `main`.
-
-## Canal com o mc (NOTICES)
-
-Decisões que impactam o mc, ou pedidos de check do mc, vão a `NOTICES` no
-`minicompiler/mc` (`NOTICES-teko.md` do repo do mc, lido no começo de cada lote).
-Exemplos: mudança de hook signature, limite de feature do mc, pacote registrado, tool
-`tekoc` vs lib `teko`. **O mc pinado é autoridade** — se o mc não compila uma feature, é
-fork (parar e perguntar).
-
-## Sem workarounds
-Achar e resolver a **causa raiz**, nunca dar voltas para contornar. Se um dispatch saiu
-errado, interromper e reiniciar certo — não remendar um agente em voo.
+`vX.Y.Z`, mc's own three-part format. The next release is **v0.4.0**; **v1.0.0 ships only
+together with mc 1.0.0**.
