@@ -183,7 +183,8 @@ i64 main() {
 
 | written | message |
 |---|---|
-| a `decimal` in an `i64`/`f64` slot | `teko: a value of type decimal does not convert to f64` |
+| a `decimal` in an `i64` slot | `teko: a value of type decimal does not convert to i64` |
+| a `decimal` in an `f64` slot | `teko: a value of type decimal does not convert to f64` |
 | an `f64` in a `decimal` slot | `teko: a value of type f64 does not convert to decimal` |
 | `null`, a class, a struct, a `T[]` in a `decimal` slot | `teko: a value of type Foo does not convert to decimal` (D32/D34's own wording) |
 | `<<`, `>>`, `&`, `|`, `^`, `~` on a `decimal` | ``teko: no operator `<<` takes these operands`` (teko_ops.tk's own) |

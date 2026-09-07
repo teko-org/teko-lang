@@ -150,7 +150,8 @@ i64 main() {
 | written | message |
 |---|---|
 | `a + b`, both `DateTime` | ``teko: no operator `+` takes these operands`` (teko_ops.tk's own) |
-| a `DateTime` in an `i64`/`f64` slot | `teko: a value of type DateTime does not convert to i64` |
+| a `DateTime` in an `i64` slot | `teko: a value of type DateTime does not convert to i64` |
+| a `DateTime` in an `f64` slot | `teko: a value of type DateTime does not convert to f64` |
 | an integer in a `DateTime`/`TimeSpan` slot | `teko: a value of type i64 does not convert to DateTime` |
 | `(i64) dt`, `(DateTime) n` written by hand | ``teko: a date does not cast; `.Ticks` reads it and `new DateTime(t)` builds it`` |
 | an unknown member | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` |
