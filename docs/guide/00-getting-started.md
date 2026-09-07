@@ -15,16 +15,19 @@ to build this tree.
 
 ```sh
 version=$(cat MC_VERSION)                          # 0.15.13
-name="mc-$version-macos-arm64"                     # linux-x86_64, windows-arm64, ...
-curl -fsSLO "https://github.com/minicompiler/mc/releases/download/v$version/$name.tar.gz"
-curl -fsSLO "https://github.com/minicompiler/mc/releases/download/v$version/$name.tar.gz.sha256"
-shasum -a 256 -c "$name.tar.gz.sha256"
+name="mc-$version-macos-arm64"                     # or linux-x86_64, linux-arm64, windows-x86_64, windows-arm64
+base="https://github.com/minicompiler/mc/releases/download/v$version"
+curl -fsSLO "$base/$name.tar.gz"
+curl -fsSLO "$base/$name.tar.gz.sha256"
+sha256sum -c "$name.tar.gz.sha256" 2>/dev/null || shasum -a 256 -c "$name.tar.gz.sha256"   # Linux, then macOS
 tar xzf "$name.tar.gz"
-install -m 755 "$name/mc" /usr/local/bin/mc
+mkdir -p ~/.local/bin && install -m 755 "$name/mc" ~/.local/bin/mc   # no root needed; put ~/.local/bin on PATH
 
 mc --version                                       # must print the pinned version
 mc --host                                          # the (os, arch) pair this binary is
 ```
+
+On Windows the asset is a `.tar.gz` too; extract it and put `mc.exe` on `PATH`.
 
 The release names the machine `x86_64` or `arm64`; `mc --host` calls the same machine
 `x86_64` or `aarch64`. On macOS the binary is ad-hoc signed, so a download through a
