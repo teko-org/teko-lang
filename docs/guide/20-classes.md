@@ -21,9 +21,8 @@ the vtable.
 One base class, first in the `:` list, then any number of interfaces. `virtual` takes a
 vtable slot and `override` fills it — hiding an inherited virtual without saying
 `override` is refused. An `abstract` class cannot be instantiated and its abstract members
-have no body; the first concrete class below it owes an `override` for each of them.
-`: base(args)` chains to the base constructor; a destructor chain runs the derived class's
-first.
+have no body; the first concrete class below it owes an `override` for each of them, and
+`: base(args)` chains to the base constructor.
 
 An `interface` declares methods and properties, never a field, and a class naming one
 carries an interface table. An interface member may carry a **default body** (C# 8): a
@@ -38,7 +37,7 @@ backing field, `get => e` / `set => e` is the expression form, `get { }` the blo
 is a `public static` member naming **both** operands, resolved by their static types;
 pairs are mandatory (`==`/`!=`, `<`/`>`, `<=`/`>=`).
 
-Order of declaration is free: a type may be used above the line that declares it — as a
+Order of declaration is free: a type may be used above the line that declares it, as a
 field, a parameter, a base class, an interface or the target of `new`.
 
 ## One program
