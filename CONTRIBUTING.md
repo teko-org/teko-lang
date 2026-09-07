@@ -66,7 +66,8 @@ vendored here — so rendering the site locally starts with a shallow checkout o
 
 ```sh
 git clone --depth 1 --branch "v$(cat MC_VERSION)" https://github.com/minicompiler/mc _mc
-(cd _mc && mc build site --config site/mc.linux.toml)   # site/mc.toml on macOS
+(cd _mc && mc build site --config site/mc.toml)         # macOS
+# (cd _mc && mc build site --config site/mc.linux.toml) # Linux instead
 _mc/build/mcsite site --check                           # writes site/public, then validates
 python3 -m http.server 8000 --directory site/public
 ```

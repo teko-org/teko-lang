@@ -61,8 +61,9 @@ def channel(c):
 
 def luminance(hexcolor):
     h = hexcolor.lstrip("#")
-    if len(h) == 3:
+    if len(h) in (3, 4):                     # #RGB or #RGBA shorthand: expand each nibble
         h = "".join(ch * 2 for ch in h)
+    h = h[:6]                                # #RRGGBBAA: the alpha does not enter the luminance
     r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
     return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
 
@@ -77,7 +78,7 @@ def parse():
     text = CSS.read_text()
     dark_at = text.index("@media (prefers-color-scheme: dark)")
     light_src, dark_src = text[:dark_at], text[dark_at:]
-    decl = re.compile(r"(--[a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{3,8})\s*;")
+    decl = re.compile(r"(--[a-z0-9-]+)\s*:\s*(#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3,4}))\s*;")
     light = dict(decl.findall(light_src))
     dark = dict(light)
     dark.update(dict(decl.findall(dark_src)))
