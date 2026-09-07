@@ -147,13 +147,13 @@ enforces it mechanically over the tracked sources, with the brand assets exempt 
 they are metadata, not prose.
 
 ### D19 · The documentation gate proves the docs (2026-09-07)
-`sh scripts/check-docs.sh`, the `docs` job in CI, checks four things and now two more:
-every relative link resolves; no live page names a path of the retired compiler; every
-`teko: …` message the sources emit is listed in `docs/reference/diagnostics.md`; and every
-fenced ` ```teko ` block either carries `// expect-exit: N` — in which case it is compiled
-by the taught compiler and RUN, with the exit code compared — or `// no-run`. Added on
-2026-09-07: the language check of D18, and link extraction that skips fenced code, so a
-code sample is never read as a broken link.
+`sh scripts/check-docs.sh`, the `docs` job in CI, checks five things: every relative link
+resolves (link extraction skips fenced code, so a code sample is never read as a broken
+link); no path of the retired compiler appears outside `docs/history/`; no Portuguese
+appears in the public tree (D18); every `teko: …` diagnostic the modules emit appears in
+`docs/reference/diagnostics.md`; and every fenced ` ```teko ` block either carries
+`// expect-exit: N` — in which case it is compiled by the taught compiler and RUN, with the
+exit code compared — or `// no-run`. A doc that cannot pass the gate does not merge.
 
 ### D20 · The refusals are a documented surface (2026-09-07)
 The rule of the cut is **no silently wrong result**: a construct that is not taught is
