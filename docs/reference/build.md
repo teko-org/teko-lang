@@ -165,7 +165,8 @@ Three criteria, all of them checked:
 1. `cmp build/teko2.o build/teko3.o` — **byte-identical objects**. `teko1.o` against
    `teko2.o` is deliberately not the criterion: those come from two different compilers.
 2. the `--dump-asm` of `teko2` and of `teko3` differ nowhere.
-3. `teko1` compiles and runs all 45 fixtures of [`../../tests/`](../../tests/), each one's
+3. `teko1` compiles and runs all 45 fixtures of
+   [`tests/`](https://github.com/teko-org/teko-lang/tree/main/tests), each one's
    own `// expect-exit: N` being the oracle.
 
 It prints `FIXPOINT OK` when all three hold. The ladder **runs** every stage it builds, so

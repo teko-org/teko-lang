@@ -7,7 +7,8 @@ here too — as a page of its own and as the catalogue of every message.
 Every fenced `teko` example on these pages is **compiled and run** by
 [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh), and its `// expect-exit: N`
 header is the assertion. Most of them are derived from the fixtures in
-[`../../tests/`](../../tests/), which the five native CI legs run on every push.
+[`tests/`](https://github.com/teko-org/teko-lang/tree/main/tests), which the five native
+CI legs run on every push.
 
 | page | covers |
 |---|---|
