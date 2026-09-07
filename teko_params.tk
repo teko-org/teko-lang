@@ -43,6 +43,13 @@
 // overloads, which census by ARITY -- the call has to already carry its single
 // argument -- and ahead of the reclaim, which is what parks the array.
 //
+// A NAME WITH MORE THAN ONE SIGNATURE is the one thing this pass does not
+// decide (C3). `f(i64)` beside `f(params i64[])` is C#'s own pair, and which
+// of them `f(1)` means is a question about all the signatures at once. Such a
+// row is marked shared (`tk_pm_scan_shared`) and its call sites are left as
+// written; teko_over.tk's fifth round chooses the candidate and calls
+// `tk_pm_expand_call` back here to build exactly the same chain.
+//
 // The walk is POST-ORDER, so `total(total(1, 2), 3)` packs the inner call
 // first, and every argument is cut off its sibling list before it becomes an
 // argument of a `put`: a node lives in ONE list.
@@ -58,6 +65,8 @@ i64 tk_npm = 0;
 uptr pmd_name[TK_MAXPMD];             // the declaration's name, as it stands at pass time
 i64  pmd_fixed[TK_MAXPMD];            // parameters that come before the list
 i64  pmd_ty[TK_MAXPMD];               // the `T[]` row the list is
+i64  pmd_node[TK_MAXPMD];             // the declaration the three above came from
+i64  pmd_over[TK_MAXPMD];             // 1 when the name carries a second signature (C3)
 i64  tk_npmd = 0;
 
 #define TK_MAXPMP 16                  // parameters of the declaration the walk is inside
@@ -84,9 +93,13 @@ void set_pmp_ty_at(i64 i, i64 v)    { st64(pmp_ty + i * 8, v); }
 uptr pmd_name_at(i64 i)  { return ld64(pmd_name + i * 8); }
 i64  pmd_fixed_at(i64 i) { return ld64(pmd_fixed + i * 8); }
 i64  pmd_ty_at(i64 i)    { return ld64(pmd_ty + i * 8); }
+i64  pmd_node_at(i64 i)  { return ld64(pmd_node + i * 8); }
+i64  pmd_over_at(i64 i)  { return ld64(pmd_over + i * 8); }
 void set_pmd_name_at(i64 i, uptr v)  { st64(pmd_name + i * 8, v); }
 void set_pmd_fixed_at(i64 i, i64 v)  { st64(pmd_fixed + i * 8, v); }
 void set_pmd_ty_at(i64 i, i64 v)     { st64(pmd_ty + i * 8, v); }
+void set_pmd_node_at(i64 i, i64 v)   { st64(pmd_node + i * 8, v); }
+void set_pmd_over_at(i64 i, i64 v)   { st64(pmd_over + i * 8, v); }
 
 // xs[i] -- the `[` the core's Pratt grammar does not have. `[` is punctuation
 // the lexer already knows, and `ops_init()` does not touch it, so unlike an
@@ -218,12 +231,14 @@ i64 tk_pm_find(uptr name) {
     return 0 - 1;
 }
 
-void tk_pm_add(uptr name, i64 fixed, i64 ty) {
+void tk_pm_add(uptr name, i64 fixed, i64 ty, i64 d) {
     if (tk_npmd == TK_MAXPMD)
         err_at(tk_file, tk_line, "teko: too many `params` declarations in one unit");
     set_pmd_name_at(tk_npmd, name);
     set_pmd_fixed_at(tk_npmd, fixed);
     set_pmd_ty_at(tk_npmd, ty);
+    set_pmd_node_at(tk_npmd, d);
+    set_pmd_over_at(tk_npmd, 0);
     tk_npmd = tk_npmd + 1;
 }
 
@@ -249,6 +264,16 @@ i64 tk_pm_pos(i64 d) {
     return 0 - 1;
 }
 
+// the `params` list of `d`: its POSITION through `pk`, and the `T[]` row type
+// as the answer -- -1, and `pk` -1, for a declaration that carries none. The
+// one call teko_over.tk's fifth round needs to ask about a candidate.
+i64 tk_pm_list_of(i64 d, uptr pk) {
+    i64 k = tk_pm_pos(d);
+    st64(pk, k);
+    if (k < 0) return 0 - 1;
+    return pm_ty_at(tk_pm_hit);
+}
+
 void tk_pm_collect(i64 root) {
     i64 n = root;
     loop {
@@ -259,24 +284,46 @@ void tk_pm_collect(i64 root) {
                 if (nd_kind(n) == N_EXTERN)
                     err_at2(nd_file(n), nd_line(n), "teko: an `extern` symbol takes no `params` list", nd_name(n));
                 if (tk_pm_find(nd_name(n)) < 0)
-                    tk_pm_add(nd_name(n), k, pm_ty_at(tk_pm_hit));
+                    tk_pm_add(nd_name(n), k, pm_ty_at(tk_pm_hit), n);
             }
         }
         n = nd_next(n);
     }
 }
 
-// A name that carries a list carries nothing else. Which candidate a short
-// call means is a question about ALL of a name's signatures at once, and the
-// round that answers it is teko_over.tk's, which runs behind this pass -- so
-// a second signature of the name would have this pass expanding a call the
-// overload resolution had not decided yet.
-void tk_pm_check_unique(i64 root) {
+// 1 when two declarations take the same parameters -- the same types in the
+// same order, each with the same `ref`/`out` kind, which is exactly what
+// `tk_ov_sig` (teko_over.tk) mangles a symbol out of. A prototype and its own
+// definition answer 1, whether or not both spell the modifier; two
+// declarations that differ anywhere answer 0 and are two signatures.
+i64 tk_pm_same_shape(i64 d1, i64 d2) {
+    i64 p1 = nd_a(d1);
+    i64 p2 = nd_a(d2);
+    loop {
+        if (p1 == 0 || p2 == 0) break;
+        if (tk_param_ty(p1) != tk_param_ty(p2)) return 0;
+        if (tk_rp_kind(p1) != tk_rp_kind(p2)) return 0;
+        p1 = nd_next(p1);
+        p2 = nd_next(p2);
+    }
+    return p1 == 0 && p2 == 0;
+}
+
+// C3: a name that carries a list may carry other signatures too. Which
+// candidate a call means is a question about ALL of them at once, and the
+// round that answers it is teko_over.tk's fifth, behind this pass -- so the
+// row is MARKED here and every call site of it is left exactly as written.
+// The expansion happens there instead, against the candidate the arguments
+// chose (`tk_pm_expand_call` below).
+void tk_pm_scan_shared(i64 root) {
     i64 n = root;
     loop {
         if (n == 0) break;
-        if (decl_valid(n) && tk_pm_find(nd_name(n)) >= 0 && tk_pm_pos(n) < 0)
-            err_at2(nd_file(n), nd_line(n), "teko: a `params` list cannot be overloaded", nd_name(n));
+        if (decl_valid(n)) {
+            i64 r = tk_pm_find(nd_name(n));
+            if (r >= 0 && n != pmd_node_at(r) && !tk_pm_same_shape(pmd_node_at(r), n))
+                set_pmd_over_at(r, 1);
+        }
         n = nd_next(n);
     }
 }
@@ -345,22 +392,64 @@ i64 tk_pm_arg_ty(i64 a) {
     return tk_pty_of(a);
 }
 
-// one element against the declared element type: identity, or -- for an
-// element type that names a row -- the derives/implements rule every other
-// slot of this compiler already takes (`tk_check_compat`). An integer literal
-// lands in any integer of the core; there is no implicit numeric conversion,
-// so `total(1)` against a `params f64[]` is a refusal, in the same wording a
-// mismatched argument gets anywhere else.
-void tk_pm_check_elem(i64 ety, i64 a, i64 line, uptr fl) {
-    i64 aty = tk_pm_arg_ty(a);
-    if (aty < 0) return;
-    if (aty == ety) return;
+// the type of the argument at position `i`: the one the caller already has,
+// when it brought its own array (teko_over.tk computed every argument's type
+// to choose the candidate, under a scope this module's own tables know
+// nothing about), and the tree's own answer otherwise.
+i64 tk_pm_argty_at(i64 a, i64 i, uptr tys) {
+    if (tys == 0) return tk_pm_arg_ty(a);
+    return ld64(tys + i * 8);
+}
+
+// one element against the declared element type, as a VERDICT: identity, or
+// -- for an element type that names a row -- the derives/implements rule
+// every other slot of this compiler already takes (`tk_row_fits`). A type
+// nothing here knows fits, since nothing is refused on it. There is no
+// implicit numeric conversion, so an `f64` never lands in an `i64[]`; an
+// integer LITERAL carries no type of its own and lands, at `loose`, on any
+// integer of the core, and without it only on `i64` -- the same tie-break
+// teko_over.tk's own rounds take, and what tells `params i64[]` from
+// `params u8[]` at a site that wrote a bare `1`.
+i64 tk_pm_elem_fits(i64 ety, i64 a, i64 aty, i64 loose) {
+    if (aty < 0) return 1;
+    if (aty == ety) return 1;
+    i64 ti = tk_struct_by_ty(ety);
+    if (ti >= 0) {
+        if (tk_is_null_lit(a)) return 1;
+        return tk_row_fits(ti, tk_struct_by_ty(aty));
+    }
+    if (nd_kind(a) != N_INT) return 0;
+    if (type_kind(aty) == TK_FLOAT || type_kind(ety) == TK_FLOAT) return 0;
+    if (loose) return 1;
+    return ety == TY_I64;
+}
+
+// the same rule, reported: the element the chain is about to store, in the
+// wording a mismatched argument gets anywhere else. `aty` is the type the
+// caller already has for the argument.
+void tk_pm_check_elem(i64 ety, i64 a, i64 aty, i64 line, uptr fl) {
+    if (tk_pm_elem_fits(ety, a, aty, 1)) return;
     if (tk_struct_by_ty(ety) >= 0) {
         tk_check_compat(ety, aty, a, line, fl);
         return;
     }
-    if (nd_kind(a) == N_INT && type_kind(aty) != TK_FLOAT && type_kind(ety) != TK_FLOAT) return;
     tk_reject_compat(type_name(aty), type_name(ety), line, fl);
+}
+
+// every argument from position `k` on, against the element type of the list
+// `ty` -- the verdict teko_over.tk's fifth round asks of a candidate, with
+// nothing reported. `tys` is that pass's own array of argument types.
+i64 tk_pm_tail_fits(i64 ty, i64 args, i64 k, uptr tys, i64 loose) {
+    i64 ety = ha_ety_at(tk_struct_by_ty(ty));
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        if (i >= k && !tk_pm_elem_fits(ety, a, ld64(tys + i * 8), loose)) return 0;
+        i = i + 1;
+        a = nd_next(a);
+    }
+    return 1;
 }
 
 // how many arguments are left once the fixed ones have been walked past
@@ -379,7 +468,7 @@ i64 tk_pm_count(i64 tail) {
 // is the one node registered OWNED -- the whole chain carries its single
 // reference -- and every link above it is registered borrowed, so the reclaim
 // parks the array exactly once.
-i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 line, uptr fl) {
+i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 first, uptr tys, i64 line, uptr fl) {
     tk_ha_ensure_put(si);
     i64 pack = tk_call(tk_ha_allocname(ety), tk_int(v));
     tk_xt_add(pack, si, 0);
@@ -391,7 +480,7 @@ i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 line, uptr fl) {
         if (t == 0) break;
         i64 nxt = nd_next(t);
         set_nd_next(t, 0);
-        tk_pm_check_elem(ety, t, line, fl);
+        tk_pm_check_elem(ety, t, tk_pm_argty_at(t, first + k, tys), line, fl);
         pack = tk_call(put, list_append(list_append(pack, tk_int(TK_HAOBJSIZE + k * w)), t));
         tk_xt_put(pack, si, ty, 1);
         k = k + 1;
@@ -400,15 +489,11 @@ i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 line, uptr fl) {
     return pack;
 }
 
-// `total(a, b)` -> `total(<the chain>)`. The fixed arguments keep their place;
-// the tail is cut off the list and becomes the array. A tail that is already a
-// single `T[]` of the row passes straight through, without a copy -- C#'s own
-// normal form.
-void tk_pm_lower_call(i64 n) {
-    i64 r = tk_pm_find(nd_name(n));
-    if (r < 0) return;
-    i64 k = pmd_fixed_at(r);
-    i64 ty = pmd_ty_at(r);
+// `total(a, b)` -> `total(<the chain>)`. The first `k` arguments keep their
+// place; the tail is cut off the list and becomes the array of the list `ty`.
+// A tail that is already a single `T[]` of the row passes straight through,
+// without a copy -- C#'s own normal form.
+void tk_pm_lower_at(i64 n, i64 k, i64 ty, uptr tys) {
     i64 si = tk_struct_by_ty(ty);
     i64 ety = ha_ety_at(si);
     i64 args = nd_a(n);
@@ -422,16 +507,37 @@ void tk_pm_lower_call(i64 n) {
         tail = nd_next(tail);
         i = i + 1;
     }
-    if (tail != 0 && nd_next(tail) == 0 && tk_pm_arg_ty(tail) == ty) return;
+    if (tail != 0 && nd_next(tail) == 0 && tk_pm_argty_at(tail, k, tys) == ty) return;
     i64 line = nd_line(n);
     uptr fl = nd_file(n);
     i64 v = tk_pm_count(tail);
     tk_line = line;
     tk_file = fl;
-    i64 pack = tk_pm_pack(si, ty, ety, tail, v, line, fl);
+    i64 pack = tk_pm_pack(si, ty, ety, tail, v, k, tys, line, fl);
     if (prev) set_nd_next(prev, 0);
     if (!prev) args = 0;
     set_nd_a(n, list_append(args, pack));
+}
+
+// a call of a name this unit declares ONCE: the row says where the list
+// starts and what it is. A name that carries a second signature is left to
+// teko_over.tk, which is the only pass that can tell which of them the site
+// means (`tk_pm_scan_shared` above).
+void tk_pm_lower_call(i64 n) {
+    i64 r = tk_pm_find(nd_name(n));
+    if (r < 0) return;
+    if (pmd_over_at(r)) return;
+    tk_pm_lower_at(n, pmd_fixed_at(r), pmd_ty_at(r), 0);
+}
+
+// C3: the same expansion, at a call teko_over.tk's fifth round has just
+// resolved to the candidate `d` -- the list is `d`'s own, not a row keyed by
+// name, because the name has more than one. Nothing else differs: the chain,
+// its ownership and the element check are the ones above.
+void tk_pm_expand_call(i64 n, i64 d, uptr tys) {
+    i64 k = 0;
+    i64 ty = tk_pm_list_of(d, &k);
+    tk_pm_lower_at(n, k, ty, tys);
 }
 
 // ---- the walk ----
@@ -479,7 +585,7 @@ i64 tk_params_pass(i64 root) {
     }
     if (tk_npm == 0) return root;
     tk_pm_collect(root);
-    tk_pm_check_unique(root);
+    tk_pm_scan_shared(root);
     tk_pm_check_orphans();
     tk_pm_walk_unit(root, last);
     return root;

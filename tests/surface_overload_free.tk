@@ -13,6 +13,18 @@
 // unit is complete inside a pass, so a recursive site is an ordinary
 // site.
 //
+// A `params T[]` is one signature among the name's (C3), and C#'s own rule
+// falls out of the round order: a candidate applicable in its NORMAL form
+// wins, and only a call no candidate takes as written asks a list to swallow
+// the tail. `span(9)` is `span(i64)`, `span(1, 2)` and `span()` are the list,
+// and `span(ready)` -- an `i64[]` already built -- is the list's own normal
+// form, without a copy. `mix` is two lists, told apart by their element type;
+// `wide` proves a default-completed normal form still beats the expanded one;
+// `more` is C#'s last tie-break, the candidate with more declared parameters
+// winning between two expanded ones. `sum_cells` carries the same ownership
+// rule the list has anywhere else: one reference for the whole chain, and the
+// statement that built the array gives it and every element back.
+//
 // What is not touched is half the point. `plain` has one signature and
 // keeps the symbol `_plain`; `chmod` is an `extern` and owns `_chmod`,
 // the C ABI and not ours to move; and `steps` is declared by a
@@ -74,6 +86,104 @@ i64 plain(i64 n) {
     return n;
 }
 
+i64 span(i64 n) {
+    return 1000 + n;
+}
+
+i64 span(params i64[] xs) {
+    i64 s = 0;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return 2000 + s;
+}
+
+i64 mix(params i64[] xs) {
+    return 100 + xs.Length;
+}
+
+i64 mix(params f64[] ys) {
+    return 200 + ys.Length;
+}
+
+i64 wide(i64 a, i64 b = 5) {
+    return 300 + a + b;
+}
+
+i64 wide(params i64[] xs) {
+    return 400 + xs.Length;
+}
+
+i64 more(params i64[] xs) {
+    return 500 + xs.Length;
+}
+
+i64 more(i64 a, params i64[] rest) {
+    return 600 + a + rest.Length;
+}
+
+i64 gone = 0;
+
+class Cell {
+    i64 v;
+
+    public Cell(i64 v) { this.v = v; }
+    public i64 get() { return v; }
+    ~Cell() { gone = gone + 1; }
+}
+
+i64 sum_cells(i64 n) {
+    return n;
+}
+
+i64 sum_cells(params Cell[] cs) {
+    i64 s = 0;
+    i64 i = 0;
+    while (i < cs.Length) {
+        s = s + cs[i].get();
+        i = i + 1;
+    }
+    return s;
+}
+
+// the fifth round, and the four above it: which form a site is in decides
+// which signature it means
+i64 listcheck() {
+    if (span(9) != 1009) return 1;                // the normal form wins
+    if (span(1, 2) != 2003) return 2;             // ...and only then the list
+    if (span() != 2000) return 3;                 // an array of length 0
+
+    i64[] ready = new i64[2];
+    ready[0] = 4;
+    ready[1] = 6;
+    if (span(ready) != 2010) return 4;            // the list's own normal form
+    if (ready.Length != 2) return 5;              // ...and it was not consumed
+
+    if (mix(1) != 101) return 6;                  // the integer list
+    if (mix(1.5) != 201) return 7;                // the float one
+    if (mix(1, 2) != 102) return 8;
+
+    if (wide(1) != 306) return 9;                 // a default completes the normal form
+    if (wide(1, 2) != 303) return 10;
+    if (wide(1, 2, 3) != 403) return 11;          // only the list takes three
+    if (wide() != 400) return 12;
+
+    if (more(1, 2) != 602) return 13;             // more declared parameters wins
+    return 0;
+}
+
+// the counted element, through the same expansion
+i64 cellcheck() {
+    if (sum_cells(7) != 7) return 1;              // the scalar signature
+    i64 held = rt_live();                         // what the caller holds, `v` included
+    if (sum_cells(new Cell(20), new Cell(22)) != 42) return 2;
+    if (gone != 2) return 3;                      // the array released its elements
+    if (rt_live() != held) return 4;              // ...and the statement released it
+    return 0;
+}
+
 i64 main() {
     Vec v = new Vec;
     v.x = 4;
@@ -92,6 +202,12 @@ i64 main() {
 
     if (plain(4) != 4) return 9;                  // one signature: symbol untouched
     chmod("no-such-file.teko", 0);                // an extern: never renamed
+
+    i64 bad = listcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = cellcheck();
+    if (bad != 0) return 30 + bad;
 
     return pick(9) + pick(v) + pick(3, 4) + tally() + plain(8);   // 10+10+12+2+8
 }
