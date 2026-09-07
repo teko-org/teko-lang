@@ -14,8 +14,15 @@ dependency injection, the self-hosting fixed point.
 
 ## The reference — exhaustive, read by lookup
 
-[`reference/`](reference/README.md): grammar, types, functions, the CLI, `teko.toml`/
-`mc.toml` keys, and every diagnostic message the taught compiler emits.
+[`reference/`](reference/README.md): [types](reference/types.md),
+[classes and interfaces](reference/classes.md), [generics](reference/generics.md),
+[delegates](reference/delegates.md), [arrays](reference/arrays.md),
+[namespaces](reference/namespaces.md), [control flow](reference/control-flow.md),
+[parameters](reference/parameters.md), [dependency injection](reference/di.md),
+[memory](reference/memory.md), [the runtime](reference/runtime.md),
+[the CLI and `teko.toml`](reference/build.md), every
+[diagnostic](reference/diagnostics.md) the taught compiler emits, and
+[what v0.1.0 refuses](reference/not-yet.md).
 
 ## The specs — designed, not yet implemented
 
