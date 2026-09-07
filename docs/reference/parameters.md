@@ -88,7 +88,8 @@ i64 main() {
 
 One name, several signatures — on a method, on a constructor, on an operator and on a free
 function. Which one a site calls is decided by the **argument types**, from the compiler's
-own static-type oracle; an integer literal is an `i64`.
+own static-type oracle; an integer literal is an `i64`, and a float literal is an `f64`
+(an `f32` under the `f` suffix).
 
 | | |
 |---|---|
@@ -104,6 +105,26 @@ own static-type oracle; an integer literal is an `i64`.
 Resolution is by arity first, then by types; the return type never takes part. A call
 nested in another is resolved first, so its return type types the outer site, and a
 recursive call is an ordinary site.
+
+### What a literal converts to
+
+An **integer** literal carries no type of its own: it lands on any of the core's integers,
+and on `i64` before the others, which is what makes `pick(1)` with both `pick(i64)` and
+`pick(u8)` in reach `pick(i64)`.
+
+A **float** literal does carry one. `1.5` is an `f64` exactly as C# reads it, so only an
+`f64` parameter takes it — in the exact round and in every round after it, whatever the
+declaration order. There is no implicit conversion from a float to an integer, so a value
+of float type in an integer slot is refused, `teko: a value of type f64 does not convert
+to i64`, and it is refused the same way when the name is declared once and no overload is
+searched at all. It holds for an expression as much as for a literal: a local of float
+type, a call whose return type is `f64`, and a binary whose left operand is a float all
+pick the float signature — `near` in the sample below.
+
+The **`null`** literal is a reference, as in C#: it lands on a parameter whose type is a
+struct, a class or an interface (or a raw `uptr`), and never on an integer, in the exact
+round and in every round after it — `held(null)` is `held(Cell)` even with `held(i64)`
+declared first.
 
 ```teko
 // expect-exit: 42
@@ -132,6 +153,14 @@ i64 tally() {
 
 i64 tally(i64 k) {
     return k;
+}
+
+i64 near(i64 n) {
+    return 700 + n;
+}
+
+i64 near(f64 x) {
+    return 800;
 }
 
 class Box {
@@ -163,6 +192,9 @@ i64 main() {
     b.w = 5;
     if (b.grow() != 6) return 7;
     if (b.grow(3) != 8) return 8;
+
+    if (near(9) != 709) return 9;                // the integer literal is i64
+    if (near(1.5) != 800) return 10;             // the float literal is f64
 
     return pick(9) + pick(v) + pick(3, 4) + tally() + b.grow() + 2;
 }

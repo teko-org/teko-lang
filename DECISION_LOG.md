@@ -368,3 +368,43 @@ No accepted program changes by it. The `params` pass runs behind the oracle, the
 that consults `tk_pure`, so nothing had duplicated a link — the correction stops the next
 pass to be moved from inheriting a licence nobody meant to give, and that is worth a column
 rather than a comment.
+
+### D32 · A float literal has a type of its own; it does not land on an integer (2026-09-07)
+`1.5` is an `f64` — `<float>`'s `fl_lit` gives it the bit pattern of the value and that type,
+in an `N_INT` node, because the core has no float node of its own. Overload resolution
+([`teko_over.tk`](teko_over.tk), `tk_ov_args_fit`) read the node's KIND alone and treated
+every `N_INT` as the untyped integer literal, so `f(1.5)` matched `f(i64)` in the **exact**
+round, before `f(f64)` was ever asked: the eight bytes of the pattern reached a parameter
+that reads them as an integer, silently and with the wrong value. The rule is C#'s — an
+integer widens to a double, nothing narrows back without being written down — and it now
+holds in every round: a float literal fits a parameter of its own float type and no other,
+the same rule an element of a `params` list was already judged by (`tk_pm_elem_fits`).
+
+A site left with nothing says what did not convert rather than that nothing matched. C#
+answers such a call by naming the argument of a candidate (§12.6.4.5), so a float argument
+no signature of the name takes **at that position, at that arity** is reported
+`teko: a value of type f64 does not convert to i64` — the wording every other mismatched
+value already gets — and a site whose ARITY is what failed keeps
+`teko: no overload of f matches these arguments`.
+
+The same rule holds where no overload is searched. `tk_check_compat`
+([`teko_typeof.tk`](teko_typeof.tk)) judges a float by its KIND before anything else, so a
+name declared ONCE refuses `g(1.5)` against `i64 g(i64)` exactly as an overloaded one does,
+and so do an assignment, an initializer and a `return`. That check ran only in a unit
+declaring some teko type; the gate ([`teko_rc.tk`](teko_rc.tk), `tk_compat_needed`) is
+widened to every unit, since whether a float belongs in an integer slot cannot depend on
+whether the file happens to hold a class. Nothing else follows the widening: with no row in
+the type table, `tk_is_counted` answers 0 and every rewrite of the reclaim stays gated off —
+the `--dump-ast` of all 45 fixtures is byte-identical to the one before the change.
+
+`null` is the other N_INT that is not the untyped integer literal — `TY_UPTR`, value 0 —
+and it is a reference, C#'s rule: `tk_ov_args_fit` lets it land on a parameter that is a
+row of the type table or a raw `uptr`, and on no integer, in every round; before, the
+exact round read it as an integer literal and `held(null)` with both `held(Cell)` and
+`held(i64)` declared was `held(i64)`.
+
+Two gaps are left standing, both older than this and neither a float in an integer slot: an
+integer literal does NOT convert to a float parameter (the rounds refuse it, and a call of a
+name declared once accepts it and passes the integer's own bits, unconverted), and a binary
+mixing the two takes the type of its LEFT operand, which is the core's own rule — `2 * 1.5`
+is an `i64` site and `1.5 * 2.0` an `f64` one.
