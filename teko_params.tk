@@ -383,6 +383,12 @@ i64 tk_pm_param_ty(uptr name) {
 // tagged node, which by now includes every delegate call the delegate pass
 // rewrote, a bare local, and a call whose callee the unit declares. -1 is
 // "not known here", and nothing is refused on it.
+//
+// A bare NAME is the one that cannot go through `tk_pty_of` here. This is a
+// PASS: every scope of the unit closed while it was still parsing, so the
+// parser's own in-scope lookup has nothing left to answer with, and the
+// append-only rows are what the name is read from instead
+// (`tk_slv_find_unit`, teko_struct.tk's own header on the two questions).
 i64 tk_pm_arg_ty(i64 a) {
     i64 k = nd_kind(a);
     if (k == N_INT)  return nd_type(a);
@@ -390,7 +396,9 @@ i64 tk_pm_arg_ty(i64 a) {
     if (k == N_IDENT) {
         i64 pt = tk_pm_param_ty(nd_name(a));
         if (pt >= 0) return pt;
-        pt = tk_pty_of(a);
+        pt = tk_xt_ty(a);                        // a node the parse already tagged
+        if (pt >= 0) return pt;
+        pt = tk_slv_find_unit(nd_name(a));
         if (pt >= 0) return pt;
         return tk_ty_global_ha(nd_name(a));      // G1: a global `T[]` of heap
     }
@@ -409,12 +417,20 @@ i64 tk_pm_argty_at(i64 a, i64 i, uptr tys) {
 // one element against the declared element type, as a VERDICT: identity, or
 // -- for an element type that names a row -- the derives/implements rule
 // every other slot of this compiler already takes (`tk_row_fits`). A type
-// nothing here knows fits, since nothing is refused on it. There is no
-// implicit numeric conversion, so an `f64` never lands in an `i64[]`; an
-// integer LITERAL carries no type of its own and lands, at `loose`, on any
-// integer of the core, and without it only on `i64` -- the same tie-break
+// nothing here knows fits, since nothing is refused on it. An `f64` never
+// lands in an `i64[]` -- C# narrows nothing without a cast written down -- and
+// an integer LITERAL carries no type of its own and lands, at `loose`, on any
+// integer of the core, and without it only on `i64`: the same tie-break
 // teko_over.tk's own rounds take, and what tells `params i64[]` from
 // `params u8[]` at a site that wrote a bare `1`.
+//
+// An INTEGER in a `params f64[]` converts, C# §12.6.4 over §10.2.3: a list is
+// applicable in its expanded form when every element of the tail converts
+// implicitly to the element type, and an integer converts to a double. It is
+// asked at `loose` only, which is what keeps the tie-break the log already
+// took: the strict stage runs first, `f(1)` fits `params i64[]` there and
+// never reaches this arm, while `f(1, 1.5)` fails every strict candidate and
+// lands on `params f64[]` at the loose stage with the `1` converted.
 i64 tk_pm_elem_fits(i64 ety, i64 a, i64 aty, i64 loose) {
     if (aty < 0) return 1;
     if (aty == ety) return 1;
@@ -423,6 +439,7 @@ i64 tk_pm_elem_fits(i64 ety, i64 a, i64 aty, i64 loose) {
         if (tk_is_null_lit(a)) return 1;
         return tk_row_fits(ti, tk_struct_by_ty(aty));
     }
+    if (loose && type_kind(ety) == TK_FLOAT && tk_is_int_ty(aty)) return 1;
     if (nd_kind(a) != N_INT) return 0;
     if (type_kind(aty) == TK_FLOAT || type_kind(ety) == TK_FLOAT) return 0;
     if (loose) return 1;
@@ -486,7 +503,11 @@ i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 first, uptr tys, i6
         if (t == 0) break;
         i64 nxt = nd_next(t);
         set_nd_next(t, 0);
-        tk_pm_check_elem(ety, t, tk_pm_argty_at(t, first + k, tys), line, fl);
+        i64 tty = tk_pm_argty_at(t, first + k, tys);
+        tk_pm_check_elem(ety, t, tty, line, fl);
+        t = tk_num_widen(ety, tty, t);            // an integer in a `params f64[]`
+        tk_line = line;
+        tk_file = fl;
         pack = tk_call(put, list_append(list_append(pack, tk_int(TK_HAOBJSIZE + k * w)), t));
         tk_xt_put(pack, si, ty, 0, TK_BORROWED);
         k = k + 1;

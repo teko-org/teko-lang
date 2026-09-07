@@ -97,6 +97,13 @@ i64 tk_take_decl_vis();
 i64 tk_take_decl_proj();
 i64 tk_type_word(uptr name);
 
+// teko_typeof.tk is included after this file: `p.items[i] = e` below is one of
+// the two parse-time field stores, and this is the value it writes -- the two
+// scalar verdicts (a float in an integer slot, `null` in a numeric one) and
+// C# §10.2.3's own widening of an integer into a float slot, over the row
+// check `tk_check_field_store` (this file) already gave it
+i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl);
+
 // `top_add` for a declaration GENERATED while one of the program's own is
 // still being read -- a thunk built at `new Op(fn)`, the three functions
 // `new T[n]` needs, `tk_ix` at an array-field index: every one of them fires
@@ -201,7 +208,10 @@ i64  tk_nlocal = 0;
 
 uptr slv_name[TK_MAXSLV];             // every local's NAME, whatever its type
 i64  slv_ty[TK_MAXSLV];               // ...and the type it was declared with
-i64  tk_nslv = 0;
+i64  tk_nslv = 0;                     // append-only: the whole unit, for a PASS
+
+i64  slv_live[TK_MAXSLV];             // indices into the two above, the ones IN SCOPE
+i64  tk_nslv_live = 0;                // a stack, cut at every `}`, for the PARSER
 
 i64  xt_node[TK_MAXXT];               // a node this module built, and its type
 i64  xt_str[TK_MAXXT];                // the row of the type table, or -1 for a scalar
@@ -251,6 +261,7 @@ uptr lv_name_at(i64 i)  { return ld64(lv_name + i * 8); }
 i64  lv_str_at(i64 i)   { return ld64(lv_str + i * 8); }
 uptr slv_name_at(i64 i) { return ld64(slv_name + i * 8); }
 i64  slv_ty_at(i64 i)   { return ld64(slv_ty + i * 8); }
+i64  slv_live_at(i64 i) { return ld64(slv_live + i * 8); }
 i64  xt_node_at(i64 i)  { return ld64(xt_node + i * 8); }
 i64  xt_str_at(i64 i)   { return ld64(xt_str + i * 8); }
 i64  xt_ty_at(i64 i)    { return ld64(xt_ty + i * 8); }
@@ -294,6 +305,7 @@ void set_lv_name_at(i64 i, uptr v)  { st64(lv_name + i * 8, v); }
 void set_lv_str_at(i64 i, i64 v)    { st64(lv_str + i * 8, v); }
 void set_slv_name_at(i64 i, uptr v) { st64(slv_name + i * 8, v); }
 void set_slv_ty_at(i64 i, i64 v)    { st64(slv_ty + i * 8, v); }
+void set_slv_live_at(i64 i, i64 v)  { st64(slv_live + i * 8, v); }
 void set_xt_node_at(i64 i, i64 v)   { st64(xt_node + i * 8, v); }
 void set_xt_str_at(i64 i, i64 v)    { st64(xt_str + i * 8, v); }
 void set_xt_ty_at(i64 i, i64 v)     { st64(xt_ty + i * 8, v); }
@@ -986,17 +998,49 @@ void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
 
 // every local's (name, declared type), whatever the type -- K4's `use (a,
 // &b)` needs a capture's type at the exact point it reads the clause, and
-// only a struct/class local is tracked by `tk_local_add` below. Grown
-// ever-forward over the whole unit, like `tk_local_add` itself: the most
-// recent declaration of a name is the one a lookup right after it means.
+// only a struct/class local is tracked by `tk_local_add` below.
+//
+// TWO QUESTIONS, and they were one answer for too long. The PARSER asks "what
+// is this name, HERE?" and the answer has to respect the scope: `tk_slv_live`
+// is a stack of indices, pushed with the entry and cut back at the same `}`
+// `tk_local` is (teko_stmt.tk's `tk_block`, teko_loop.tk's own `foreach`
+// header). A PASS asks "what did this unit ever declare under that name?",
+// long after every scope closed, and reads the append-only rows instead --
+// teko_params.tk's `tk_pm_arg_ty`, the one caller that runs there, and the
+// reason the rows cannot simply be popped.
+//
+// One table answering both let a name declared in ONE function answer for a
+// name spelled the same in the NEXT: an `f64 s` in one body typed the `i64 s`
+// PARAMETER of another, and a virtual call passing it was refused for a
+// conversion nobody wrote. A parameter is in no scope table at parse time, so
+// the honest answer for it is -1, "not known here", which every caller of
+// `tk_pty_of` already treats as "refuse nothing".
 void tk_slv_add(uptr name, i64 ty) {
     if (tk_nslv == TK_MAXSLV) err_at(tk_file, tk_line, "teko: too many locals in one unit");
     set_slv_name_at(tk_nslv, name);
     set_slv_ty_at(tk_nslv, ty);
+    set_slv_live_at(tk_nslv_live, tk_nslv);
+    tk_nslv_live = tk_nslv_live + 1;
     tk_nslv = tk_nslv + 1;
 }
 
+// the parser's own lookup: the innermost declaration still in scope
 i64 tk_slv_find(uptr name) {
+    i64 i = tk_nslv_live - 1;
+    loop {
+        if (i < 0) break;
+        i64 j = slv_live_at(i);
+        if (str_eq(slv_name_at(j), name)) return slv_ty_at(j);
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// a PASS's lookup, with every scope of the unit already closed: the last
+// declaration of the name the unit read. It is what tells a `params` call site
+// that the single argument it carries is already the `T[]` the list wants
+// (teko_params.tk's own normal form), and nothing is refused on its answer.
+i64 tk_slv_find_unit(uptr name) {
     i64 i = tk_nslv - 1;
     loop {
         if (i < 0) break;
@@ -1019,12 +1063,22 @@ i64 tk_slv_find(uptr name) {
 // arguments are checked at the PARSE-TIME call site (teko_expr.tk's
 // `tk_vcall_args_check`, teko_iface.tk's `tk_ifargs_check`), before the
 // pass-time scope table (`tk_ty_scope_find`) exists.
+//
+// A LITERAL and a CAST carry their own type in the node, and both are answered
+// here -- the two arms `tk_pm_arg_ty` (teko_params.tk) had already stacked on
+// top of this call for the elements of a `params` list, now given to every
+// caller. `1.5` is an N_INT typed `f64` (`<float>`'s `fl_lit`) and `null` an
+// N_INT typed `uptr` (teko_type.tk), so it is these two arms that let a
+// virtual and an interface call be told, at the site that writes them, what an
+// ordinary call already was.
 i64 tk_pty_of(i64 n) {
     i64 t = tk_xt_ty(n);
     if (t >= 0) return t;
     i64 k = nd_kind(n);
     if (k == N_IDENT) return tk_slv_find(nd_name(n));
     if (k == N_CALL)  return decl_ret(decl_find(nd_name(n)));
+    if (k == N_INT)   return nd_type(n);
+    if (k == N_CAST)  return nd_type(n);
     return 0 - 1;
 }
 
@@ -1243,9 +1297,9 @@ i64 tk_array_index(i64 addr, i64 x) {
         err_at(fl, line, "teko: the left side of = is not a place");
     if (p_accept(K_ASSIGN)) {
         i64 v = parse_expr(0);
+        v = tk_field_store_val(ety, v, line, fl);
         tk_line = line;
         tk_file = fl;
-        tk_check_field_store(ety, v, line, fl);
         return tk_os_mark(tk_call2(tk_stn(ety), at, v), ety);
     }
     i64 r = tk_call(tk_ldn(ety), at);

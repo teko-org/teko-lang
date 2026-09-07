@@ -1,11 +1,100 @@
-// primitives_float.tk -- f32/f64 (mc's own `<float>` machinery) and the
+// primitives_float.tk -- f32/f64 (mc's own `<float>` machinery): the
 // bit-reinterpret `wrap`/`unwrap` realizes for them (docs/reference/types.md,
-// lib/rt.tk `tk_f64_bits`/`tk_f64_from_bits`): the same eight bytes read back
-// as the other type, no value conversion.
+// lib/rt.tk `tk_f64_bits`/`tk_f64_from_bits`), and C# §10.2.3's implicit
+// numeric conversion, an integer in a slot of float type.
+//
+// `widen` walks the nine slots that convert, each with a value that only comes
+// out right if the conversion happened: an integer written into an `f64` slot
+// unconverted is read as a mantissa, so `1` would be a denormal near zero and
+// every check below would fail. `through` is the other half -- the parse-time
+// table of locals is a SCOPE and not the whole unit, so the `i64 v` PARAMETER
+// there is not typed by the `f64 v` local `widen` declares above it.
 //
 // expect-exit: 42
 
 #include "../lib/rt.tk"
+
+f64 seven() { return 7; }                        // a `return`
+
+f64 twice(f64 x) { return x + x; }               // a free call's own argument
+
+f64 ftotal(params f64[] xs) {                    // an element of a `params f64[]`
+    f64 s = 0.0;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+class Scale {
+    public virtual f64 by(f64 k) { return k; }   // a virtual call's own argument
+}
+
+class Twice : Scale {
+    public override f64 by(f64 k) { return k + k; }
+}
+
+interface Sink {
+    f64 take(f64 v);                             // an interface call's own argument
+}
+
+class Echo : Sink {
+    public f64 take(f64 v) { return v; }
+}
+
+struct Box {
+    public f64 w;                                // a field store
+}
+
+i64 widen() {
+    f64 y = 1;                                   // a variable initializer
+    if (y != 1.0) return 1;
+    y = 5;                                       // an assignment
+    if (y != 5.0) return 2;
+    if (seven() != 7.0) return 3;
+    if (twice(3) != 6.0) return 4;
+
+    Scale s = new Twice();
+    if (s.by(4) != 8.0) return 5;
+
+    Sink k = new Echo();
+    if (k.take(9) != 9.0) return 6;
+
+    Box b = new Box();
+    b.w = 4;
+    f64 v = b.w;                                 // `(i64) b.w` reads as `((i64) b).w`
+    if (v != 4.0) return 7;
+
+    if (ftotal(1, 1.5) != 2.5) return 8;         // the `1` converted; the list is `f64[]`
+
+    if (1 + 2.5 != 3.5) return 9;                // the integer on the LEFT
+    if (2.5 + 1 != 3.5) return 10;               // ...and on the RIGHT
+    if (1 + 2 + 2.5 != 5.5) return 11;           // the integer arithmetic first, then the value
+    if (2 * 1.5 != 3.0) return 12;
+    if (3.5 - 1 != 2.5) return 13;
+    if (7 / 2.0 != 3.5) return 14;
+    if (2.5 > 3) return 15;                      // a comparison promotes the same way
+    if (!(3 > 2.5)) return 16;
+    return 0;
+}
+
+class Pick {
+    public virtual i64 same(i64 n) { return n; }
+}
+
+class Pick2 : Pick {
+    public override i64 same(i64 n) { return n; }
+}
+
+// `v` is an `f64` LOCAL of `widen` above and an `i64` PARAMETER here. The
+// virtual call is told which by the scope the parser stands in; a table that
+// kept every local of the whole unit answered `f64` and refused the call.
+i64 through(i64 v) {
+    Pick p = new Pick2();
+    return p.same(v);
+}
 
 i64 main() {
     f64 a = 40.0;
@@ -13,5 +102,10 @@ i64 main() {
     f64 sum = a + b;
     u64 bits = tk_f64_bits(sum);
     f64 back = tk_f64_from_bits(bits);
-    return (i64) back;
+    if ((i64) back != 42) return 30;
+
+    i64 bad = widen();
+    if (bad != 0) return bad;
+
+    return through(42);
 }

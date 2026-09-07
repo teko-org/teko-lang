@@ -218,6 +218,70 @@ void tk_reject_scalar_member(uptr fl, i64 line, i64 ty, uptr m) {
     err_at2(fl, line, tk_join3("teko: ", type_name(ty), " has no members"), m);
 }
 
+// ---- C# §10.2.3, the implicit numeric conversion ----
+
+// the five ids a slot of INTEGER type can have. Every integer word teko
+// teaches is an alias collapsing to one of them (teko_type.tk), so this is the
+// whole set: `TY_VOID` sits below it and `TY_UPTR` above it, and neither is a
+// number. The KIND cannot answer this question -- a class, an interface and a
+// delegate are all registered `TK_INT` (teko_struct.tk's `type_new`), because
+// the core carries them as one pointer word -- so the ID is what is asked.
+i64 tk_is_int_ty(i64 t) { return t >= TY_U8 && t <= TY_I64; }
+
+// the half of the compatibility check that needs no row of the type table.
+// `tk_check_compat` below opens with it, and so does the field store, which
+// reads its value's type by another route (teko_struct.tk's
+// `tk_check_field_store`) and would otherwise be the one slot of the language
+// where a float lands on an integer in silence.
+//
+// Two values do not convert, in either direction of C#'s rule. A FLOAT in a
+// slot of any other type is a narrowing, and C# has none without a cast
+// written down. `null` is a REFERENCE (D32) and a number is not a reference:
+// it lands on a row of the type table or on a raw `uptr`, and on no integer
+// and no float. A plain `uptr` value is left alone -- the core converts it to
+// an integer of its own accord, and only the LITERAL is judged here.
+void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
+    if (tty < 0) return;
+    if (tk_is_null_lit(en)) {
+        if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT)
+            tk_reject_compat(type_name(TY_UPTR), type_name(tty), line, fl);
+        return;
+    }
+    if (ety < 0) return;
+    if (type_kind(ety) == TK_FLOAT && type_kind(tty) != TK_FLOAT)
+        tk_reject_compat(type_name(ety), type_name(tty), line, fl);
+}
+
+// the OTHER direction, the one that converts: an integer in a slot of float
+// type becomes that float, C# §10.2.3's implicit numeric conversion. The core
+// has none -- `walk_narrow` (mc/src/gen_walk.mc) answers 0 for `TK_FLOAT`, so
+// the eight bytes of the integer would reach the slot unchanged and be read as
+// a mantissa -- and the one surface form that lowers to `scvtf` is the cast
+// (`tk_cast`, teko_array.tk, and `<float>`'s own `fa_cast`), so the conversion
+// IS a cast, written by the compiler where the source did not have to.
+//
+// The node is handed BACK rather than rewritten in place: an argument is a
+// link of a sibling list and an operand is a child, so the caller is the one
+// that knows how to put it back. `ety` is the type the caller already had to
+// ask for -- the pass-time oracle answers a different question from the
+// parse-time one -- and nothing outside `tk_is_int_ty` converts, so `null`, a
+// class, a `T[]` and an `f32` in an `f64` slot all travel untouched.
+//
+// The wrapped node stops being a SIBLING the moment it becomes a child, so its
+// own `nd_next` is cut here: a caller splicing into an argument list has read
+// the link it needs before calling, and one that leaves it in place would give
+// the walk two ways to reach the rest of the list.
+i64 tk_num_widen(i64 tty, i64 ety, i64 e) {
+    if (e == 0) return e;
+    if (tty < 0) return e;
+    if (type_kind(tty) != TK_FLOAT) return e;
+    if (!tk_is_int_ty(ety)) return e;
+    tk_line = nd_line(e);
+    tk_file = nd_file(e);
+    set_nd_next(e, 0);
+    return tk_cast(tty, e);
+}
+
 // D226 compat crumb (assignment/initializer/argument/return): `tty`/`ety` as
 // the ORACLE answers them -- `ety < 0` is "not known", never a rejection, so
 // the check only ever recuses what it is SURE about. `en` is the value's own
@@ -234,8 +298,7 @@ void tk_reject_scalar_member(uptr fl, i64 line, i64 ty, uptr m) {
 // (teko_over.tk's `tk_ov_float_refuse`), and it holds for a `return`, an
 // initializer and an assignment through the same three call sites.
 void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
-    if (ety >= 0 && tty >= 0 && type_kind(ety) == TK_FLOAT && type_kind(tty) != TK_FLOAT)
-        tk_reject_compat(type_name(ety), type_name(tty), line, fl);
+    tk_check_scalar_compat(tty, ety, en, line, fl);
     i64 ti = tk_struct_by_ty(tty);
     if (ti < 0) return;
     if (tk_is_null_lit(en)) return;
@@ -246,6 +309,21 @@ void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     uptr ename = type_name(ety);
     if (ei >= 0) ename = sr_name_at(ei);
     tk_reject_compat(ename, sr_name_at(ti), line, fl);
+}
+
+// the value a field store actually writes, at the two PARSE-TIME sites that
+// build one -- `p.f = e` (teko_expr.tk's `tk_field_use`) and `p.items[i] = e`
+// (teko_struct.tk's `tk_array_index`). The row check those two already had
+// (`tk_check_field_store`) reads the value through `tk_struct_of_expr`, which
+// answers about objects only, so the two scalar verdicts are asked here
+// instead and the widened node is what the store is built over. A field is a
+// slot like any other: `f64 w; p.w = 4;` writes four point zero, and
+// `i64 n; p.n = 2.5;` does not compile.
+i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
+    i64 vty = tk_pty_of(v);
+    tk_check_scalar_compat(fty, vty, v, line, fl);
+    tk_check_field_store(fty, v, line, fl);
+    return tk_num_widen(fty, vty, v);
 }
 
 // ---- the walk a pass drives ----
@@ -396,7 +474,11 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
         i64 val = pd_arg_at(pi);
         i64 vp = tk_pend_at(val);
         if (vp >= 0) tk_pend_do(vp);
-        tk_check_compat(fty, tk_ty_of(val), val, tk_line, tk_file);
+        i64 vty = tk_ty_of(val);
+        tk_check_compat(fty, vty, val, tk_line, tk_file);
+        val = tk_num_widen(fty, vty, val);
+        tk_line = pd_line_at(pi);
+        tk_file = pd_file_at(pi);
         return tk_os_mark(tk_call2(tk_stn(fty), addr, val), fty);
     }
     st64(pty, fty);
