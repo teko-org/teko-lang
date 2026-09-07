@@ -17,7 +17,9 @@ windows/aarch64, each on a runner of that operating system **and** architecture,
 `mc --host` asserted against the leg before anything is built. That is what makes "native" a
 checked fact rather than a runner label: nothing is cross-compiled and left unproven.
 
-`main` requires the twelve above, plus the branch-policy gate and CodeQL.
+All twelve run on every push and pull request, with the branch-policy gate and CodeQL beside
+them; the `main` ruleset requires exactly one of them, the aggregator `mc build ngen && run`,
+which fails when any of the five legs fails. The others are reported, not required.
 
 **The aggregator keeps its literal name.** A required check is matched by name, so renaming
 the job without changing the ruleset in the same step would leave `main` waiting forever for

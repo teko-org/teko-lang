@@ -15,7 +15,7 @@ need it.
 | [runtime.md](runtime.md) | [`lib/rt.tk`](../../lib/rt.tk) from the compiler's side: the layouts it assumes and the calls the passes emit into it |
 | [di.md](di.md) | the service registry, `inject` as a deferred placeholder, and how a scope becomes locals of a block |
 | [bootstrap.md](bootstrap.md) | the teko0 → teko3 ladder, the derived configs, and what the criteria compare |
-| [ci.md](ci.md) | the workflows, the eleven required checks, the composite actions and the release |
+| [ci.md](ci.md) | the workflows, the twelve jobs every push runs and the one check `main` requires, the composite actions and the release |
 | [pitfalls.md](pitfalls.md) | the traps this port has already paid for, each as a rule |
 | [debts.md](debts.md) | what is known to be missing on the inside |
 
