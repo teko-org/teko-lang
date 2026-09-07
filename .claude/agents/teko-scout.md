@@ -20,8 +20,9 @@ Every crumb runs scout first, and your verdict decides whether an implementer is
 
 ## Typical questions you answer
 
-- Where does a construct live? The 31 `teko_*.tk` modules at the root plus `lib/rt.tk`,
-  driven by `core_teko.mc` and `user.mc` — name the module and the line, not the folder.
+- Where does a construct live? The 31 modules at the root — `teko.tk` and the 30
+  `teko_*.tk` — plus `lib/rt.tk`, driven by `core_teko.mc` and `user.mc`. Name the module
+  and the line, not the folder.
 - What is the blast radius of a rename or a new hook? Every call site, as `file:line`, across
   the modules, `tests/`, `docs/` and the manifests `mc.toml` / `teko.toml`.
 - Is a claim still true? Read the current tree, not the crumb's memory of it: a task written

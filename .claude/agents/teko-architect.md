@@ -20,7 +20,7 @@ which describes only what runs) or a plan returned as your final message. Both c
    to close, whether `mc limits` moves, which docs page the crumb owes).
 2. **The surface**, written as teko code the way a user would write it — the legal form, the
    illegal form next to it, and the `teko: <short cause>` refusal the illegal form earns.
-3. **The hooks**, by module: which of the 31 `teko_*.tk` files owns the construct, which pass
+3. **The hooks**, by module: which of the 31 modules at the root owns the construct, which pass
    it runs in, what `lib/rt.tk` has to grow, and what `core_teko.mc`/`user.mc` register.
 4. **The fixtures**, by name, each with the exit code it will assert.
 5. **The risks and the law tensions**, each with a recommended resolution.
