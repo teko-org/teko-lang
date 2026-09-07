@@ -230,3 +230,26 @@ from inside a body is the defect: it left the compiler with a null owner, which 
 `str_eq` of `tk_taint_find` read through — an explicit thunk written before a
 by-reference lambda crashed the compiler instead of compiling (K6). A generator is
 invisible to the parse it interrupts.
+
+The rule, in one line: **every top-level declaration teko emits from inside a body goes
+through `tk_top_emit`.** K6's audit reads every `top_add` call site in the port as one of
+three. **(a) Top level only**, inside a `class`/`struct`/`namespace` body read by
+`parse_top` — member bodies and constructors (`teko_class.tk`), accessors
+(`teko_prop.tk`), the static field and the struct constructor (`teko_struct.tk`), the
+namespace body and its function (`teko_ns.tk`): no declaration of the program's own is
+open. **(b) After the parse, from a `pass()`** — the memoized DI getter and its slot
+(`teko_di.tk`), the `params` instance (`teko_params.tk`): `p_decl_name()` is 0 already and
+nobody reads it any more. **(c) Possibly mid-declaration, fired by an expression** — the
+delegate thunk and the lambda's own four (`teko_deleg.tk`), the three of `new T[n]`
+(`teko_heaparr.tk`), `tk_ix` (`teko_struct.tk`), and everything `tk_class_close` emits:
+the vtable, the release, `tk_vt_init`, the interface table, the method table and each
+allocator (`teko_class.tk`), because a `partial class` closes at its first USE and that
+`new` may stand in any body. Every (c) site adds through `tk_top_emit`; the one exception
+is `teko_generic.tk`'s replay, which saves and restores the name with the rest of its
+scratch because `parse_top` writes it itself, once per declaration the instance produces.
+
+The same invariant covers a body a handler reads ITSELF, with no generated declaration in
+sight: an arrow accessor (`get => e;` / `set => s;`, `teko_prop.tk`) is not read by
+`parse_function`, so its statements belonged to nobody and `tk_taint_owner` keyed them
+under a null owner — the same crash. It now calls `p_set_decl_name`, which mc's hook
+reference requires of exactly a handler that owns a declaration and reads it itself.
