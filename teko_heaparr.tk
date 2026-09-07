@@ -62,6 +62,10 @@ i64  ha_gen[TK_MAXSTRUCT];             // 1 once a row's vtable/release/alloc ar
 i64  ha_gen_at(i64 i)        { return ld64(ha_gen + i * 8); }
 void set_ha_gen_at(i64 i, i64 v) { st64(ha_gen + i * 8, v); }
 
+i64  ha_put[TK_MAXSTRUCT];             // 1 once a row's element store is top_add-ed too
+i64  ha_put_at(i64 i)        { return ld64(ha_put + i * 8); }
+void set_ha_put_at(i64 i, i64 v) { st64(ha_put + i * 8, v); }
+
 // teko_expr.tk is included after this file: `xs[i](args)`, an array whose
 // ELEMENT is a delegate (`Op[]`), reads the argument list the same way a
 // delegate FIELD's own call does (`tk_field_deleg_call`).
@@ -70,6 +74,7 @@ i64 tk_args(uptr pn);
 uptr tk_ha_relname(i64 ety)   { return tk_join("tkarr_release_", type_name(ety)); }
 uptr tk_ha_vtname(i64 ety)    { return tk_join("tkarr_vt_", type_name(ety)); }
 uptr tk_ha_allocname(i64 ety) { return tk_join("tkarr_new_", type_name(ety)); }
+uptr tk_ha_putname(i64 ety)   { return tk_join("tkarr_put_", type_name(ety)); }
 
 // `ld64(t + 16)`, freshly built every time: a node lives in only one sibling
 // list, so a caller that needs it twice (the release fn's own size, and,
@@ -108,9 +113,56 @@ i64 tk_ha_alloc_fn(i64 si, i64 ety, uptr allocname, uptr vtname, uptr relname) {
     i64 lenslot = tk_bin(K_ADD, tk_id("p"), tk_int(16));
     st = list_append(st, tk_stmt(tk_call2("st64", lenslot, tk_id("n"))));
     i64 r = tk_id("p");
-    tk_xt_add(r, si, 0);                          // already owned: the count above, not rt_own
+    tk_xt_add(r, si, 1, TK_OWNED);                // a NAME, so pure; owned from the count
+                                                  // above, not an rt_own
     st = list_append(st, tk_ret(r));
     return tk_func(sr_ty_at(si), allocname, param_new(TY_I64, "n"), tk_blk(st));
+}
+
+// `T[] tkarr_put_T(uptr a, i64 off, T v) { stW(a + off, v); return a; }` --
+// ONE element of an array under construction, written at the site that builds
+// it. A store is a statement and a construction has to be one EXPRESSION, so
+// each link hands the array back to the next and a whole array is a chain of
+// them over the allocator: `tkarr_put_i64(tkarr_put_i64(tkarr_new_i64(2), 24,
+// a), 32, b)`. It is the shape `tk_cap_put` (lib/rt.tk) already builds a
+// closure with, generated per ELEMENT TYPE instead of written once, which is
+// what lets `v` be DECLARED at that type: a float travels in the other
+// register file and an `i64` parameter never receives it, so `f64` is declared
+// `f64` and stored with `stf64` -- `tk_stn` (teko_struct.tk) is the one table
+// that picks between `st8`/`st16`/`st32`/`st64`/`stf32`/`stf64`, and no new
+// runtime helper is needed for any of them.
+//
+// The offset is the caller's constant (`TK_HAOBJSIZE + k * width`), not an
+// index: an element wider or narrower than a word costs the site an addition
+// the generated code does not repeat.
+//
+// OWNERSHIP. The array carries exactly ONE reference for the whole chain --
+// the count `tkarr_new_T` was born with -- and no link may add or drop one.
+// Registering the returned name as owned is what says so: `tk_rc_return`
+// (teko_rc.tk) increments a BORROWED value on its way out of a function whose
+// declared return type is counted, and an increment per link is a reference
+// the statement's own sweep never gives back. The mirror of the same rule
+// belongs to the CALL SITE, where the OUTER node of the chain is registered
+// borrowed so the park happens once, at the allocator inside it.
+//
+// A COUNTED element earns its own reference, `rt_own` (lib/rt.tk), exactly as
+// `tk_cap_own` takes one for a capture of class type: the array is what holds
+// it from there on, and `tkarr_release_T`'s own per-slot pass is what gives it
+// back.
+i64 tk_ha_put_fn(i64 si, i64 ety, uptr putname) {
+    uptr a = "a";
+    i64 v = tk_id("v");
+    if (tk_is_counted(ety)) v = tk_call("rt_own", v);
+    i64 slot = tk_bin(K_ADD, tk_id(a), tk_id("off"));
+    i64 st = tk_stmt(tk_call2(tk_stn(ety), slot, v));
+    i64 r = tk_id(a);
+    tk_xt_add(r, si, 1, TK_OWNED);                // a NAME, so pure; OWNED is what keeps the
+                                                  // chain's one reference off rc_inc
+    st = list_append(st, tk_ret(r));
+    i64 prs = param_new(TY_UPTR, a);
+    prs = list_append(prs, param_new(TY_I64, "off"));
+    prs = list_append(prs, param_new(ety, "v"));
+    return tk_func(sr_ty_at(si), putname, prs, tk_blk(st));
 }
 
 // generates the three top-level declarations a row needs, once, the first
@@ -130,6 +182,18 @@ void tk_ha_ensure_gen(i64 si) {
     tk_top_emit(tk_ha_alloc_fn(si, ety, tk_ha_allocname(ety), vtname, relname));
 }
 
+// the element store, behind a flag of its OWN: a row that is merely allocated
+// (`new T[n]`) does not pay for it, so a program that never builds an array
+// out of a list of expressions keeps the tree it had. The allocator group is
+// ensured first because a chain has nothing to write into without it.
+void tk_ha_ensure_put(i64 si) {
+    tk_ha_ensure_gen(si);
+    if (ha_put_at(si)) return;
+    set_ha_put_at(si, 1);
+    i64 ety = ha_ety_at(si);
+    tk_top_emit(tk_ha_put_fn(si, ety, tk_ha_putname(ety)));
+}
+
 // `tk_arr_at(base, idx, width)` -- the run-time-checked address (lib/rt.tk's
 // new `tk_arr_at`), shared by every load/store/compound below.
 i64 tk_ha_addr(i64 base, i64 idx, i64 ety) {
@@ -142,7 +206,7 @@ i64 tk_ha_addr(i64 base, i64 idx, i64 ety) {
 i64 tk_ha_load(i64 base, i64 ety, i64 idx) {
     i64 r = tk_arr_load(ety, tk_ha_addr(base, idx, ety));
     i64 es = tk_struct_by_ty(ety);
-    if (es >= 0) tk_xt_add(r, es, 1);
+    if (es >= 0) tk_xt_add(r, es, 1, TK_BORROWED);
     return r;
 }
 
@@ -174,7 +238,7 @@ i64 tk_ha_deleg_call(i64 addr, i64 ety, i64 di, i64 line, uptr fl) {
     i64 args = tk_args(&na);
     i64 r = tk_deleg_build(di, obj, args, na, line, fl);
     i64 ret = dg_ret_at(di);
-    tk_xt_put(r, tk_struct_by_ty(ret), ret, 0);
+    tk_xt_put(r, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
     return r;
 }
 
@@ -255,7 +319,7 @@ i64 tk_new_array(i64 ety, i64 line, uptr fl) {
     i64 si = tk_struct_by_ty(ty);
     tk_ha_ensure_gen(si);
     i64 call = tk_call(tk_ha_allocname(ety), n);
-    tk_xt_add(call, si, 0);
+    tk_xt_add(call, si, 0, TK_OWNED);
     return call;
 }
 

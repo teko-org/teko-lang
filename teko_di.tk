@@ -352,7 +352,7 @@ i64 tk_inject() {
     tk_file = fl;
     i64 n = tk_call("tk_unresolved_inject", 0);
     tk_di_defer(n, si, tk_di_cur_scope(), line, fl);
-    tk_xt_add(n, si, 0);                          // owned until the pass knows the lifetime
+    tk_xt_add(n, si, 0, TK_OWNED);                // owned until the pass knows the lifetime
     return n;
 }
 
@@ -512,10 +512,14 @@ i64 tk_di_ctor_args(i64 i, i64 dscope) {
             a = tk_di_resolve(implsv, dscope, pline, pfile);
             // D226 compat crumb: a Singleton's own getter answers `uptr`, the one
             // branch `tk_di_resolve` takes with no type of its own to fall back
-            // on; the service's own class is what the oracle is to see, `pure`
-            // exactly when the value is NOT a fresh Transient allocation (the
-            // memoized getter and a Scoped's own local are both borrowed).
-            tk_xt_add(a, sv_cls_at(implsv), sv_life_at(implsv) != TK_SVC_TRANSIENT);
+            // on; the service's own class is what the oracle is to see. A
+            // TRANSIENT allocates here, so it is impure and owned; the memoized
+            // getter and a Scoped's own local are idempotent and borrowed --
+            // two answers, and the lifetime happens to decide both.
+            i64 fresh = sv_life_at(implsv) == TK_SVC_TRANSIENT;
+            i64 own = TK_BORROWED;
+            if (fresh) own = TK_OWNED;
+            tk_xt_add(a, sv_cls_at(implsv), !fresh, own);
         } else {
             a = tk_clone(df_node_at(d0 + j - nreq));
         }
@@ -689,7 +693,10 @@ i64 tk_di_pass(i64 root) {
         set_nd_next(n, keep);
         if (sv_life_at(sv) != TK_SVC_TRANSIENT) {
             i64 x = tk_xt_at(n);
-            if (x >= 0) set_xt_pure_at(x, 1);
+            if (x >= 0) {
+                set_xt_pure_at(x, 1);
+                set_xt_own_at(x, TK_BORROWED);
+            }
         }
         i = i + 1;
     }

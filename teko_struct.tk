@@ -41,6 +41,15 @@
 #define TK_MAXOS     128              // stores into a slot of counted type
 #define TK_MAXSLV    8192             // every local seen via on_stmt, any type (K4's `use`)
 
+// The two answers a registration gives, and they are DIFFERENT questions.
+// `pure` is "re-evaluating this node costs nothing", asked by whoever would
+// duplicate it; `own` is "the value carries a reference of its own", asked by
+// the reclaim. A node may be borrowed and effectful at once -- a store that
+// hands its array back is exactly that -- so saying "pure" to mean "borrowed"
+// hands out a licence to duplicate a store.
+#define TK_BORROWED  0                // the value belongs to whoever it was read from
+#define TK_OWNED     1                // the value carries a reference of its own
+
 // teko_generic.tk is included after this file, because a generic body is
 // re-parsed by the very machine below; these two are what the declaration of a
 // type has to ask it before there is a type at all
@@ -198,6 +207,7 @@ i64  xt_node[TK_MAXXT];               // a node this module built, and its type
 i64  xt_str[TK_MAXXT];                // the row of the type table, or -1 for a scalar
 i64  xt_ty[TK_MAXXT];                 // the type id itself, scalar ones included
 i64  xt_pure[TK_MAXXT];               // 1 when re-evaluating the node is free of effects
+i64  xt_own[TK_MAXXT];                // TK_OWNED or TK_BORROWED: who holds the reference
 i64  tk_nxt = 0;
 
 i64  os_node[TK_MAXOS];               // a store into a slot of counted type
@@ -245,6 +255,7 @@ i64  xt_node_at(i64 i)  { return ld64(xt_node + i * 8); }
 i64  xt_str_at(i64 i)   { return ld64(xt_str + i * 8); }
 i64  xt_ty_at(i64 i)    { return ld64(xt_ty + i * 8); }
 i64  xt_pure_at(i64 i)  { return ld64(xt_pure + i * 8); }
+i64  xt_own_at(i64 i)   { return ld64(xt_own + i * 8); }
 i64  os_node_at(i64 i)  { return ld64(os_node + i * 8); }
 
 void set_sr_name_at(i64 i, uptr v)  { st64(sr_name + i * 8, v); }
@@ -287,6 +298,7 @@ void set_xt_node_at(i64 i, i64 v)   { st64(xt_node + i * 8, v); }
 void set_xt_str_at(i64 i, i64 v)    { st64(xt_str + i * 8, v); }
 void set_xt_ty_at(i64 i, i64 v)     { st64(xt_ty + i * 8, v); }
 void set_xt_pure_at(i64 i, i64 v)   { st64(xt_pure + i * 8, v); }
+void set_xt_own_at(i64 i, i64 v)    { st64(xt_own + i * 8, v); }
 void set_os_node_at(i64 i, i64 v)   { st64(os_node + i * 8, v); }
 
 // ---- derived names ----
@@ -793,7 +805,8 @@ i64 tk_xt_ty(i64 n) {
 
 // 1 when the node may be evaluated twice with no observable difference: a name,
 // or a field load this module built. A constructor and a method call answer 0,
-// so `new C().m()` is refused instead of allocating twice.
+// so `new C().m()` is refused instead of allocating twice. Ownership is NOT
+// this question and is not read here: a borrowed node may still be a store.
 i64 tk_pure(i64 n) {
     if (n == 0) return 0;
     if (nd_kind(n) == N_IDENT) return 1;
@@ -813,17 +826,19 @@ void tk_local_add(uptr name, i64 si) {
 // the node's type as this module knows it: the row of the type table when the
 // type has one, and the type id in every case. `si` is -1 for a scalar, which
 // is the answer `.` and the oracle both need to tell "not a struct" from
-// "nothing known".
-void tk_xt_put(i64 n, i64 si, i64 ty, i64 pure) {
+// "nothing known". `pure` and `own` are asked SEPARATELY because they are
+// separate questions, and a registration has to answer both.
+void tk_xt_put(i64 n, i64 si, i64 ty, i64 pure, i64 own) {
     if (tk_nxt == TK_MAXXT) err_at(tk_file, tk_line, "teko: too many expressions whose type is known");
     set_xt_node_at(tk_nxt, n);
     set_xt_str_at(tk_nxt, si);
     set_xt_ty_at(tk_nxt, ty);
     set_xt_pure_at(tk_nxt, pure);
+    set_xt_own_at(tk_nxt, own);
     tk_nxt = tk_nxt + 1;
 }
 
-void tk_xt_add(i64 n, i64 si, i64 pure) { tk_xt_put(n, si, sr_ty_at(si), pure); }
+void tk_xt_add(i64 n, i64 si, i64 pure, i64 own) { tk_xt_put(n, si, sr_ty_at(si), pure, own); }
 
 // appends the field under its owner, so a method parsed further down the same
 // body already sees the fields declared above it. `sym` is the global a STATIC
@@ -1041,8 +1056,9 @@ i64 tk_ctor(uptr name, i64 ty, i64 size, i64 install) {
     i64 stmts = tk_var(TY_UPTR, "p", tk_call("rt_alloc", tk_int(size)));
     if (install) stmts = list_append(stmts, install);
     i64 r = tk_id("p");
-    tk_xt_add(r, tk_struct_by_ty(ty), 0);         // D226 compat crumb: `p` is `uptr`, the
-                                                   // fresh object it names is the type itself
+    tk_xt_add(r, tk_struct_by_ty(ty), 1, TK_OWNED);  // a NAME, so pure; D226 compat crumb:
+                                                     // `p` is `uptr`, and the fresh object it
+                                                     // names is the type itself
     stmts = list_append(stmts, tk_ret(r));
     return tk_func(ty, tk_ctor_name(name), 0, tk_blk(stmts));
 }
@@ -1234,7 +1250,7 @@ i64 tk_array_index(i64 addr, i64 x) {
     }
     i64 r = tk_call(tk_ldn(ety), at);
     i64 es = tk_struct_by_ty(ety);
-    if (es >= 0) tk_xt_add(r, es, 1);
+    if (es >= 0) tk_xt_add(r, es, 1, TK_BORROWED);
     return r;
 }
 

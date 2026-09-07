@@ -280,7 +280,6 @@ an inline array field; the element type may widen, never narrow. A **global** `T
 | `T[][]`, or any multidimensional array | not taught (`an array of arrays is not taught yet`) |
 | a fixed array of a class or struct type | not taught; use `T[]` |
 | reading a `ref T[]` / `out T[]` **inside the callee** | not taught: the parameter carries the caller's slot, so `xs[i]` and `xs.Length` there are refused (`expression with no codegen`) |
-| `params T[]` | not taught; `params` holds words ([parameters.md](parameters.md)) |
 | `.Length` on a **global fixed** array | not taught; a local fixed array and any `T[]` answer |
 | an inline array field through a **parameter** (`p.items[i]`) | not taught; a local or `this` resolves |
 | a run-time index into a **fixed** array | not guarded (a `T[]` index always is) |

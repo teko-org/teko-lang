@@ -99,6 +99,7 @@ own static-type oracle; an integer literal is an `i64`.
 | `main` | takes one signature |
 | two signatures differing only by `ref`/`out` | refused |
 | two candidates fitting one site | refused as ambiguous |
+| a `params T[]` | one signature among the name's; the site decides (§ `params`) |
 
 Resolution is by arity first, then by types; the return type never takes part. A call
 nested in another is resolved first, so its return type types the outer site, and a
@@ -298,64 +299,142 @@ i64 main() {
 ## `params`
 
 ```
-i64 total(params xs) { ... xs_len ... xs[i] ... }
+i64 total(params i64[] xs) { ... xs.Length ... xs[i] ... }
 ```
 
-The spelling is the core's — `params xs`, not `params i64[] xs` — and the list holds
-**words**. Inside the body, `xs_len` is the count and `xs[i]` is the i-th element. The
-declaration is a generic in that count: a site with `k` arguments instantiates a body of
-its own with `xs_len` equal to `k`, so a **literal** index is checked against it at compile
-time and costs no guard, while a computed index keeps one and panics out of range.
+`params` is a **modifier** read before the type, the way `ref` and `out` are, and the type
+after it is a genuine `T[]` ([arrays.md](arrays.md)). It goes on the **last** parameter of
+a **free function**, one only, never with `ref`/`out`, never with a default, never on an
+`extern`. Inside the body `xs` is an ordinary `T[]`: `xs.Length`, `xs[i]`, `xs[i] = e`,
+`foreach (T v in xs)`, passing it on, returning it.
 
-The list is allocated at the call site, so a variadic call may sit inside another one and
-inside the body of a variadic function; each list is its own block. A fixed parameter may
-come before the list.
+**At the call site**, N arguments of type `T` become the array, N ≥ 0 — zero arguments is
+an array of length 0, never null. A single argument that is **already a `T[]`** passes
+straight through, without a copy. The element type is anything a `T[]` holds: a scalar, a
+**float**, a class, an interface, a delegate.
+
+The array is a counted object, so it is released at the end of the statement that built it,
+taking every counted element with it ([memory.md](memory.md)). Nothing is left on the
+arena.
 
 ```teko
 // expect-exit: 42
 #include "rt.tk"
 
-i64 total(params xs) {
+i64 total(params i64[] xs) {
     i64 s = 0;
     i64 i = 0;
-    loop {
-        if (i >= xs_len) break;
+    while (i < xs.Length) {
         s = s + xs[i];
         i = i + 1;
     }
     return s;
 }
 
-i64 offset_total(i64 base, params rest) {
-    i64 s = base;
+i64 offset_total(i64 base, params i64[] rest) {
+    return base + total(rest);                   // the list passed on, no copy
+}
+
+f64 ftotal(params f64[] xs) {
+    f64 s = 0.0;
     i64 i = 0;
-    loop {
-        if (i >= rest_len) break;
-        s = s + rest[i];
+    while (i < xs.Length) {
+        s = s + xs[i];
         i = i + 1;
     }
     return s;
 }
 
-i64 first_and(params xs) {
-    return xs[0] + xs[1];                        // literal indexes, checked per instance
-}
-
 i64 main() {
-    if (total() != 0) return 1;                  // the empty list
+    if (total() != 0) return 1;                  // an array of length 0
     if (total(7) != 7) return 2;
     if (total(1, 2, 3, 4, 5) != 15) return 3;
     if (offset_total(10, 1, 2, 3) != 16) return 4;
     if (total(total(1, 2), 3) != 6) return 5;    // one variadic call inside another
-    if (first_and(10, 20, 30) != 30) return 6;
+    if ((i64) ftotal(1.5, 2.5) != 4) return 6;   // a float element
+
+    i64[] ready = new i64[2];
+    ready[0] = 20;
+    ready[1] = 20;
+    if (total(ready) != 40) return 7;            // the normal form
 
     return total(20, 20, 2);
 }
 ```
 
-The list itself is **not** reclaimed: it is born and read inside one expression, with no
-name to hold it, so a `params` call in a hot loop walks the arena forward
-([memory.md](memory.md)).
+### `params` and overloading
+
+A list is **one signature among the name's**, and C#'s own rule decides a site: a candidate
+applicable in its **normal form** wins, and only a call that no candidate takes as written
+asks a list to swallow the tail.
+
+| written, with `f(i64)` and `f(params i64[])` both in reach | what it means |
+|---|---|
+| `f(1)` | `f(i64)`, the normal form |
+| `f(1, 2)` | the list, expanded |
+| `f()` | the list, expanded — an array of length 0 |
+| `f(xs)`, `xs` an `i64[]` | the list in **its own** normal form, without a copy |
+
+A default belongs to the normal form, so `f(i64 a, i64 b = 5)` takes `f(1)` ahead of any
+list. Two lists of one name are told apart by their **element type**, and between two that
+both take a site the one with **more declared parameters** wins — `f(i64, params i64[])`
+over `f(params i64[])` at `f(1, 2)`, as in C#. A tail no element type takes is
+`teko: no overload of f matches these arguments`; two lists nothing tells apart are
+`teko: more than one overload of f matches these arguments`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+i64 span(i64 n) {
+    return 1000 + n;
+}
+
+i64 span(params i64[] xs) {
+    i64 s = 0;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return 2000 + s;
+}
+
+i64 mix(params i64[] xs) {
+    return 100 + xs.Length;
+}
+
+i64 mix(params f64[] ys) {
+    return 200 + ys.Length;
+}
+
+i64 wide(i64 a, i64 b = 5) {
+    return 300 + a + b;
+}
+
+i64 wide(params i64[] xs) {
+    return 400 + xs.Length;
+}
+
+i64 main() {
+    if (span(9) != 1009) return 1;               // the normal form wins
+    if (span(1, 2) != 2003) return 2;            // ...and only then the list
+    if (span() != 2000) return 3;                // an array of length 0
+
+    i64[] ready = new i64[2];
+    ready[0] = 20;
+    ready[1] = 20;
+    if (span(ready) != 2040) return 4;           // the list's own normal form
+
+    if (mix(1) != 101) return 5;                 // the integer list
+    if (mix(1.5) != 201) return 6;               // the float one
+
+    if (wide(1) != 306) return 7;                // a default completes the normal form
+    if (wide(1, 2, 3) != 403) return 8;          // only the list takes three
+
+    return 42;
+}
+```
 
 ---
 
@@ -365,12 +444,12 @@ name to hold it, so a `params` call in a hot loop walks the arena forward
 |---|---|
 | parameters of a function | 12 (8 in registers) |
 | parameters of a method | 12, the receiver and a virtual call's vtable pointer included |
-| fixed parameters before a `params` list | 10 (the list costs two of the twelve) |
-| arguments at one `params` call site | 12, the fixed ones included |
-| a `float` argument to a `params` list | not taught |
-| `params T[]` | not taught |
-| a `params` list with a default, an overload, or an address (`&f`) | refused |
-| `params` on an `extern` | refused |
+| fixed parameters before a `params` list | 11 (the list itself is the twelfth) |
+| arguments at one `params` call site | no ceiling: the tail goes to memory, not to the ABI |
+| arguments at one call of an **overloaded** name | 64, every one of them typed at once |
+| a `params` list with a default or with `ref`/`out` | refused |
+| `params` on an `extern`, a method, a constructor or a `delegate` | refused |
+| `params` lists in one unit | 64 |
 | reading a `ref T[]` / `out T[]` inside the callee | not taught: `xs[i]` and `xs.Length` there are refused |
 | `f(out i64 a)` declaring the variable at the call site | not taught |
 | an `out` assigned only along some paths | only "never assigned" is checked |

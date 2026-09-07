@@ -41,7 +41,7 @@
 // What is NEVER renamed: `main`, any `extern`, and any name whose declarations
 // do not disagree on a signature. The C ABI stays intact, and a name that would
 // need it to move is refused instead (an overloaded `extern`, an overloaded
-// `main`, an overloaded `params` list).
+// `main`).
 //
 // The types come from the C3 oracle (teko_typeof.tk): `tk_ty_of` under the
 // scope `tk_ty_pass_walk` enters for each function, so a parameter, a local, a
@@ -51,9 +51,9 @@
 // guess, since guessing means calling another function than the one written.
 //
 // Order matters twice. The pass is registered AFTER `tk_params_pass`, which
-// rewrites `i64 total(params xs)` into `i64 total(uptr xs, i64 xs_len)`, so
-// what is read here is an ordinary parameter list and nothing here knows what a
-// `params` list is; and AFTER `tk_typeof_pass`, which rebuilds the deferred `.`
+// expands every call of a name declared ONCE with a `params` list, so what
+// reaches here of those is an ordinary argument list; and AFTER
+// `tk_typeof_pass`, which rebuilds the deferred `.`
 // accesses, so `pick(s.area())` has a call to ask about rather than a
 // placeholder. The declarations are renamed BEFORE the call sites are rewritten
 // so that `decl_find` answers about a call this pass has already resolved --
@@ -69,9 +69,21 @@
 // (§12.6.4.5) for free: `add(1)` against `add(i64)` and `add(i64, i64 = 10)`
 // is resolved -- unambiguously, to the first -- before the second is ever
 // asked whether it could cover the call too.
+//
+// C3 (teko_params.tk) adds a FIFTH, on the same principle and for the same
+// reason: a candidate whose last parameter is a `params T[]` is asked to
+// swallow the tail of the site only once no candidate takes the arguments as
+// they stand. That IS C#'s "the normal form beats the expanded one"
+// (§12.6.4.5), round order and nothing else: `f(1)` against `f(i64)` and
+// `f(params i64[])` is the first, and `f(xs)` with an `i64[]` in hand is the
+// second's own normal form, both settled by the exact rounds above; `f(1, 2)`
+// and `f()` reach the fifth. When the round chooses a list, the chain that
+// builds the array is teko_params.tk's own (`tk_pm_expand_call`) -- one
+// expansion, called from the two places that know which list a site means.
 
 #define TK_MAXODECL 8192              // declarations of one unit
 #define TK_MAXOVER  64                // names declared at more than one signature
+#define TK_MAXOARGS 64                // arguments at one site, all typed at once
 
 uptr od_name[TK_MAXODECL];            // the name as the source wrote it
 uptr od_sig[TK_MAXODECL];             // "__i64__Vec", empty for a parameterless one
@@ -282,8 +294,9 @@ i64 tk_ov_refout_clash(uptr name) {
 
 // the verdict on one name, taken once, at its first row. Two declarations of the
 // SAME signature are not this pass's business -- the core reports them where it
-// always did. A `params` list never reaches here: teko_params.tk instantiates it
-// per call site under `name__k` and refuses its overloading itself.
+// always did. A name carrying a `params` list is judged like any other: its
+// list is one signature among the name's, and the fifth round below is what
+// reads it.
 void tk_ov_judge(i64 i) {
     uptr name = od_name_at(i);
     i64 d = od_node_at(i);
@@ -353,12 +366,15 @@ i64 tk_ov_arg_ty(i64 a) {
 // no type of its own: at `loose` it lands on any of the core's integers, and
 // without it only on `i64` -- which is the tie-break, since the exact round is
 // tried first and `pick(1)` with both `pick(i64)` and `pick(u8)` in reach is
-// `pick(i64)`.
-i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose) {
+// `pick(i64)`. `stop` is how many arguments to read: all of them for a round
+// that matches arity exactly, and only the FIXED ones for the expanded form,
+// whose tail is the list's own elements and is judged against the element
+// type instead (`tk_pm_tail_fits`, teko_params.tk).
+i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose, i64 stop) {
     i64 a = args;
     i64 i = 0;
     loop {
-        if (a == 0) break;
+        if (a == 0 || i >= stop) break;
         i64 pt = tk_decl_param_ty(d, i);
         if (tk_rp_kind(tk_decl_param_node(d, i)) != tk_rfarg_kind(a)) return 0;   // K2: `ref`/`out` kind must match too
         if (nd_kind(a) == N_INT) {
@@ -379,7 +395,7 @@ i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose) {
 // 1 when the arguments land on `d`'s parameters, all of them, exactly
 i64 tk_ov_fits(i64 d, i64 args, i64 na, uptr tys, i64 loose) {
     if (decl_nparams(d) != na) return 0;
-    return tk_ov_args_fit(d, args, tys, loose);
+    return tk_ov_args_fit(d, args, tys, loose, na);
 }
 
 // `na` short of `d`'s own parameter count, but not short of what its
@@ -394,7 +410,7 @@ i64 tk_ov_fits_default(i64 d, uptr orig_name, i64 args, i64 na, uptr tys, i64 lo
     i64 np = decl_nparams(d);
     if (na >= np) return 0;
     if (na < np - tk_default_ndef_of_name(orig_name)) return 0;
-    return tk_ov_args_fit(d, args, tys, loose);
+    return tk_ov_args_fit(d, args, tys, loose, na);
 }
 
 // the row of `name` the arguments land on, and through `pn` how many signatures
@@ -446,6 +462,69 @@ i64 tk_ov_match_default(uptr name, i64 args, i64 na, uptr tys, i64 loose, uptr p
     return found;
 }
 
+// C3 / C# §12.6.4.5: `d` in its EXPANDED form. `k` arguments land on the
+// parameters before its `params` list and everything after them is an element
+// of that list, so a site of any length from `k` up is applicable -- `f()`
+// included, which is the empty array. `elem` is what asks the elements
+// themselves to fit; without it only the shape is read.
+i64 tk_ov_fits_expanded(i64 d, i64 args, i64 na, uptr tys, i64 loose, i64 elem) {
+    i64 k = 0;
+    i64 ty = tk_pm_list_of(d, &k);
+    if (ty < 0) return 0;
+    if (na < k) return 0;
+    if (!tk_ov_args_fit(d, args, tys, loose, k)) return 0;
+    if (!elem) return 1;
+    return tk_pm_tail_fits(ty, args, k, tys, loose);
+}
+
+// the same search as `tk_ov_match`, over the fifth (expanded) round. Two
+// candidates both applicable here are separated the way C# separates them:
+// the one with MORE declared parameters wins, which is `f(i64, params i64[])`
+// over `f(params i64[])` at `f(1, 2)`. Only a tie at that count is counted as
+// a second match, and only then is the call ambiguous.
+i64 tk_ov_match_expanded(uptr name, i64 args, i64 na, uptr tys, i64 loose, i64 elem, uptr pn) {
+    i64 found = 0 - 1;
+    i64 count = 0;
+    i64 best = 0 - 1;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) {
+            if (tk_ov_fits_expanded(od_node_at(i), args, na, tys, loose, elem)) {
+                i64 np = decl_nparams(od_node_at(i));
+                if (np > best) {
+                    found = i;
+                    best = np;
+                    count = 1;
+                } else if (np == best && !str_eq(od_sig_at(found), od_sig_at(i))) {
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    st64(pn, count);
+    return found;
+}
+
+// the fifth round as a whole, in two stages. The first reads the SHAPE alone,
+// and a single list applicable by shape is chosen there: its own elements are
+// then checked where the chain is built, so a tail that does not convert is
+// reported against the type it was written for. Only when two lists take the
+// site does the second stage ask the element types to tell them apart --
+// `f(params i64[])` and `f(params f64[])` at `f(1)` -- and a site no element
+// type takes leaves with nothing, which the caller reports as the call
+// matching no overload of the name.
+i64 tk_ov_match_expanded_rounds(uptr name, i64 args, i64 na, uptr tys, uptr pn) {
+    i64 r = tk_ov_match_expanded(name, args, na, tys, 0, 0, pn);
+    if (r < 0) r = tk_ov_match_expanded(name, args, na, tys, 1, 0, pn);
+    if (r < 0) return r;
+    if (ld64(pn) < 2) return r;
+    i64 e = tk_ov_match_expanded(name, args, na, tys, 0, 1, pn);
+    if (e < 0) e = tk_ov_match_expanded(name, args, na, tys, 1, 1, pn);
+    return e;
+}
+
 i64 tk_ov_nargs(i64 args) {
     i64 n = 0;
     i64 a = args;
@@ -468,8 +547,8 @@ i64 tk_ov_resolve(i64 n) {
     uptr fl = nd_file(n);
     i64 args = nd_a(n);
     i64 na = tk_ov_nargs(args);
-    if (na > MAXPARAMS) err_at2(fl, line, "teko: too many arguments", name);
-    i64 tys[MAXPARAMS];
+    if (na > TK_MAXOARGS) err_at2(fl, line, "teko: too many arguments", name);
+    i64 tys[TK_MAXOARGS];
     i64 a = args;
     i64 i = 0;
     loop {
@@ -489,13 +568,22 @@ i64 tk_ov_resolve(i64 n) {
     // a default-bearing candidate whether it could cover it instead
     if (r < 0) r = tk_ov_match_default(name, args, na, tys, 0, &count);
     if (r < 0) r = tk_ov_match_default(name, args, na, tys, 1, &count);
+    // the fifth: a `params` list is asked to swallow the tail only once every
+    // candidate that takes the arguments as they stand has failed
+    i64 expanded = 0;
+    if (r < 0) {
+        r = tk_ov_match_expanded_rounds(name, args, na, tys, &count);
+        expanded = r >= 0;
+    }
     if (r < 0)
         err_at(fl, line, tk_join3("teko: no overload of ", name, " matches these arguments"));
     if (count > 1)
         err_at(fl, line, tk_join3("teko: more than one overload of ", name, " matches these arguments"));
     i64 d = od_node_at(r);
     i64 np = decl_nparams(d);
-    if (na < np) {
+    if (expanded) {
+        tk_pm_expand_call(n, d, tys);
+    } else if (na < np) {
         uptr orig_name = od_name_at(r);
         set_nd_a(n, tk_fill_defaults(nd_a(n), na, np, np - tk_default_ndef_of_name(orig_name),
                                       tk_default_d0_of_name(orig_name)));

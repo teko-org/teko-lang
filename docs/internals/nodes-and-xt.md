@@ -15,10 +15,12 @@ itself, and every rule on this page follows from that one decision.
 | `xt_str` | the row of the type table, or `-1` for a scalar |
 | `xt_ty` | the type id itself, scalars included |
 | `xt_pure` | 1 when re-evaluating the node is free of effects |
+| `xt_own` | `TK_OWNED` or `TK_BORROWED`: who holds the reference |
 
-Two writers, `tk_xt_put(n, si, ty, pure)` and `tk_xt_add(n, si, pure)` — the second reads
-the type id off the row. Three readers: `tk_xt_find(n)` for the row, `tk_xt_ty(n)` for the
-type id, and `tk_pure(n)`.
+Two writers, `tk_xt_put(n, si, ty, pure, own)` and `tk_xt_add(n, si, pure, own)` — the
+second reads the type id off the row. Three readers: `tk_xt_find(n)` for the row,
+`tk_xt_ty(n)` for the type id, and `tk_pure(n)`; the reclaim reads `xt_own_at` directly,
+beside `xt_ty_at`, in `tk_rc_own` ([`teko_rc.tk`](../../teko_rc.tk)).
 
 The lookup `tk_xt_at` walks **backwards** from the newest entry, so a later registration on
 the same node wins. There is no removal: a node that has been rewritten simply stops being
@@ -33,6 +35,87 @@ untypable to everyone downstream, the overload resolution included. `-1` in `xt_
 pure by definition and a field load this module built is registered pure, while a
 constructor and a method call answer 0, so a rewrite that would evaluate the receiver twice
 declines to.
+
+## Purity and ownership are two questions
+
+`xt_pure` answers **"may this node be evaluated twice?"**. It is read by `tk_pure`, and by
+nothing else: the virtual-call shaping in [`teko_expr.tk`](../../teko_expr.tk),
+[`teko_iface.tk`](../../teko_iface.tk) and [`teko_typeof.tk`](../../teko_typeof.tk) asks it
+before `tk_clone` copies a receiver into the vtable load.
+
+`xt_own` answers **"does the value carry a reference of its own?"**. It is read by
+`tk_rc_own` ([`teko_rc.tk`](../../teko_rc.tk)), and through it by all three lowerings of the
+reclaim: a borrowed value is not parked, is incremented into an owning slot, and is
+incremented on the way out of a counted `return`.
+
+The two agree for most nodes — a load is pure and borrowed, a call that hands out a
+reference is neither — and that coincidence is what made one column look like enough. It is
+not. **A node may be borrowed and effectful at once**, and the `params` chain is exactly
+that: each `tkarr_put_T` link stores an element, takes a reference for a counted one, and
+hands the array back, so it owns nothing *and* may not be duplicated. Registering it pure to
+say "borrowed" licensed a later shaper to clone a store.
+
+The rule, in one line: **never say "pure" to mean "borrowed"** — answer the question that
+was asked. A registration states both, so the site that knows says so once.
+
+The audit that came with the split, every registration in the port:
+
+| site | the node it registers | pure | ownership |
+|---|---|---|---|
+| `teko_struct.tk` `tk_ctor` | `p`, the name of a fresh object | yes (a name) | owned |
+| `teko_struct.tk` `tk_array_index` | element load of an inline array field | yes | borrowed |
+| `teko_array.tk` `tk_hg_rewrite_index` | element load of a global `T[]` | yes | borrowed |
+| `teko_access.tk` `tk_static_use` | static field load | yes | borrowed |
+| `teko_access.tk` `tk_static_call` | static method call | no | owned |
+| `teko_access.tk` `tk_fwd_resolve_static_one` | method call, accessor call, field load | no, no, yes | owned, owned, borrowed |
+| `teko_class.tk` `tk_new_fn` | `p`, the name of a fresh object | yes (a name) | owned |
+| `teko_deleg.tk` `tk_deleg_alloc_fn` | `p`, the name of a fresh object | yes (a name) | owned |
+| `teko_deleg.tk` `tk_deleg_wrap` | the thunk's allocator call | no | owned |
+| `teko_deleg.tk` `tk_deleg_call` | the typed `callp` | no | owned |
+| `teko_deleg.tk` `tk_lambda_prologue` | a by-value capture, loaded out of the env | yes | borrowed |
+| `teko_deleg.tk` `tk_lambda_alloc_fn` | `p`, the name of a fresh object | yes (a name) | owned |
+| `teko_deleg.tk` `tk_lambda_finish` | the allocator call over the capture chain | no | owned |
+| `teko_di.tk` `tk_inject` | the `inject` placeholder | no | owned |
+| `teko_di.tk` `tk_di_ctor_args` | a resolved service argument | Transient no, else yes | Transient owned, else borrowed |
+| `teko_di.tk` `tk_di_pass` | the resolved `inject`, not Transient | yes | borrowed |
+| `teko_expr.tk` `tk_fwd_defer_new` | the `new` placeholder | no | owned |
+| `teko_expr.tk` `tk_new` | the allocator call | no | owned |
+| `teko_expr.tk` `tk_field_deleg_call` | the typed `callp` of a delegate field | no | owned |
+| `teko_expr.tk` `tk_field_use` | field load | yes | borrowed |
+| `teko_expr.tk` `tk_emit_call` | method call, direct or through the vtable | no | owned |
+| `teko_expr.tk` `tk_iface_call` | itab call | no | owned |
+| `teko_expr.tk` `tk_iface_prop_use` | itab accessor call | no | owned |
+| `teko_heaparr.tk` `tk_ha_alloc_fn` | `p`, the name of a fresh array | yes (a name) | owned |
+| `teko_heaparr.tk` `tk_ha_put_fn` | `a`, the array the store hands back | yes (a name) | owned |
+| `teko_heaparr.tk` `tk_ha_load` | element load | yes | borrowed |
+| `teko_heaparr.tk` `tk_ha_deleg_call` | the typed `callp` of a delegate element | no | owned |
+| `teko_heaparr.tk` `tk_new_array` | `tkarr_new_T(n)` | no | owned |
+| `teko_ops.tk` `tk_ops_emit` | the overloaded operator's call | no | owned |
+| `teko_params.tk` `tk_pm_pack` | `tkarr_new_T(n)`, the chain's allocator | no | owned |
+| **`teko_params.tk` `tk_pm_pack`** | **`tkarr_put_T(...)`, one link of the chain** | **no — it is a STORE** | **borrowed** |
+| `teko_prop.tk` `tk_prop_static_use` | a static property's accessor call | no | owned |
+| `teko_this.tk` `tk_base_call` | `base.m()` | no | owned |
+| `teko_this.tk` `tk_this_prop_read` | the getter call on `this` | no | owned |
+| `teko_this.tk` `tk_this_ident` | field load off `this` | yes | borrowed |
+| `teko_this.tk` `tk_this_call` | method call on `this` | no | owned |
+| `teko_this.tk` `tk_this_iface_call` | itab call from a default body | no | owned |
+| `teko_this.tk` `tk_this_iface_prop` | itab accessor from a default body | no | owned |
+| `teko_typeof.tk` `tk_pend_field` | deferred field load | yes | borrowed |
+| `teko_typeof.tk` `tk_pend_ha_length` | deferred `.Length` | yes | borrowed |
+| `teko_typeof.tk` `tk_pend_emit_call` | deferred method or property call | no | owned |
+| `teko_typeof.tk` `tk_pend_iface`, `tk_pend_iface_prop` | deferred itab call | no | owned |
+
+Two kinds of row moved. The `params` link is the defect: it said pure and meant borrowed.
+The six that name a **name** (`p`, `a`) said `pure = 0` and meant owned — harmless, because
+`tk_pure` short-circuits on `N_IDENT` before it reads the table, but a recorded falsehood,
+so they now say that a name is pure and that the value is owned.
+
+The contrast that tells the two columns apart is a closure's own capture chain
+([`teko_deleg.tk`](../../teko_deleg.tk) `tk_lambda_capture_chain`): its `tk_cap_put*` links
+are registered **nowhere**, because `tk_cap_put` is declared to answer `uptr` and
+`tk_rc_call_owned` reads that off the tree — an uncounted return is borrowed already. A
+`tkarr_put_T` is generated to answer `T[]`, which **is** counted, so the site has to say
+borrowed out loud. What it must not do is say it with the purity flag.
 
 Three sibling tables use the same key: `ax_*` for the address of an inline array field
 (with its element type, its count and its name, so an out-of-range constant index has a

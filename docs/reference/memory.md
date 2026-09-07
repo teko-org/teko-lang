@@ -154,7 +154,6 @@ with classes sees a floor above zero rather than a wrong answer.
 | | why |
 |---|---|
 | a `struct` allocation | a struct has no vtable, so there is no release function to reach and no count to keep |
-| the argument block of a `params` call | it is born and read inside one expression; there is no name to hold it |
 | a `static` field of class type | it holds its reference correctly, and lives for the whole run |
 | a global, and a global `T[]` | a root by construction |
 | a Singleton service | a root by design ([di.md](di.md)) |
@@ -186,8 +185,6 @@ no handler. `panic("...")` is a surface function a program may call itself.
 | `index below zero into an array` | a negative index into a `T[]` |
 | `index past the end of an array` | an index at or past `Length` |
 | `a negative array length` | `new T[n]` with `n < 0` |
-| ``index below zero into a `params` list`` | a computed index below the list |
-| ``index past the end of a `params` list`` | a computed index past the list |
 | `interface dispatch on a class with no interface table` | an interface call on an object whose class declares none |
 | `interface not implemented by this class` | the table has no row for that interface |
 | `arena exhausted` | the 4 MiB block cannot serve the allocation |

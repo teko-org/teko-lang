@@ -16,26 +16,11 @@ This is a real ceiling and it is honest: an overflow is one clear message naming
 never silent corruption, and raising a cap is a one-line change. But no cap is derived from
 anything except a measurement, so none of them scales with the input on its own.
 
-## `params` carries words, and the block is not reclaimed
-
-A `params` list is a block of machine words, allocated **at the call site** and read by the
-instance. Two consequences live inside:
-
-- the element type is the register-wide word every teko scalar already is, which is why a
-  float argument and a float element are refusals rather than conversions;
-- the block is never handed back. Freeing it at the end of the call site's scope needs a
-  name to hold it, and there is none — the block is born and read inside one expression. A
-  `params` call in a hot loop still walks the bump pointer forward, where `new` in one no
-  longer does.
-
-The redesign that closes both — `params T[]`, an ordinary heap array — is designed in
-[`../specs/params-typed.md`](../specs/params-typed.md).
-
 ## Reclaim has a floor above zero
 
-A `struct` has no vtable, so there is no release to reach and no count to keep, and a
-`params` block is not returned. `rt_live()` counts both, so a program that mixes them with
-classes sees a floor rather than a wrong answer. What is and is not reclaimed for a program
+A `struct` has no vtable, so there is no release to reach and no count to keep.
+`rt_live()` counts it, so a program that mixes structs with classes sees a floor rather
+than a wrong answer. What is and is not reclaimed for a program
 is [`../reference/memory.md`](../reference/memory.md) § What is not reclaimed.
 
 ## The object is reproducible, and not pinned

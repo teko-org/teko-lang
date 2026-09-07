@@ -27,8 +27,8 @@ the derived class's destructor before the base's.
 ## What is not reclaimed
 
 Declared debt, not silence — `rt_live()` counts all of it: a `struct` allocation (no vtable
-means no release function to reach), the argument block of a `params` call (no name holds
-it), and every root: a global, a `static` field of class type, a Singleton.
+means no release function to reach) and every root: a global, a `static` field of class
+type, a Singleton.
 
 `rt_live()` is the blocks handed out and not yet given back, `rt_used()` how far the bump
 pointer moved, `rt_peak()` its high-water mark; the fixtures use them as the oracle of

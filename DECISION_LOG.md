@@ -238,8 +238,9 @@ three. **(a) Top level only**, inside a `class`/`struct`/`namespace` body read b
 (`teko_prop.tk`), the static field and the struct constructor (`teko_struct.tk`), the
 namespace body and its function (`teko_ns.tk`): no declaration of the program's own is
 open. **(b) After the parse, from a `pass()`** — the memoized DI getter and its slot
-(`teko_di.tk`), the `params` instance (`teko_params.tk`): `p_decl_name()` is 0 already and
-nobody reads it any more. **(c) Possibly mid-declaration, fired by an expression** — the
+(`teko_di.tk`): `p_decl_name()` is 0 already and nobody reads it any more. The `params`
+pass emits from here too, and goes through `tk_top_emit` all the same, because what it asks
+for is what `new T[n]` asks for mid-parse, from one shared `tk_ha_ensure_put`. **(c) Possibly mid-declaration, fired by an expression** — the
 delegate thunk and the lambda's own four (`teko_deleg.tk`), the three of `new T[n]`
 (`teko_heaparr.tk`), `tk_ix` (`teko_struct.tk`), and everything `tk_class_close` emits:
 the vtable, the release, `tk_vt_init`, the interface table, the method table and each
@@ -302,3 +303,68 @@ Baseline (mc 0.15.18, `MC_VERSION` still reading `0.15.13`): 45/45 fixtures, `FI
 `scripts/check-docs.sh` 63 samples / 277 links / 349 diagnostics. Only then was
 `MC_VERSION` written and the literal `0.15.13` mentions (`CONTRIBUTING.md`,
 `docs/guide/00-getting-started.md`, `.github/workflows/site.yml`) raised to `0.15.18`.
+### D30 · `params T[]` is the only `params`; the word list is gone (2026-09-07)
+`params` is a **modifier** read before the type, as `ref` and `out` are, and the type after
+it is a genuine `T[]` — C#'s own form (D3). It goes on the last parameter of a **free
+function**, one only, never with `ref`/`out`, never with a default, never on an `extern`;
+in the body it is an ordinary array, and at the call site the compiler builds the array out
+of the arguments, with a single argument that is already a `T[]` passing straight through
+without a copy. The array is counted, so the statement that built it releases it and every
+counted element with it.
+
+The list of machine **words** it replaces — the declaration instantiated once per argument
+count, the twelve-argument ceiling, the two refusals of a float, and the three runtime
+helpers of `lib/rt.tk` that backed it — is **removed in the same change**, so no program has
+two spellings to choose between and no dead body is left behind. Two consequences follow:
+`&f` on such a function is legal, and there is no ceiling on the arguments at one site,
+because the tail goes to memory rather than to the call convention.
+
+`params` on a **method, a constructor, an interface signature or a `delegate`** is refused,
+``teko: `params` is taught on a free function only``: the virtual path is five call-shaping
+sites and a vtable slot keyed by signature, and refusing it trades a silent hole for a
+message.
+
+A list is **one signature among the name's**, and C#'s §12.6.4.5 decides a site by ROUND
+ORDER alone: the exact-arity rounds and the default-completing one all run before any list
+is asked to swallow a tail, so a candidate applicable in its **normal form** wins — `f(1)`
+is `f(i64)`, and `f(1)` is `f(i64 a, i64 b = 5)`, before `f(params i64[])` is ever asked.
+`f(1, 2)` and `f()` are the list; `f(xs)` with an `i64[]` in hand is the list's own normal
+form, without a copy. Two lists of one name are told apart by their **element type**, and
+between two that both take a site the one with **more declared parameters** wins. What is
+left is two refusals the resolution already had: a tail no element type takes is
+`teko: no overload of f matches these arguments`, and a genuine tie — the same declared
+parameter count, both element types taking the arguments — is
+`teko: more than one overload of f matches these arguments`. A call of an overloaded name
+carries at most **64** arguments, because resolution types them as a set; a name declared
+once has no ceiling. The design, the steps and what each of them measured are
+[`docs/specs/params-typed.md`](docs/specs/params-typed.md).
+
+### D31 · Ownership is a column of its own; purity is never asked to stand in (2026-09-07)
+`tk_xt` ([`teko_struct.tk`](teko_struct.tk)) answers two questions about a node teko built,
+and they are different questions. `xt_pure` is **"may this be evaluated twice?"** — read by
+`tk_pure`, and by the virtual-call shaping alone, before `tk_clone` copies a receiver into
+the vtable load. `xt_own` is **"does the value carry a reference of its own?"** — read by
+`tk_rc_own` ([`teko_rc.tk`](teko_rc.tk)), and through it by the three lowerings of the
+reclaim: a borrowed value is not parked, is incremented into an owning slot, and is
+incremented on the way out of a counted `return`.
+
+They agree for most nodes — a load is pure and borrowed, a call that hands out a reference
+is neither — and that coincidence is what let one column carry both. It cannot: **a node may
+be borrowed and effectful at once.** Every `tkarr_put_T` link of a `params` chain
+([`teko_params.tk`](teko_params.tk)) is one — it stores an element, takes a reference for a
+counted one, and hands the array back — and it was registered `xt_pure = 1` to say the chain
+carries a single reference. That said "duplicate me freely" to whoever would.
+
+The rule: **never mark a node pure to say it is borrowed.** Ownership is `TK_OWNED` or
+`TK_BORROWED` in `xt_own`; `tk_xt_put`/`tk_xt_add` take both answers, so a registration
+states both and the site that knows says so once. The audit of all forty registrations in
+the port is
+[`docs/internals/nodes-and-xt.md`](docs/internals/nodes-and-xt.md) § *Purity and ownership
+are two questions*: the loads are pure and borrowed, the calls are neither, the `params` link
+is borrowed and not pure, and six sites that said `pure = 0` about a NAME to mean "owned" now
+say what they mean.
+
+No accepted program changes by it. The `params` pass runs behind the oracle, the last pass
+that consults `tk_pure`, so nothing had duplicated a link — the correction stops the next
+pass to be moved from inheriting a licence nobody meant to give, and that is worth a column
+rather than a comment.

@@ -298,35 +298,11 @@ f64 tk_f64_from_bits(u64 bits) {
     return ldf64(tk_f64_bits_scratch);
 }
 
-// the argument list of a `params` call (teko_params.tk). `total(a, b, c)` is
-// rewritten into `total(tk_va_put(tk_va_put(tk_va_put(tk_va_new(3), 0, a), 1,
-// b), 2, c), 3)`: the block is allocated AT THE CALL SITE, on the same bump
-// arena `new` goes through, and the callee reads it with tk_va_at.
-//
-// Per site, so there is no state to share and nothing to reenter: a variadic
-// call may sit inside another one, or inside the body of a variadic function,
-// and each list is its own block. The chain is what carries a write inside an
-// expression -- the core has no comma operator and `st64` is a statement, so
-// every put hands the block back to the next one.
-//
-// DECLARED DEBT: the block is never given back. Freeing it at the end of the
-// call site's scope needs a name to hold it, and there is no name -- the block
-// is born and read inside one expression. So a `params` call in a hot loop
-// still walks the bump pointer forward; `new` in one no longer does.
-uptr tk_va_new(i64 n) {
-    return rt_alloc(n * 8);
-}
-
-uptr tk_va_put(uptr xs, i64 i, i64 v) {
-    st64(xs + i * 8, v);
-    return xs;
-}
-
 // one capture of a closure, written into the object AT THE CREATION SITE
 // (teko_deleg.tk, higiene 3 item B). The chain is the same shape a `params`
-// list is built with, and for the same reason -- a store is a statement and
-// the whole closure has to be ONE expression -- so each link hands the object
-// back to the next. The allocator therefore takes the object and no capture
+// list is built with (`tkarr_put_T`, teko_heaparr.tk), and for the same reason
+// -- a store is a statement and the whole closure has to be ONE expression --
+// so each link hands the object back to the next. The allocator therefore takes the object and no capture
 // at all: `MAXPARAMS` (12, the mc ABI) stops bounding how many names one
 // `use (...)` may hold.
 //
@@ -361,10 +337,3 @@ uptr tk_cap_putf32(uptr p, i64 off, f32 v) {
     return p;
 }
 
-// xs[i] of a `params` list, guarded: an index outside [0, n) has no word to
-// read, so it panics instead of handing back whatever the arena holds there.
-i64 tk_va_at(uptr xs, i64 n, i64 i) {
-    if (i < 0) rt_panic("index below zero into a `params` list");
-    if (i >= n) rt_panic("index past the end of a `params` list");
-    return ld64(xs + i * 8);
-}
