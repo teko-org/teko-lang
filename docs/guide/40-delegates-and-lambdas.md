@@ -74,23 +74,22 @@ class Box {
 
 i64 main() {
     Op named = twice;                            // contextual: the name is wrapped
+    Op made = new Op(twice);                     // the explicit form of the same
     Op lambda = (i64 x) => x + 1;
     Op shorter = x => x + 1;
     if (named(3) + lambda(1) + shorter(1) != 10) return 1;
+    if (made(4) != 8) return 2;
 
     i64 k = 3;
     Op byval = new Op((i64 x) use (k) => x * k);
     k = 999;                                     // frozen at construction
-    if (byval(5) != 15) return 2;
+    if (byval(5) != 15) return 3;
 
     i64 acc = 0;
     Op byref = new Op((i64 x) use (&acc) => { acc = acc + x; return acc; });
-    if (byref(4) != 4) return 3;
-    if (byref(6) != 10) return 4;                // the declarer's own slot
-    if (acc != 10) return 5;
-
-    Op made = new Op(twice);                     // the explicit form of `named`
-    if (made(4) != 8) return 6;
+    if (byref(4) != 4) return 4;
+    if (byref(6) != 10) return 5;                // the declarer's own slot
+    if (acc != 10) return 6;
 
     Box b = new Box(20);
     Op reads = new Op((i64 x) use (b) => b.v + x);

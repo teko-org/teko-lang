@@ -215,3 +215,18 @@ package reaches its own files, the libraries the binary ships and its declared `
 nothing else. On mc 0.16.0 `<float>` and the two float machines move into the `stdlib`
 package and teko declares `[deps] stdlib`. The whole agreement is
 [`docs/specs/packages.md`](docs/specs/packages.md).
+
+### D27 · A generated declaration keeps the name of the one being parsed (2026-09-07)
+`top_add` clears `p_decl_name()` (mc `docs/reference/hooks.md` § Asking about the parse),
+and teko generates declarations from EXPRESSIONS: the thunk of `new Op(fn)`, the vtable,
+release and allocator of `new T[n]`, `tk_ix` at an array-field index, a whole generic
+instance re-parsed at `Box<i64> b = ...`. Every one of them fires while a declaration of
+the program's own is still being read, whose rest still asks whose it is —
+`tk_taint_owner` (teko_deleg.tk) keys the escape of a by-reference capture by it,
+`tk_default_param` (teko_default.tk) starts a parameter row on it. So a generator adds
+through `tk_top_emit` (teko_struct.tk), which restores the name, and a generator that
+re-parses whole declarations saves and restores it around the replay. A bare `top_add`
+from inside a body is the defect: it left the compiler with a null owner, which the
+`str_eq` of `tk_taint_find` read through — an explicit thunk written before a
+by-reference lambda crashed the compiler instead of compiling (K6). A generator is
+invisible to the parse it interrupts.
