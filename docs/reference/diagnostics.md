@@ -455,9 +455,13 @@ entry says what completes it.
 - `"teko: cannot take the address of an overloaded function"` — `&f` needs one symbol.
 - `"teko: an overloaded call outside a function body has no arguments to resolve it"` — a
   call in a global initializer has no site to type.
-- `"teko: no overload of "` — completed by *`X` matches these arguments*.
+- `"teko: no overload of "` — completed by *`X` matches these arguments*: including a call
+  no `params` list of the name can take, `f(1, 1.5)` against `params i64[]` and
+  `params f64[]`.
 - `"teko: more than one overload of "` — completed by *`X` matches these arguments*: two
-  candidates fit.
+  candidates fit, and nothing tells them apart — two `params` lists of the same declared
+  parameter count whose element types both take the arguments, `params u8[]` and
+  `params u64[]` at `f(1)`.
 - `"teko: ambiguous overload; two signatures take this many arguments"` — the arity alone
   does not choose.
 - `"teko: the type of argument "` — completed by *N of `X` is not known here*: the
@@ -473,7 +477,6 @@ entry says what completes it.
   an interface signature or a `delegate`.
 - ``"teko: a `params` list is not `ref` or `out`"`` — the two do not mix.
 - ``"teko: a `params` list has no default"`` — the site decides the count.
-- ``"teko: a `params` list cannot be overloaded"`` — one signature per name.
 - ``"teko: an `extern` symbol takes no `params` list"`` — the C ABI is not variadic here.
 
 ## Dependency injection
@@ -561,7 +564,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many overloaded names in one unit"` | 64 |
 | `"teko: too many free-function declarations with parameters"` | 4096 |
-| `"teko: too many arguments"` | 12 at one call |
+| `"teko: too many arguments"` | 64 at one call of an overloaded name |
 | `"teko: too many parameters in one declaration"` | 16, which the ABI's own 12 is under |
 | ``"teko: too many `params` lists in one unit"`` | 64 |
 | ``"teko: too many `params` declarations in one unit"`` | 64 |

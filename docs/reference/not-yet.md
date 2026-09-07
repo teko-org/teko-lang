@@ -83,8 +83,9 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 | `params` over anything but a `T[]` (`params xs`, `params i64 xs`) | ``teko: `params` names an array type: write `params T[] xs``` |
 | `params` with `ref`/`out`, with a default, or on an `extern` | ``teko: a `params` list is not `ref` or `out```, ``teko: a `params` list has no default``, ``teko: an `extern` symbol takes no `params` list`` |
 | `params` outside parameter position | ``teko: `params` declares a parameter list, nothing else`` |
-| a second signature of a name that carries a `params` list | ``teko: a `params` list cannot be overloaded`` |
 | an argument that does not convert to the element type | `teko: a value of type X does not convert to T` — identity or derives/implements, and an integer literal into any integer of the core; there is no implicit numeric conversion |
+| two `params` lists of one name that a site cannot tell apart (`params u8[]` and `params u64[]` at `f(1)`) | `teko: more than one overload of X matches these arguments` |
+| a tail no `params` list of the name takes (`params i64[]` and `params f64[]` at `f(1, 1.5)`) | `teko: no overload of X matches these arguments` |
 | two overloads differing only by `ref`/`out` | ``teko: two overloads differ only by `ref`/`out``` |
 | a `ref` **parameter** repassed to an **overloaded** name | `teko: the type of argument N of X is not known here` |
 | `f(out i64 a)` declaring the variable at the call site | not taught: declare it first |

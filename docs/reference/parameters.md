@@ -99,6 +99,7 @@ own static-type oracle; an integer literal is an `i64`.
 | `main` | takes one signature |
 | two signatures differing only by `ref`/`out` | refused |
 | two candidates fitting one site | refused as ambiguous |
+| a `params T[]` | one signature among the name's; the site decides (§ `params`) |
 
 Resolution is by arity first, then by types; the return type never takes part. A call
 nested in another is resolved first, so its return type types the outer site, and a
@@ -361,6 +362,80 @@ i64 main() {
 }
 ```
 
+### `params` and overloading
+
+A list is **one signature among the name's**, and C#'s own rule decides a site: a candidate
+applicable in its **normal form** wins, and only a call that no candidate takes as written
+asks a list to swallow the tail.
+
+| written, with `f(i64)` and `f(params i64[])` both in reach | what it means |
+|---|---|
+| `f(1)` | `f(i64)`, the normal form |
+| `f(1, 2)` | the list, expanded |
+| `f()` | the list, expanded — an array of length 0 |
+| `f(xs)`, `xs` an `i64[]` | the list in **its own** normal form, without a copy |
+
+A default belongs to the normal form, so `f(i64 a, i64 b = 5)` takes `f(1)` ahead of any
+list. Two lists of one name are told apart by their **element type**, and between two that
+both take a site the one with **more declared parameters** wins — `f(i64, params i64[])`
+over `f(params i64[])` at `f(1, 2)`, as in C#. A tail no element type takes is
+`teko: no overload of f matches these arguments`; two lists nothing tells apart are
+`teko: more than one overload of f matches these arguments`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+i64 span(i64 n) {
+    return 1000 + n;
+}
+
+i64 span(params i64[] xs) {
+    i64 s = 0;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return 2000 + s;
+}
+
+i64 mix(params i64[] xs) {
+    return 100 + xs.Length;
+}
+
+i64 mix(params f64[] ys) {
+    return 200 + ys.Length;
+}
+
+i64 wide(i64 a, i64 b = 5) {
+    return 300 + a + b;
+}
+
+i64 wide(params i64[] xs) {
+    return 400 + xs.Length;
+}
+
+i64 main() {
+    if (span(9) != 1009) return 1;               // the normal form wins
+    if (span(1, 2) != 2003) return 2;            // ...and only then the list
+    if (span() != 2000) return 3;                // an array of length 0
+
+    i64[] ready = new i64[2];
+    ready[0] = 20;
+    ready[1] = 20;
+    if (span(ready) != 2040) return 4;           // the list's own normal form
+
+    if (mix(1) != 101) return 5;                 // the integer list
+    if (mix(1.5) != 201) return 6;               // the float one
+
+    if (wide(1) != 306) return 7;                // a default completes the normal form
+    if (wide(1, 2, 3) != 403) return 8;          // only the list takes three
+
+    return 42;
+}
+```
+
 ---
 
 ## Limits
@@ -371,7 +446,8 @@ i64 main() {
 | parameters of a method | 12, the receiver and a virtual call's vtable pointer included |
 | fixed parameters before a `params` list | 11 (the list itself is the twelfth) |
 | arguments at one `params` call site | no ceiling: the tail goes to memory, not to the ABI |
-| a `params` list with a default, an overload, or `ref`/`out` | refused |
+| arguments at one call of an **overloaded** name | 64, every one of them typed at once |
+| a `params` list with a default or with `ref`/`out` | refused |
 | `params` on an `extern`, a method, a constructor or a `delegate` | refused |
 | `params` lists in one unit | 64 |
 | reading a `ref T[]` / `out T[]` inside the callee | not taught: `xs[i]` and `xs.Length` there are refused |

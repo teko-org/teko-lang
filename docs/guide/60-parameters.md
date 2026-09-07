@@ -129,6 +129,8 @@ i64 main() {
 }
 ```
 
-`params` on a method or a constructor, a second signature of a name that carries one, and
-`f(out i64 a)` declaring the variable at the call site are not taught; the full account is
+A list is one signature among the name's: `f(i64)` beside `f(params i64[])` is C#'s own
+pair, and `f(1)` is the first — a candidate that takes the arguments as written wins, and
+only then is a list asked to swallow the tail. `params` on a method or a constructor, and
+`f(out i64 a)` declaring the variable at the call site, are not taught; the full account is
 [parameters.md](../reference/parameters.md).

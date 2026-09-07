@@ -36,7 +36,7 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_ternary.tk` | `c ? a : b` | `syntax_infix("?")` | the placeholder calls the pass rewrites |
 | `teko_stmt.tk` | every `{` block, and the honest stops for `var`, `match`, `when`, a local `const` | `syntax_stmt("{")` and one per stopped word | — |
 | `teko_expr.tk` | `new`, `.` as field/method/property access | `syntax_expr("new")`, `syntax_infix(".")` | forward-deferred `new` sites |
-| `teko_params.tk` | `params T[]`, the array built at the call site | `syntax_infix("[")` | the parameters the modifier marked, and the declarations carrying one |
+| `teko_params.tk` | `params T[]`, the array built at the call site | `syntax_infix("[")` | the parameters the modifier marked, and the declarations carrying one, each shared or not |
 | `teko_default.tk` | `i64 add(i64 a, i64 b = 10)` | `syntax_param` — the one in this compiler | one row per free declaration with a parameter list |
 | `teko_over.tk` | overload of a top-level function by signature | nothing: one `pass()` | every declaration of the unit, and the names declared more than once |
 | `teko_ops.tk` | `operator+` and its siblings as static members, and the unary `+` | `syntax_expr("+")` | the operators each type declares |

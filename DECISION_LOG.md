@@ -322,8 +322,19 @@ because the tail goes to memory rather than to the call convention.
 `params` on a **method, a constructor, an interface signature or a `delegate`** is refused,
 ``teko: `params` is taught on a free function only``: the virtual path is five call-shaping
 sites and a vtable slot keyed by signature, and refusing it trades a silent hole for a
-message. A **second signature** of a name that carries a list is refused as well, because
-the pass that builds the array matches a call site by name and runs ahead of the overload
-resolution; making a `params` candidate one candidate among many is its own change. The
-design, the steps and what the flip measured are
+message.
+
+A list is **one signature among the name's**, and C#'s §12.6.4.5 decides a site by ROUND
+ORDER alone: the exact-arity rounds and the default-completing one all run before any list
+is asked to swallow a tail, so a candidate applicable in its **normal form** wins — `f(1)`
+is `f(i64)`, and `f(1)` is `f(i64 a, i64 b = 5)`, before `f(params i64[])` is ever asked.
+`f(1, 2)` and `f()` are the list; `f(xs)` with an `i64[]` in hand is the list's own normal
+form, without a copy. Two lists of one name are told apart by their **element type**, and
+between two that both take a site the one with **more declared parameters** wins. What is
+left is two refusals the resolution already had: a tail no element type takes is
+`teko: no overload of f matches these arguments`, and a genuine tie — the same declared
+parameter count, both element types taking the arguments — is
+`teko: more than one overload of f matches these arguments`. A call of an overloaded name
+carries at most **64** arguments, because resolution types them as a set; a name declared
+once has no ceiling. The design, the steps and what each of them measured are
 [`docs/specs/params-typed.md`](docs/specs/params-typed.md).

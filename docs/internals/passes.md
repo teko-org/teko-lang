@@ -26,9 +26,9 @@ about a static type a deferred access does not carry.
 | 9 | `tk_ternary_pass` | `teko_ternary.tk` | the `?:` placeholder becomes a local plus an `if`, hoisted above the statement that used it |
 | 10 | `tk_switch_guard_pass` | `teko_switch.tk` | checks the level a bare `continue` reaches once every `N_LOOP` is in the tree |
 | 11 | `tk_ops_pass` | `teko_ops.tk` | an operator over operands of declared type becomes the call to the static member that declares it |
-| 12 | `tk_params_pass` | `teko_params.tk` | builds the `T[]` of a `params` call site out of its arguments, and refuses an index nothing resolved |
+| 12 | `tk_params_pass` | `teko_params.tk` | builds the `T[]` of a `params` call site out of its arguments, for a name declared once, and refuses an index nothing resolved |
 | 13 | `tk_default_pass` | `teko_default.tk` | fills the missing trailing arguments of a name declared exactly once |
-| 14 | `tk_over_pass` | `teko_over.tk` | gives each overload of one name its own symbol and rewrites every call site, defaults included |
+| 14 | `tk_over_pass` | `teko_over.tk` | gives each overload of one name its own symbol and rewrites every call site, defaults and `params` lists included |
 | 15 | `tk_rc_pass` | `teko_rc.tk` | injects the reference counting over every body: owning stores, releases at `}`, at a jump and at `return`, and the parking of temporaries |
 
 ## Why that order
@@ -67,6 +67,11 @@ member's own symbol, so a mangling pass has nothing left to pick there.
 **Pass 13 before pass 14, and only for a name declared once.** A name declared more than
 once is left untouched by the default fill on purpose; the overload resolution has a round
 of its own that handles those, defaults included.
+
+**Pass 12 too, and for the same reason.** A `params` list whose name carries a second
+signature is left as written: which candidate a site means is a question about all of them
+at once. Pass 14's fifth round answers it and calls pass 12's own expansion back, so the
+chain and its ownership are built in one place either way.
 
 **Pass 15 last.** Ownership is a question about a value's static type: the deferred accesses
 have to be resolved, the operators have to be the calls they are, and the overloads have to

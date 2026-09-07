@@ -3,9 +3,9 @@
 **Built, and what runs today** is [the parameters reference](../reference/parameters.md)
 § `params`. This page is the design it was built from; the steps stand as
 **P0 ✔** (the probes), **C1 ✔** (the element store), **C2 ✔** (the flip: the modifier, the
-call site, the pass move, and the removal of the word list). What is left is **C3**,
-overload resolution with a `params` candidate in it, and the two steps after it. The
-divergences C2 measured are recorded at the bottom of this page.
+call site, the pass move, and the removal of the word list) and **C3 ✔** (overload
+resolution with a list among the candidates). What the flip and the resolution measured,
+and where each diverged, is recorded at the bottom of this page.
 
 It needs nothing new from `mc`. The parameter position and the `T[]` type suffix are both
 already reachable, and `params` stops being the parameter's **type** and becomes a
@@ -35,10 +35,12 @@ a delegate (the array owns the references: an increment on the store, a release 
 and `str`/`ptr`, identical to a `uptr[]` and uncounted.
 
 **Overload resolution.** A candidate applicable in **normal** form beats an expanded one, as
-in C#. That falls out of the existing rounds: the two exact rounds match `pick(1)` against
-`pick(i64)` before the new round runs. Element conversion is identity or derived-to-base;
-an integer literal lands in any integer of the core; there is **no** implicit numeric
-conversion, so `total(1)` against `params f64[]` is a refusal.
+in C# (§12.6.4.5). That falls out of the round ORDER: the two exact rounds, and then the
+default-completing one, all run before a list is ever asked to swallow a tail — so `f(1)`
+against `f(i64)` and `f(params i64[])` is the first, and so is `f(1)` against
+`f(i64 a, i64 b = 5)`. Element conversion is identity or derived-to-base; an integer literal
+lands in any integer of the core; there is **no** implicit numeric conversion, so `total(1)`
+against `params f64[]` is a refusal.
 
 ## The mechanism
 
@@ -174,11 +176,11 @@ Every refusal above is in force, with three corrections and two additions the fl
   a lambda go through the core's own `parse_params`, so they reach the same
   `syntax_param` handler and are caught in the pass instead, as a marked parameter no
   declaration of the unit claimed.
-* **The overload refusal stays for now.** ``teko: a `params` list cannot be overloaded`` is
-  what keeps C2 from expanding a call the overload resolution has not decided yet — the
-  pass matches a call site to a declaration **by name**, and `tk_over_pass` runs behind it.
-  Making a `params` candidate one candidate among many is C3, and only there does the
-  refusal go.
+* **The overload refusal stayed for C2 only.** ``teko: a `params` list cannot be
+  overloaded`` was what kept the flip from expanding a call the overload resolution had not
+  decided yet — the pass matches a call site to a declaration **by name**, and
+  `tk_over_pass` runs behind it. C3 below makes a list one candidate among many, and the
+  refusal is gone with it.
 
 Two mechanisms the design did not name:
 
@@ -191,3 +193,66 @@ Two mechanisms the design did not name:
   declaration of this name" does not answer for a **parameter** — which is exactly the name
   a list is passed on under (`total(rest)`). The pass reads the parameter list of the
   declaration it is walking, and falls back to that table and then to a global `T[]`.
+
+---
+
+## What C3 measured, and where it diverged
+
+**The shape.** The fifth round is `tk_ov_resolve`'s (teko_over.tk), mirroring the fourth:
+tried only once the two exact-arity rounds and the default-completing one have all failed,
+which is C#'s "the normal form wins" for free — round order and no comparison of candidates
+at all. The alternative shape, moving the `params` pass BEHIND `tk_over_pass` and matching
+by the resolved symbol, was measured on the tree and rejected: `tk_default_fill`
+(teko_default.tk) refuses a call short of a name's parameter count, so `total()` would be
+``teko: total takes at least 1 arguments`` before the list ever saw it, and the default pass
+would have had to learn what a `params` list is. The round keeps that knowledge in one
+place.
+
+**Which pass expands.** A name declared once is expanded where it always was, in
+`tk_params_pass`. A name that carries a **second signature** is marked shared
+(`tk_pm_scan_shared`) and its call sites are left as written; the fifth round chooses the
+candidate and calls `tk_pm_expand_call` back in teko_params.tk, which builds the same chain
+with the same ownership registration. One expansion, two callers — the second knowing which
+list a site means, which is the only thing the first cannot answer.
+
+**Two holes the refusal was hiding.** Neither was a second signature the C2 check could see,
+because both declarations carried a list and the check only looked for one that did not:
+
+* `f(params i64[])` beside `f(params f64[])` compiled, and every site went to the FIRST row
+  — `f(1.5)` was `teko: a value of type f64 does not convert to i64`;
+* `f(params i64[])` beside `f(i64 a, params i64[] rest)` compiled too, and `f(1, 2)` silently
+  called the first (measured: exit 102 where C# gives 202).
+
+C3 answers both from the same table: the row is shared when any other declaration of the
+name has a different parameter shape (`tk_pm_same_shape`), which a prototype and its own
+definition never do — spelled with the modifier or without it.
+
+**Two stages, so a failure earns the right message.** The round reads the SHAPE first (the
+fixed prefix against the parameters before the list, and any tail length from zero up); a
+single list applicable by shape is chosen there and its elements are checked where the chain
+is built, so a tail that does not convert is reported against the list it was written for.
+Only when two lists take the site do the element types have to tell them apart, and only a
+site no element type takes leaves with nothing.
+
+**C#'s last tie-break, adopted.** Between two lists both applicable in expanded form, the
+one with **more declared parameters** wins (§12.6.4.5), so `f(i64, params i64[])` takes
+`f(1, 2)` over `f(params i64[])`. Without it a perfectly ordinary C# pair would be refused
+as ambiguous. What is left ambiguous is a genuine tie: the same declared parameter count and
+two element types that both take the arguments — `params u8[]` beside `params u64[]` at
+`f(1)`, refused with `teko: more than one overload of f matches these arguments`.
+
+**An integer literal picks `i64` here too.** The element check has the same two rounds the
+argument check has: strictly, a bare `1` lands only in an `i64` element, and loosely in any
+integer of the core. That is what makes `f(1)` the `params i64[]` when a `params u8[]` is
+also in reach, and it is the tie-break `tk_ov_args_fit` already applied to a parameter.
+
+**A ceiling the overloaded path does have.** Resolution types every argument of a site at
+once, into an array of the frame, so a call of an OVERLOADED name is bounded — the bound
+went from `MAXPARAMS` (12) to **64**, `teko: too many arguments`. A name declared once is
+unbounded as before: nothing types its arguments as a set. A fourteen-argument site on an
+overloaded list is in the probes.
+
+**What C3 did not touch.** The refusal on a method, a constructor, an interface signature
+and a `delegate` stands unchanged; no new message was added, and the three the round can
+reach (`no overload of`, `more than one overload of`, `does not convert`) are the ones the
+resolution and the element check already had.
