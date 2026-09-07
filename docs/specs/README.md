@@ -20,8 +20,8 @@ looking up a construct must never find a plan described as if it worked.
 
 ## The order the type work lands in
 
-The four pages above, together with `docs/specs/decimal.md` and `docs/specs/datetime.md`
-(open as `docs/specs-decimal-time`), are **one sequence**, cheapest first. Each crumb lands
+The four pages above, together with [decimal.md](decimal.md) and [datetime.md](datetime.md),
+are **one sequence**, cheapest first. Each crumb lands
 on its own and is gated on its own fixtures; the dependency column is the only thing that
 fixes the order.
 

@@ -71,7 +71,7 @@ or `f64 x = Color.Red;` would compile.
 
 Two tables, both of which exist:
 
-1. **The qualified constant table** (`teko_const.tk`'s own, the one that answers `Nome.MAX`
+1. **The qualified constant table** (`teko_const.tk`'s own, the one that answers `Name.MAX`
    and `geo.N`), under the key `Color__Red`. This is what makes `case Color.Red:` work with
    **zero lines in `teko_switch.tk`** — `docs/reference/not-yet.md` records that a qualified
    `const` already resolves as a case label, and an enum member is one.

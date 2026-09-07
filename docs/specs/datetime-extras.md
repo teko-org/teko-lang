@@ -4,8 +4,8 @@
 `// no-run` for that reason. What runs is [the type reference](../reference/types.md), and
 this page is kept apart from it on purpose ([the specs index](README.md)).
 
-**This page is a proposed section of `docs/specs/datetime.md`**, not a design of its own.
-That page (open as `docs/specs-decimal-time`) designs `DateTime` and `TimeSpan` and lists
+**This page is a proposed section of [datetime.md](datetime.md)**, not a design of its own.
+That page designs `DateTime` and `TimeSpan` and lists
 `DateOnly` and `TimeOnly` under "What stays out" with the reason *"C# has them; nothing asks
 for them yet"*, and `DateTimeOffset` beside the time-zone database. Something asks for them
 now — the owner's "types are missing" — and the answer is short, because all three are
