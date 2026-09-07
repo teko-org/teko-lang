@@ -39,6 +39,12 @@ and published](specs/packages.md), [self-hosting](specs/self-hosting.md), [the D
 beyond what is built](specs/dependency-injection.md), [the typed variadic
 list](specs/params-typed.md), and a [draft roadmap to v1.0.0](specs/roadmap-1.0.md).
 
+The types C# has and teko does not are designed there too, in one ordered sequence
+([the order they land in](specs/README.md)): [the missing
+integers](specs/small-ints.md), [`enum`](specs/enum.md), [`Guid`](specs/guid.md),
+[`string`](specs/string.md) and [the three derived date
+types](specs/datetime-extras.md).
+
 ## The internals — how the port itself is built
 
 [`internals/`](internals/README.md): the [31 `.tk` modules](internals/modules.md), the
