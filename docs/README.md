@@ -34,14 +34,19 @@ yet](guide/99-what-is-not-there-yet.md).
 
 ## The specs — designed, not yet implemented
 
-[`specs/`](specs/README.md): [how teko is packaged and published](specs/packages.md),
-self-hosting, the DI model beyond what is built, and the roadmap of what v0.4.0 leaves
-out.
+[`specs/`](specs/README.md): [the surface policy](specs/surface.md), [how teko is packaged
+and published](specs/packages.md), [self-hosting](specs/self-hosting.md), [the DI model
+beyond what is built](specs/dependency-injection.md), [the typed variadic
+list](specs/params-typed.md), and a [draft roadmap to v1.0.0](specs/roadmap-1.0.md).
 
 ## The internals — how the port itself is built
 
-[`internals/`](internals/README.md): the 31 `.tk` modules, the pass model, reference
-counting, the bootstrap ladder, CI, and known pitfalls.
+[`internals/`](internals/README.md): the [31 `.tk` modules](internals/modules.md), the
+[pass model](internals/passes.md), the [node table](internals/nodes-and-xt.md),
+[reference counting](internals/runtime.md), [dependency
+injection](internals/di.md), the [bootstrap ladder](internals/bootstrap.md),
+[CI](internals/ci.md), the [pitfalls](internals/pitfalls.md) and the
+[known debts](internals/debts.md).
 
 ## The history — kept elsewhere
 
