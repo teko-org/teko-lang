@@ -371,7 +371,7 @@ name to hold it, so a `params` call in a hot loop walks the arena forward
 | `params T[]` | not taught |
 | a `params` list with a default, an overload, or an address (`&f`) | refused |
 | `params` on an `extern` | refused |
-| `ref T[]` / `out T[]` | not taught |
+| reading a `ref T[]` / `out T[]` inside the callee | not taught: `xs[i]` and `xs.Length` there are refused |
 | `f(out i64 a)` declaring the variable at the call site | not taught |
 | an `out` assigned only along some paths | only "never assigned" is checked |
 | a `ref` **parameter** repassed to an **overloaded** name | not taught: the argument's type is not known at that site |

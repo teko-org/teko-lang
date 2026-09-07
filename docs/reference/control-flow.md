@@ -150,9 +150,10 @@ i64 main() {
 foreach (T x in source) stmt
 ```
 
-The source is a **local** `T[]`, a **local** fixed array, or an inline array field reached
-through the receiver (`this.items`). The element type may widen (`i64 x in u8[]`), never
-narrow. `break`, `break N` and `continue` inside the body behave as in any loop, and the
+The source is a `T[]` — a local or a parameter — a **local** fixed array, or an inline
+array field reached through the receiver (`this.items`). A **global** `T[]` is refused
+(`teko: not a known array`). The element type may widen (`i64 x in u8[]`), never narrow.
+`break`, `break N` and `continue` inside the body behave as in any loop, and the
 per-iteration variable only borrows: a counted element is not released by the loop.
 
 ```teko
@@ -406,7 +407,7 @@ injected inside it is one instance for that block, released at its `}` — inclu
 
 | limit | value |
 |---|---|
-| a `foreach` over a **parameter**, a **global** or a forward-declared source | not taught |
+| a `foreach` over a **global** array, or over a forward-declared source | not taught (`not a known array`) |
 | a `case` label that is not a constant | refused |
 | control falling out of a non-empty `case` | refused |
 | a `when` on the textually last `_` arm of a switch expression | refused |

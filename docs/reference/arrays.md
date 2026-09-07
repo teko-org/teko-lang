@@ -267,8 +267,9 @@ is never released, so `rt_live()` never returns to its floor once one has been f
 
 ## Iterating
 
-`foreach (T x in xs)` walks a heap array, a local fixed array or an inline array field; the
-element type may widen, never narrow. It is [control-flow.md](control-flow.md) § foreach.
+`foreach (T x in xs)` walks a heap array — a local or a parameter — a local fixed array or
+an inline array field; the element type may widen, never narrow. A **global** `T[]` is not a
+`foreach` source. It is [control-flow.md](control-flow.md) § foreach.
 
 ---
 
@@ -278,7 +279,7 @@ element type may widen, never narrow. It is [control-flow.md](control-flow.md) �
 |---|---|
 | `T[][]`, or any multidimensional array | not taught (`an array of arrays is not taught yet`) |
 | a fixed array of a class or struct type | not taught; use `T[]` |
-| `ref T[]` / `out T[]` | not taught: the value passed would be the caller's slot, not the array |
+| reading a `ref T[]` / `out T[]` **inside the callee** | not taught: the parameter carries the caller's slot, so `xs[i]` and `xs.Length` there are refused (`expression with no codegen`) |
 | `params T[]` | not taught; `params` holds words ([parameters.md](parameters.md)) |
 | `.Length` on a **global fixed** array | not taught; a local fixed array and any `T[]` answer |
 | an inline array field through a **parameter** (`p.items[i]`) | not taught; a local or `this` resolves |

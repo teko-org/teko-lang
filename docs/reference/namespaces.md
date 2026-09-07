@@ -228,7 +228,7 @@ from an absolute path, from a path that climbs out of that directory, or from a 
 | a nested `namespace` | not taught |
 | `using X = A.B;`, `using static` | not taught |
 | a **qualified generic** (`geo.Box<i64>`) | not taught; a generic keeps its short name |
-| a namespaced `const` as a `case` label | not taught (the label is folded before the namespace pass runs) |
+| a **bare** namespaced `const` as a `case` label | not taught: the label is folded before the namespace pass runs — write `geo.N` |
 | a global `T[]` declared in a namespace | keeps the bare name |
 | a **qualified** base or interface declared **below** its use, or a base in another namespace | not taught |
 | `global`, `extern`, `main` inside a namespace block | refused |
