@@ -55,9 +55,9 @@ makes the order of declaration free does not read across it: a type used **above
 build config. A file read from an absolute path, from one climbing out of it or from a
 bundled `#include <name>` is outside.
 
-**`partial`.** The same class may be declared in more than one place, in one file or across several, and
-is united at compile time: the first part opens the row, the others add members, and the
-type closes at its first use. There is no partial **method**.
+**`partial`.** The same class may be declared in more than one place, in one file or
+across several, and is united at compile time: the first part opens the row, the others
+add members, and the type closes at its first use. There is no partial **method**.
 
 ## One program
 
