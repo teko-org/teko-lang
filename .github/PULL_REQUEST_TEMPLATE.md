@@ -5,10 +5,10 @@
 ## Checklist (project invariants — see CONTRIBUTING.md)
 
 - [ ] **Base branch is `main`**
-- [ ] All work lives in `ngen/` — the teko-over-mc port (`docs/design/port-teko-mc.md`)
-- [ ] Toolchain pinned: built with the `mc` release named by `ngen/MC_VERSION` (never `latest`)
-- [ ] `mc build ngen --config <host config>` builds and the fixture loop is green (exit 42/70)
-- [ ] Fixpoint: `sh ngen/scripts/bootstrap.sh` prints `FIXPOINT OK` (teko1 == teko2, byte-identical)
+- [ ] All work lives in the repository root — the teko-over-mc port (`docs/design/port-teko-mc.md`)
+- [ ] Toolchain pinned: built with the `mc` release named by `MC_VERSION` (never `latest`)
+- [ ] `mc build . --config <host config>` builds and the fixture loop is green (exit 42/70)
+- [ ] Fixpoint: `sh scripts/bootstrap.sh` prints `FIXPOINT OK` (`teko2.o` == `teko3.o` byte for byte, empty `--dump-asm` diff, the 45 fixtures pass under teko1)
 - [ ] `ngen (mc) CI` green on every leg
 
 ## Design rulings
