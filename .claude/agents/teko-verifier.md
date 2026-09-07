@@ -23,7 +23,8 @@ result yourself, from the branch, and report what actually happened.
 
 1. `mc build . --config <host cfg>` — the stock mc assembles the taught compiler.
 2. Every `tests/*.tk`, built `--entry-only` by `build/teko` and RUN, exit code against the
-   fixture's own `// expect-exit: N`. Report the tally as `N/45` and name each mismatch.
+   fixture's own `// expect-exit: N`. Report the tally over the fixtures on disk (45 on
+   `main` today) and name every mismatch.
 3. `sh scripts/bootstrap.sh --os <os> --arch <arch>` — teko0 to teko3; `FIXPOINT OK` means
    `teko2.o` and `teko3.o` are byte-identical and the two `--dump-asm` dumps agree.
 4. `sh scripts/check-docs.sh` — links, legacy paths, English, diagnostics, samples.

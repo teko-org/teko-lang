@@ -26,7 +26,7 @@ the newest entry on a point supersedes the older ones.
 sed -e 's/^os   = .*/os   = "macos"/' -e 's/^arch = .*/arch = "aarch64"/' \
     teko.toml >mc.macos.toml                    # or the pair this host really is
 mc build . --config mc.macos.toml               # stock mc builds the taught compiler
-for src in tests/*.tk; do                       # then the 45 fixtures, one config
+for src in tests/*.tk; do                       # then every fixture, one config
   n=$(basename "$src" .tk)                      # each: entry = the fixture, out =
   sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
       mc.macos.toml >"mc.$n.toml"               # build/$n, built --entry-only and RUN,
@@ -37,7 +37,8 @@ sh scripts/bootstrap.sh --os macos --arch aarch64   # prints FIXPOINT OK
 sh scripts/check-docs.sh
 ```
 
-45 fixtures pass, `FIXPOINT OK` prints, the docs gate is green. Anything less is a red branch.
+Every fixture passes (45 today, plus the ones the crumb adds), `FIXPOINT OK` prints and the
+docs gate is green. Anything less is a red branch.
 
 ## Laws you cannot bend
 
