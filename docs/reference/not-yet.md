@@ -1,4 +1,4 @@
-# What v0.1.0 does not accept
+# What v0.4.0 does not accept
 
 The rule of the cut is **no silently wrong result**: a construct that is not taught is
 refused where it is written, with a `teko: <cause>` naming it. This page is the list, with

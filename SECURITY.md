@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Teko is pre-release (`0.0.1.0-bootstrap`); only the tip of the active development branch (`main`) receives fixes.
+Teko is pre-release (the next release is `v0.4.0`); only the tip of the active development branch (`main`) receives fixes.
 
 ## Reporting a vulnerability
 
@@ -15,4 +15,4 @@ Include a minimal reproducer where possible. You should receive an acknowledgmen
 
 ## Scope notes
 
-The compiler runs a SAST gate in CI (CodeQL + a clang-tidy security profile) and has an audited capability surface (`src/checker/capability_audit.md`). Areas of particular interest for reports: the `extern`/FFI boundary, generated-C memory safety, the arena/region allocator, and `.tkb`/`.tkl` artifact parsing.
+Teko is a set of hook modules taught to [`mc`](https://github.com/minicompiler/mc); a defect in `mc` itself is reported to that project. Areas of particular interest here: the runtime `lib/rt.tk` (syscalls and the ABI boundary), the array and null guards the taught compiler emits, reference counting and the arena, and the package manifest a consumer resolves. CodeQL runs on every push.

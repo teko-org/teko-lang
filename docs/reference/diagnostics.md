@@ -597,5 +597,5 @@ truncation; the fix is to split the unit.
 
 ---
 
-What a v0.1.0 program cannot express at all, with the message it gets, is
+What a v0.4.0 program cannot express at all, with the message it gets, is
 [not-yet.md](not-yet.md).

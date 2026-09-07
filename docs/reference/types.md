@@ -357,5 +357,5 @@ There is no **local** `const`: declare it at the top or as a member.
 | types declared in one source | 32 |
 | fields, summed across all types | 256 |
 
-What a v0.1.0 program cannot write at all, and the message it gets, is
+What a v0.4.0 program cannot write at all, and the message it gets, is
 [not-yet.md](not-yet.md).
