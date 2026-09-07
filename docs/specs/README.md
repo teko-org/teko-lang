@@ -1,12 +1,19 @@
 # The specs
 
-Designed, not yet implemented — kept apart from the guide and the reference, which
-describe only what runs today. The pages are being written.
+**Designed, not built** — kept apart from [the guide](../guide/README.md) and
+[the reference](../reference/README.md), which describe only what runs today. A reader
+looking up a construct must never find a plan described as if it worked.
 
-Written: [packages](packages.md) — one integrated registry with `mc`, what makes a
-package a teko package, and how a consumer pins the compiler and the library.
+| page | covers |
+|---|---|
+| [surface.md](surface.md) | the policy: where a form comes from, what the surface will not become, and the closed list of what has no surface code |
+| [packages.md](packages.md) | one integrated registry with `mc`, what makes a package a teko package, and how a consumer pins the compiler and the library |
+| [self-hosting.md](self-hosting.md) | the single unit, and why the criterion is the object rather than the executable |
+| [dependency-injection.md](dependency-injection.md) | the DI model as decided, including the parts that are not built |
+| [params-typed.md](params-typed.md) | `params T[]`, the typed variadic list that replaces today's list of words |
+| [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
-Planned pages: self-hosting the taught compiler, the dependency-injection model beyond
-what is built, the `params T` design, and the roadmap of what v0.4.0 leaves out — the
-refusals themselves are already catalogued in
-[`../reference/not-yet.md`](../reference/not-yet.md).
+What v0.4.0 **refuses** is not here: it is catalogued in
+[`../reference/not-yet.md`](../reference/not-yet.md), with the message each refusal answers.
+Nothing on that list is a promise about a later version, and nothing on this one is a
+schedule.
