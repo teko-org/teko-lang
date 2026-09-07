@@ -413,8 +413,17 @@ closed by **D33**.
 
 ### D33 · An integer converts to a float slot; nothing narrows back (2026-09-07)
 C# §10.2.3's implicit numeric conversion, in every slot teko has one. An integer — a
-literal, a local, a parameter, a field, whatever the core reads as one of its five integer
-ids — written where an `f64` or an `f32` is declared becomes that float. The core converts
+literal, a local, a parameter, a field, of any integer KIND the core or a module
+registered, `i32` included — written where an `f64` or an `f32` is declared becomes that
+float. `tk_is_int_ty` (teko_typeof.tk) answers by ID, not by `type_kind`: a class, an
+interface and `ref`/`out`/`params` all register `TK_INT` too (teko_struct.tk's,
+teko_access.tk's and teko_ref.tk's own `type_new`), and every core type answers `TK_INT`
+from `type_kind` regardless — `TY_VOID` and `TY_UPTR` included, neither a number — so the
+kind alone cannot tell an integer from a reference. `i32` is the one integer id outside the
+core's five raw ones (`TY_U8`..`TY_I64`): `core_types_init()` registers it before any
+module's `user_init()` runs (`hooks.md` § "the id a registration returns"), so it always
+answers exactly `TY_MAX`, deterministically, before a class or an interface of the
+program's own claims the ids after it. The core converts
 none of them: `walk_narrow` (mc/src/gen_walk.mc) answers 0 for `TK_FLOAT`, so the eight
 bytes of the integer reached the slot and were read as a mantissa — `f64 y = 1` was zero,
 `p.w = 4` was zero, `g(3)` against `f64 g(f64)` was zero, and `1 + 2.5` was neither three
@@ -463,7 +472,24 @@ widened: `f(3)` with `f(f64)` and `f(uptr)` declared still reads
 `teko: no overload of f matches these arguments`, since a better-conversion rule (§12.6.4.4)
 is a decision of its own; a name declared once always converts.
 [`docs/reference/not-yet.md`](docs/reference/not-yet.md) § *Numeric conversions* carries
-that and the four other gaps measured here, `f32`→`f64` among them.
+that and the five other gaps measured here, `f32`→`f64` among them.
+
+**A NEGATIVE `i32` widened to a float is wrong on `aarch64`, and it is `mc`'s own defect,
+not taught here.** `tests/primitives_float.tk` was rewritten again to add `i32` at the four
+of the nine slots it can reach as a source (`i32` never converts an ARRAY element or a
+`params f64[]` one, since neither of those declares an `i32` element in this crumb) —
+caught mid-review, before `i32` reached `tk_is_int_ty` at all, a POSITIVE `i32` widens
+correctly on every target, and a NEGATIVE one does too on `x86_64`
+(`lib/machine_x86_64_float.mc`'s `fx_cast` special-cases only `TY_U64`/`TY_UPTR` and signs
+everything else), but not on `aarch64`: `lib/machine_arm64_float.mc`'s `fa_cast` chooses
+`ucvtf` over `scvtf` for any integer source that is not the exact id `TY_I64`, so a sign-
+extended `i32` register reads as a huge positive double. Reproduced on `bea5ccce`, BEFORE
+this fix, through an explicit `(f64) d` cast on a negative `i32` local — `i32` never reached
+an IMPLICIT float slot before `tk_is_int_ty` learned its id, but the explicit cast already
+took the same broken lowering, so the defect is `mc`'s own and older than this crumb (D2): a
+minimal pure-`mc` reproducer is reported upstream, not patched here, and the fixture proves
+only what is true on every target — a positive `i32` and, in an integer-only slot, a
+negative one.
 
 **The parse-time table of locals becomes a scope.** `tk_slv`
 ([`teko_struct.tk`](teko_struct.tk)) grew ever-forward over the whole unit, so a name

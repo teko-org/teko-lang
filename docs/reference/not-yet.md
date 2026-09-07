@@ -41,6 +41,7 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
 | an integer argument at a **virtual** or an **interface** call, written as a bare **parameter** name (`a.by(n)` inside `g(i64 n)`) | not converted: those two are shaped at parse time and a parameter carries no type the parser can read, so the argument passes its own bits |
 | `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |
+| a NEGATIVE `i32` widened to `f64`/`f32`, on `aarch64` | wrong: `mc`'s bundled `lib/machine_arm64_float.mc` converts unsigned (`ucvtf`) for any integer source that is not the exact id `TY_I64`, so a sign-extended `i32` register reads as a huge positive double. Correct on `x86_64`, and correct on `aarch64` too for a NON-negative `i32` or for `i32` staying in an integer-only slot. `mc`'s own defect (D2), reported upstream |
 
 ## Generics and delegates
 
