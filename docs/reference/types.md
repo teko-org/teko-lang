@@ -159,6 +159,27 @@ i64 main() {
 }
 ```
 
+Neither does a NON-null reference. A struct, a class, an interface, a delegate and a `T[]`
+of heap all carry a row of the type table, and none of them is a number — a class value
+reaching an `i64`/`f64` slot used to pass its pointer through as a bit pattern, silently,
+in every one of the same slots listed above (D34). It is refused the same way, by the
+value's own type name:
+
+```teko
+// no-run
+class Foo { public i64 v; }
+
+i64 main() {
+    Foo f = new Foo();
+    i64 n = f;                                   // teko: a value of type Foo does not convert to i64
+    return n;
+}
+```
+
+A raw `uptr`/`ptr` value is left alone in a numeric slot — the core converts it to an
+integer of its own accord, and only a value the type table has a row for (or the `null`
+literal above) is judged here.
+
 Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
 slot is neither converted nor refused ([not-yet.md](not-yet.md)).
 

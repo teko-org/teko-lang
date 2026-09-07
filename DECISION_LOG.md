@@ -200,15 +200,27 @@ link breaks. `CLAUDE.md` was rewritten from scratch for the mc era, and this log
 at D1 with the decisions in force. Nothing was translated: a decision worth keeping was
 worth restating.
 
-### D26 · Teko packages live in mc's registry, marked `toolchain = "teko"` (2026-09-07)
+### D26 · Teko packages live in mc's registry, marked `language = "teko"` (2026-09-07)
 There is one integrated index, not a teko one beside an mc one: `pkg.minicompiler.dev` is
 its canonical host, `pkg.teko-lang.org` an alias host serving the same bytes, and a
 read-only `/mcp` endpoint answers over the same rows. A teko package **is** an mc package
-plus `[package].toolchain = "teko"`, a key `mc` ignores and the registry will classify on
+plus `[package].language = "teko"`, a key `mc` ignores and the registry will classify on
 once its support lands (mc's R3): for a package carrying it the registry will build the
 taught compiler from `[package].modules` and the package's `[deps]` first (mc's R2), then
 compile the `check` units with it. Neither is live yet; the key is written now so the first
-publication does not change the manifest again. Three shapes —
+publication does not change the manifest again.
+
+**Correction (2026-09-07, same day):** the key mc's R3 reads is `[package].language`, not
+`toolchain` — `toolchain` is a word this log used for the concept before the mc side had
+settled the key's own spelling, and it is never read by the registry or by `mc` itself.
+R3 also DERIVES the language from `[deps] teko` when the key is absent, so a library that
+only declares that dependency (`teko_std` and every other library over it) is classified
+`teko` without carrying the key at all; `[package].language` is the explicit override a
+package needs only when its own name does not say so on its own (the compiler package
+`teko` itself, which declares no `[deps] teko`). `mc.toml` and
+[`docs/specs/packages.md`](docs/specs/packages.md) carry the corrected key.
+
+Three shapes —
 `teko`, the compiler; `teko_std`, the library, versioned in lockstep with it; and every
 other library on its own line over `[deps] teko_std`. The closure rule is `mc`'s: a
 package reaches its own files, the libraries the binary ships and its declared `[deps]`,
@@ -276,7 +288,7 @@ write` granted to that job and no other; the artifact carries `public/CNAME`, so
 deployment cannot drop the custom domain. The canonical host is **`teko-lang.org`**, served
 from GitHub Pages, and `[site] base_url` is `/` because the site is at the root of its own
 domain. The registry link in the header is the index route that is live today
-(`minicompiler.dev/packages`); it becomes the per-toolchain listing when mc's R3 lands
+(`minicompiler.dev/packages`); it becomes the per-language listing when mc's R3 lands
 (D26).
 
 A link to a repository **directory** is the one shape the generator does not map — it
@@ -513,3 +525,77 @@ Proof: 45/45 fixtures at their `expect-exit`, `FIXPOINT OK`, `mc limits` verdict
 `passes` still 15/30 and `intrin` still 8/16, and `--dump-ast` byte-identical on 44 of the
 45 — the one that moves is `tests/primitives_float.tk`, rewritten here to cover the nine
 slots with values that only come out right if the conversion happened.
+
+### D34 · A non-null reference does not convert to a numeric slot either (2026-09-07)
+D33 closed the integer-to-float direction and the two scalar verdicts (`null`, a float
+narrowing) `tk_check_scalar_compat` ([`teko_typeof.tk`](teko_typeof.tk)) already judged
+without a row of the type table. A THIRD value needed the same treatment and did not have
+it: `Foo f = new Foo(); f64 x = f;` — a class reference reaching a float or an integer
+slot — compiled and passed the pointer through as the slot's own bit pattern, silently,
+in every one of the nine slots D33 already covers (an initializer, an assignment, a
+`return`, an argument of a free/method/virtual/interface call, an element of a `params
+f64[]`, and a field store). `null` already refused there (D32/D33) and a float already
+refused there; a struct, a class, an interface, a delegate and a `T[]` of heap — every
+value whose type is a row of the type table, `tk_struct_by_ty(ty) >= 0` — did not, because
+`tk_check_compat` ([`teko_typeof.tk`](teko_typeof.tk)) asks the row question only when the
+TARGET is a row (`ti = tk_struct_by_ty(tty); if (ti < 0) return;`), which is exactly a
+numeric slot. C# has no such conversion in either direction (§10.2, §6.2), so the fix
+mirrors D33's own scalar half: `tk_check_scalar_compat` now asks, once the float/`null`
+cases are past, whether the VALUE's type (`ety`) is a row while the slot (`tty`) is
+numeric, and refuses with the wording every mismatched value already gets —
+`teko: a value of type Foo does not convert to f64`. The check is on the value, never the
+slot, which is what keeps a `ref`/`out`/`params` slot out of it: those are `type_new`
+ids outside `tk_is_int_ty`'s range (teko_ref.tk's, teko_access.tk's own registration,
+D33's own reasoning), so the slot side of the new check never matches one.
+
+**A pre-existing defect surfaced once the new refusal could see it.**
+`tk_ty_of` (teko_typeof.tk), the pass-time type oracle `tk_rc_call_args`
+([`teko_rc.tk`](teko_rc.tk)) asks for a call argument's type, does not know about a
+`ref`/`out` argument's tag (`tk_rfarg_kind`/`tk_rfarg_pointee`, teko_ref.tk) — it reads
+the argument's ADDRESS expression by shape instead, the same way any other node is read.
+`ref p.x`'s address is `p + offset`, an `N_BINARY`, and the core's own rule for a binary
+(kept by `tk_ty_binary`) is the LEFT operand's type — `p` itself, `Point` — so
+`bump(ref p.x)` against `bump(ref i64 x)` was asked, from this crumb's new check onward,
+whether a `Point` converts to the parameter's own pointee `i64`, and refused a program
+`tests/surface_refout.tk` already proved correct. `tk_pty_of`
+([`teko_struct.tk`](teko_struct.tk)), the PARSE-TIME twin `tk_vcall_args_check`
+([`teko_expr.tk`](teko_expr.tk)) asks the same question through, never had this problem —
+it does not recognize `N_BINARY`/`N_ADDR` at all and answers -1, "not known", which every
+caller already treats as "refuse nothing" — so only the pass-time free-call site broke.
+The fix is `tk_ty_of`'s own, at the top: a `ref`/`out`-tagged node answers its POINTEE
+(`tk_rfarg_pointee`), falling back to the live scope by name for a bare local whose
+pointee was not yet known at parse time — the exact lookup `tk_ov_arg_ty`
+([`teko_over.tk`](teko_over.tk)) already makes for the overload matcher, over the same
+side table. No accepted program's `--dump-ast` moves: a `ref`/`out` argument's `at` was
+either already right (a bare local, unresolved at parse time, both answered -1 before and
+answer its scope type now, and `tk_check_compat(pt, pt, ...)` refuses nothing) or wrong in
+a way nothing downstream ever read (`tk_num_widen` never converts a class into anything),
+so the correction is invisible to every one of the 45 fixtures and visible only to the
+refusal this crumb adds.
+
+**The inverse direction — a number reaching a reference slot — was checked, not
+widened.** `Foo f = 5;`, `f = 5;` and `g(5)` against `Foo g(Foo)` already refuse, through
+`tk_check_compat`'s own row check (`tk_row_fits(ti, ei)` with `ei = tk_struct_by_ty(ety)
+< 0` for a scalar value, which the identity/derives/implements rule always fails). `Foo f
+= null;` still accepts (D32: a reference fits any row). A raw `uptr` value into a
+reference slot (`Foo f = raw;`, `raw` an `uptr` local, not the `null` literal) already
+refuses too — `teko: a value of type uptr does not convert to Foo` — an asymmetry with the
+numeric-slot side (a raw `uptr` there is left alone, D33), pre-existing and out of this
+crumb's scope. One genuine gap stayed open and is not fixed here, out of scope by the
+crumb's own instruction: `h.f = 5;` on a field of row type, at the PARSE-TIME field store
+(`tk_check_field_store`, teko_struct.tk) — it reads the value through
+`tk_struct_of_expr`, which answers about an object expression only, so a scalar value
+answers "not known" and the store proceeds, writing the integer's bits where a pointer is
+expected. Recorded in [`docs/reference/not-yet.md`](docs/reference/not-yet.md) § Numeric
+conversions, for a crumb that fixes it deliberately.
+
+Proof: 45/45 fixtures at their `expect-exit` (`tests/surface_refout.tk`'s `bump(ref p.x)`
+included), `--dump-ast` byte-identical to `2dc1c22a` on all 45, `FIXPOINT OK`,
+`sh scripts/check-docs.sh` green, `mc limits` unchanged row for row against the same
+baseline (the pre-existing `passes`/`intrin` warnings do not move). Fourteen probes
+outside `tests/` (`build/probe_*.tk`, not committed) prove the new refusal at every
+slot — an initializer, an assignment, an argument, a `return`, a field store, a
+`params f64[]` element, a `struct` value and a `delegate` value — and the remaining six
+prove the inverse direction's existing behaviour (an integer refused at an initializer,
+an assignment and an argument; `null` accepted; a raw `uptr` refused) plus the one gap
+left open (an integer into a field, silently accepted).

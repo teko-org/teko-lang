@@ -14,17 +14,19 @@ what is agreed and **not yet live**; the full agreement is
 
 They cannot be one file: `mc pkg hash DIR` reads `DIR/mc.toml` and takes no `--config`.
 The manifest carries no `[project]`, and that absence is what makes the name a **library**
-rather than a tool; it also carries `toolchain = "teko"` and `licence`, both written now so
-that the first publication does not have to change the manifest again.
+rather than a tool; it also carries `language = "teko"` and `licence`, both written now so
+that the first publication does not have to change the manifest again. `language` is an
+override — a package that instead declares `[deps] teko` (a library, never the compiler
+itself) is classified `teko` from that dependency alone, with no key of its own to write.
 
 ```toml
 [package]
-name      = "teko"
-toolchain = "teko"
-licence   = "MIT OR Apache-2.0"
-lib       = "lib/rt.tk"
-files     = [ "core_teko.mc", "lib/rt.tk", "teko.tk", "..." ]
-check     = ["mc_teko.tk"]
+name     = "teko"
+language = "teko"
+licence  = "MIT OR Apache-2.0"
+lib      = "lib/rt.tk"
+files    = [ "core_teko.mc", "lib/rt.tk", "teko.tk", "..." ]
+check    = ["mc_teko.tk"]
 ```
 
 `files` is the exact list a consumer would receive and the bytes the tree hash digests;
@@ -80,12 +82,12 @@ drops a trailing `.mc` from an angle-bracket name and does not drop `.tk`:
 | `teko_std` | the standard library | **lockstep with `teko`** — same tag, released together |
 | any other library | a teko library published by anyone | its own, over `[deps] teko_std` |
 
-For a package marked `toolchain = "teko"` the registry will build the taught compiler from
-`[package].modules` and the package's `[deps]` **first**, in a sandbox with no network, and
-compile the `check` units with it — which is what lets a teko library declare check units
-written in teko. Until that support lands, the validator compiles `check` with the stock
-`mc`, which is why this repository's own check unit, `mc_teko.tk`, is written in core
-syntax.
+For a package classified `teko` — by `[package].language` or by a `[deps] teko` of its own —
+the registry will build the taught compiler from `[package].modules` and the package's
+`[deps]` **first**, in a sandbox with no network, and compile the `check` units with it —
+which is what lets a teko library declare check units written in teko. Until that support
+lands, the validator compiles `check` with the stock `mc`, which is why this repository's
+own check unit, `mc_teko.tk`, is written in core syntax.
 
 The closure rule is `mc`'s: a package reaches its own files, the libraries the binary ships
 and its declared `[deps]`, and nothing else. Compiler modules **run** at build time inside
