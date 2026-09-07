@@ -149,6 +149,26 @@ build_taught_compiler() {
     awk '/^\[/ { skip = ($0 == "[linker]") } !skip' teko.toml \
         | sed -e "s#^os   = .*#os   = \"$host_os\"#" -e "s#^arch = .*#arch = \"$host_arch\"#" \
         > "$host_cfg"
+    # With no `[linker]`, a Linux build goes through mc's own ELF writer, whose
+    # `PT_INTERP` defaults to MUSL's loader (mc docs/reference/toml.md
+    # § [target].libc). On a glibc box -- every Linux runner this gate runs on --
+    # such a binary is `not found` the moment a shell tries to run it, which is
+    # exactly what a compiled sample below does. So a glibc host names its own
+    # loader out loud, the way `ngen.yml`'s five legs already do; where that
+    # loader is not at the standard path nothing is added and the default stands.
+    loader=""
+    if [ "$host_os" = "linux" ]; then
+        case "$host_arch" in
+            x86_64)  loader=/lib64/ld-linux-x86-64.so.2 ;;
+            aarch64) loader=/lib/ld-linux-aarch64.so.1 ;;
+        esac
+        [ -n "$loader" ] && [ -e "$loader" ] || loader=""
+    fi
+    if [ -n "$loader" ]; then
+        printf 'interp = "%s"\nlibc   = "gnu"\n' "$loader" > "$tmp/target_tail"
+        sed -e "/^arch = /r $tmp/target_tail" "$host_cfg" > "$tmp/host_cfg"
+        cp "$tmp/host_cfg" "$host_cfg"
+    fi
     if ! "$mc" build . --config "$host_cfg" --compiler-only > "$tmp/tout" 2> "$tmp/terr"; then
         cat "$tmp/tout" "$tmp/terr" >&2
         return 1
