@@ -91,8 +91,8 @@ is written in full.
 Installing the compiler as a tool is the road that opens once `mc` ships `mc tool install`;
 the `[compiler].modules` road runs today and stays valid afterwards.
 
-**Note:** `[replace]` in `mc.toml` does not skip the fetch of a non-published teko package. To develop
-against an unpublished teko, use the vendored path (`deps/teko` on the tag, with `mc.lock` pinning
+**Note:** `[replace]` in `mc.toml` does not spare an unpublished teko package from being fetched. To
+develop against an unpublished teko, use the vendored path (`deps/teko` on the tag, with `mc.lock` pinning
 its tree hash), as `teko-org/teko-std` does.
 
 ## The closure rule
