@@ -107,5 +107,6 @@ sh scripts/bootstrap.sh
 
 ## Where to go next
 
-The next page is the surface itself, starting at the values a program names. The
-exhaustive side, construct by construct, is [the reference](../reference/README.md).
+[10-values-and-types.md](10-values-and-types.md) starts the surface itself; the whole
+route, one page at a time, is [the index](README.md), and the exhaustive side is
+[the reference](../reference/README.md).
