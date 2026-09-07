@@ -1,5 +1,5 @@
 // core_teko.mc -- the taught compiler's own main(), naming the parts of
-// D64.1 (docs/design/plano-ngen-entrega4.md §64) instead of the whole
+// D64.1 (the delivery-4 plan §64) instead of the whole
 // `<mc/core>` bundle: `<mc/core_min>` comes from `[compiler].core` in
 // `teko.toml` (this file assumes it is already included), and this file adds
 // the four parts teko actually uses --

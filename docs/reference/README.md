@@ -1,6 +1,6 @@
 # The reference
 
-Exhaustive, read by lookup: every construct v0.1.0 accepts, with its spelling, its
+Exhaustive, read by lookup: every construct v0.4.0 accepts, with its spelling, its
 semantics, its known limit and a whole program that proves it. What the language refuses is
 here too — as a page of its own and as the catalogue of every message.
 
@@ -24,7 +24,7 @@ header is the assertion. Most of them are derived from the fixtures in
 | [runtime.md](runtime.md) | everything `lib/rt.tk` exports, by signature |
 | [build.md](build.md) | `teko build`, `teko limits`, `teko.toml`, `mc.toml`, the fixed point |
 | [diagnostics.md](diagnostics.md) | every `teko: …` message, by family, with cause and fix |
-| [not-yet.md](not-yet.md) | what v0.1.0 refuses, and the message each refusal answers |
+| [not-yet.md](not-yet.md) | what v0.4.0 refuses, and the message each refusal answers |
 
 Start at [types.md](types.md) if you are reading in order; the [guide](../guide/README.md)
 is the task-oriented route, and [`../specs/`](../specs/README.md) holds what is designed

@@ -1,21 +1,24 @@
 #!/bin/sh
-# check-docs.sh [MC] -- the docs gate (docs/history/design/plano-docs-site.md §3, D1).
-# Four checks, in this order, run from the repository root as the `docs` job in
-# .github/workflows/ngen.yml does:
+# check-docs.sh [MC] -- the docs gate. Five checks, in this order, run from the
+# repository root as the `docs` job in .github/workflows/ngen.yml does:
 #
 #   1. links        every relative markdown link under docs/, plus the two root pages
 #                    that link into it (README.md, CONTRIBUTING.md), resolves to a file
-#                    that exists.
-#   2. legacy       no page under docs/, outside docs/history/, names a path of the
-#                    retired standalone compiler: `ngen/`, `.tks`, `teko.tkp`,
-#                    `fetch_teko.sh`, `bootstrap/teko.c`, or a bare `src/` that is not
-#                    `mc`'s own (a line naming `mc` is read as `mc`'s still-alive src/,
-#                    everything else as the retired tree).
-#   3. diagnostics  every `"teko: ..."` literal string in teko*.tk (the taught compiler's
+#                    that exists. Fenced code is skipped: `ops[0](3, 4)` inside a ```teko
+#                    block is a call, not a link.
+#   2. legacy       no page under docs/ names a path of the retired standalone compiler:
+#                    `ngen/`, `.tks`, `teko.tkp`, `fetch_teko.sh`, `bootstrap/teko.c`, or
+#                    a bare `src/` that is not `mc`'s own (a line naming `mc` is read as
+#                    `mc`'s still-alive src/, everything else as the retired tree).
+#   3. language     no tracked source carries Portuguese. This repository is English-only
+#                    (DECISION_LOG.md D18): Portuguese belongs in chat with the owner or
+#                    in the private history repository. Any Portuguese diacritic, or any
+#                    word of the ASCII list below, fails with `file:line`.
+#   4. diagnostics  every `"teko: ..."` literal string in teko*.tk (the taught compiler's
 #                    own sources) appears in docs/reference/diagnostics.md. The list is
 #                    extracted from source, never written down here, so a new diagnostic
 #                    fails this check until it is documented.
-#   4. samples      every fenced ```teko block under docs/ carries `// expect-exit: N`
+#   5. samples      every fenced ```teko block under docs/ carries `// expect-exit: N`
 #                    (built with the taught compiler and RUN, exit code compared) or
 #                    `// no-run` (an illustrative fragment, left uncompiled); anything
 #                    else fails the check.
@@ -47,21 +50,21 @@ fail() {
     fails=$((fails + 1))
 }
 
-find docs -name '*.md' | sort > "$tmp/mdfiles"
-printf '%s\n%s\n' README.md CONTRIBUTING.md >> "$tmp/mdfiles"
+find docs -name '*.md' | sort > "$tmp/live_mdfiles"
+printf '%s\n%s\n' README.md CONTRIBUTING.md >> "$tmp/live_mdfiles"
 
-# docs/history/ is a FROZEN, verbatim copy of retired documents (README.md, this file's
-# own header): it is never rewritten to satisfy a gate that postdates it, so it is exempt
-# from both checks below -- a page that also has to stay a faithful, unedited history
-# could not be checked the same way a live page is.
-grep -v '^docs/history/' "$tmp/mdfiles" > "$tmp/live_mdfiles"
+# A fenced block is code, not prose: `ops[0](3, 4)` in a ```teko sample reads exactly like
+# a markdown link and is not one, and a sample is checked by compiling it (check 5), not by
+# resolving its punctuation.
+strip_fences() { awk '/^[ \t]*```/ { fenced = !fenced; next } !fenced'; }
 
 # ------------------------------------------------------------------- 1. links
 : > "$tmp/badlinks"
+nlinks=0
 while read -r md; do
     [ -f "$md" ] || continue
     d=$(dirname "$md")
-    grep -oE '\]\([^)]+\)' "$md" | sed -E 's/^\]\(//; s/\)$//' > "$tmp/targets"
+    strip_fences < "$md" | grep -oE '\]\([^)]+\)' | sed -E 's/^\]\(//; s/\)$//' > "$tmp/targets"
     while read -r target; do
         case "$target" in
             http://*|https://*|mailto:*|"#"*) continue ;;
@@ -73,9 +76,9 @@ while read -r md; do
             *)  p="$d/$path" ;;
         esac
         if [ ! -e "$p" ]; then echo "$md -> $target" >> "$tmp/badlinks"; fi
+        nlinks=$((nlinks + 1))
     done < "$tmp/targets"
 done < "$tmp/live_mdfiles"
-nlinks=$(grep -rhoE '\]\([^)]+\)' $(cat "$tmp/live_mdfiles") 2>/dev/null | grep -Evc 'http|mailto:')
 if [ -s "$tmp/badlinks" ]; then
     fail "unresolved links" "$(cat "$tmp/badlinks")"
 else
@@ -84,8 +87,8 @@ fi
 
 # -------------------------------------------------------------- 2. legacy paths
 # docs/brand/ documents file-type ICONS (`.tks`/`.tkt`/`.tkp`/`.tkl`) by what they used to
-# mean; it is brand asset metadata the site consumes as-is (docs/history/design/
-# plano-docs-site.md §1), not a claim about what exists today, so it is exempt too.
+# mean; it is brand asset metadata the site consumes as-is, not a claim about what exists
+# today, so it is exempt from this check.
 banned="ngen/ .tks teko.tkp fetch_teko.sh bootstrap/teko.c"
 : > "$tmp/legacy"
 while read -r md; do
@@ -98,12 +101,46 @@ while read -r md; do
     grep -n -F -- 'src/' "$md" 2>/dev/null | grep -v -E 'minicompiler/mc|mc/src/|`mc`|<mc/' | sed "s#^#$md:#" >> "$tmp/legacy"
 done < "$tmp/live_mdfiles"
 if [ -s "$tmp/legacy" ]; then
-    fail "banned legacy references outside docs/history/" "$(cat "$tmp/legacy")"
+    fail "banned legacy references" "$(cat "$tmp/legacy")"
 else
-    echo "ok legacy: no ngen/, .tks, teko.tkp, fetch_teko.sh, bootstrap/teko.c or bare src/ outside docs/history/"
+    echo "ok legacy: no ngen/, .tks, teko.tkp, fetch_teko.sh, bootstrap/teko.c or bare src/"
 fi
 
-# ------------------------------------------------------------- 3. diagnostics
+# ----------------------------------------------------------------- 3. language
+# The tracked sources, minus three exemptions: docs/brand/ is asset metadata written in
+# whatever the asset says, tests/ is fixture text a future encoding test may need to write
+# in any language, and THIS file carries the word list itself.
+if git rev-parse --git-dir > /dev/null 2>&1; then
+    git ls-files > "$tmp/all_tracked"
+else
+    find . -type f | sed 's#^\./##' | sort > "$tmp/all_tracked"
+fi
+grep -E '\.(md|tk|mc|sh|yml|yaml|toml|cff)$|^\.git(ignore|attributes)$' "$tmp/all_tracked" \
+    | grep -v -E '^(docs/brand/|tests/|scripts/check-docs\.sh$)' > "$tmp/english_files"
+
+# Two rules. A Portuguese diacritic is decisive on its own -- no English word in this tree
+# carries one. The ASCII list catches Portuguese written without accents; every word on it
+# is matched whole, and none of them is an English word (`state` is not `esta`).
+#
+# The accents are spelled as an ALTERNATION of whole characters, never as a bracket class:
+# outside a UTF-8 locale a bracket class matches single BYTES, and the continuation bytes
+# of `a` are also the continuation bytes of an em dash, a checkmark and a curly quote.
+pt_accents='á|à|â|ã|é|ê|í|ó|ô|õ|ú|ü|ç|Á|À|Â|Ã|É|Ê|Í|Ó|Ô|Õ|Ú|Ü|Ç'
+pt_words='nao|entao|sao|voce|esta|estao|tambem|atraves|divida|dono|dona|arquivo|arquivos|ficheiro|entrega|entregas|escada|primitivas|superficie|nivel|codigo|funcao|porque|quando|isso|dele|dela'
+: > "$tmp/pt"
+while read -r f; do
+    [ -f "$f" ] || continue
+    grep -n -E "($pt_accents)" "$f" 2>/dev/null | sed "s#^#$f:#" >> "$tmp/pt"
+    grep -n -w -E "($pt_words)" "$f" 2>/dev/null | sed "s#^#$f:#" >> "$tmp/pt"
+done < "$tmp/english_files"
+nfiles=$(grep -c . "$tmp/english_files")
+if [ -s "$tmp/pt" ]; then
+    fail "Portuguese in an English-only repository (DECISION_LOG.md D18)" "$(cut -c1-140 "$tmp/pt")"
+else
+    echo "ok language: $nfiles tracked sources carry no Portuguese"
+fi
+
+# ------------------------------------------------------------- 4. diagnostics
 grep -ohE '"teko: [^"]*"' teko*.tk | sort -u > "$tmp/diag"
 : > "$tmp/diag_missing"
 while IFS= read -r d; do
@@ -116,7 +153,7 @@ else
     echo "ok diagnostics: $ndiag teko: strings documented in docs/reference/diagnostics.md"
 fi
 
-# ------------------------------------------------------------------ 4. samples
+# ------------------------------------------------------------------ 5. samples
 : > "$tmp/manifest"
 fno=0
 while read -r md; do

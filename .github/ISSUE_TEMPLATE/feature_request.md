@@ -17,7 +17,7 @@ assignees: ''
 ## Law-first analysis
 
 <!-- Teko resolves design tensions by ruling, not preference. Which entry of DECISION_LOG.md
-     (or which section of docs/specs/*.md or docs/history/design/*.md) does the proposal
+     (or which section of docs/specs/*.md) does the proposal
      satisfy, and does it conflict with a more recent one? The most recent ruling wins. -->
 
 ## Alternatives considered

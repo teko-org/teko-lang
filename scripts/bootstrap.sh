@@ -1,7 +1,6 @@
 #!/bin/sh
-# bootstrap.sh -- S4.2 (docs/design/plano-ngen-entrega4.md §64(e), "Rito do
-# fixpoint"): the fixed point of the SELF-HOSTED teko, in the protocol of the
-# `mc` repository's own `scripts/bootstrap.sh`.
+# bootstrap.sh -- the fixpoint rite: the fixed point of the SELF-HOSTED teko,
+# in the protocol of the `mc` repository's own `scripts/bootstrap.sh`.
 #
 #   teko0 = mc build . --config <cfg> --compiler-only     (the stock mc)
 #   teko1 = teko0 build . --config <cfg1> --entry-only     over mc_teko.tk
@@ -41,8 +40,8 @@
 #
 # `mc` has to already be on PATH -- this script never downloads one. The `mc`
 # the CI puts on PATH before this script runs is the version PINNED by
-# `MC_VERSION` (`cat MC_VERSION`, read by `.github/actions/setup-mc`;
-# `HANDOFF.md` §3.2/§4), so a local run against a different `mc` is
+# `MC_VERSION` (`cat MC_VERSION`, read by `.github/actions/setup-mc`), so a
+# local run against a different `mc` is
 # comparing against a different fixed point than CI's.
 #
 # Needs mc >= 0.15.10 (`MC_VERSION`): before it, `source_claim` hid the
@@ -92,7 +91,7 @@ if [ ! -f mc_teko.tk ]; then
     exit 1
 fi
 if ! command -v mc >/dev/null 2>&1; then
-    echo "FAIL: no 'mc' on PATH (HANDOFF.md §4 installs it from the release)" >&2
+    echo "FAIL: no 'mc' on PATH (CONTRIBUTING.md installs it from the release)" >&2
     exit 1
 fi
 
@@ -175,7 +174,7 @@ base_config() {
 }
 
 # derive CONFIG ENTRY OUT -- teko.toml with the host's own target and one
-# stage's entry/output, the same `sed` shape HANDOFF.md §4 uses for a fixture
+# stage's entry/output, the same `sed` shape CONTRIBUTING.md uses for a fixture
 derive() {
     base_config \
         | sed -e "s#^os   = .*#os   = \"$os\"#" \
