@@ -1,11 +1,31 @@
 # The reference
 
-Exhaustive, read by lookup. Pages land in [D3](../history/design/plano-docs-site.md) of
-the docs plan, derived from
-[`../history/design/superficie-v0.1.0.md`](../history/design/superficie-v0.1.0.md) §1 and
-[`../../tests/*.tk`](../../tests/). Until then, [`diagnostics.md`](diagnostics.md) is the
-one page this index already links to: every `teko: …` diagnostic string the taught
-compiler's sources carry, checked by [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh).
+Exhaustive, read by lookup: every construct v0.1.0 accepts, with its spelling, its
+semantics, its known limit and a whole program that proves it. What the language refuses is
+here too — as a page of its own and as the catalogue of every message.
 
-Planned pages: language, types, functions, arrays, namespaces, dependency injection,
-memory, runtime, CLI, `teko.toml`/`mc.toml` keys.
+Every fenced `teko` example on these pages is **compiled and run** by
+[`../../scripts/check-docs.sh`](../../scripts/check-docs.sh), and its `// expect-exit: N`
+header is the assertion. Most of them are derived from the fixtures in
+[`../../tests/`](../../tests/), which the five native CI legs run on every push.
+
+| page | covers |
+|---|---|
+| [types.md](types.md) | the scalars, teko's seven aliases, `f32`/`f64`, `ptr`/`uptr`/`str`, `struct`, `class`, members, modifiers, `static`, `const` |
+| [classes.md](classes.md) | inheritance, the implicit receiver, `base`, constructors and destructors, `abstract`, interfaces, traits, properties, operators, `partial`, free order of declaration |
+| [generics.md](generics.md) | `class Box<T, const N: i64>`, instantiation and mangling, inline array fields, partial generics |
+| [delegates.md](delegates.md) | `delegate`, contextual and explicit values, the null panic, lambdas, `use (...)` by value and by reference |
+| [arrays.md](arrays.md) | fixed arrays local, global and inline; the heap `T[]`, its run-time index guard and its counted elements |
+| [namespaces.md](namespaces.md) | `namespace`, `using`, `import`, how a bare name resolves, `internal` |
+| [control-flow.md](control-flow.md) | `if`, `loop`/`break N`/`continue N`, `while`, `do`, `for`, `foreach`, both `switch` spellings, the ternary |
+| [parameters.md](parameters.md) | default arguments, overloads, `ref`/`out`, `params` |
+| [di.md](di.md) | the three lifetime markers, `inject`, constructor injection, `scope { }` |
+| [memory.md](memory.md) | the arena, reference counting per scope, ownership, destructors, panics |
+| [runtime.md](runtime.md) | everything `lib/rt.tk` exports, by signature |
+| [build.md](build.md) | `teko build`, `teko limits`, `teko.toml`, `mc.toml`, the fixed point |
+| [diagnostics.md](diagnostics.md) | every `teko: …` message, by family, with cause and fix |
+| [not-yet.md](not-yet.md) | what v0.1.0 refuses, and the message each refusal answers |
+
+Start at [types.md](types.md) if you are reading in order; the [guide](../guide/README.md)
+is the task-oriented route, and [`../specs/`](../specs/README.md) holds what is designed
+and not built.
