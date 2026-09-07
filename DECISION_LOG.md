@@ -303,7 +303,7 @@ Baseline (mc 0.15.18, `MC_VERSION` still reading `0.15.13`): 45/45 fixtures, `FI
 `scripts/check-docs.sh` 63 samples / 277 links / 349 diagnostics. Only then was
 `MC_VERSION` written and the literal `0.15.13` mentions (`CONTRIBUTING.md`,
 `docs/guide/00-getting-started.md`, `.github/workflows/site.yml`) raised to `0.15.18`.
-### D29 · `params T[]` is the only `params`; the word list is gone (2026-09-07)
+### D30 · `params T[]` is the only `params`; the word list is gone (2026-09-07)
 `params` is a **modifier** read before the type, as `ref` and `out` are, and the type after
 it is a genuine `T[]` — C#'s own form (D3). It goes on the last parameter of a **free
 function**, one only, never with `ref`/`out`, never with a default, never on an `extern`;
@@ -339,7 +339,7 @@ carries at most **64** arguments, because resolution types them as a set; a name
 once has no ceiling. The design, the steps and what each of them measured are
 [`docs/specs/params-typed.md`](docs/specs/params-typed.md).
 
-### D30 · Ownership is a column of its own; purity is never asked to stand in (2026-09-07)
+### D31 · Ownership is a column of its own; purity is never asked to stand in (2026-09-07)
 `tk_xt` ([`teko_struct.tk`](teko_struct.tk)) answers two questions about a node teko built,
 and they are different questions. `xt_pure` is **"may this be evaluated twice?"** — read by
 `tk_pure`, and by the virtual-call shaping alone, before `tk_clone` copies a receiver into
