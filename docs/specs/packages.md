@@ -110,8 +110,7 @@ dependency is one change, made after the whole local recipe is green on the new 
 
 ## What is still missing here
 
-- `mc.toml` needs `licence` and `[package].modules` before the first publication; today it
-  carries neither.
+- `teko` declares `licence`; `[package].modules` is needed only where the `check` unit needs the taught compiler.
 - The registry records `[package].toolchain` when its own support lands.
 - `tekoc`, the compiler as an executable package, is a separate name published later: a
   package's kind is fixed at its first publication, so the library and the tool cannot share

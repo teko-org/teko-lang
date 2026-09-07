@@ -16,9 +16,10 @@ refers to that record, not to this file.
 ---
 
 ### D1 · Teko is a language taught to `mc` (2026-09-07)
-Teko has no compiler of its own. It is a set of hook modules — 31 `teko_*.tk` files plus
-the runtime `lib/rt.tk`, driven by `core_teko.mc` and `user.mc` — that teach `mc` the
-constructs teko adds on top of its base grammar. `mc` enters by release, pinned in
+Teko has no compiler of its own. It is a set of hook modules — `teko.tk` and 30
+`teko_*.tk` files (31 module files in all) plus the runtime `lib/rt.tk`, driven by
+`core_teko.mc` and `user.mc` — that teach `mc` the constructs teko adds on top of its
+base grammar. `mc` enters by release, pinned in
 `MC_VERSION`, never as a submodule and never from a working clone; a version other than
 the pin is not expected to build this tree. Raising the pin is its own change, taken only
 after the whole local recipe is green on the new release.

@@ -107,16 +107,17 @@ else
 fi
 
 # ----------------------------------------------------------------- 3. language
-# The tracked sources, minus three exemptions: docs/brand/ is asset metadata written in
-# whatever the asset says, tests/ is fixture text a future encoding test may need to write
-# in any language, and THIS file carries the word list itself.
+# The tracked sources, minus two exemptions: docs/brand/ is asset metadata written in
+# whatever the asset says, and THIS file carries the word list itself. tests/ carries
+# no exemption: a fixture that genuinely needs an accented character as test data (an
+# encoding case) is exempted by name here, with its own justification, not by directory.
 if git rev-parse --git-dir > /dev/null 2>&1; then
     git ls-files > "$tmp/all_tracked"
 else
     find . -type f | sed 's#^\./##' | sort > "$tmp/all_tracked"
 fi
 grep -E '\.(md|tk|mc|sh|yml|yaml|toml|cff)$|^\.git(ignore|attributes)$' "$tmp/all_tracked" \
-    | grep -v -E '^(docs/brand/|tests/|scripts/check-docs\.sh$)' > "$tmp/english_files"
+    | grep -v -E '^(docs/brand/|scripts/check-docs\.sh$)' > "$tmp/english_files"
 
 # Two rules. A Portuguese diacritic is decisive on its own -- no English word in this tree
 # carries one. The ASCII list catches Portuguese written without accents; every word on it
