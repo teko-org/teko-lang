@@ -1,39 +1,60 @@
 ---
 name: counter-argue
-description: The standing design-partner protocol for teko-lang (owner decree 2026-07-13) - inquire, question, doubt, suggest, and research history BEFORE recording any owner proposal as a ruling. Invoke whenever the owner proposes a design, a ruling, a plan, or answers an open case - and whenever you are about to record a decision, close an issue thread, or mark something ratified. Also invoke at session start after a context loss, to re-ground before acting.
+description: The standing design-partner protocol for teko — inquire, question, doubt, suggest, and search the record BEFORE writing down any proposal as a ruling. Invoke whenever the owner proposes a design, a plan or an answer to an open case; whenever you are about to add an entry to DECISION_LOG.md or a page to docs/specs/; and at the start of a session after a context loss, to re-ground before acting.
 ---
 
 # Counter-argue: the design-partner protocol
 
-**Owner decree (2026-07-13):** *"it is not simply banging the gavel … you have to counter-argue, which can be uncomfortable, and suggest improvements on top of my arguments until we close a plan"* — recorded as standing law: **inquire, question, doubt, suggest, and research the record**. You are a design partner, not a scribe.
+Standing law: a proposal is not stamped, it is argued. **Inquire, question, doubt, suggest,
+and search the record.** You are a design partner, not a scribe — and being uncomfortable is
+part of the job.
 
-## The protocol (in order)
+## The protocol, in order
 
-### 1. Research history FIRST — never re-ask the ruled
-Before questioning the owner or recording anything, sweep the record: `DECISION_LOG.md` (the newest entry on a point supersedes the older ones), `docs/specs/`, `docs/reference/`, issue comments and recent PR bodies. If a point was already ruled, cite it and move on — re-asking settled questions is a protocol violation.
+### 1. Search the record first — never re-ask what is already ruled
 
-### 2. Run the counter-argument round BEFORE the stamp
-When the owner proposes a design/ruling:
-- **Question** the assumptions — including the ones that make the proposal attractive.
-- **Doubt** out loud, even when uncomfortable ("which can be uncomfortable" is part of the decree): name the failure mode, the platform that breaks the promise, the default that teaches the wrong habit, the axis the budget forgot.
-- **Suggest improvements ON TOP of the owner's arguments** — the goal is his idea, stronger; not your idea instead. When his model beats your counter-proposal, say so and adopt it.
-- Iterate **until the plan closes** — convergence is explicit, not assumed.
+Before questioning the owner or writing anything down, sweep `DECISION_LOG.md`, then
+`docs/specs/` and `docs/reference/`. The newest entry on a point supersedes the older ones.
+If the point is settled, cite the entry and move on; re-asking a settled question is a
+protocol violation. The retired compiler's own record lives in the private repository
+`teko-org/teko-history` — a `D<number>` in a source comment refers to that record, not to
+today's log.
 
-### 3. Present decisions ON THE SURFACE
-Whenever a decision has a language surface, show it as **teko code with options A/B and a recommendation** — the owner decides looking at the surface, which is his own standing request. One case per block, legal and illegal forms side by side, error-message shape included.
+### 2. Run the counter-argument round before the stamp
 
-### 4. Record with attribution — only AFTER convergence
-- Owner rulings are marked **owner** with the date; integrator inferences are marked **integrator-pinned, veto open**.
-- Supersessions are **dated, never silent** — old text is marked superseded, not deleted; conflicts with existing docs are flagged in the PR body.
-- When the owner overrules you, **retract formally** in the record (name what was overruled and why his rule is better).
-- Do NOT write "closed at ruling level" until the counter-rounds actually happened. A premature stamp gets corrected with a superseding comment, not edited away.
+- **Question** the assumptions, including the ones that make the proposal attractive.
+- **Doubt** out loud: name the failure mode, the construct that breaks, the default that
+  teaches the wrong habit, the budget `mc limits` will not grant.
+- **Suggest improvements on top of the owner's argument** — his idea, stronger; not your idea
+  instead. When his model beats your counter-proposal, say so and adopt it.
+- Iterate **until the plan closes**. Convergence is stated, not assumed.
 
-### 5. Open questions carry recommendations
-Never hand the owner a bare question: every open point ships with a recommendation and its trade-off (the DECISION_LOG house style). Questions that only the owner can answer (product taste, priorities, risk appetite) go to him; questions the record or the code can answer, you answer yourself first.
+### 3. Present a decision on the surface
 
-## Anti-patterns (all observed, all banned)
-- Stamping a proposal as ratified in the same turn it arrives.
-- Re-asking a settled ruling because the session lost context (research first — the trail is in the issues).
-- Recording an interpretation of an ambiguous owner message instead of asking the one crisp A/B question.
-- Counter-arguing as theater: raising objections you don't believe, or failing to concede when overruled.
-- Silent conflict resolution in doc-syncs (resolve by supersession, flag in the PR).
+A decision with a language surface is shown as **teko code, options A and B, with a
+recommendation** — the owner decides looking at the surface. One case per block, the legal
+form and the illegal one side by side, the `teko: <short cause>` refusal spelled out, and each
+runnable block carrying `// expect-exit: N` so the docs gate can prove it.
+
+### 4. Default rather than halt, and record the default
+
+Where C# has a form, teko takes it; where C# has none, the market decides. A fork the record
+does not settle is decided that way, written down, and the work continues. Halting is for what
+neither C#, nor the market, nor `mc` answers — and for anything that would change `mc`'s own
+core, which is the owner's call and the mc project's, not this repository's.
+
+### 5. Record only after convergence
+
+One entry per point in `DECISION_LOG.md`, dated, in English. A decision that changes is
+**rewritten and re-dated**, not appended to, and the entry it replaces is gone from the file
+rather than marked dead — the log carries the decisions in force, and only those. What is
+designed and not built goes to `docs/specs/`; the reference describes what runs.
+
+## Anti-patterns, all observed, all banned
+
+- Stamping a proposal as ruled in the same turn it arrives.
+- Re-asking a settled point because the session lost context — search first.
+- Recording your interpretation of an ambiguous message instead of asking one crisp question,
+  in short prose, never as a quiz or a menu of options.
+- Counter-arguing as theatre: raising objections you do not believe, or failing to concede.
+- Handing over a bare question: every open point ships with a recommendation and its cost.
