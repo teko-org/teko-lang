@@ -183,8 +183,26 @@ i64 tk_ty_binary(i64 n) {
     return tk_ty_of(nd_a(n));
 }
 
+// a `ref`/`out` call argument is an ADDRESS (`p + offset`, `base + idx*width`,
+// `&a`), structurally indistinguishable from an ordinary expression that adds
+// to a pointer -- so the generic rules below, read over its SHAPE, land on
+// whatever the address happens to be built from (`p + offset`'s own LEFT
+// operand is `p` itself, `tk_ty_binary`'s rule, so the address of a field of
+// a `Point` answered `Point`, not the field's own `i64`). `tk_rfarg_pointee`
+// (teko_ref.tk) is the POINTEE the argument was tagged with when `ref`/`out`
+// parsed it, the one answer a call-argument check (`tk_rc_call_args`,
+// teko_rc.tk) needs -- the same lookup `tk_ov_arg_ty` (teko_over.tk) already
+// makes for the overload matcher. A bare local's pointee may still be -1 at
+// this point (parsed before its own declaration read the scope this pass
+// now has live), so the fallback is the same scope lookup by name.
 i64 tk_ty_of(i64 n) {
     if (n == 0) return 0 - 1;
+    if (tk_rfarg_kind(n) != TK_RP_NONE) {
+        i64 pty = tk_rfarg_pointee(n);
+        if (pty >= 0) return pty;
+        if (nd_kind(n) == N_ADDR) return tk_ty_scope_find(nd_name(n));
+        return 0 - 1;
+    }
     i64 t = tk_xt_ty(n);
     if (t >= 0) return t;
     i64 k = nd_kind(n);
@@ -246,12 +264,24 @@ i64 tk_is_int_ty(i64 t) { return (t >= TY_U8 && t <= TY_I64) || t == TY_MAX; }
 // `tk_check_field_store`) and would otherwise be the one slot of the language
 // where a float lands on an integer in silence.
 //
-// Two values do not convert, in either direction of C#'s rule. A FLOAT in a
+// Three values do not convert, in either direction of C#'s rule. A FLOAT in a
 // slot of any other type is a narrowing, and C# has none without a cast
 // written down. `null` is a REFERENCE (D32) and a number is not a reference:
 // it lands on a row of the type table or on a raw `uptr`, and on no integer
 // and no float. A plain `uptr` value is left alone -- the core converts it to
 // an integer of its own accord, and only the LITERAL is judged here.
+//
+// D34: neither is a NON-null reference. A struct, a class, an interface, a
+// delegate and a `T[]` of heap are all a row of the type table
+// (`tk_struct_by_ty(ety) >= 0`), the same identity `tk_check_compat` below
+// asks for a row target -- but that function returns at once when the
+// TARGET is not a row (`ti < 0`), which is exactly a numeric slot, so a
+// reference reaching a numeric slot was never asked about at all: the core
+// takes whatever bit pattern the pointer carries and reads it as the
+// number. C# has no such conversion in either direction, so the value's
+// type is what is judged here, never the slot's -- a `ref`/`out`/`params`
+// slot (teko_ref.tk's, teko_access.tk's own `type_new`) is a POINTER-width
+// id outside `tk_is_int_ty`'s range, so the slot itself never matches.
 void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     if (tty < 0) return;
     if (tk_is_null_lit(en)) {
@@ -262,6 +292,10 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     if (ety < 0) return;
     if (type_kind(ety) == TK_FLOAT && type_kind(tty) != TK_FLOAT)
         tk_reject_compat(type_name(ety), type_name(tty), line, fl);
+    if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT) {
+        i64 ei = tk_struct_by_ty(ety);
+        if (ei >= 0) tk_reject_compat(sr_name_at(ei), type_name(tty), line, fl);
+    }
 }
 
 // the OTHER direction, the one that converts: an integer in a slot of float
