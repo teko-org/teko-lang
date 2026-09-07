@@ -362,14 +362,21 @@ i64 tk_ov_arg_ty(i64 a) {
 }
 
 // the arguments actually given, checked against `d`'s parameters one by one --
-// arity is the caller's business, not this loop's. An integer literal carries
+// arity is the caller's business, not this loop's. An INTEGER literal carries
 // no type of its own: at `loose` it lands on any of the core's integers, and
 // without it only on `i64` -- which is the tie-break, since the exact round is
 // tried first and `pick(1)` with both `pick(i64)` and `pick(u8)` in reach is
-// `pick(i64)`. `stop` is how many arguments to read: all of them for a round
-// that matches arity exactly, and only the FIXED ones for the expanded form,
-// whose tail is the list's own elements and is judged against the element
-// type instead (`tk_pm_tail_fits`, teko_params.tk).
+// `pick(i64)`. A FLOAT literal is an N_INT too -- `<float>`'s `fl_lit` gives
+// `1.5` the bit pattern for a value and the type `f64` (`f32` under the `f`
+// suffix) -- and it is NOT that untyped literal: it carries its own type, so
+// only a parameter of that same type takes it, in this round and in every
+// other. Reading the kind alone let `f(1.5)` land on `f(i64)`, which passes
+// the pattern to a parameter that reads it as an integer; there is no implicit
+// numeric conversion, the same rule an element of a `params` list is judged by
+// (`tk_pm_elem_fits`, teko_params.tk). `stop` is how many arguments to read:
+// all of them for a round that matches arity exactly, and only the FIXED ones
+// for the expanded form, whose tail is the list's own elements and is judged
+// against the element type instead (`tk_pm_tail_fits`, teko_params.tk).
 i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose, i64 stop) {
     i64 a = args;
     i64 i = 0;
@@ -377,7 +384,7 @@ i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose, i64 stop) {
         if (a == 0 || i >= stop) break;
         i64 pt = tk_decl_param_ty(d, i);
         if (tk_rp_kind(tk_decl_param_node(d, i)) != tk_rfarg_kind(a)) return 0;   // K2: `ref`/`out` kind must match too
-        if (nd_kind(a) == N_INT) {
+        if (nd_kind(a) == N_INT && type_kind(nd_type(a)) != TK_FLOAT) {
             if (loose) {
                 if (!tk_ov_int_ty(pt)) return 0;
             } else {
@@ -525,6 +532,51 @@ i64 tk_ov_match_expanded_rounds(uptr name, i64 args, i64 na, uptr tys, uptr pn) 
     return e;
 }
 
+// the parameter type at position `i` among the declarations of `name` that
+// take `na` arguments. -1 when no declaration takes that many -- the arity,
+// not a type, is what the site got wrong -- and -1 as well when one of them
+// declares a FLOAT there, since a candidate for the value does exist and what
+// failed is another argument.
+i64 tk_ov_param_ty_at(uptr name, i64 na, i64 i) {
+    i64 found = 0 - 1;
+    i64 j = 0;
+    loop {
+        if (j >= tk_nodecl) break;
+        if (str_eq(od_name_at(j), name)) {
+            i64 d = od_node_at(j);
+            if (decl_nparams(d) == na) {
+                i64 pt = tk_decl_param_ty(d, i);
+                if (type_kind(pt) == TK_FLOAT) return 0 - 1;
+                if (found < 0) found = pt;
+            }
+        }
+        j = j + 1;
+    }
+    return found;
+}
+
+// a site that matched nothing, when what stopped it is a FLOAT argument no
+// signature of the name takes there. C# answers such a call by naming the
+// conversion, not the search: it picks a candidate and reports its invalid
+// argument (§12.6.4.5), so `f(1.5)` against `f(i64)` reads as the value that
+// does not convert -- the same wording a mismatched argument gets anywhere
+// else in this compiler. A site whose ARITY is what failed says nothing here
+// and leaves with the search's own message.
+void tk_ov_float_refuse(uptr name, i64 args, i64 na, uptr tys, i64 line, uptr fl) {
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        i64 at = ld64(tys + i * 8);
+        if (at >= 0 && type_kind(at) == TK_FLOAT) {
+            i64 pt = tk_ov_param_ty_at(name, na, i);
+            if (pt >= 0) tk_reject_compat(type_name(at), type_name(pt), line, fl);
+        }
+        i = i + 1;
+        a = nd_next(a);
+    }
+}
+
 i64 tk_ov_nargs(i64 args) {
     i64 n = 0;
     i64 a = args;
@@ -575,8 +627,10 @@ i64 tk_ov_resolve(i64 n) {
         r = tk_ov_match_expanded_rounds(name, args, na, tys, &count);
         expanded = r >= 0;
     }
-    if (r < 0)
+    if (r < 0) {
+        tk_ov_float_refuse(name, args, na, tys, line, fl);
         err_at(fl, line, tk_join3("teko: no overload of ", name, " matches these arguments"));
+    }
     if (count > 1)
         err_at(fl, line, tk_join3("teko: more than one overload of ", name, " matches these arguments"));
     i64 d = od_node_at(r);
