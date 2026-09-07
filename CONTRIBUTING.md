@@ -75,11 +75,12 @@ sh scripts/check-docs.sh
 
 - **Short, clear.** No doc-comments longer than the code they document.
 - **No inline `//` comments.** Inline commentary is banned — the code speaks for itself, or the design
-  lives in `docs/specs/` or `docs/history/design/`.
+  lives in `docs/specs/`.
 - **Error messages: compiler style.** `file:line:column: "short cause"` (e.g., `teko: unsupported (os,arch)`).
   No lengthy explanations or references to docs.
-- **Refused features carry `teko:` prefix:** v0.1.0 does not support `Func<>`, `params T[]`, `T[][]`,
-  nested `namespace`, float in `params`, `when` on the last `_` arm. Any of these triggers `teko: <cause short>`.
+- **Refused features carry the `teko:` prefix:** v0.4.0 does not support `Func<>`, `params T[]`,
+  `T[][]`, nested `namespace`, float in `params`, `when` on the last `_` arm. Any of these triggers
+  `teko: <short cause>`; the full list is [`docs/reference/not-yet.md`](docs/reference/not-yet.md).
 
 ## Decisions and forks
 
@@ -87,9 +88,8 @@ sh scripts/check-docs.sh
 mirror C# grammar and behavior (where applicable).
 
 **Open forks** (design decisions not yet decided, or tensions between laws):
-1. Check `DECISION_LOG.md` (D211 onward; D1–D210 in `docs/history/decision-log-legacy.md`).
-2. Check `docs/history/design/port-teko-mc.md` and `docs/history/handoff-2026-09.md` (the
-   laws), and `docs/specs/` for anything already designed.
+1. Check `DECISION_LOG.md`; the newest entry on a point supersedes the older ones.
+2. Check `docs/reference/` for what is built and `docs/specs/` for what is already designed.
 3. If genuinely open, record the fork in `DECISION_LOG.md` and ask the owner, with the fork
    statement and context. Do not implement competing designs.
 
@@ -110,8 +110,16 @@ If `mc` itself has a bug or limitation affecting teko's port:
 - **No legacy workflows.** The retired standalone compiler's own CI configuration
   (`pr.yml`, release cycles) is history, not run.
 
+## Language
+
+**This repository is English-only.** Every file that lands here — documentation, code
+comments, commit messages, PR bodies, workflow comments — is written in English, and
+`sh scripts/check-docs.sh` fails on Portuguese words in tracked sources. Portuguese belongs
+in chat with the maintainer, or in the private history repository `teko-org/teko-history`,
+which keeps the retired compiler's record verbatim.
+
 ---
 
-For the full operational guide (superseded page by page as `docs/internals/` fills in),
-see `docs/history/handoff-2026-09.md`. For design decisions and the port rationale, see
-`docs/history/design/port-teko-mc.md` and `DECISION_LOG.md`.
+How the port itself is built is [`docs/internals/`](docs/internals/README.md); what is
+designed and not yet built is [`docs/specs/`](docs/specs/README.md); the decisions in
+force are `DECISION_LOG.md`.

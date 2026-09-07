@@ -1,9 +1,8 @@
 #!/bin/sh
-# measure.sh BINARY CONFIG [DIR] -- the S1m register (docs/history/design/
-# plano-ngen-entrega4.md §64(f)): given the taught compiler's own binary,
-# print the size it landed at, its sections, and `mc limits` for the same
-# project/config, so a crumb that changes the parts a compiler is built
-# from (D64.1) can quote a real number instead of a guess.
+# measure.sh BINARY CONFIG [DIR] -- the size register: given the taught
+# compiler's own binary, print the size it landed at, its sections, and
+# `mc limits` for the same project/config, so a change to the parts a
+# compiler is built from can quote a real number instead of a guess.
 #
 # BINARY is the compiler `mc build` produced (`[compiler].out`, e.g.
 # `build/teko`); CONFIG is the build config `mc build`/`mc limits` read
