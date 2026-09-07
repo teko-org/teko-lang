@@ -61,15 +61,31 @@ total(a, b)  ->  total(tkarr_put_i64(tkarr_put_i64(tkarr_new_i64(2), 24, a), 32,
 
 `tkarr_put_T` is **generated per element type**, beside the allocator and release the heap
 array already generates, behind a flag of its own — only a program that uses `params` pays
-for it, and the tree of one that does not is unchanged. The element type is **declared** in
-the generated parameter (a float must be declared float all the way down) and the offset is
-a constant at the site; the increment is emitted only when the element is counted.
+for it, and the tree of one that does not is unchanged. It is
+`T[] tkarr_put_T(uptr a, i64 off, T v)`, one store and the array handed back, the shape
+`tk_cap_put` already gives a closure's captures. The element type is **declared** in the
+generated parameter (a float must be declared float all the way down) and the second
+argument is a byte **offset**, `24 + k * width`, constant at the site rather than an index;
+the increment is emitted only when the element is counted. Nothing is added to `lib/rt.tk`
+for any of it: `tk_stn` already answers `st8`/`st16`/`st32`/`st64`/`stf32`/`stf64` for every
+element kind, and `rt_own` is the increment a counted one earns.
 
-**Ownership** needs no new machinery. A `T[]` is counted, the node the allocator returns is
-born owned, and an owned value in argument position is already parked and swept at the end of
-the statement, taking each counted element with it through the generated release. The outer
-node of the chain is registered as **borrowed** so the park happens once, at the allocator
-inside — registering it as owned would release the array twice.
+**Ownership** needs no new machinery, and it is **one reference for the whole chain** — the
+count the allocator was born with. Neither end may add to it or take from it, so the rule has
+two halves and both are needed:
+
+- the **call site** registers the OUTER node as **borrowed**, so the park happens once, at
+  the allocator inside — registering it as owned parks the same array once per link, and the
+  statement's sweep then releases it as many times as it parked it (`teko: reference count
+  below zero`, measured);
+- the **generated store** registers the name it returns as **owned**, because
+  `tk_rc_return` increments a *borrowed* value on the way out of a function whose declared
+  return type is counted. An increment per link is the mirror defect: a reference the sweep
+  never gives back, and the array leaks (measured as well).
+
+Past those two, a `T[]` is counted, the node the allocator returns is born owned, and an
+owned value in argument position is already parked and swept at the end of the statement,
+taking each counted element with it through the generated release.
 
 **Interactions.** `ref`/`out` and defaults do not mix with it; the type oracle needs no new
 branch; DI is untouched. `&total` becomes legal, so the refusal that a `params` function has
