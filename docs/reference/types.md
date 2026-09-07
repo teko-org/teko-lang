@@ -1,0 +1,361 @@
+# Types
+
+What a teko program can name: the scalars it inherits from the `mc` core, the seven words
+teko adds on top of them, and the two declarations that build a type of your own —
+`struct` and `class`.
+
+Every example on this page is a whole program, compiled and run by
+[`../../scripts/check-docs.sh`](../../scripts/check-docs.sh); the exit code is the
+assertion.
+
+---
+
+## Scalars
+
+The core's own eight words are teko's ([the core language](https://github.com/minicompiler/mc/blob/main/docs/reference/language.md) § 2):
+
+| type | width | signed | notes |
+|---|---|---|---|
+| `u8` | 1 | no | a byte |
+| `u16` | 2 | no | |
+| `u32` | 4 | no | |
+| `u64` | 8 | no | |
+| `i32` | 4 | **yes** | C's `int`; the type an `extern` returning `int` declares |
+| `i64` | 8 | **yes** | the working integer |
+| `uptr` | 8 | no | the only pointer: opaque, no pointee, byte arithmetic |
+| `void` | — | — | a return type, and nothing else |
+
+teko adds seven names of its own. Each one is an **alias**: a new word for a
+representation the core already has, so mixing an alias with its base needs no cast and
+costs no instruction.
+
+| word | is | notes |
+|---|---|---|
+| `bool` | `u8` | the width of a declaration; `true`/`false` are the literals |
+| `byte` | `u8` | |
+| `char` | `u32` | a scalar code point; `'a'`, `'\n'` are its literals |
+| `isize` | `i64` | index/size, architecture-dependent — 64-bit today |
+| `usize` | `u64` | the unsigned half of the same |
+| `ptr` | `uptr` | teko draws no signed/unsigned pointer distinction: `ptr` and `uptr` are one type |
+| `str` | `uptr` | a NUL-terminated string, by pointer; there is no separate string object |
+
+`f32` and `f64` come from the `<float>` library the compiler loads, with their own
+literals (`2.0`, `0.5f`) and the intrinsics `ldf64`/`ldf32`/`stf64`/`stf32`/`sqrt_f64`/
+`fabs`/`fmin`/`fmax`.
+
+A type word is **reserved program-wide**: `i64 str = 1;` is refused, exactly as C#
+refuses a variable named `int`.
+
+```teko
+// expect-exit: 42
+isize sum_isize(isize a, i64 b) {
+    return a + b;
+}
+
+i64 main() {
+    byte  b = 20;
+    char  c = 12;
+    usize u = (usize) b + (usize) c;
+    isize n = sum_isize(10, 0);
+    return (i64) u + (i64) n;
+}
+```
+
+### Casts, width and sign
+
+A cast is C-shaped and unambiguous, `(u32) x`, because a type word always follows the
+`(`. Narrowing masks; widening is by the type's own kind — zero for `u8`/`u16`/`u32`,
+**sign** for `i32`. Arithmetic is 64-bit on the widened value and wraps at the next store.
+A comparison yields `i64` `0` or `1`.
+
+### `bool`, `true` and `false`
+
+`true` and `false` are integer literals `1` and `0`, and both words are reserved. `bool`
+sizes a declaration (one byte); a truth value in flight is an `i64`, so `if (x == 42)`
+and `bool ok = x == 42;` are both ordinary.
+
+```teko
+// expect-exit: 42
+bool is_the_answer(i64 x) {
+    return x == 42;
+}
+
+i64 main() {
+    bool ok = is_the_answer(42);
+    if (ok == false) return 1;
+    if (true == false) return 2;
+    return 42;
+}
+```
+
+### `f32` and `f64`
+
+Float arithmetic is the `<float>` library's; the bit pattern of an `f64` is reached
+through the runtime pair `tk_f64_bits`/`tk_f64_from_bits`
+([runtime.md](runtime.md)), because a cast between a float and an integer converts the
+**value**, never the bits.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+i64 main() {
+    f64 a = 40.0;
+    f64 b = 2.0;
+    u64 bits = tk_f64_bits(a + b);
+    f64 back = tk_f64_from_bits(bits);
+    return (i64) back;
+}
+```
+
+### `ptr`, `uptr` and `str`
+
+Memory is read and written by explicit width — `ld8`/`ld16`/`ld32`/`ld64` and
+`st8`/`st16`/`st32`/`st64` — and `&x` is the address of a local, a global or a function.
+`p + 1` is one **byte** further: a pointer has no pointee to scale by. `str` is that same
+pointer with a NUL at the end, so `tk_str_len` and `tk_str_slice` (a view, zero copy) are
+ordinary functions over it.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+u8 tbl[8];
+
+ptr at(uptr base, i64 i) {
+    return base + i;
+}
+
+i64 main() {
+    st64(tbl, 40);
+    ptr p = at(tbl, 0);
+    str s = "hi";
+    return ld64(p) + tk_str_len(s);
+}
+```
+
+---
+
+## `struct`
+
+A struct is a block of fields with no header of its own: the first field sits at offset 0.
+A value of struct type is a **pointer to the allocation**, eight bytes wide, produced by
+`new`; `new Name` and `new Name()` both hand out zeroed bytes, so a field nobody assigned
+reads as `0` and a reference field reads as null.
+
+```
+struct Name { [modifier] type field; ... methods ... }
+```
+
+Fields are laid out in declaration order at their natural alignment. Every offset, and the
+total size, is published as a compile-time constant: `NAME_FIELD` (both parts uppercased)
+and `NAME_SIZE`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+struct Point {
+    public u8  tag;
+    public i64 x;
+    public u32 y;
+}
+
+struct Line {
+    public Point a;
+    public i64   len;
+}
+
+i64 main() {
+    if (POINT_TAG != 0) return 1;
+    if (POINT_X != 8) return 2;                  // natural alignment, not offset 1
+    if (POINT_Y != 16) return 3;
+    if (POINT_SIZE != 24) return 4;
+
+    Point p = new Point;
+    if (p.x != 0) return 5;                      // the allocation is zeroed
+    p.tag = 2;
+    p.x = 30;
+    p.y = 10;
+
+    Line l = new Line();
+    l.a = p;
+    l.len = 0;
+    return l.a.x + l.a.y + l.a.tag;              // a struct field chains
+}
+```
+
+A struct declares methods, with the same implicit receiver, default arguments and
+overloads a class method has ([classes.md](classes.md)). What it does not have is a
+vtable: `virtual`, `override` and `use` of a trait are refused on a struct by name, and a
+struct is never a base class.
+
+A struct is **not reference-counted** — it has no vtable, hence no release function to
+reach. Its allocation lives for the run ([memory.md](memory.md)).
+
+---
+
+## `class`
+
+A class is a struct with two words in front of it: word 0 is the vtable pointer and word 1
+the reference count, so its own fields start at offset 16, after the base class's.
+
+```
+[public|internal] [abstract] [partial] class Name [: Base] [, Iface...] { members }
+```
+
+`NAME_FIELD`/`NAME_SIZE` are published the same way, and they measure the object — a
+`static` field is a global of its own and takes none of it.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+class Shape {
+    public i64 side;
+
+    public i64 twice() {
+        return side * 2;                         // `side` is `this.side`
+    }
+}
+
+class Square : Shape {
+    public i64 tag;
+}
+
+i64 main() {
+    if (SHAPE_SIDE != 16) return 1;              // the vtable and the count come first
+    if (SHAPE_SIZE != 24) return 2;
+    if (SQUARE_TAG != 24) return 3;              // the base's field keeps its place
+    if (SQUARE_SIZE != 32) return 4;
+
+    Shape p = new Shape;
+    p.side = 21;
+    return p.twice();
+}
+```
+
+A class value is a reference. Assigning one to another name copies the reference and the
+object is released when the last reference to it dies ([memory.md](memory.md)); everything
+a class can carry — inheritance, `virtual`, interfaces, traits, properties, operators,
+constructors and destructors — is [classes.md](classes.md).
+
+---
+
+## Members
+
+The same member grammar serves a struct and a class.
+
+| member | written |
+|---|---|
+| field | `public i64 side;` |
+| method | `public i64 area() { ... }` |
+| constructor | `public Name(i64 x) { ... }` (a class only) |
+| destructor | `~Name() { ... }` (a class only) |
+| property | `public i64 Side { get; set; }` |
+| constant | `public const i64 MAX = 4;` |
+| operator | `public static Vec operator+(Vec a, Vec b)` |
+
+### Modifiers
+
+Modifiers come before the type, in any order, each at most once.
+
+| modifier | on | means |
+|---|---|---|
+| `public` | member, top-level type | reachable from anywhere |
+| `private` | member | the declaring type only — the **default** for a member |
+| `protected` | member | the declaring type and the types derived from it |
+| `internal` | top-level type | this project only — the **default** for a type |
+| `static` | member | no receiver; reached through the type |
+| `const` | member | a compile-time constant; no slot in the object |
+| `virtual` `override` `abstract` | method, property | the vtable slot ([classes.md](classes.md)) |
+
+`public` and `internal` are reserved words, because they open a top-level declaration.
+`private`, `protected`, `static`, `virtual`, `override`, `abstract` and `operator` are
+**contextual**: they mean something inside a type body and are ordinary names outside it.
+
+`internal` names the **project**: a declaration belongs to it when the file it was read
+from lives inside the directory of the build config. An absolute path, a path that climbs
+out (`../elsewhere.tk`) and a bundled `#include <name>` are all outside.
+
+### `static`
+
+A static field is one global named `Type_field`, so it takes no byte of the object; a
+static method takes no receiver. Both are reached through the type, never through an
+instance.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+struct Point {
+    public i64 x;
+
+    public static i64 made;
+
+    public static i64 tally() {
+        return made;                             // the bare name, no receiver
+    }
+}
+
+i64 main() {
+    if (POINT_SIZE != 8) return 1;               // the static field is not in the object
+    if (Point.made != 0) return 2;
+    Point.made = 41;
+    Point.made = Point.made + 1;
+    return Point.tally();
+}
+```
+
+### `const`
+
+A member `const` has no slot either: it is a folded constant, read as `Type.MAX` from
+outside and by its bare name inside. A top-level `const` is the same thing without an
+owner, and it is what an array size or a `const` generic argument may name.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+const i64 BASE = 30;
+const i64 SIZE = 4;
+
+i64 arr[SIZE];
+
+class Counter {
+    public const i64 MAX = 4;
+    private const i64 STEP = 2;
+
+    public i64 sum() {
+        return MAX + STEP;                       // bare, from inside
+    }
+}
+
+i64 main() {
+    if (BASE != 30) return 1;
+    arr[3] = 4;                                  // `SIZE` sized the global array
+    if (arr[3] != 4) return 2;
+    if (Counter.MAX != 4) return 3;              // through the type, from outside
+    Counter c = new Counter;
+    return BASE + c.sum() + arr[3] + 2;          // 30 + 6 + 4 + 2
+}
+```
+
+There is no **local** `const`: declare it at the top or as a member.
+
+---
+
+## Limits
+
+| limit | value |
+|---|---|
+| there is no type inside a type | nested classes and structs are refused |
+| a struct is never a base class | `: Base` names a class |
+| a struct has no reference count | its allocation lives for the run |
+| `str` has no length field | `tk_str_len` walks to the NUL |
+| `ptr` and `uptr` are the same type | an overload cannot tell them apart |
+| types declared in one source | 32 |
+| fields, summed across all types | 256 |
+
+What a v0.1.0 program cannot write at all, and the message it gets, is
+[not-yet.md](not-yet.md).
