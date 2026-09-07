@@ -69,9 +69,12 @@ i64 tk_default_param() {
         set_fpd_mark_at(tk_dflt_row, tk_ndflt);
         tk_nfdecl = tk_nfdecl + 1;
         tk_hp_reset();                            // K3: this declaration's own `T[]` parameters
+        tk_pm_reset();                            // ...and its own `params` list, if it has one
     }
+    i64 isp = tk_pm_before_type();               // `params T[]`: the modifier, ahead of the type
     i64 rk = tk_ref_kind();                      // K2 (§41): `ref`/`out` before the pointee type
     if (rk != TK_RP_NONE) {
+        if (isp) err_at(p_file(), p_line(), "teko: a `params` list is not `ref` or `out`");
         p_next();
         i64 pty = tk_ref_param(rk);
         uptr pn = p_ident();
@@ -85,15 +88,18 @@ i64 tk_default_param() {
         p_next();
     } else {
         ty = type_of_token(p_id());
-        if (ty < 0 || ty == TY_VOID) return 0;   // not ours: the core's own two diagnostics stand
+        if (ty < 0 || ty == TY_VOID) {
+            if (isp) tk_pm_reject_bare();        // `params xs`: the old spelling, named
+            return 0;                            // not ours: the core's own two diagnostics stand
+        }
         ty = p_type();                           // K3 (§41): lets a `[]` suffix register
     }
     uptr pn = p_ident();
-    if (ty == tk_ty_params && p_id() == K_ASSIGN)
-        err_at(p_file(), p_line(), "teko: a `params` list has no default");
+    i64 pnode = param_new(ty, pn);
+    if (isp) tk_pm_after_type(pnode, ty);        // the `T[]` the modifier requires, and the mark
     tk_hp_add(pn, ty);                            // K3: a `T[]` parameter of a free function
     tk_param_default(fpd_mark_at(tk_dflt_row));
-    return param_new(ty, pn);
+    return pnode;
 }
 
 // how many DECLARATIONS (not calls, and not rows of the table above) share
@@ -240,9 +246,8 @@ void tk_default_fill(i64 root, i64 n, i64 row) {
 // `extern` owns its symbol, and its argument list is the C ABI's -- there is
 // no call this compiler lowers that could ever supply a missing word for it.
 // Checked once, over EVERY row, the moment a declaration is read, exactly
-// like `teko_params.tk`'s own `tk_va_check_decl` refuses `params` on an
-// `extern`: a default that no call ever exercises is still a refusal, not a
-// dead default.
+// like `teko_params.tk`'s own collection refuses `params` on an `extern`: a
+// default that no call ever exercises is still a refusal, not a dead default.
 void tk_default_check_decls(i64 root) {
     i64 i = 0;
     loop {

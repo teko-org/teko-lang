@@ -1,9 +1,11 @@
 # `params T[]`: a typed variadic list
 
-**Designed, not built.** What runs today is
-[the parameters reference](../reference/parameters.md) § `params`: a list of machine
-**words**, instantiated once per argument count. This page is the design that replaces it
-with C#'s own form, a real heap array.
+**Built, and what runs today** is [the parameters reference](../reference/parameters.md)
+§ `params`. This page is the design it was built from; the steps stand as
+**P0 ✔** (the probes), **C1 ✔** (the element store), **C2 ✔** (the flip: the modifier, the
+call site, the pass move, and the removal of the word list). What is left is **C3**,
+overload resolution with a `params` candidate in it, and the two steps after it. The
+divergences C2 measured are recorded at the bottom of this page.
 
 It needs nothing new from `mc`. The parameter position and the `T[]` type suffix are both
 already reachable, and `params` stops being the parameter's **type** and becomes a
@@ -115,12 +117,11 @@ it detaches each argument from its sibling list before making it an argument of 
 ## What the change removes
 
 The whole word-list machine: the per-count instantiation, the element read, the length
-constant, the float refusals, and the three runtime helpers that back it
-(`tk_va_new`/`tk_va_put`/`tk_va_at`). The per-site ceiling of twelve disappears with them —
-the tail goes to **memory**, not to the ABI, so only the fixed parameters have to fit the
-call convention.
+constant, the float refusals, and the three runtime helpers of `lib/rt.tk` that backed it.
+The per-site ceiling of twelve disappears with them — the tail goes to **memory**, not to
+the ABI, so only the fixed parameters have to fit the call convention.
 
-The two debts it closes are [the internal ones](../internals/debts.md): `params` carrying
+The two debts it closed were [internal ones](../internals/debts.md): `params` carrying
 words rather than a type, and the argument block never being handed back. A `T[]` is counted,
 so the array is released at the end of the statement that built it.
 
@@ -136,7 +137,6 @@ so the array is released at the end of the statement that built it.
 | on an `extern` | ``teko: an `extern` symbol takes no `params` list`` |
 | an argument that does not convert | the existing element-conversion message |
 | `params i64[][] xs` | the existing "an array of arrays is not taught yet" |
-| more arguments than the site's ceiling | ``teko: too many arguments for a `params` list`` |
 
 ## Deliberately outside this design
 
@@ -149,3 +149,45 @@ same call.** None is refused on principle; none is part of this design.
 
 **Implicit numeric conversion of an element.** C# has it; teko does not, here or anywhere
 else in overload resolution.
+
+---
+
+## What C2 measured, and where it diverged
+
+Every refusal above is in force, with three corrections and two additions the flip made:
+
+* **The old spelling and a non-array type are one message.** `params xs`, `params i64 xs`
+  and `params ref i64[] xs` are all "the type after the modifier is not a `T[]`", so the
+  first two answer ``teko: `params` names an array type: write `params T[] xs``` and only
+  the `ref`/`out` case has one of its own. A separate message for the retired spelling would
+  be a message about a form the surface no longer has.
+* **There is no ceiling to refuse.** ``teko: too many arguments for a `params` list`` and
+  ``teko: too many parameters before `params``` are gone with the words: the tail is memory,
+  so only the declaration's own parameter list meets `MAXPARAMS`, through the core's own
+  check. A site passing fourteen arguments is in the fixture.
+* **A prototype needs no body.** The list is an ordinary `T[]` parameter now, so a
+  declaration without a definition is the linker's business like any other; the refusal
+  that a `params` list "needs a body" went with the instantiation.
+* **`params` on a method, a constructor, an interface signature or a `delegate`** is one
+  refusal, ``teko: `params` is taught on a free function only``. The first three are caught
+  where the member's parameter list is read (`tk_params`, `teko_class.tk`); a `delegate` and
+  a lambda go through the core's own `parse_params`, so they reach the same
+  `syntax_param` handler and are caught in the pass instead, as a marked parameter no
+  declaration of the unit claimed.
+* **The overload refusal stays for now.** ``teko: a `params` list cannot be overloaded`` is
+  what keeps C2 from expanding a call the overload resolution has not decided yet — the
+  pass matches a call site to a declaration **by name**, and `tk_over_pass` runs behind it.
+  Making a `params` candidate one candidate among many is C3, and only there does the
+  refusal go.
+
+Two mechanisms the design did not name:
+
+* **A leftover index is refused where it stands.** With `xs[i]` on a list resolving at parse
+  time like any other array, nothing rewrites an `N_INDEX` the parse could not resolve, and
+  the core defines that node without lowering it. The pass refuses it,
+  ``teko: `[` needs an array`` — the same backstop the old walk gave under another name.
+* **The normal form needs the walked declaration's own parameters.** Deciding that a single
+  argument is *already* a `T[]` means typing it, and the unit-wide table of "the most recent
+  declaration of this name" does not answer for a **parameter** — which is exactly the name
+  a list is passed on under (`total(rest)`). The pass reads the parameter list of the
+  declaration it is walking, and falls back to that table and then to a global `T[]`.

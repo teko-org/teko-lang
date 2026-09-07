@@ -52,9 +52,8 @@ of its own ([memory.md](memory.md)).
 | `T[][]`, or any multidimensional array | `teko: an array of arrays is not taught yet` |
 | a **fixed** array of a class or struct type | `teko: an array of objects is not taught yet; use a field array or wait for T[]` |
 | reading a `ref T[]` / `out T[]` inside the callee | `expression with no codegen`, from the core — the parameter carries the caller's slot, and the array is not reachable through it |
-| `params T[]` | not taught: a `params` list holds words |
 | `.Length` on a **global fixed** array | `teko: unknown member: Length` — a local fixed array and any `T[]` answer |
-| an inline array field through a **parameter** (`p.items[i]`) | ``teko: `[` indexes a `params` list only`` |
+| an index whose base is not an array the parse can name | ``teko: `[` needs an array`` |
 | an inline array field by its bare name | ``teko: an array field is reached through `this.``` |
 | an inline array field of a type declared **below** | `teko: an array field on a type declared below is not taught yet` |
 | a heap array as the element of another heap array | not taught |
@@ -79,10 +78,13 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 
 | written | message |
 |---|---|
-| a float argument to a `params` list | ``teko: a `params` list holds words; a float argument is not taught yet`` |
-| a `params` element read as a float | ``teko: a `params` list holds words; its element does not read as a float`` |
+| `params` on a method, a constructor, an interface signature or a `delegate` | ``teko: `params` is taught on a free function only`` |
+| `params` not last, or two of them | ``teko: `params` must be the last parameter, and there is only one`` |
+| `params` over anything but a `T[]` (`params xs`, `params i64 xs`) | ``teko: `params` names an array type: write `params T[] xs``` |
+| `params` with `ref`/`out`, with a default, or on an `extern` | ``teko: a `params` list is not `ref` or `out```, ``teko: a `params` list has no default``, ``teko: an `extern` symbol takes no `params` list`` |
 | `params` outside parameter position | ``teko: `params` declares a parameter list, nothing else`` |
-| an overload, a default or `&f` on a `params` function | ``teko: a `params` list cannot be overloaded``, ``teko: a `params` list has no default``, ``teko: a `params` function exists once per call site and has no address`` |
+| a second signature of a name that carries a `params` list | ``teko: a `params` list cannot be overloaded`` |
+| an argument that does not convert to the element type | `teko: a value of type X does not convert to T` — identity or derives/implements, and an integer literal into any integer of the core; there is no implicit numeric conversion |
 | two overloads differing only by `ref`/`out` | ``teko: two overloads differ only by `ref`/`out``` |
 | a `ref` **parameter** repassed to an **overloaded** name | `teko: the type of argument N of X is not known here` |
 | `f(out i64 a)` declaring the variable at the call site | not taught: declare it first |

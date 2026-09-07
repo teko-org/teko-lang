@@ -37,11 +37,13 @@ to another `ref`/`out` parameter as many levels down as you like. A parameter ca
 
 ## `params`
 
-The spelling is the core's — `params xs`, not `params i64[] xs` — and the list holds
-**words**. Inside the body `xs_len` is the count and `xs[i]` is the element. The
-declaration is generic in that count: a site with `k` arguments instantiates a body of its
-own, so a literal index is checked at compile time and costs no guard. A fixed parameter
-may come first, and a variadic call may sit inside another one.
+`params i64[] xs` is C#'s own: a **modifier** before the type, a genuine `T[]` after it, on
+the last parameter of a free function. Inside the body `xs` is an ordinary array —
+`xs.Length`, `xs[i]`, `foreach`, passing it on. At the call site the compiler builds the
+array out of the arguments, none of them being a limit; a single argument that is already a
+`T[]` passes straight through. The element may be a float, or a class, and the array is
+released at the end of the statement that built it. A fixed parameter may come first, and a
+variadic call may sit inside another one.
 
 ## One program
 
@@ -74,11 +76,22 @@ void split(i64 v, out i64 hi, out i64 lo) {
     lo = v % 10;
 }
 
-i64 total(params xs) {
+i64 total(params i64[] xs) {
     i64 s = 0;
     i64 i = 0;
     loop {
-        if (i >= xs_len) break;
+        if (i >= xs.Length) break;
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+f64 ftotal(params f64[] xs) {                // a float element travels as a float
+    f64 s = 0.0;
+    i64 i = 0;
+    loop {
+        if (i >= xs.Length) break;
         s = s + xs[i];
         i = i + 1;
     }
@@ -103,13 +116,19 @@ i64 main() {
     if (hi != 5) return 7;
     if (lo != 7) return 8;
 
-    if (total() != 0) return 9;              // the empty list
+    if (total() != 0) return 9;              // an array of length 0
     if (total(1, 2, 3) != 6) return 10;
+    if ((i64) ftotal(1.5, 2.5) != 4) return 11;
+
+    i64[] ready = new i64[2];
+    ready[0] = 4;
+    ready[1] = 3;
+    if (total(ready) != 7) return 12;        // the normal form: no copy
 
     return add(1) + pick(3, 4) + total(10, 7) + a;
 }
 ```
 
-`params T[]`, a float argument to a `params` list and `f(out i64 a)` declaring the
-variable at the call site are not taught; the full account is
+`params` on a method or a constructor, a second signature of a name that carries one, and
+`f(out i64 a)` declaring the variable at the call site are not taught; the full account is
 [parameters.md](../reference/parameters.md).

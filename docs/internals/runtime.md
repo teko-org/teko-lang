@@ -41,7 +41,6 @@ indirection is the whole reason a class, a delegate and a `T[]` can share one re
 | `tk_itab` | `teko_expr.tk`, `teko_this.tk`, `teko_typeof.tk` | every interface call, wherever the receiver was typed |
 | `tk_deleg_code` | `teko_deleg.tk` | every call through a delegate value |
 | `tk_arr_at` | `teko_heaparr.tk` | every index into a `T[]` |
-| `tk_va_new` / `tk_va_put` / `tk_va_at` | `teko_params.tk` | a `params` call site, and the reads inside the instance |
 | `tk_cap_put` / `tk_cap_own` / `tk_cap_putf` / `tk_cap_putf32` | `teko_deleg.tk` | one link per capture, at the site that builds the closure |
 | `panic` / `rt_panic` | `lib/rt.tk`'s own guards | a null delegate, an index out of range, an interface a class does not implement, an exhausted arena |
 

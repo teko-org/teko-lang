@@ -42,10 +42,10 @@
 //   Name<Circle, 4> x = new Name<Circle, 4>;                  p_push_source + p_subst_*
 //   T items[N]  /  x.items[i]                                 an inline array field
 //
-// and C7c makes `params` one of them -- a declaration generic in its COUNT,
-// instantiated per call site so the bound is a constant there too:
-//   i64 total(params xs) { ... xs_len ... xs[i] ... }          teko_params.tk
-//   total(1, 2)  ->  total__2(<two words>)                     one body per count
+// and `params` is C#'s own variadic, a modifier over a genuine `T[]` the call
+// site builds out of its arguments (teko_params.tk):
+//   i64 total(params i64[] xs) { ... xs.Length ... xs[i] ... }  a heap array
+//   total(1, 2)  ->  total(tkarr_put_i64(...))                  built at the site
 // What delivery 5's C5b adds -- operator overloading as C# writes it, a STATIC
 // member naming both operands and resolved over both of them (teko_ops.tk):
 //   public static Vec operator+(Vec a, Vec b)                  a contextual word
@@ -409,14 +409,6 @@ void teko_init() {
     // among handlers does not come up -- see teko_default.tk's own header.
     syntax_param(&tk_default_param);
 
-    // FIRST among the passes, and a later one must not slip in front: the
-    // `params` pass INSTANTIATES `i64 total(params xs)` once per argument count
-    // -- `total(a, b, c)` becomes `total__3(ptr)`, with the count a constant
-    // inside the body -- and the declaration that was generic leaves the unit.
-    // Whatever comes next -- the overload mangling of C4 above all -- then sees
-    // ordinary functions with ordinary parameters, and never has to know what a
-    // `params` list is. Running after it would mean mangling a declaration the
-    // `params` pass is about to take away.
     // AHEAD of every other pass: a partial class no use closed is closed here,
     // and what that emits -- a constructor, a vtable initializer -- is an
     // ordinary declaration the passes below have to see like any other.
@@ -442,13 +434,11 @@ void teko_init() {
     // tree by name (teko_di.tk's own header).
     pass(&tk_di_pass);
 
-    // ahead of tk_params_pass: a global array's own leftover N_INDEX has to
-    // be gone before that walk runs, unconditionally, over every N_INDEX in
-    // the unit the moment a `params` list exists anywhere in it
+    // ahead of tk_params_pass, which refuses every N_INDEX still standing:
+    // a global array's own is resolved here, and nowhere else
     // (teko_array.tk's own header).
     pass(&tk_array_pass);
 
-    pass(&tk_params_pass);
     pass(&tk_typeof_pass);
 
     // K2 (D221 §41): BEHIND the oracle (a parameter's own type is already the
@@ -490,6 +480,15 @@ void teko_init() {
     // gave the declaration -- and has nothing left for a mangling pass to pick.
     pass(&tk_ops_pass);
 
+    // BEHIND the oracle, `ref`, the delegates and the operators, because those
+    // are what give an argument its type: `params i64[]` builds its array out
+    // of the arguments at every call site, and a delegate call is only a typed
+    // `callp` once tk_deleg_pass has run, an overloaded operator only a call
+    // once tk_ops_pass has. AHEAD of the two below, which census by ARITY --
+    // the call has to already carry its single argument -- and ahead of the
+    // reclaim, which is what parks the array (teko_params.tk's own header).
+    pass(&tk_params_pass);
+
     // C6's own default-fill, for a name declared exactly once: no type to
     // compare, so it needs neither the oracle above nor the overload mangling
     // below, and it must run BEFORE that mangling -- a name declared MORE
@@ -499,9 +498,9 @@ void teko_init() {
     pass(&tk_default_pass);
 
     // BEHIND both of the above: the overload mangling reads ordinary
-    // parameter lists (a `params` list is gone by now, replaced by its
-    // instances, whose `__k` suffix is a number and cannot collide with the
-    // type-named suffix an overload takes) and ordinary calls (the oracle's
+    // parameter lists (a `params` one is an ordinary `T[]` by now, and its
+    // name carries no second signature -- teko_params.tk refuses that) and
+    // ordinary calls (the oracle's
     // pass has already rebuilt every deferred `.`), and it renames
     // declarations, which is the one rewrite the two before it would not
     // survive.

@@ -238,8 +238,9 @@ three. **(a) Top level only**, inside a `class`/`struct`/`namespace` body read b
 (`teko_prop.tk`), the static field and the struct constructor (`teko_struct.tk`), the
 namespace body and its function (`teko_ns.tk`): no declaration of the program's own is
 open. **(b) After the parse, from a `pass()`** — the memoized DI getter and its slot
-(`teko_di.tk`), the `params` instance (`teko_params.tk`): `p_decl_name()` is 0 already and
-nobody reads it any more. **(c) Possibly mid-declaration, fired by an expression** — the
+(`teko_di.tk`): `p_decl_name()` is 0 already and nobody reads it any more. The `params`
+pass emits from here too, and goes through `tk_top_emit` all the same, because what it asks
+for is what `new T[n]` asks for mid-parse, from one shared `tk_ha_ensure_put`. **(c) Possibly mid-declaration, fired by an expression** — the
 delegate thunk and the lambda's own four (`teko_deleg.tk`), the three of `new T[n]`
 (`teko_heaparr.tk`), `tk_ix` (`teko_struct.tk`), and everything `tk_class_close` emits:
 the vtable, the release, `tk_vt_init`, the interface table, the method table and each
@@ -302,3 +303,27 @@ Baseline (mc 0.15.18, `MC_VERSION` still reading `0.15.13`): 45/45 fixtures, `FI
 `scripts/check-docs.sh` 63 samples / 277 links / 349 diagnostics. Only then was
 `MC_VERSION` written and the literal `0.15.13` mentions (`CONTRIBUTING.md`,
 `docs/guide/00-getting-started.md`, `.github/workflows/site.yml`) raised to `0.15.18`.
+### D29 · `params T[]` is the only `params`; the word list is gone (2026-09-07)
+`params` is a **modifier** read before the type, as `ref` and `out` are, and the type after
+it is a genuine `T[]` — C#'s own form (D3). It goes on the last parameter of a **free
+function**, one only, never with `ref`/`out`, never with a default, never on an `extern`;
+in the body it is an ordinary array, and at the call site the compiler builds the array out
+of the arguments, with a single argument that is already a `T[]` passing straight through
+without a copy. The array is counted, so the statement that built it releases it and every
+counted element with it.
+
+The list of machine **words** it replaces — the declaration instantiated once per argument
+count, the twelve-argument ceiling, the two refusals of a float, and the three runtime
+helpers of `lib/rt.tk` that backed it — is **removed in the same change**, so no program has
+two spellings to choose between and no dead body is left behind. Two consequences follow:
+`&f` on such a function is legal, and there is no ceiling on the arguments at one site,
+because the tail goes to memory rather than to the call convention.
+
+`params` on a **method, a constructor, an interface signature or a `delegate`** is refused,
+``teko: `params` is taught on a free function only``: the virtual path is five call-shaping
+sites and a vtable slot keyed by signature, and refusing it trades a silent hole for a
+message. A **second signature** of a name that carries a list is refused as well, because
+the pass that builds the array matches a call site by name and runs ahead of the overload
+resolution; making a `params` candidate one candidate among many is its own change. The
+design, the steps and what the flip measured are
+[`docs/specs/params-typed.md`](docs/specs/params-typed.md).

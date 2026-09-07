@@ -354,8 +354,8 @@ entry says what completes it.
 - `"teko: the field is not an array"` — the member indexed is a plain field.
 - `"teko: the left side of = is not a place"` — the target of the assignment is not a
   variable, a field or an element.
-- ``"teko: `[` indexes a `params` list only"`` — an index on a receiver whose type the parse
-  does not know. Bind it to a local of the right type first.
+- ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
+  know to be one. Bind it to a local of the right type first.
 
 ## Namespaces, `using` and `import`
 
@@ -465,21 +465,16 @@ entry says what completes it.
 - `"teko: too few arguments"` — the call passes fewer than the declaration requires.
 - ``"teko: `params` declares a parameter list, nothing else"`` — `params` only in parameter
   position.
+- ``"teko: `params` names an array type: write `params T[] xs`"`` — the modifier takes a
+  genuine `T[]`.
 - ``"teko: `params` must be the last parameter, and there is only one"`` — one list, at the
   end.
+- ``"teko: `params` is taught on a free function only"`` — not on a method, a constructor,
+  an interface signature or a `delegate`.
+- ``"teko: a `params` list is not `ref` or `out`"`` — the two do not mix.
 - ``"teko: a `params` list has no default"`` — the site decides the count.
-- ``"teko: a `params` list cannot be overloaded"`` — one declaration per name.
-- ``"teko: a `params` function exists once per call site and has no address"`` — `&f` on a
-  variadic.
-- ``"teko: a `params` list is instantiated per call site and needs a body"`` — a prototype
-  cannot carry one.
+- ``"teko: a `params` list cannot be overloaded"`` — one signature per name.
 - ``"teko: an `extern` symbol takes no `params` list"`` — the C ABI is not variadic here.
-- ``"teko: a `params` list holds words; a float argument is not taught yet"`` — pass the
-  bits, or a fixed parameter.
-- ``"teko: a `params` list holds words; its element does not read as a float"`` — an element
-  read back as a float.
-- ``"teko: the name a `params` instance takes is already declared"`` — the per-site
-  instance's name collides with an existing declaration.
 
 ## Dependency injection
 
@@ -567,10 +562,9 @@ truncation; the fix is to split the unit.
 | `"teko: too many overloaded names in one unit"` | 64 |
 | `"teko: too many free-function declarations with parameters"` | 4096 |
 | `"teko: too many arguments"` | 12 at one call |
-| ``"teko: too many arguments for a `params` list (twelve, the fixed ones included)"`` | 12 |
-| ``"teko: too many parameters before `params` (the list costs two of the twelve)"`` | 10 |
-| ``"teko: too many `params` declarations in one unit"`` | 16 |
-| ``"teko: too many `params` instances"`` | 64 over the whole unit |
+| `"teko: too many parameters in one declaration"` | 16, which the ABI's own 12 is under |
+| ``"teko: too many `params` lists in one unit"`` | 64 |
+| ``"teko: too many `params` declarations in one unit"`` | 64 |
 | ``"teko: too many `ref`/`out` parameters in one unit"`` | 512 |
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |

@@ -91,14 +91,6 @@ bytes instead.
 | `u64 tk_f64_bits(f64 x)` | the bit pattern of `x` |
 | `f64 tk_f64_from_bits(u64 bits)` | the `f64` those bits are |
 
-## The `params` list
-
-| signature | does |
-|---|---|
-| `uptr tk_va_new(i64 n)` | a block of `n` words for one call site's argument list |
-| `uptr tk_va_put(uptr xs, i64 i, i64 v)` | writes element `i` and hands the block back, so the puts chain inside one expression |
-| `i64 tk_va_at(uptr xs, i64 n, i64 i)` | element `i`, guarded against an index outside `[0, n)` |
-
 ## Closure captures
 
 Written at the site that builds a closure, one link per capture, each handing the object
