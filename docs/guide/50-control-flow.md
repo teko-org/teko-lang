@@ -19,8 +19,8 @@ labels are needed; a level beyond the current depth is refused where it is writt
 `continue` inside a `do` lands on the condition and inside a `for` it runs the step, so a
 loop that would otherwise never advance still terminates.
 
-A `{ }` block is a scope: a name declared inside it stops answering at the `}`, and a
-local of counted type is released there ([90-memory](../reference/memory.md)).
+A `{ }` block is a scope: a name declared inside it stops answering at the `}`, where a
+local of counted type is released ([memory.md](../reference/memory.md)).
 
 ## `switch`, twice
 
@@ -39,10 +39,8 @@ unconditional base of the chain, so it cannot itself carry a `when`.
 
 `c ? a : b` has C#'s precedence and associates to the right, so `c1 ? a : c2 ? b : d`
 chains. Only the taken arm is evaluated, the two arms must have the same type, and a
-ternary of two objects picks between references without allocating.
-
-`scope { }` is a lexical scope of its own, for dependency injection
-([di.md](../reference/di.md)).
+ternary of two objects picks between references without allocating. `scope { }` is a
+lexical scope of its own, for dependency injection ([di.md](../reference/di.md)).
 
 ## One program
 
