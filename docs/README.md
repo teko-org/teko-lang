@@ -9,8 +9,16 @@ implemented lives in [`specs/`](specs/), never mixed into the pages describing w
 
 ## The guide — task-oriented, read in order
 
-[`guide/`](guide/README.md): install, first project, types, control flow, memory,
-dependency injection, the self-hosting fixed point.
+[`guide/`](guide/README.md), twelve numbered pages: [getting
+started](guide/00-getting-started.md) (the pinned `mc`, the taught compiler, a first
+program, the fixed point), [values and types](guide/10-values-and-types.md),
+[classes](guide/20-classes.md), [generics](guide/30-generics.md), [delegates and
+lambdas](guide/40-delegates-and-lambdas.md), [control flow](guide/50-control-flow.md),
+[parameters](guide/60-parameters.md), [namespaces and
+imports](guide/70-namespaces-and-imports.md), [dependency
+injection](guide/80-dependency-injection.md), [memory](guide/90-memory.md),
+[packages](guide/95-packages.md) and [what is not there
+yet](guide/99-what-is-not-there-yet.md).
 
 ## The reference — exhaustive, read by lookup
 
