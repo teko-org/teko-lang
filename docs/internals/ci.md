@@ -1,7 +1,7 @@
 # CI
 
-Four workflows and three composite actions. Everything a change has to pass runs from
-`.github/workflows/ngen.yml`; the other three guard the edges.
+Five workflows and three composite actions. Everything a change has to pass runs from
+`.github/workflows/ngen.yml`; the other four guard the edges.
 
 ## The jobs of `ngen.yml`
 
@@ -61,13 +61,38 @@ disagree about which compiler they tested. `latest` resolves only when asked for
 an unannounced release must never change what CI tests. Both Windows jobs use the same
 sysroot action, so they cannot assemble different sysroots.
 
-## The other three workflows
+## The other four workflows
 
 | workflow | runs on | does |
 |---|---|---|
+| `site.yml` | a push to `main`, a pull request touching `docs/**` or `site/**`, a dispatch | renders `docs/` into the website and deploys it to GitHub Pages |
 | `branch-policy.yml` | every pull request | refuses an ungated source namespace against a protected base. The head branch name is read through `env:`, never interpolated into a `run:` — it is text the opener of the pull request controls |
 | `codeql.yml` | pull requests only | the `actions` analyzer. There is no analyzer for `.tk` or `.mc`, and what is left to scan is CI that downloads a toolchain, creates a release with `contents: write` and interpolates branch names. No `paths:` filter: a required check that stops **reporting** goes pending forever rather than red |
 | `release.yml` | a `v*` tag, or a dispatch on one | promotes what the gate proved |
+
+## The site is rendered by mc's generator, at the pinned tag
+
+`site.yml` has two jobs. `build` obtains the pinned `mc` through `setup-mc`, checks
+`minicompiler/mc` out at **the tag that action resolved** into `_mc/`, builds `mcsite` there
+(`mc build site --config site/mc.linux.toml`, mc's own ELF writer, no linker), and runs
+`_mc/build/mcsite site --check` from the repository root. `deploy` uploads what `build`
+produced to GitHub Pages, with `pages: write` and `id-token: write` granted to that job
+alone.
+
+Nothing of the generator is vendored here, so it cannot drift from the compiler the fixtures
+were proved on: raising `MC_VERSION` moves both at once. Everything `mcsite` reads at run
+time — `site/templates/`, `site/static/`, `site/tools/*.py` — is resolved against the
+directory holding `site.toml`, so the mc checkout is dead weight the moment the binary
+exists.
+
+`--check` is the gate, and it runs on a **pull request** too, without deploying: it resolves
+every internal link of every page it wrote, then spawns `site/tools/checkhtml.py` (structure,
+accessibility, the three Content-Security-Policy rules) and `site/tools/contrast.py` (WCAG
+ratios read out of the stylesheet). A page that breaks the site is caught before the merge.
+The artifact carries `public/CNAME`, so a deployment cannot drop the custom domain.
+
+`docs` (in `ngen.yml`) and `site` prove different things and neither replaces the other: the
+first compiles and runs the samples, the second checks the pages they end up on.
 
 ## The release promotes, it does not rebuild
 

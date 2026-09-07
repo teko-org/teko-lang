@@ -2,10 +2,10 @@
 # check-docs.sh [MC] -- the docs gate. Five checks, in this order, run from the
 # repository root as the `docs` job in .github/workflows/ngen.yml does:
 #
-#   1. links        every relative markdown link under docs/, plus the two root pages
-#                    that link into it (README.md, CONTRIBUTING.md), resolves to a file
-#                    that exists. Fenced code is skipped: `ops[0](3, 4)` inside a ```teko
-#                    block is a call, not a link.
+#   1. links        every relative markdown link under docs/ and site/, plus the two root
+#                    pages that link into them (README.md, CONTRIBUTING.md), resolves to a
+#                    file that exists. Fenced code is skipped: `ops[0](3, 4)` inside a
+#                    ```teko block is a call, not a link.
 #   2. legacy       no page under docs/ names a path of the retired standalone compiler:
 #                    `ngen/`, `.tks`, `teko.tkp`, `fetch_teko.sh`, `bootstrap/teko.c`, or
 #                    a bare `src/` that is not `mc`'s own (a line naming `mc` is read as
@@ -50,7 +50,9 @@ fail() {
     fails=$((fails + 1))
 }
 
-find docs -name '*.md' | sort > "$tmp/live_mdfiles"
+# site/ is documentation too -- site/README.md describes how docs/ becomes the website,
+# and site/public/ is generated (and gitignored), so it never carries a page of its own.
+find docs site -name '*.md' | sort > "$tmp/live_mdfiles"
 printf '%s\n%s\n' README.md CONTRIBUTING.md >> "$tmp/live_mdfiles"
 
 # A fenced block is code, not prose: `ops[0](3, 4)` in a ```teko sample reads exactly like

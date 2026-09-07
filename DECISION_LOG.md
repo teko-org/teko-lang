@@ -253,3 +253,32 @@ sight: an arrow accessor (`get => e;` / `set => s;`, `teko_prop.tk`) is not read
 `parse_function`, so its statements belonged to nobody and `tk_taint_owner` keyed them
 under a null owner — the same crash. It now calls `p_set_decl_name`, which mc's hook
 reference requires of exactly a handler that owns a declaration and reads it itself.
+
+### D28 · The site is mc's generator over `docs/`, published to teko-lang.org (2026-09-07)
+`docs/` is the source of the website and `site/` holds only what turns it into one: the
+configuration, the templates, the stylesheet, the brand assets the pages reference and the
+two Python checkers. **The generator is not vendored.** `mcsite` is `minicompiler/mc`'s
+own, written in mc, and `.github/workflows/site.yml` checks that repository out at the tag
+`MC_VERSION` pins — the same release `setup-mc` resolves — builds `mcsite` there and runs it
+over `site/site.toml`; nothing of that checkout is read after the build, because `mcsite`
+resolves the templates, the static files and `tools/*.py` against the directory holding
+`site.toml`. So the generator cannot drift from the compiler the fixtures were proved on:
+raising the pin moves both at once, and the templates carry the attribution the MIT licence
+of the copied files asks for.
+
+`--check` is the gate — every internal link, then `checkhtml.py` (structure, accessibility,
+the three Content-Security-Policy rules) and `contrast.py` (WCAG ratios read out of the
+stylesheet) — and it runs on a pull request touching `docs/**` or `site/**` as well, without
+deploying. `sh scripts/check-docs.sh` covers `site/**/*.md` for the same reason. Deployment
+is `actions/deploy-pages` on a push to `main` alone, with `pages: write` and `id-token:
+write` granted to that job and no other; the artifact carries `public/CNAME`, so a
+deployment cannot drop the custom domain. The canonical host is **`teko-lang.org`**, served
+from GitHub Pages, and `[site] base_url` is `/` because the site is at the root of its own
+domain. The registry link in the header is the index route that is live today
+(`minicompiler.dev/packages`); it becomes the per-toolchain listing when mc's R3 lands
+(D26).
+
+A link to a repository **directory** is the one shape the generator does not map — it
+resolves a `.md` of the site to its page, any other repository FILE to `edit_url`, and a
+section directory to that section's index, leaving everything else as written and reporting
+it. So a page that means the fixture directory names it by URL, not as `../../tests/`.

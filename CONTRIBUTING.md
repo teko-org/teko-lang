@@ -58,6 +58,24 @@ checks that every fenced ` ```teko ` example actually compiles and, with
 sh scripts/check-docs.sh
 ```
 
+### Seeing the site
+
+`docs/` is also the source of [teko-lang.org](https://teko-lang.org). The generator is
+`mcsite`, `minicompiler/mc`'s own, built from the release `MC_VERSION` pins and never
+vendored here — so rendering the site locally starts with a shallow checkout of that tag:
+
+```sh
+git clone --depth 1 --branch "v$(cat MC_VERSION)" https://github.com/minicompiler/mc _mc
+(cd _mc && mc build site --config site/mc.linux.toml)   # site/mc.toml on macOS
+_mc/build/mcsite site --check                           # writes site/public, then validates
+python3 -m http.server 8000 --directory site/public
+```
+
+`--check` resolves every internal link and runs the two Python checkers in `site/tools/`;
+it is the same gate `site.yml` runs on a pull request that touches `docs/**` or `site/**`.
+`site/public/` and `_mc/` are generated and ignored. [`site/README.md`](site/README.md) has
+the rest.
+
 ## What a PR must contain
 
 - **Green `mc build ngen && run`**: all 45 fixtures compile and execute with correct exit codes
@@ -106,6 +124,9 @@ If `mc` itself has a bug or limitation affecting teko's port:
 - **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen` and all 45 fixtures.
 - **`fixpoint` job**: teko0→teko1→teko2→teko3, object comparison and ASM diff, all 45 fixtures via teko1.
 - **`docs` job**: `sh scripts/check-docs.sh` against `docs/**`.
+- **`site.yml`**: builds `mcsite` from the pinned mc tag and renders `docs/` into the
+  website; `--check` on every pull request touching `docs/**` or `site/**`, deploy to
+  GitHub Pages only on a push to `main`.
 - **Squash merge only.** The ruleset `main` requires fast-forward or squash; merge commits are blocked.
 - **No legacy workflows.** The retired standalone compiler's own CI configuration
   (`pr.yml`, release cycles) is history, not run.
