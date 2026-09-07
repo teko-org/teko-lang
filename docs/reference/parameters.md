@@ -121,6 +121,11 @@ searched at all. It holds for an expression as much as for a literal: a local of
 type, a call whose return type is `f64`, and a binary whose left operand is a float all
 pick the float signature — `near` in the sample below.
 
+The **`null`** literal is a reference, as in C#: it lands on a parameter whose type is a
+struct, a class or an interface (or a raw `uptr`), and never on an integer, in the exact
+round and in every round after it — `held(null)` is `held(Cell)` even with `held(i64)`
+declared first.
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"

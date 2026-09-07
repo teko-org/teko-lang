@@ -397,6 +397,12 @@ whether the file happens to hold a class. Nothing else follows the widening: wit
 the type table, `tk_is_counted` answers 0 and every rewrite of the reclaim stays gated off —
 the `--dump-ast` of all 45 fixtures is byte-identical to the one before the change.
 
+`null` is the other N_INT that is not the untyped integer literal — `TY_UPTR`, value 0 —
+and it is a reference, C#'s rule: `tk_ov_args_fit` lets it land on a parameter that is a
+row of the type table or a raw `uptr`, and on no integer, in every round; before, the
+exact round read it as an integer literal and `held(null)` with both `held(Cell)` and
+`held(i64)` declared was `held(i64)`.
+
 Two gaps are left standing, both older than this and neither a float in an integer slot: an
 integer literal does NOT convert to a float parameter (the rounds refuse it, and a call of a
 name declared once accepts it and passes the integer's own bits, unconverted), and a binary
