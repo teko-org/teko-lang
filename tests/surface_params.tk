@@ -19,6 +19,10 @@
 //      element, the whole chain carries exactly ONE reference of its own, and
 //      the statement that built it releases both -- `rt_live()` back to zero
 //      and the destructor count are the proof.
+//   5. `boxed` -- the chain as the RECEIVER of a call: `boxed(a, b).read()`.
+//      Each link of the chain is a store, so it is registered borrowed and
+//      NOT pure, and nothing re-evaluates it: every element is built once,
+//      the array is allocated once, and the statement releases both.
 //
 // expect-exit: 42
 
@@ -62,6 +66,20 @@ class Cell {
     ~Cell() { dtors = dtors + 1; }
 }
 
+i64 builds = 0;
+
+Cell mk(i64 v) {
+    builds = builds + 1;
+    return new Cell(v);
+}
+
+class Total {
+    i64 sum;
+
+    public Total(i64 s) { this.sum = s; }
+    public i64 read() { return sum; }
+}
+
 i64 sum_cells(params Cell[] cs) {
     i64 s = 0;
     i64 i = 0;
@@ -98,6 +116,24 @@ i64 floatcheck() {
     return 0;
 }
 
+// the chain as a receiver: `boxed(...)` answers with a class, and `.read()` is
+// called on it. The whole chain stands where a shaper could duplicate a node,
+// so `builds` is what says every argument was evaluated once and `rt_live()`
+// that one array was allocated and released.
+Total boxed(params Cell[] cs) {
+    return new Total(sum_cells(cs));
+}
+
+i64 recvcheck() {
+    builds = 0;
+    i64 before = dtors;
+    if (boxed(mk(1), mk(2), mk(3)).read() != 6) return 1;
+    if (builds != 3) return 2;                    // each element built ONCE
+    if (dtors != before + 3) return 3;            // the array released its elements
+    if (rt_live() != 0) return 4;                 // the array and the Total went too
+    return 0;
+}
+
 i64 cellcheck() {
     if (sum_cells(new Cell(1), new Cell(2), new Cell(3)) != 6) return 1;
     if (dtors != 3) return 2;                     // the array released its elements
@@ -126,6 +162,9 @@ i64 main() {
 
     bad = cellcheck();
     if (bad != 0) return 30 + bad;
+
+    bad = recvcheck();
+    if (bad != 0) return 40 + bad;
 
     return total(20, 20, 2);
 }
