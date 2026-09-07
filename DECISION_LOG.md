@@ -599,3 +599,43 @@ slot — an initializer, an assignment, an argument, a `return`, a field store, 
 prove the inverse direction's existing behaviour (an integer refused at an initializer,
 an assignment and an argument; `null` accepted; a raw `uptr` refused) plus the one gap
 left open (an integer into a field, silently accepted).
+
+### D35 · The pin rises to 0.15.22 (2026-09-07)
+`MC_VERSION` moves from `0.15.18` to `0.15.22` (`minicompiler/mc` PRs #51-#57). The reason
+is the registry, not this repository: the registry's validator runs an `mc` newer than
+whatever tag it is checking, and `v0.4.0` was cut pinned at `0.15.13`, whose `lex_set_libs`
+still took one argument — the validator's own `mc` already carries the two-argument form
+(PR #50, landed in `0.15.18`, D29), so every validation of `v0.4.0` died `wrong number of
+arguments` before it ever reached this repository's own gate. `v0.4.1` is the fix: the same
+cut, re-tagged from `main` once `main` itself is pinned on an `mc` whose hook API matches
+what the validator runs. 0.15.22 also carries the `[replace]` fix (`mc` PR #57,
+`5747958`): `deps_apply` (`src/deps.mc`) applied `dep_resolve` before `dep_replace`, so a
+package named in `[deps]` and pinned in `mc.lock` but never fetched, and pointed at a local
+path by `[replace]`, died `is not fetched` before the replacement was ever consulted —
+`[replace]` was unusable on its own. This repository's `mc.toml` carries no `[replace]`
+table today, so the fix changes nothing here; it is cited because it is the other
+user-visible change in the range and because a package under `teko_std` may lean on it.
+
+**Zero code changes.** `docs/reference/hooks.md` at `v0.15.22` differs from `v0.15.18` by
+two additions only — `host_self_path()` and `host_getcwd()`, both new hooks for `mc tool`
+(PR #55) and `mc upgrade` (PR #53), neither called from this repository — and the
+`lex_set_libs` row, unchanged since the D29 pin (`core_teko.mc`'s `lex_set_libs(&libs_open,
+0)` call site is already the two-argument form). The rest of the range (`M49` steps A/D1 —
+the `-O` flag and the arm64 register allocator; `M44` step 5 — `mc upgrade`; the bootstrap
+decoupling of PR #54) is codegen and driver internals behind hooks this repository does not
+call. No hook this repository calls changed signature or behaviour.
+
+Baseline (mc 0.15.22, `MC_VERSION` still reading `0.15.18` during the proof): 45/45
+fixtures at their `expect-exit`, `FIXPOINT OK` (`teko1.o == teko2.o` on the first turn,
+`--dump-asm` diff empty), `sh scripts/check-docs.sh` green (292 links, 345 diagnostics, 68
+samples), `mc limits . --config mc.macos.toml` verdict `ok` on every table for both
+`build/teko.mc` and `tests/hello.tk`, unchanged in shape against the 0.15.18 baseline (the
+raw estimates move a few percent — the estimator is `mc`'s own, not this repository's — but
+every table stays `ok` at `tolerance = 1.0`). `mc pkg hash .` is byte-identical between the
+two releases (`3e6feff8e981912423654dbc12ca6d4948efa89d21ea02128b7636f0683791b1` — the
+source tree did not move). `--dump-ast` of all 45 fixtures, compiled by the taught compiler
+built once by each release, is byte-identical between `0.15.18` and `0.15.22` on every one
+— the codegen and driver changes in the range touch nothing this repository's grammar
+parses into. Only then was `MC_VERSION` written and the literal `0.15.18` mentions
+(`CONTRIBUTING.md`, `docs/guide/00-getting-started.md`, `.github/workflows/site.yml`)
+raised to `0.15.22`.
