@@ -50,7 +50,7 @@ i64 main(i64 argc, uptr argv, uptr envp) {
     mc_machines_init();
     mc_writers_init();
     mc_bundle_init();
-    lex_set_libs(&libs_open);
+    lex_set_libs(&libs_open, 0);
     sysroots_init();
     on_plan(&mc_plan);
     subcommand("build", &tk_build,
