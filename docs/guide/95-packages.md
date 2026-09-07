@@ -57,7 +57,8 @@ teko_std = "0.4.0"
 
 [compiler]
 core    = "<mc/core_min>"
-modules = ["<teko/teko.tk>", "user.mc"]
+modules = ["<teko/core_teko.mc>", "<teko/teko.tk>", "user.mc"]
+out     = "build/teko"
 ```
 
 The library is then included by package name, with the extension **spelled out** — `mc`

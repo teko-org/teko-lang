@@ -127,7 +127,7 @@ every other library evolves on its own version line.
 
 ### D16 · How a consumer uses teko (2026-09-07)
 A consumer pins `[deps] teko = "x.y.z"` and names the taught compiler in its own build:
-`[compiler] modules = ["<teko/teko.tk>", "user.mc"]`, so its `mc` builds teko locally,
+`[compiler] modules = ["<teko/core_teko.mc>", "<teko/teko.tk>", "user.mc"]` with `core = "<mc/core_min>"` and `out = "build/teko"`, so its `mc` builds teko locally,
 nailed by the tree hash. Once the registry's toolchain support lands (mc's R2/R3, agreed
 2026-09-07), it validates a teko package by building the taught compiler from
 `[package].modules` and the package's `[deps]` **first**, in a sandbox with no network, and
