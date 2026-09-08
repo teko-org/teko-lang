@@ -148,40 +148,32 @@ the one addition on this page, and it is additive: `g == Guid.Empty` works too.
 
 A version-4 `Guid` is sixteen bytes of **cryptographically random** data with the version
 nibble set to `4` and the variant bits to `10`. The nibbles are arithmetic; the randomness
-is not, and teko cannot get it:
+comes from the host, under one name per operating system:
 
-| host | the name |
+| host | the `extern` |
 |---|---|
-| Linux | `getrandom(2)`, or `/dev/urandom` |
-| macOS | `getentropy(3)`, or `/dev/urandom` |
-| Windows | `BCryptGenRandom` — `bcrypt.dll`, and **not** one of the kernel32 entry points `<sys>` binds |
+| Linux | `i64 getrandom(uptr buf, i64 n, u32 flags)` — `flags` 0, looped until `n` |
+| macOS | `i32 getentropy(uptr buf, i64 n)` — at most 256 bytes a call, sliced |
+| Windows | `u32 BCryptGenRandom(uptr h, uptr buf, u32 n, u32 flags)` — `h` 0, `flags` 2; `bcrypt.dll`, and **not** one of the kernel32 entry points teko's sysroot already binds |
 
-`mc` has no conditional compilation, the five legs compile one source, and the Windows leg
-resolves `<sys>`'s libc-shaped names through `mc`'s own runtime object, which is `mc`'s file
-and not this repository's. Writing a second include per host, or a `[libs]`/`[externs]`
-mapping in the leg config, would push an operating-system choice into every consumer's
-`teko.toml` for one function — which is exactly the workaround
-`docs/specs/datetime.md` § 8 refuses for the wall clock, for the same reasons.
-
-**The ask is one function, and it goes to `mc`'s notices file beside the wall clock:**
-
-```
-i64 sys_random(uptr buf, i64 n);      // n bytes of entropy; 0 on success
-```
-
-one name across the three hosts, `getrandom`/`getentropy` under it on the two POSIX legs and
-`BCryptGenRandom` on Windows. It unblocks on whichever `mc` release carries it. Until then
+**These are teko's own** (the owner's ruling of 2026-09-08: the tooling `mc` gives —
+`extern`, the target host the taught compiler knows at compile time, and a sysroot this
+repository writes itself — is enough, and nothing is asked of `mc`). `teko_guid.tk` emits
+the one declaration the target host needs, `lib/guid.tk` loops it into sixteen bytes, and
+teko's `windows-sysroot` action writes a one-line `bcrypt.def` (`EXPORTS BCryptGenRandom`)
+beside its `kernel32.def` and runs `llvm-dlltool` over it, exactly as `kernel32.lib` is made
+(D36 for the site's own precedent of a hand-written piece of infrastructure). Until N9 lands
 `Guid.NewGuid` is refused **by name**, and every other member of this page lands without it.
 
 A `Guid` built from a counter, a clock or an address would compile and would be a wrong
 answer — two processes would collide — so it is not the fallback. There is no fallback;
-there is a refusal and a filed ask.
+there is a refusal until the `extern` lands.
 
 ## 6. What stays out
 
 | left out | why |
 |---|---|
-| `Guid.NewGuid` | § 5, blocked on `<sys>` |
+| `Guid.NewGuid` | § 5, N9 |
 | version 1, 3, 5 and 7 `Guid`s | v1 needs a MAC address and a clock, v3/v5 need MD5/SHA-1, v7 needs a clock; all of them are a library over `NewGuid`'s own primitive |
 | `ToByteArray`, `new Guid(byte[])` | the byte order question of § 1 becomes visible the moment either exists, and neither is asked for |
 | `"B"`, `"P"`, `"X"` formats | three more spellings of the same bytes |
@@ -243,11 +235,11 @@ section in [types.md](../reference/types.md), the refusals in
 [not-yet.md](../reference/not-yet.md), and the new module in
 [modules.md](../internals/modules.md).
 
-### N9 — `Guid.NewGuid` (S, blocked)
+### N9 — `Guid.NewGuid` (S)
 
 One static row, one call into `lib/guid.tk`, one fixture asserting that two consecutive
 `NewGuid()` values differ, that the version nibble is `4` and that the variant bits are
-`10`. **Blocked** until `mc`'s `<sys>` carries § 5's entropy function on the three hosts.
+`10`. The entropy `extern` per host and the `bcrypt.def` in teko's Windows sysroot (§ 5) are part of the crumb; it depends on N3 and on nothing outside this repository.
 
 ## 11. Risks and law tensions
 
@@ -255,6 +247,6 @@ One static row, one call into `lib/guid.tk`, one fixture asserting that two cons
 |---|---|
 | **The ordering diverges from C#.** `a < b` answers by the printed bytes, C# by its fields. | § 1, deliberately, and written into `types.md` beside the type. Matching C# would mean matching its in-memory byte swap, which would make `ToString` a shuffle and `Parse` its inverse, for an ordering C# users are warned about anyway. The fixture pins teko's order with values that only pass under it. |
 | **`Guid` is the second `TK_WIDE` type and the first that is not `decimal`.** If `teko_wide.tk` turned out to be `decimal`-shaped, this is where it shows. | That is a feature of the order, not a risk of it: N3 lands right after C3 and **before** `decimal`'s arithmetic, so the machine module is proved general while it is still small. The `_bytes.tk` fixture reads raw bytes through `&` rather than trusting an arithmetic result, which is `docs/specs/decimal.md` § 13's own technique. |
-| **`NewGuid` invites a workaround** — an `extern getentropy` would work on four of the five legs. | Refuse it. Four legs out of five is a silently wrong build on the fifth, and D2 says a construct `mc` cannot express is reported, never worked around. The refusal is by name and the ask is filed with the wall clock. |
-| **`Guid.NewGuid` and `DateTime.Now` are blocked on the same kind of thing.** | They are one ask with two functions, and it should be sent as one: `<sys>` grows a wall clock and an entropy source. A release carrying either unblocks its own crumb independently. |
+| **`NewGuid` on four legs only** — an `extern getentropy` alone would work on four of the five. | Refuse it. Four legs out of five is a silently wrong build on the fifth; N9 lands with all three host `extern`s and the `bcrypt.def`, or not at all. |
+| **`Guid.NewGuid` and `DateTime.Now` need the same kind of thing.** | One `extern` per host each, chosen by the taught compiler for the target; C6 and N9 share the mechanism (`docs/specs/datetime.md` § 8) and land independently. |
 | **The include.** `#include "guid.tk"` is a build-time step C# does not have. | Same answer as `docs/specs/datetime.md` § 13: refuse the type word with the include named in the message, and leave the flip into `lib/rt.tk` open for the owner — it is a one-line change either way, and it is the same decision for `time.tk`, `decimal.tk`, `guid.tk` and `string.tk`, so it should be taken once for all four. |

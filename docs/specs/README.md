@@ -54,7 +54,7 @@ fixes the order.
 | 17 | **N8** `string`, the methods and the index | string.md | L | N7 |
 | 18 | **C6** `DateTime.Now`, `UtcNow`, `Today` | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |
 | 19 | **N9** `Guid.NewGuid` | guid.md | S | N3 — an entropy `extern` per target host and a `bcrypt.def` in teko's Windows sysroot, teko's own |
-| 20 | **N10** `$"..."` interpolation | string.md | M | N8, and a pin at `mc` ≥ 0.15.25, where `$` before `"` is a token a module claims with `syntax_expr("$")` |
+| 20 | **N10** `$"..."` interpolation | string.md | M | N8, and a pin at `mc` ≥ 0.15.25, where `$` before `"` is a token a module claims with `syntax_expr("$", …)` |
 | 21 | **C7** the native wide instructions (optional, speed only) | `docs/specs/decimal.md` | S | C4 |
 
 **N7 and N8 depend on nothing** and are placed late only because they are the most

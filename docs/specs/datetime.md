@@ -421,12 +421,13 @@ plus a `not-yet.md` row for `Now` and one for the time zone. **Owes:** the `Date
 section of types.md, diagnostics.md, runtime.md, and
 [guide/10-values-and-types.md](../guide/10-values-and-types.md).
 
-### C6 — `Now` and `UtcNow` (S, blocked)
+### C6 — `Now` and `UtcNow` (S)
 
 One static row per name, one call into `lib/time.tk`, one fixture that asserts
-`UtcNow > UnixEpoch` and `Now.Kind == DateTimeKind.Local`. **Blocked** until `mc`'s `<sys>`
-carries a wall clock on the three hosts; it is numbered C6 because it lands after
-`decimal`'s crumbs whenever it unblocks, and it needs nothing from them.
+`UtcNow > UnixEpoch` and `Now.Kind == DateTimeKind.Local`. The wall-clock `extern` per host
+(§ 8: `clock_gettime` on Linux and macOS, `GetSystemTimePreciseAsFileTime` on Windows) is
+part of the crumb; it is numbered C6 because it lands after `decimal`'s crumbs, and it
+needs nothing from them and nothing outside this repository.
 
 ## 13. Risks and law tensions
 

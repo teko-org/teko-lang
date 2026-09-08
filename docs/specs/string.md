@@ -272,26 +272,19 @@ tk_num(n)` is the road today and `$"n={n}"` is the road when § 9 unblocks.
 
 ## 9. `$"..."` needs `mc` 0.15.25, where a module claims `$`
 
-C#'s interpolation is `$"a{x}b"`, and teko cannot lex it today. `$` opens a **hole** token
-in `mc`'s lexer — `$1`, `$name`, `$$name`, the machinery `#rule` substitution uses — and
-`$` followed by anything that is not a digit or a letter is `invalid hole`, raised inside
-`lex_next` and therefore **before any hook can see the token**. `syntax_lit`, `syntax_expr`
-and `syntax_infix` all run at parse positions the lexer has already passed. Measured on the
-tree: `puts($"hi")` is `invalid hole` at the `$`.
+C#'s interpolation is `$"a{x}b"`. In `mc` up to 0.15.24 the lexer could not hand it over:
+`$` opens a **hole** token — `$1`, `$name`, `$$name`, the machinery `#rule` substitution
+uses — and `$` followed by anything that is not a digit or a letter was `invalid hole`,
+raised inside `lex_next` and therefore before any hook could see the token. Measured on the
+tree at the 0.15.23 pin: `puts($"hi")` is `invalid hole` at the `$`.
 
-There is no spelling that works today and is C#'s, and C# decides the form (D3), so the
-answer is not another spelling. **The ask is one clause, and it goes to `mc`'s notices
-file:**
-
-> `lex_hole`, in `mc`'s own `mc/src/lex.mc`, should not raise `invalid hole` when `$` is
-> followed by `"`.
-> Hand back a one-character token instead — a `$` operator token, or a `T_HOLE` with a
-> value that says "not a hole" — so a module can claim it with `syntax_expr("$", …)` and
-> read the string literal after it. Two lines, no other token moves, and `#rule`'s three
-> existing forms are untouched because none of them is `$"`.
-
-It unblocks on whichever `mc` release carries it. Until then `$"…"` is what the lexer says
-it is, and this page's own refusal (`teko: string interpolation is not taught yet`) only
+**`mc` 0.15.25 made it pure surface.** When `$` is not a hole (not followed by a name, a
+digit or `$`), the lexer falls through to the punctuation matcher, so a module that
+registered `syntax_expr("$", …)` owns the token and reads the string literal after it with
+`p_cp()`/`p_take_lit`; the three `#rule` forms are untouched, nothing in `mc`'s core changed.
+N10 therefore waits for one thing only: teko's pin reaching 0.15.25 (a `MC_VERSION` crumb
+proved by the whole recipe, D29/D35/D37). Until then `$"…"` is what the pinned lexer says it
+is, and this page's own refusal (`teko: string interpolation is not taught yet`) only
 becomes reachable afterwards.
 
 **What it lowers to, so the crumb is ready the day it lands.** `$"a{x}b{y}"` becomes a
