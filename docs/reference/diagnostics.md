@@ -30,14 +30,6 @@ entry says what completes it.
   what followed is not a usable name.
 - `"teko: type not taught yet"` — the word in type position is reserved for a construct
   this version does not implement.
-- `"teko: a struct is built by new"` — a `struct`-typed local declared with no initializer
-  (`Point p;`). A struct value IS a pointer to an allocation ([types.md](types.md#struct)),
-  produced by `new` alone; unlike a class/delegate/`T[]` of heap, a struct carries no
-  reference count, so its bare declaration gets none of the zero-to-`null` compensation a
-  counted local's does (`tk_rc_var`, K2b bug 1a) — it would reach the run holding whatever
-  bit pattern the stack frame already had, and a field access through it crashes with
-  whatever signal that garbage pointer earns (`SIGBUS`, `SIGSEGV`, ...), never a `teko:`
-  diagnostic. `Point p = new Point;` or `Point p = new Point();` is required.
 - `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: the only implicit
   reference conversions are derived-to-base and class-to-interface, the only implicit
   numeric one is an integer into a float ([types.md](types.md#f32-and-f64)), and nothing

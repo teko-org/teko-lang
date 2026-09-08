@@ -1194,73 +1194,23 @@ is the same cast the surface already writes elsewhere, built where one site did 
 it. By-reference captures (`use (&a)`) were never affected — they hand `tk_addr(...)`, an
 address, to `tk_cap_put`'s OWN `ref` writer, not through `tk_cap_val` at all.
 
-**Defect 2 — `struct P p;` with no initializer crashed the run instead of the compiler.**
-A struct value IS a pointer to an allocation ([types.md](docs/reference/types.md) § struct),
-produced by `new` alone, and a struct is NOT reference-counted (the same page, same
-section) — so a bare declaration gets none of the K2b compensation a counted local's does
-(`tk_rc_var`, teko_rc.tk: `if (!tk_is_counted(nd_type(n))) return;` skips it by name before
-the zero-to-`null` fill ever runs). `Point p;` reaches the run holding whatever bit pattern
-the stack frame already had — not `null`, GARBAGE — and `p.x = 4` stores through it: the
-probe crashed `SIGBUS` (exit 138) on one stack layout and `SIGSEGV` on another, never a
-`teko:` diagnostic, and a bare CLASS local (`C c;`) turned out to be no better in practice —
-it IS deterministically `null` (K2b's own fix reaches it, being counted), but a field access
-on it is an unguarded `ld64`/`st64` with no null check anywhere in that path either, so it
-segfaults at address 0 just as rawly, only more predictably. Adding a null-check to every
-field access (struct and class share the one lowering) would move `--dump-ast` on nearly
-every existing fixture for a construct this crumb was not asked to touch — out of scope,
-reported below instead.
+**Defect 2 — `struct P p;` with no initializer crashed the run.** A struct value IS a
+pointer to an allocation ([types.md](docs/reference/types.md) § struct), produced by `new`
+alone, and a struct is NOT reference-counted, so a bare local of struct type never receives
+the zero-to-`null` a counted local gets (`tk_rc_var`, K2b): `p` reaches the run holding
+whatever the stack held, and `p.x = 4` writes through it — a `SIGBUS`/`SIGSEGV`, never a
+`teko:` line. A bare CLASS local is the same one level down (a deterministic null
+dereference, no guard on any field access), and a global struct with no initializer the
+same one level up (BSS zeroes it to `null`, unguarded).
 
-The chosen fix is a compile-time refusal, `` `"teko: a struct is built by new"` ``, at
-`tk_on_stmt` (teko_struct.tk, M21.5's own statement hook): a `struct`-typed local
-(`tk_is_struct(si)`, the new predicate beside `tk_is_class`/`tk_is_enum`) with `nd_a(n) ==
-0` — no initializer at all — is refused right where the row already answers whether `si`
-names a struct, before `tk_local_add` lets `p.x` parse as a field access. Ternary/`foreach`
-locals of struct type are unaffected: both ALWAYS build their hidden local WITH an
-initializer (`tk_null()` for a struct slot, `tk_tern_lower`, teko_ternary.tk) and neither
-one is even seen by `tk_on_stmt`, which only fires for a genuine parsed statement. No
-existing fixture declares a bare struct local — a grep of every `Type name;` shape in
-`tests/` found only counted types (`C c;`, `Box x;`, DI service locals), each followed
-immediately by an `out` parameter or a resolver call that fills it before any read — so the
-refusal moves nothing.
+**The owner's ruling: this is the developer's error, documented, not the language's.** A
+struct is not a primitive with a default value; a declaration without `new` is not
+initialized, and the reference page says so in as many words. No compile-time refusal
+(declaring first and building in a branch is legitimate code, and deciding that a name is
+definitely assigned is the nullable design's job, not a statement hook's), and no runtime
+guard (it would sit on the one lowering every field access shares and move `--dump-ast` on
+nearly every fixture). What makes the case sound in the end is nullability by declaration:
+no type is nullable unless written `T?`, and `T?` is sugar for `Nullable<T>` over ANY type,
+reference or value — a spec of its own, ahead of `string`, where the compiler learns that a
+name declared without `?` must be built before it is read.
 
-**Adjacent finding, not fixed here (reported, not a new crumb):** a bare CLASS local's
-field access is ALSO an unguarded raw pointer dereference (`C c; c.x;` segfaults at address
-0, `SIGSEGV`, exit 139) rather than a `teko:`-style panic — the vtable path a delegate CALL
-checks (`tk_deleg_code`, `lib/rt.tk`) has no analogue on a plain field load/store, for a
-class OR a struct. This crumb declined to add one because the guard would sit on the ONE
-lowering every field access in the language shares, moving `--dump-ast` on effectively
-every existing fixture for a question ("does a null-check belong on every field access, at
-what cost") this crumb was not asked to settle. A GLOBAL struct with no initializer
-(`P g_p;`) is the same danger by the same root cause, one level up — BSS zeroes it to a
-genuine `null` (a deterministic `SIGSEGV`, not the local's raw-garbage `SIGBUS`), but it is
-just as wrong, and `tk_on_stmt` never sees a top-level declaration (its own header names the
-gap: "there is no public hook over a top-level declaration") — closing it needs a small
-walk over `root`'s own `N_GLOBAL` siblings, the shape `tk_prim_cast_globals` (teko_prim.tk)
-already has for a different check, left for a crumb that wants it.
-
-No `tests/*.tk` fixture panics for defect 2 — the chosen fix is a REFUSAL, and every
-`tests/*.tk` fixture is built `--entry-only` and RUN (`CLAUDE.md`'s own recipe), which a
-compile error breaks by construction; a refusal is proven by a probe outside `tests/`
-instead (`build/refuse/struct_no_new.tk`, not committed, `teko: a struct is built by new`
-at the declaration's own line) and documented in
-[diagnostics.md](docs/reference/diagnostics.md).
-
-Proof: `mc build . --config mc.macos.toml` clean on mc **0.15.23**; **51/51** fixtures at
-their `expect-exit` (three existing ones — `surface_timespan`, `surface_datetime`,
-`surface_enum` — grew a lambda-capture case each, no fixture added or removed); `--dump-ast`
-of the 48 untouched fixtures byte-identical to `1d195e1d`, and the three that grew a case
-differ ONLY by the new statements inserted and the trailing gensym renumber that insertion
-causes in the SAME function (`$g13` → `$g15` in `surface_timespan`'s `main`, the same shape
-in the other two) — no existing branch, call or literal moved; `FIXPOINT OK` (`teko1.o ==
-teko2.o == teko3.o` on the first turn, `--dump-asm` diff empty over 205772 lines — 205653
-plus this crumb's own code — 51/51 under the self-hosted `teko1`); `sh
-scripts/check-docs.sh` green (467 links, 357 diagnostics, 95 samples); `mc limits . --config
-mc.macos.toml` over `tests/hello.tk` (the number every prior entry reports) unchanged —
-`types` `11`, `alias` `19`, `syntax` `15`, `passes` `15/30`, `intrin` `8/16`, all
-**unmoved**; the FIRST table `mc limits` also prints, `build/teko.mc` analyzed by stock
-`mc`'s own generic estimator before teko exists as a binary, shows `passes`/`alias`/`types`
-"grew" and exits 3 on `1d195e1d` UNCHANGED TOO (verified on a freshly-bootstrapped base
-before touching anything) — a pre-existing mismatch between that estimator's generic
-defaults and teko's own registration count, reported as the same kind of adjacent finding
-as the class-field-access gap above, not this crumb's to fix. `mc pkg hash .`:
-`d674f980a5ba9863c8724a53d78fb12ea0a398bb4decc81c96579c3e5f84648f`.
