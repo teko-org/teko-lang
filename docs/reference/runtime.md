@@ -2,7 +2,7 @@
 
 Two library files, both **program** code compiled under the same taught vocabulary as the
 program that includes them: `lib/rt.tk`, the runtime every program links against, and
-[`lib/time.tk`](#libtimetk), the surface code every `TimeSpan` member and operator lowers
+[`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` member and operator lowers
 to.
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
@@ -144,9 +144,9 @@ i64 main() {
 
 ---
 
-## `lib/time.tk`
+## The time library
 
-What [`TimeSpan`](timespan.md) lowers to. It includes `rt.tk` for `panic`, so a program
+`lib/time.tk`, what [`TimeSpan`](timespan.md) lowers to. It includes `rt.tk` for `panic`, so a program
 that includes it has both:
 
 ```

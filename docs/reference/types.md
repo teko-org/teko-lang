@@ -486,7 +486,7 @@ include:
 It is a **primitive with members**: eight bytes like an `i64`, a distinct type no integer
 converts into, and a table of members — `.Ticks`, `.Days`, `.TotalHours`,
 `TimeSpan.FromHours(x)`, `new TimeSpan(ticks)` — that lower to ordinary functions of
-[`lib/time.tk`](runtime.md#libtimetk). `+ - * /`, the unary minus and the six comparisons
+[`lib/time.tk`](runtime.md#the-time-library). `+ - * /`, the unary minus and the six comparisons
 are calls with an overflow check; every other operator is refused.
 
 ```teko

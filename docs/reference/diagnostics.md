@@ -322,7 +322,7 @@ messages reuse the wordings a declared type already gets; only three are its own
 
 The three panics `lib/time.tk` raises at RUN time (`a time span overflowed`,
 `a time span divided by zero`, `a time span is out of range`) are exit 70 and are listed in
-[runtime.md](runtime.md#libtimetk).
+[runtime.md](runtime.md#the-time-library).
 
 ## Properties
 

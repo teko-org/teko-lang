@@ -71,7 +71,7 @@ A member is read-only: `t.Ticks = 5;` is `teko: a member of TimeSpan is read-onl
 `t += a` and `t -= a` are the compound forms of the first row, rewritten to `t = t + a`
 before the operator pass reads them, and they work.
 
-Every one of them is a call into `lib/time.tk` ([runtime.md](runtime.md#libtimetk)), never
+Every one of them is a call into `lib/time.tk` ([runtime.md](runtime.md#the-time-library)), never
 the core's raw arithmetic on the tick counts, which is what makes the overflow a panic
 (`teko: a time span overflowed`, exit 70) instead of a wrap. Precedence is the core's own
 and is not touched.
