@@ -1,0 +1,222 @@
+// surface_datetime.tk -- `DateTime` as C# spells it (docs/specs/datetime.md,
+// crumb C2): eight bytes holding the ticks since 0001-01-01 in bits 0..61 and
+// the `Kind` in the two above them, with the proleptic Gregorian calendar of
+// `lib/time.tk` between the number and every component --
+//
+//   new DateTime(2024, 2, 29)          the calendar constructor, checked
+//   new DateTime(t, DateTimeKind.Utc)  ...and the raw one, with a Kind
+//   DateTime.MinValue / MaxValue       the two ends of the range
+//   DateTime.UnixEpoch                 621355968000000000, Utc, as C# declares
+//   d.Year d.Month d.Day d.DayOfWeek   the civil components
+//   d.Ticks d.Kind d.Date d.TimeOfDay  the eight bytes, read four ways
+//   d.AddDays(1) d.AddMonths(1)        the Add* family, C#'s clamping included
+//   DateTime.IsLeapYear DaysInMonth    the two statics that need no value
+//   b - a  d + t  t + d  d - t         the operators mixing the two types
+//   a < b  a == b  ...                 the six comparisons, Kind masked off
+//
+// EVERY NUMBER BELOW IS EXACT and most of them only come out right with the
+// real calendar: `2024-02-29` is 638447616000000000 ticks and nothing else,
+// `2024-01-31` plus one month is `2024-02-29` (C#'s clamp), `2000-02-29` plus
+// one year is `2001-02-28`, 1900 is not a leap year and 2000 is, and the day
+// of the week of 2024-02-29 is Thursday. That is what makes this an oracle
+// rather than a smoke test.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+class Meeting {
+    public DateTime moment;
+    public Meeting() { moment = DateTime.MinValue; }
+}
+
+DateTime g_moment;                                   // a global of primitive type
+
+// the receiver the PARSER cannot type: a parameter, deferred to the oracle's
+// own pass and lowered there against the very same table
+i64 year_of(DateTime d) { return d.Year; }
+i64 ticks_of(DateTime d) { return d.Ticks; }
+DateTime tomorrow(DateTime d) { return d.AddDays(1); }
+
+// a `ref` pointee read through the table, and an `out` one written through it
+void shift(ref DateTime d, TimeSpan t) { d = d + t; }
+void midnight_of(out DateTime d, DateTime src) { d = src.Date; }
+// the ternary's hidden local, zero under the slot's own type
+DateTime later(DateTime a, DateTime b) { return a > b ? a : b; }
+
+i64 main() {
+    // ---- the calendar constructor, exact to the tick ----
+    DateTime leap = new DateTime(2024, 2, 29);
+    if (leap.Ticks != 638447616000000000) return 1;
+    if (leap.Year != 2024) return 2;
+    if (leap.Month != 2) return 3;
+    if (leap.Day != 29) return 4;
+    if (leap.Hour != 0 || leap.Minute != 0 || leap.Second != 0) return 5;
+    if (leap.Millisecond != 0) return 6;
+    if (leap.DayOfYear != 60) return 7;
+    if (leap.DayOfWeek != 4) return 8;             // a Thursday, and C# counts from Sunday
+
+    // ...the six-field and seven-field ones, and the raw tick one
+    DateTime stamp = new DateTime(2024, 2, 29, 13, 45, 30);
+    if (stamp.Hour != 13 || stamp.Minute != 45 || stamp.Second != 30) return 9;
+    if (stamp.Millisecond != 0) return 10;
+    DateTime precise = new DateTime(2024, 2, 29, 13, 45, 30, 123);
+    if (precise.Ticks != 638448111301230000) return 11;
+    if (precise.Millisecond != 123) return 12;
+    DateTime raw = new DateTime(638447616000000000);
+    if (raw.Ticks != leap.Ticks) return 13;
+    if (raw.Year != 2024 || raw.Day != 29) return 14;
+    DateTime zero = new DateTime();
+    if (zero.Ticks != 0) return 15;
+    if (zero.Year != 1 || zero.Month != 1 || zero.Day != 1) return 16;
+
+    // ---- the statics ----
+    if (DateTime.MinValue.Ticks != 0) return 17;
+    if (DateTime.MinValue.Year != 1) return 18;
+    if (DateTime.MaxValue.Ticks != 3155378975999999999) return 19;
+    if (DateTime.MaxValue.Year != 9999) return 20;
+    if (DateTime.MaxValue.Month != 12) return 21;
+    if (DateTime.MaxValue.Day != 31) return 22;
+    if (DateTime.MaxValue.Hour != 23) return 23;
+    if (DateTime.UnixEpoch.Ticks != 621355968000000000) return 24;
+    if (DateTime.UnixEpoch.Year != 1970) return 25;
+    if (DateTime.UnixEpoch.Kind != DateTimeKind.Utc) return 26;
+
+    // ---- the calendar, where only the real one answers ----
+    DateTime next = leap.AddDays(1);
+    if (next.Year != 2024 || next.Month != 3 || next.Day != 1) return 27;
+    if (next.DayOfYear != 61) return 28;
+    DateTime jan31 = new DateTime(2024, 1, 31);
+    DateTime clamped = jan31.AddMonths(1);         // C# clamps to the last day
+    if (clamped.Year != 2024 || clamped.Month != 2 || clamped.Day != 29) return 29;
+    DateTime feb29_2000 = new DateTime(2000, 2, 29);
+    DateTime after = feb29_2000.AddYears(1);       // ...and so does AddYears
+    if (after.Year != 2001 || after.Month != 2 || after.Day != 28) return 30;
+    DateTime back = clamped.AddMonths(0 - 1);
+    if (back.Month != 1 || back.Day != 29) return 31;
+
+    if (DateTime.IsLeapYear(2024) != 1) return 32;
+    if (DateTime.IsLeapYear(1900) != 0) return 33;
+    if (DateTime.IsLeapYear(2000) != 1) return 34;
+    if (DateTime.IsLeapYear(2023) != 0) return 35;
+    if (DateTime.DaysInMonth(1900, 2) != 28) return 36;
+    if (DateTime.DaysInMonth(2000, 2) != 29) return 37;
+    if (DateTime.DaysInMonth(2024, 2) != 29) return 38;
+    if (DateTime.DaysInMonth(2023, 1) != 31) return 39;
+    if (DateTime.DaysInMonth(2023, 4) != 30) return 40;
+
+    // the day of the week of three dates a wrong cycle would move
+    if (new DateTime(1970, 1, 1).DayOfWeek != 4) return 41;
+    if (new DateTime(2000, 1, 1).DayOfWeek != 6) return 43;
+    if (new DateTime(9999, 12, 31).DayOfWeek != 5) return 44;
+
+    // ---- the Add* family ----
+    if (leap.AddHours(12).Hour != 12) return 45;
+    if (leap.AddDays(0.5).Hour != 12) return 46;   // a fraction of a day
+    if (leap.AddMinutes(90).Hour != 1) return 47;
+    if (leap.AddMinutes(90).Minute != 30) return 48;
+    if (leap.AddSeconds(61).Second != 1) return 49;
+    if (leap.AddMilliseconds(1500).Millisecond != 500) return 50;
+    if (leap.AddTicks(864000000000).Day != 1) return 51;
+    if (leap.AddTicks(864000000000).Month != 3) return 52;
+    if (leap.AddYears(1).Day != 28) return 53;     // 2025 is not a leap year
+
+    // ---- the operators mixing the two types ----
+    DateTime march = new DateTime(2024, 3, 15);
+    TimeSpan gap = march - leap;
+    if (gap.Days != 15) return 54;
+    if (gap.TotalDays != 15.0) return 55;
+    if (gap.Ticks != 12960000000000) return 56;
+    TimeSpan day = TimeSpan.FromDays(1.0);
+    if ((leap + day).Day != 1) return 57;
+    if ((day + leap).Month != 3) return 58;        // the reversed row
+    if ((next - day).Day != 29) return 59;
+    if ((next - day).Ticks != leap.Ticks) return 60;
+    if ((leap - march).TotalDays != 0.0 - 15.0) return 61;
+
+    // ---- the six comparisons ----
+    if (!(leap < march)) return 62;
+    if (!(march > leap)) return 63;
+    if (!(leap <= march)) return 64;
+    if (!(leap <= leap)) return 65;
+    if (!(march >= leap)) return 66;
+    if (!(leap == raw)) return 67;
+    if (leap != raw) return 68;
+    if (leap > march) return 69;
+    if (march <= leap) return 71;
+    if (leap.CompareTo(march) != 0 - 1) return 72;
+    if (march.CompareTo(leap) != 1) return 73;
+    if (leap.CompareTo(raw) != 0) return 74;
+    if (!leap.Equals(raw)) return 75;
+    if (leap.Equals(march)) return 76;
+
+    // ---- the Kind, kept by the arithmetic and ignored by the comparison ----
+    DateTime utc = new DateTime(638447616000000000, DateTimeKind.Utc);
+    DateTime local = new DateTime(638447616000000000, DateTimeKind.Local);
+    if (utc.Kind != DateTimeKind.Utc) return 77;
+    if (local.Kind != DateTimeKind.Local) return 78;
+    if (leap.Kind != DateTimeKind.Unspecified) return 79;
+    if (local.Ticks != leap.Ticks) return 80;      // ...the bits are NOT the ticks
+    if (!(local == leap)) return 81;               // C#'s own Compare: Kind masked off
+    if (!(local == utc)) return 82;
+    if (local < utc || local > utc) return 83;
+    if (utc.AddDays(1).Kind != DateTimeKind.Utc) return 84;
+    if (local.AddMonths(1).Kind != DateTimeKind.Local) return 85;
+    if ((utc + day).Kind != DateTimeKind.Utc) return 86;
+    if (local.Date.Kind != DateTimeKind.Local) return 87;
+
+    // ---- .Date and .TimeOfDay ----
+    DateTime midnight = precise.Date;
+    if (midnight.Ticks != leap.Ticks) return 88;
+    if (midnight.Hour != 0 || midnight.Minute != 0) return 89;
+    TimeSpan tod = precise.TimeOfDay;
+    if (tod.Hours != 13) return 90;
+    if (tod.Minutes != 45) return 91;
+    if (tod.Seconds != 30) return 92;
+    if (tod.Milliseconds != 123) return 93;
+    if (midnight + tod != precise) return 94;
+
+    // ---- a parameter, a return, a field, an array element, a global ----
+    if (year_of(leap) != 2024) return 95;
+    if (ticks_of(leap) != 638447616000000000) return 96;
+    if (tomorrow(leap).Month != 3) return 97;
+
+    Meeting m = new Meeting();
+    if (m.moment.Ticks != 0) return 98;
+    m.moment = precise;
+    DateTime fromfield = m.moment;
+    if (fromfield.Minute != 45) return 99;
+
+    DateTime table[3];
+    table[0] = leap;
+    table[1] = march;
+    table[2] = leap + day;
+    DateTime e2 = table[2];
+    if (e2.Month != 3 || e2.Day != 1) return 100;
+
+    g_moment = precise;
+    DateTime fromglobal = g_moment;
+    if (fromglobal.Second != 30) return 101;
+
+    // ---- `ref`/`out` pointees and the ternary, typed as DateTime ----
+    DateTime moved = leap;
+    shift(ref moved, day);
+    if (moved.Month != 3 || moved.Day != 1) return 102;
+    DateTime cut;
+    midnight_of(out cut, precise);
+    if (cut.Ticks != leap.Ticks) return 103;
+    if (later(leap, march).Ticks != march.Ticks) return 104;
+    DateTime pick = moved > leap ? moved : leap;
+    if (pick.Day != 1) return 105;
+
+    // ---- a loop, one day at a time across the end of a month ----
+    DateTime walk = new DateTime(2024, 2, 27);
+    i64 i = 0;
+    while (i < 3) {
+        walk = walk.AddDays(1);
+        i = i + 1;
+    }
+    if (walk.Month != 3 || walk.Day != 1) return 106;
+
+    return 42;
+}

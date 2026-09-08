@@ -43,6 +43,31 @@ one **byte** further: a pointer has no pointee to scale by.
 Those names come from the runtime, so a program that touches them opens with
 `#include "rt.tk"` ([the runtime reference](../reference/runtime.md)).
 
+## Time
+
+`TimeSpan` and `DateTime` are C#'s, behind one include of their own:
+
+```
+#include "time.tk"          // brings rt.tk with it
+```
+
+A `TimeSpan` is a length of time in 100-nanosecond ticks; a `DateTime` is a point in time,
+a tick count from `0001-01-01` with a `Kind` (`Unspecified`, `Utc`, `Local`) carried along.
+Both are eight bytes, both are types of their own — no integer becomes one without
+`new DateTime(t)` and neither becomes an integer without `.Ticks` — and the arithmetic
+between them is C#'s: `b - a` is a `TimeSpan`, `d + t` is a `DateTime`, and everything past
+the range panics instead of wrapping.
+
+```
+DateTime leap = new DateTime(2024, 2, 29);
+DateTime next = leap.AddDays(1);               // 2024-03-01
+TimeSpan gap  = next - leap;                   // one day, 864000000000 ticks
+```
+
+`DateTime.Now` is not taught: a wall clock is one symbol per operating system and belongs
+to `mc`. [`timespan.md`](../reference/timespan.md) and
+[`datetime.md`](../reference/datetime.md) are the two reference pages.
+
 ## The two array shapes
 
 They are different types, and the difference is where the length lives.

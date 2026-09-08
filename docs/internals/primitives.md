@@ -8,23 +8,45 @@ it `.Ticks`, `.Days`, `TimeSpan.FromHours(x)` and `a + b` is a **lowering table*
 registers them, and four sites that already existed read them.
 
 This page is the mechanism. The surface it produces is
-[timespan.md](../reference/timespan.md); the design it comes from is
-[`docs/specs/datetime.md`](../specs/datetime.md) § 2, and `DateTime`, `decimal`, `Guid` and
+[timespan.md](../reference/timespan.md) and [datetime.md](../reference/datetime.md); the
+design it comes from is
+[`docs/specs/datetime.md`](../specs/datetime.md) § 2, and `decimal`, `Guid` and
 the `enum` statics are meant to land on the same table without a line of their own here.
+`DateTime` was the second primitive and cost the mechanism three additions, each listed
+below: rows of more than one argument, a row that is refused BY NAME, and the list that
+tells a compiler-written cast from a hand-written one.
 
 ---
 
 ## The two tables
 
-A **member row** is `(type id, member name, kind, parameter type, symbol, result type)`:
+A **member row** is
+`(type id, member name, kind, how many arguments, their type, symbol, result type)`:
 
 | kind | reached as | example |
 |---|---|---|
 | `TK_PMSVAL` | `Type.Name` | `TimeSpan.Zero` |
-| `TK_PMSFUN` | `Type.Name(arg)` | `TimeSpan.FromHours(2.0)` |
+| `TK_PMSFUN` | `Type.Name(args)` | `DateTime.DaysInMonth(2024, 2)` |
 | `TK_PMPROP` | `x.Name` | `t.Days` |
-| `TK_PMFUN` | `x.Name(arg)` | `t.CompareTo(u)` |
-| `TK_PMCTOR` | `new Type(arg)` | `new TimeSpan(864000000000)` |
+| `TK_PMFUN` | `x.Name(args)` | `t.CompareTo(u)` |
+| `TK_PMCTOR` | `new Type(args)` | `new DateTime(2024, 2, 29)` |
+| `TK_PMSOON` | `Type.Name`, refused by name | `DateTime.Now` |
+
+**The parameter list is a count and ONE type**, because every row this mechanism carries
+takes its arguments in a single type: three integers for `new DateTime(y, m, d)`, one float
+for `TimeSpan.FromHours(x)`. A member whose parameters differ from each other —
+`DateTime.SpecifyKind(DateTime, DateTimeKind)`, the two `Subtract` overloads — is not
+taught ([not-yet.md](../reference/not-yet.md)); the day one is, that column becomes a list
+and nothing else moves.
+
+**Rows of one name and different counts are the overload set of that name.** `new
+DateTime(...)` is five rows (1, 2, 3, 6 and 7 arguments) and the site picks by how many it
+wrote; a count no row has is `teko: wrong number of arguments for new`.
+
+**A `TK_PMSOON` row names a member the type HAS and this version does not teach.**
+`DateTime.Now`, `UtcNow` and `Today` need a wall clock, which is `mc`'s to give
+([the spec](../specs/datetime.md) § 8), and the row is what makes the site say
+`teko: DateTime.Now is not taught yet` instead of reading as an unknown member.
 
 An **operator row** is `(token, arity, left type, right type, symbol, result type, swap)`.
 `swap` is C#'s reversed declaration — `n * t` and `t * n` are one function, called with the
@@ -59,6 +81,24 @@ three are why the design is this and not a compiler intrinsic:
   and the result the oracle sees is a `TimeSpan` because the cast says so.
 - **No new intrinsic and no new pass** (D2/D21): `mc limits` shows `passes 15/30` and
   `intrin 8/16` unmoved.
+
+`DateTime` is the type that makes the pair load-bearing rather than tidy. Its raw eight
+bytes are the ticks in bits 0..61 and the `Kind` in the two above them, so `(i64) d` is
+**not** `d.Ticks` — for a `Local` date it is a negative number — and `(DateTime) n` is an
+integer that skipped every range check. Both are therefore **refused in the surface**
+(`docs/specs/datetime.md` § 3), and the compiler's own casts, which are the very same two
+nodes, are told apart by a list of node indices: `tk_cast` (teko_array.tk) records the ones
+it builds toward a primitive and `tk_prim_raw` the ones it builds away from one, and
+`tk_prim_cast_check` refuses every other cast that touches a primitive. A MARK on the node
+was not an option — `--dump-ast` prints every field a node has, so a mark would move the
+dump of code that did not change.
+
+Two details of that list are the whole of its subtlety. A node replaced **in place**
+(`node_assign`, mc's own) keeps the placeholder's index and not the built node's, so the
+two passes that replace a lowering's own result — the deferred `.` and the operator
+rewrite — hand the record over with `tk_prim_own_cast_moved`. And the check runs over the
+operator pass's walk, which covers function bodies only, so a second tiny walk
+(`tk_prim_cast_globals`) covers what is written outside them: a global's own initializer.
 
 ## The four sites that read the table
 
@@ -98,12 +138,22 @@ the registration alone, macOS/aarch64, `mc` 0.15.23.
 | `TK_MAXPRIMT` | 8 | primitive types with a member table |
 | `TK_MAXPRIMM` | 96 | member rows, over every primitive |
 | `TK_MAXPRIMO` | 32 | operator rows, over every primitive |
+| `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 
-`TimeSpan` uses 1, 30 and 12 of them.
+`TimeSpan` uses 1, 30 and 12 of the first three; `DateTime` brings the totals to 2, 66 and
+22. The fourth is per compilation unit and not per registration: it grows with how much
+date arithmetic one program writes, roughly two entries per member access, and a unit past
+it is `teko: too many casts over a primitive in one unit`.
 
-## What a second primitive costs
+## What the second primitive actually cost
 
-`DateTime` (`docs/specs/datetime.md`'s C2) adds one `type_new`, one `syntax_expr`/
-`syntax_stmt` pair, its rows, and the functions in `lib/time.tk` they name. Nothing in
-`teko_prim.tk` changes, and no pass is added — the only genuinely new work is the calendar
-itself, which is ordinary teko.
+`DateTime` added one `type_new`, one `syntax_expr`/`syntax_stmt` pair, one `type_alias`
+(`DateTimeKind`, over `i32`, with a three-value handler of its own), its 36 rows, and the
+calendar in `lib/time.tk` — about 300 lines of ordinary teko. In `mc limits` that is
+`types 10 → 11` and `alias 17 → 19`, with `syntax`, `passes 15/30` and `intrin 8/16`
+unmoved, verdict `ok`.
+
+In `teko_prim.tk` it cost the three additions this page names (multi-argument rows,
+`TK_PMSOON`, the own-cast list) and no pass. The next primitive —
+[`decimal`](../specs/decimal.md), sixteen bytes and a derived machine — is the one that
+will ask the mechanism a question it has not answered yet.

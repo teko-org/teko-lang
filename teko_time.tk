@@ -1,7 +1,10 @@
-// teko_time.tk -- `TimeSpan`, C#'s own (docs/specs/datetime.md, crumb C1): a
-// signed 64-bit count of ticks, and a tick is 100 nanoseconds.
+// teko_time.tk -- `TimeSpan` and `DateTime`, C#'s own (docs/specs/datetime.md,
+// crumbs C1 and C2): a signed 64-bit count of ticks, and a tick is 100
+// nanoseconds; a date is a tick count from `0001-01-01 00:00:00` with a `Kind`
+// in the two bits above it.
 //
-// The type is ONE registration -- `type_new("TimeSpan", 8, 8, TK_SINT)` --
+// Each type is ONE registration -- `type_new("TimeSpan", 8, 8, TK_SINT)`,
+// `type_new("DateTime", 8, 8, TK_SINT)` --
 // plus the two `syntax_expr`/`syntax_stmt` a type word needs to open an
 // expression and a statement, which is exactly what a class name already gets
 // (teko_access.tk's `tk_type_word`). Eight bytes wide is the word, so nothing
@@ -18,12 +21,24 @@
 // `lib/time.tk` written over the raw `i64` ticks. No pass, no intrinsic, no
 // `syntax*` of its own beyond the type word.
 //
-// WHAT IS NOT HERE, and why: `DateTime` and `DateTimeKind` are crumb C2;
-// `.ToString()`/`Parse` are text, which lands with the `enum` text crumb's own
-// machinery (docs/reference/not-yet.md); `TimeSpan * f64` and
-// `TimeSpan / TimeSpan` are C# operators the spec's § 4 leaves out.
+// `DateTime` IS ORDERED BY ITS TICKS AND NOT BY ITS BITS. C#'s own `dateData`
+// packing puts the `Kind` in bits 62 and 63 (the maximum tick value,
+// `3155378975999999999`, needs 62), so a `Local` date is a NEGATIVE `i64` and
+// the core's own `<` over the raw eight bytes would answer backwards. That is
+// why every comparison is a row -- a call into `lib/time.tk` that masks the
+// two bits off -- and why `.Ticks` is a call here where `TimeSpan.Ticks` is
+// the identity cast: the raw bits of a date are not its ticks.
+//
+// WHAT IS NOT HERE, and why: `.ToString()`/`Parse` are text, which lands with
+// the `enum` text crumb's own machinery (docs/reference/not-yet.md);
+// `DateTime.Now`/`UtcNow`/`Today` need a wall clock, one symbol per host, and
+// are refused BY NAME (a `TK_PMSOON` row) until `mc`'s `<sys>` carries one
+// (docs/specs/datetime.md § 8); `TimeSpan * f64`, `TimeSpan / TimeSpan`,
+// `DateTime.SpecifyKind` and `.Subtract` are C# members the spec's § 4/§ 6
+// leave out of these two crumbs.
 
 i64 tk_ty_timespan = 0;
+i64 tk_ty_datetime = 0;
 
 // the include the lowering symbols live in, named in the refusal a program
 // that forgot it gets (docs/specs/datetime.md § 9)
@@ -105,9 +120,135 @@ void tk_ts_operators() {
     tk_prim_op(K_GE, 2, ts, ts, "tk_ts_ge", TY_I64, 0);
 }
 
-// Called from teko.tk's `teko_init()` AFTER `tk_float_init()`: the `From*`
-// rows name `ty_f64`, the id `<float>`'s own registration returns, so the
-// float library has to be wired before this table is written.
+// ---- `DateTime` (crumb C2) ----
+// The statics, C#'s own. `UnixEpoch` carries `DateTimeKind.Utc` in its two top
+// bits, exactly as C# declares it, which is why it is a call and not the bare
+// tick constant -- `UnixEpoch.Ticks` still answers `621355968000000000`,
+// because `.Ticks` masks the `Kind` off.
+void tk_dt_statics() {
+    i64 dt = tk_ty_datetime;
+    tk_prim_member(dt, "MinValue",  TK_PMSVAL, 0 - 1, "tk_dt_min",   dt);
+    tk_prim_member(dt, "MaxValue",  TK_PMSVAL, 0 - 1, "tk_dt_max",   dt);
+    tk_prim_member(dt, "UnixEpoch", TK_PMSVAL, 0 - 1, "tk_dt_epoch", dt);
+    tk_prim_member(dt, "IsLeapYear", TK_PMSFUN, TY_I64, "tk_dt_is_leap", TY_I64);
+    tk_prim_membern(dt, "DaysInMonth", TK_PMSFUN, 2, TY_I64, "tk_dt_days_in_month", TY_I64);
+    // § 8: blocked on a wall clock in `mc`'s `<sys>`, refused by name until it
+    // lands. C# spells all three as static properties, and so does the row.
+    tk_prim_member(dt, "Now",    TK_PMSOON, 0 - 1, 0, dt);
+    tk_prim_member(dt, "UtcNow", TK_PMSOON, 0 - 1, 0, dt);
+    tk_prim_member(dt, "Today",  TK_PMSOON, 0 - 1, 0, dt);
+}
+
+// The five constructors C# has that need no calendar the surface cannot
+// spell, each a row of its own arity (`tk_prim_pick` is what tells them
+// apart). NONE of them is the identity cast `TimeSpan`'s is: a tick count has
+// to be checked against the range and packed with its `Kind`, and a date
+// that does not exist -- `new DateTime(2023, 2, 29)` -- panics where it is
+// built.
+void tk_dt_ctors() {
+    i64 dt = tk_ty_datetime;
+    tk_prim_membern(dt, "new", TK_PMCTOR, 1, TY_I64, "tk_dt_from_ticks", dt);
+    tk_prim_membern(dt, "new", TK_PMCTOR, 2, TY_I64, "tk_dt_from_ticks_kind", dt);
+    tk_prim_membern(dt, "new", TK_PMCTOR, 3, TY_I64, "tk_dt_ymd", dt);
+    tk_prim_membern(dt, "new", TK_PMCTOR, 6, TY_I64, "tk_dt_ymdhms", dt);
+    tk_prim_membern(dt, "new", TK_PMCTOR, 7, TY_I64, "tk_dt_ymdhmsms", dt);
+}
+
+void tk_dt_members() {
+    i64 dt = tk_ty_datetime;
+    i64 ts = tk_ty_timespan;
+    // `.Ticks` is a CALL here, unlike `TimeSpan.Ticks`: the raw eight bytes
+    // carry the `Kind` above the ticks, so reading them as a number is the one
+    // thing that would be silently wrong. `.Kind` answers a `DateTimeKind`,
+    // which is `i32` under an alias (§ 1).
+    tk_prim_member(dt, "Ticks", TK_PMPROP, 0 - 1, "tk_dt_ticks", TY_I64);
+    tk_prim_member(dt, "Kind",  TK_PMPROP, 0 - 1, "tk_dt_kind",  ty_i32);
+    // the civil calendar: proleptic Gregorian, computed as C# computes it
+    tk_prim_member(dt, "Year",        TK_PMPROP, 0 - 1, "tk_dt_year",   TY_I64);
+    tk_prim_member(dt, "Month",       TK_PMPROP, 0 - 1, "tk_dt_month",  TY_I64);
+    tk_prim_member(dt, "Day",         TK_PMPROP, 0 - 1, "tk_dt_day",    TY_I64);
+    tk_prim_member(dt, "Hour",        TK_PMPROP, 0 - 1, "tk_dt_hour",   TY_I64);
+    tk_prim_member(dt, "Minute",      TK_PMPROP, 0 - 1, "tk_dt_minute", TY_I64);
+    tk_prim_member(dt, "Second",      TK_PMPROP, 0 - 1, "tk_dt_second", TY_I64);
+    tk_prim_member(dt, "Millisecond", TK_PMPROP, 0 - 1, "tk_dt_ms",     TY_I64);
+    tk_prim_member(dt, "DayOfWeek",   TK_PMPROP, 0 - 1, "tk_dt_dow",    TY_I64);
+    tk_prim_member(dt, "DayOfYear",   TK_PMPROP, 0 - 1, "tk_dt_doy",    TY_I64);
+    // the two that answer a value of another type: the date at midnight, and
+    // the time since it
+    tk_prim_member(dt, "Date",      TK_PMPROP, 0 - 1, "tk_dt_date", dt);
+    tk_prim_member(dt, "TimeOfDay", TK_PMPROP, 0 - 1, "tk_dt_tod",  ts);
+    // C#'s `Add*` family: the five that take a `double` round to the nearest
+    // millisecond (C#'s own `DateTime.Add(double, int)`), and the three that
+    // take a whole count do not.
+    tk_prim_member(dt, "AddDays",         TK_PMFUN, ty_f64, "tk_dt_add_days",    dt);
+    tk_prim_member(dt, "AddHours",        TK_PMFUN, ty_f64, "tk_dt_add_hours",   dt);
+    tk_prim_member(dt, "AddMinutes",      TK_PMFUN, ty_f64, "tk_dt_add_minutes", dt);
+    tk_prim_member(dt, "AddSeconds",      TK_PMFUN, ty_f64, "tk_dt_add_seconds", dt);
+    tk_prim_member(dt, "AddMilliseconds", TK_PMFUN, ty_f64, "tk_dt_add_ms",      dt);
+    tk_prim_member(dt, "AddTicks",  TK_PMFUN, TY_I64, "tk_dt_add_ticks",  dt);
+    tk_prim_member(dt, "AddMonths", TK_PMFUN, TY_I64, "tk_dt_add_months", dt);
+    tk_prim_member(dt, "AddYears",  TK_PMFUN, TY_I64, "tk_dt_add_years",  dt);
+    tk_prim_member(dt, "CompareTo", TK_PMFUN, dt, "tk_dt_cmp", TY_I64);
+    tk_prim_member(dt, "Equals",    TK_PMFUN, dt, "tk_dt_eq",  TY_I64);
+}
+
+// docs/specs/datetime.md § 4, the rows that mix the two types. `d + t` and
+// `t + d` are C#'s two declarations of one operator and share one function
+// through the row's swap flag; `d + d` has NO row and is refused where it is
+// written, which is the whole point of claiming every binary with a primitive
+// operand.
+void tk_dt_operators() {
+    i64 dt = tk_ty_datetime;
+    i64 ts = tk_ty_timespan;
+    tk_prim_op(K_ADD, 2, dt, ts, "tk_dt_add", dt, 0);
+    tk_prim_op(K_ADD, 2, ts, dt, "tk_dt_add", dt, 1);
+    tk_prim_op(K_SUB, 2, dt, ts, "tk_dt_sub_ts", dt, 0);
+    tk_prim_op(K_SUB, 2, dt, dt, "tk_dt_sub", ts, 0);
+    // C#'s own `Compare`: the ticks, with the `Kind` masked off. Two dates of
+    // different `Kind` compare by their ticks and do not convert.
+    tk_prim_op(K_EQ, 2, dt, dt, "tk_dt_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, dt, dt, "tk_dt_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, dt, dt, "tk_dt_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, dt, dt, "tk_dt_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, dt, dt, "tk_dt_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, dt, dt, "tk_dt_ge", TY_I64, 0);
+}
+
+// ---- `DateTimeKind`: an alias over `i32`, and three constants ----
+// § 1's own shape, and § 8's reason: teko had no `enum` when the page was
+// written, and an alias plus three constants is the same surface. Now that
+// `enum` is taught (docs/specs/enum.md N2a) turning it into one is a crumb of
+// its own (N2c) -- a TIGHTENING, since an alias converts from any integer and
+// an enum from nothing but itself.
+//
+// The word is a TYPE (`type_alias`) and an EXPRESSION (`syntax_expr`) at once,
+// which mc's own hooks.md § "a word may be a type and something else" makes a
+// contract: the two tables are read at disjoint grammar positions. A
+// declaration -- `DateTimeKind k = dt.Kind;` -- is the core's own `parse_var`
+// through `type_of_token`, so no `syntax_stmt` is registered for it.
+i64 tk_dtk_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "DateTimeKind");
+    uptr m = p_ident();
+    if (p_id() == K_LPAR)
+        err_at2(fl, line, "teko: the member is a property; it is not called", m);
+    uptr sym = 0;
+    if (str_eq(m, "Unspecified")) sym = "tk_dtk_unspecified";
+    if (str_eq(m, "Utc"))         sym = "tk_dtk_utc";
+    if (str_eq(m, "Local"))       sym = "tk_dtk_local";
+    if (sym == 0) err_at2(fl, line, "teko: unknown static member of DateTimeKind", m);
+    tk_prim_need_include_of("DateTimeKind", tk_time_include(), sym, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call(sym, 0);
+}
+
+// Called from teko.tk's `teko_init()` AFTER `tk_float_init()`: the `From*` and
+// `Add*` rows name `ty_f64`, the id `<float>`'s own registration returns, so
+// the float library has to be wired before this table is written.
 void tk_time_init() {
     tk_ty_timespan = type_new("TimeSpan", 8, 8, TK_SINT);
     syntax_expr("TimeSpan", &tk_prim_expr);
@@ -116,4 +257,16 @@ void tk_time_init() {
     tk_ts_statics();
     tk_ts_members();
     tk_ts_operators();
+
+    tk_ty_datetime = type_new("DateTime", 8, 8, TK_SINT);
+    syntax_expr("DateTime", &tk_prim_expr);
+    syntax_stmt("DateTime", &tk_prim_stmt);
+    tk_prim_type(tk_ty_datetime, "DateTime", tk_time_include());
+    tk_dt_statics();
+    tk_dt_ctors();
+    tk_dt_members();
+    tk_dt_operators();
+
+    type_alias("DateTimeKind", ty_i32);
+    syntax_expr("DateTimeKind", &tk_dtk_expr);
 }

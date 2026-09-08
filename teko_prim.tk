@@ -61,6 +61,7 @@ void tk_ops_replace(i64 n, i64 with);
 #define TK_MAXPRIMT 8                 // primitive types carrying a member table
 #define TK_MAXPRIMM 96                // member rows, over every primitive
 #define TK_MAXPRIMO 32                // operator rows, over every primitive
+#define TK_MAXPRIMC 4096              // casts over a primitive the COMPILER wrote
 
 // what a row is reached as, and therefore what the site may write after it
 #define TK_PMSVAL 0                   // Type.Name           a static value, no ()
@@ -68,6 +69,11 @@ void tk_ops_replace(i64 n, i64 with);
 #define TK_PMPROP 2                   // x.Name              an instance property, no ()
 #define TK_PMFUN  3                   // x.Name(args)        an instance method
 #define TK_PMCTOR 4                   // new Type(arg)       the value constructor
+// ...and the fifth, which is a member the type HAS and this version does not
+// teach: `DateTime.Now` is blocked on a wall clock in `mc`'s `<sys>`
+// (docs/specs/datetime.md § 8), and a row is what makes the site say so by
+// name instead of reading as an unknown member.
+#define TK_PMSOON 5                   // Type.Name           named, refused by name
 
 // ---- the primitives themselves ----
 i64  pt_ty[TK_MAXPRIMT];
@@ -80,10 +86,23 @@ uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
 uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
 
 // ---- the member rows ----
+// A row's parameter list is a COUNT and ONE type: every row this mechanism
+// carries takes its arguments in a single type (`new DateTime(y, m, d)` is
+// three integers, `TimeSpan.FromHours(x)` one float), which is what keeps the
+// list one column instead of a pool. A member whose parameters differ from
+// each other -- C#'s `DateTime.SpecifyKind(DateTime, DateTimeKind)`, its two
+// `Subtract` overloads -- is not taught (docs/reference/not-yet.md); the day
+// one is, this column becomes a list and nothing else moves.
+//
+// Rows of ONE name and DIFFERENT counts are the overload set of that name:
+// `new DateTime(ticks)`, `new DateTime(y, m, d)` and `new DateTime(y, m, d, h,
+// mi, s)` are three rows, and the site picks by the number of arguments
+// written (`tk_prim_pick`).
 i64  pmr_ty[TK_MAXPRIMM];
 uptr pmr_name[TK_MAXPRIMM];
 i64  pmr_kind[TK_MAXPRIMM];
-i64  pmr_p0[TK_MAXPRIMM];              // the type of the ONE argument, or -1 for none
+i64  pmr_np[TK_MAXPRIMM];              // how many arguments the row takes
+i64  pmr_p0[TK_MAXPRIMM];              // the type of EVERY argument, or -1 for none
 uptr pmr_sym[TK_MAXPRIMM];             // the lib function the row lowers to
 i64  pmr_ret[TK_MAXPRIMM];
 i64  tk_nprimm = 0;
@@ -91,6 +110,7 @@ i64  tk_nprimm = 0;
 i64  pmr_ty_at(i64 i)   { return ld64(pmr_ty + i * 8); }
 uptr pmr_name_at(i64 i) { return ld64(pmr_name + i * 8); }
 i64  pmr_kind_at(i64 i) { return ld64(pmr_kind + i * 8); }
+i64  pmr_np_at(i64 i)   { return ld64(pmr_np + i * 8); }
 i64  pmr_p0_at(i64 i)   { return ld64(pmr_p0 + i * 8); }
 uptr pmr_sym_at(i64 i)  { return ld64(pmr_sym + i * 8); }
 i64  pmr_ret_at(i64 i)  { return ld64(pmr_ret + i * 8); }
@@ -125,15 +145,24 @@ void tk_prim_type(i64 ty, uptr name, uptr inc) {
     tk_nprimt = tk_nprimt + 1;
 }
 
-void tk_prim_member(i64 ty, uptr name, i64 kind, i64 p0, uptr sym, i64 ret) {
+// `np` arguments, each of type `p0` (-1 and 0 for a row that takes none).
+void tk_prim_membern(i64 ty, uptr name, i64 kind, i64 np, i64 p0, uptr sym, i64 ret) {
     if (tk_nprimm == TK_MAXPRIMM) err_at(tk_file, tk_line, "teko: too many primitive members");
     st64(pmr_ty + tk_nprimm * 8, ty);
     st64(pmr_name + tk_nprimm * 8, name);
     st64(pmr_kind + tk_nprimm * 8, kind);
+    st64(pmr_np + tk_nprimm * 8, np);
     st64(pmr_p0 + tk_nprimm * 8, p0);
     st64(pmr_sym + tk_nprimm * 8, sym);
     st64(pmr_ret + tk_nprimm * 8, ret);
     tk_nprimm = tk_nprimm + 1;
+}
+
+// the shape most rows have: no argument (`p0` -1) or exactly one.
+void tk_prim_member(i64 ty, uptr name, i64 kind, i64 p0, uptr sym, i64 ret) {
+    i64 np = 0;
+    if (p0 >= 0) np = 1;
+    tk_prim_membern(ty, name, kind, np, p0, sym, ret);
 }
 
 void tk_prim_op(i64 tok, i64 np, i64 t0, i64 t1, uptr sym, i64 ret, i64 swap) {
@@ -183,6 +212,9 @@ i64 tk_prim_by_name(uptr nm) {
     return 0 - 1;
 }
 
+// the FIRST row of a name: whether the type has the member at all, and what
+// kind of member it is -- every row of one name shares its kind and its result
+// type, and differs only in how many arguments it takes.
 i64 tk_prim_find(i64 ty, uptr m) {
     i64 i = 0;
     loop {
@@ -191,6 +223,25 @@ i64 tk_prim_find(i64 ty, uptr m) {
         i = i + 1;
     }
     return 0 - 1;
+}
+
+// ...and the row of that name the SITE lands on, by the number of arguments it
+// wrote. This is the whole of overloading a primitive member has: the counts
+// are distinct inside one name, so no two rows ever match one site.
+i64 tk_prim_find_na(i64 ty, uptr m, i64 na) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimm) break;
+        if (pmr_ty_at(i) == ty && pmr_np_at(i) == na && str_eq(pmr_name_at(i), m)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_prim_pick(i64 ty, uptr m, i64 na, i64 line, uptr fl) {
+    i64 ri = tk_prim_find_na(ty, m, na);
+    if (ri < 0) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+    return ri;
 }
 
 // 1 when an operand of type `t` lands on a row column declared `pt`. A column
@@ -233,14 +284,59 @@ i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb) {
 }
 
 // ---- the two casts the lowering is written with (§ 2) ----
+// ...and the ONE list that tells them from the same two casts written by hand.
+// `(i64) dt` and `(DateTime) n` are refused in the surface (§ 3), because the
+// raw eight bytes of a date are NOT its ticks -- the `Kind` sits above them --
+// so a hand-written cast is the one spelling that answers a wrong number
+// instead of refusing. The compiler writes both casts all the time, though, so
+// the refusal needs to tell one from the other, and the node itself cannot say:
+// `--dump-ast` prints every field a node has, so a mark on the node would move
+// the dump of code that did not change. The compiler's own casts are therefore
+// remembered by node index, here, and everything else that casts a primitive is
+// the source's.
+i64  pc_node[TK_MAXPRIMC];
+i64  tk_nprimc = 0;
+
+void tk_prim_own_cast(i64 n) {
+    if (tk_nprimc == TK_MAXPRIMC) err_at(tk_file, tk_line, "teko: too many casts over a primitive in one unit");
+    st64(pc_node + tk_nprimc * 8, n);
+    tk_nprimc = tk_nprimc + 1;
+}
+
+i64 tk_prim_own_cast_is(i64 n) {
+    i64 i = tk_nprimc - 1;
+    loop {
+        if (i < 0) break;
+        if (ld64(pc_node + i * 8) == n) return 1;
+        i = i - 1;
+    }
+    return 0;
+}
+
+// A node this project REPLACES IN PLACE keeps the placeholder's index and not
+// the built node's (`node_assign`, mc/src/ast.mc: the fields are copied over
+// the node the tree already points at), so a cast that travels that road
+// arrives under another number. The two passes that replace a lowering's own
+// result -- the deferred `.` (teko_typeof.tk) and the operator rewrite
+// (teko_ops.tk) -- say so here, and the cast stays the compiler's.
+void tk_prim_own_cast_moved(i64 from, i64 to) {
+    if (tk_prim_own_cast_is(from)) tk_prim_own_cast(to);
+}
+
 // the raw eight bytes, for a call into `lib/`: `(i64) t`. Not an instruction --
 // both slots are eight bytes -- and not a licence the SURFACE has: it is the
 // compiler's own cast, the same way `tk_num_widen` is.
-i64 tk_prim_raw(i64 e) { return tk_cast(TY_I64, e); }
+i64 tk_prim_raw(i64 e) {
+    i64 n = tk_cast(TY_I64, e);
+    tk_prim_own_cast(n);
+    return n;
+}
 
 // ...and the way back, `(TimeSpan) r`, for a row whose result is the primitive
 // itself. A row whose result is `i64` or `f64` needs neither: the call's own
-// declared return type is what every oracle already reads.
+// declared return type is what every oracle already reads. The other direction
+// -- a cast TO a primitive -- is remembered by `tk_cast` itself (teko_array.tk),
+// so every module that writes one is covered by construction.
 i64 tk_prim_ret(i64 ret, i64 call) {
     if (tk_prim_is(ret)) return tk_cast(ret, call);
     return call;
@@ -267,6 +363,16 @@ void tk_prim_is_instance(i64 ty, uptr m, i64 line, uptr fl) {
                               " is an instance member; reach it through an object"));
 }
 
+// a TK_PMSOON row: the type HAS the member, C# spells it, and this version
+// does not teach it. `DateTime.Now` is the one this crumb registers -- it needs
+// a wall clock, which is one symbol per host and `mc`'s own to give
+// (docs/specs/datetime.md § 8) -- and the row is what makes the site say so by
+// name instead of reading as a member nobody ever heard of.
+void tk_prim_not_yet(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at(fl, line, tk_join3("teko: ", tk_join3(tk_prim_name(ty), ".", m),
+                              " is not taught yet"));
+}
+
 // a member of a primitive is a value read out of the eight bytes, never a slot:
 // there is nothing to assign to
 void tk_prim_readonly(i64 ty, uptr m, i64 line, uptr fl) {
@@ -277,11 +383,15 @@ void tk_prim_readonly(i64 ty, uptr m, i64 line, uptr fl) {
 // in the owner module's own include, so a program that named the type without
 // it is told which file it forgot instead of reaching the core's own
 // `call to unknown function` two phases later.
-void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl) {
+void tk_prim_need_include_of(uptr word, uptr inc, uptr sym, i64 line, uptr fl) {
     if (decl_find(sym) >= 0) return;
+    err_at(fl, line, tk_join3(tk_join3("teko: ", word, " needs #include "),
+                              inc, " before it is used"));
+}
+
+void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl) {
     i64 pi = tk_prim_slot(ty);
-    err_at(fl, line, tk_join3(tk_join3("teko: ", tk_prim_name(ty), " needs #include "),
-                              pt_inc_at(pi), " before it is used"));
+    tk_prim_need_include_of(tk_prim_name(ty), pt_inc_at(pi), sym, line, fl);
 }
 
 // ---- one argument, checked and converted ----
@@ -310,27 +420,40 @@ i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
     return tk_prim_conv(pty, a, aty);
 }
 
-// the argument list of a row, checked position by position. Every row this
-// mechanism carries takes one argument or none (§ 6), which is what lets the
-// parameter type be one column; a row that ever needs two takes a list here.
-i64 tk_prim_args(i64 ri, i64 args, i64 na, i64 atpass, uptr m, i64 line, uptr fl) {
-    i64 want = 0;
-    if (pmr_p0_at(ri) >= 0) want = 1;
-    if (na != want) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
-    if (want == 0) return 0;
-    return tk_prim_arg(pmr_p0_at(ri), args, atpass, line, fl);
+// the argument list of a row, checked and converted position by position. The
+// row was already picked BY the number of arguments (`tk_prim_pick`), so the
+// list is exactly as long as the row asks for.
+//
+// Each argument is a LINK of a sibling list and the conversion may wrap it in
+// a cast, so the link is read and cut before the position is converted: a
+// wrapped node keeps no `nd_next` of its own (`tk_num_widen`'s own rule), and
+// the list is rebuilt in order out of what the conversion hands back.
+i64 tk_prim_args(i64 ri, i64 args, i64 atpass, i64 line, uptr fl) {
+    i64 pty = pmr_p0_at(ri);
+    i64 np = pmr_np_at(ri);
+    i64 head = 0;
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (i >= np) break;
+        i64 nx = nd_next(a);
+        set_nd_next(a, 0);
+        head = list_append(head, tk_prim_arg(pty, a, atpass, line, fl));
+        a = nx;
+        i = i + 1;
+    }
+    return head;
 }
 
 // ---- the emission ----
 // `recv` is 0 for a static row and the receiver's node for an instance one; the
 // receiver is the first argument of the lowered call, exactly as a method's
 // mangled `Owner_method` already takes it.
-i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 na, i64 atpass, i64 line, uptr fl) {
+i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 atpass, i64 line, uptr fl) {
     i64 ty = pmr_ty_at(ri);
-    uptr m = pmr_name_at(ri);
     uptr sym = pmr_sym_at(ri);
     i64 kind = pmr_kind_at(ri);
-    i64 a = tk_prim_args(ri, args, na, atpass, m, line, fl);
+    i64 a = tk_prim_args(ri, args, atpass, line, fl);
     tk_line = line;
     tk_file = fl;
     // A row with NO SYMBOL is the identity (§ 2): `new TimeSpan(t)` is
@@ -339,13 +462,23 @@ i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 na, i64 atpass, i64 line, uptr 
     // cast by hand and the compiler writes both, exactly as `tk_num_widen` is
     // the compiler's own cast and not a licence to narrow.
     if (sym == 0) {
+        // `tk_cast` remembers a cast TO a primitive by itself; this one goes
+        // the other way (`t.Ticks` is `(i64) t`), so it is remembered here --
+        // the same node a source may not write (§ 3).
         if (kind == TK_PMCTOR) return tk_cast(pmr_ret_at(ri), a);
-        return tk_cast(pmr_ret_at(ri), recv);
+        i64 idn = tk_cast(pmr_ret_at(ri), recv);
+        tk_prim_own_cast(idn);
+        return idn;
     }
     tk_prim_need_include(ty, sym, line, fl);
     i64 list = 0;
     if (recv != 0) list = tk_prim_raw(recv);
-    if (a != 0) list = list_append(list, a);
+    // `a` is already a LIST of converted arguments: appending its head links
+    // the whole chain behind the receiver, in the order the source wrote it.
+    if (a != 0) {
+        if (list == 0) list = a;
+        else           list = list_append(list, a);
+    }
     tk_line = line;
     tk_file = fl;
     return tk_prim_ret(pmr_ret_at(ri), tk_call(sym, list));
@@ -362,6 +495,7 @@ i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
     i64 ri = tk_prim_find(ty, m);
     if (ri < 0) tk_prim_no_static(ty, m, line, fl);
     i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMSOON) tk_prim_not_yet(ty, m, line, fl);
     if (kind == TK_PMPROP || kind == TK_PMFUN) tk_prim_is_instance(ty, m, line, fl);
     if (kind == TK_PMCTOR) tk_prim_no_static(ty, m, line, fl);
     i64 args = 0;
@@ -373,7 +507,7 @@ i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
     }
     else if (p_id() == K_LPAR)
         err_at2(fl, line, "teko: the member is a property; it is not called", m);
-    return tk_prim_emit(ri, 0, args, na, 0, line, fl);
+    return tk_prim_emit(tk_prim_pick(ty, m, na, line, fl), 0, args, 0, line, fl);
 }
 
 i64 tk_prim_expr() {
@@ -416,7 +550,7 @@ i64 tk_prim_new(i64 ty, i64 line, uptr fl) {
         tk_file = fl;
         return tk_cast(ty, tk_int(0));
     }
-    return tk_prim_emit(ri, 0, args, na, 0, line, fl);
+    return tk_prim_emit(tk_prim_pick(ty, "new", na, line, fl), 0, args, 0, line, fl);
 }
 
 // ---- `x.member`, the instance side, at PARSE time ----
@@ -426,6 +560,7 @@ i64 tk_prim_dot(i64 left, i64 ty, uptr m, i64 line, uptr fl) {
     i64 ri = tk_prim_find(ty, m);
     if (ri < 0) tk_prim_no_member(ty, m, line, fl);
     i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMSOON) tk_prim_is_static(ty, m, line, fl);
     if (kind == TK_PMSVAL || kind == TK_PMSFUN) tk_prim_is_static(ty, m, line, fl);
     if (kind == TK_PMCTOR) tk_prim_no_member(ty, m, line, fl);
     i64 args = 0;
@@ -439,7 +574,7 @@ i64 tk_prim_dot(i64 left, i64 ty, uptr m, i64 line, uptr fl) {
             err_at2(fl, line, "teko: the member is a property; it is not called", m);
         if (p_id() == K_ASSIGN) tk_prim_readonly(ty, m, line, fl);
     }
-    return tk_prim_emit(ri, left, args, na, 0, line, fl);
+    return tk_prim_emit(tk_prim_pick(ty, m, na, line, fl), left, args, 0, line, fl);
 }
 
 // ---- ...and at PASS time, for a receiver only the oracle could type ----
@@ -457,6 +592,7 @@ i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown) {
     i64 ri = tk_prim_find(ty, m);
     if (ri < 0) tk_prim_no_member(ty, m, line, fl);
     i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMSOON) tk_prim_is_static(ty, m, line, fl);
     if (kind == TK_PMSVAL || kind == TK_PMSFUN) tk_prim_is_static(ty, m, line, fl);
     if (kind == TK_PMCTOR) tk_prim_no_member(ty, m, line, fl);
     if (kind == TK_PMFUN && form != TK_PCALL)
@@ -469,10 +605,71 @@ i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown) {
         args = pd_arg_at(pi);
         na = pd_na_at(pi);
     }
-    st64(pty, pmr_ret_at(ri));
+    i64 pick = tk_prim_pick(ty, m, na, line, fl);
+    st64(pty, pmr_ret_at(pick));
     st64(ppure, 0);
     st64(pown, TK_OWNED);
-    return tk_prim_emit(ri, pd_recv_at(pi), args, na, 1, line, fl);
+    return tk_prim_emit(pick, pd_recv_at(pi), args, 1, line, fl);
+}
+
+// ---- the cast written BY HAND (§ 3), read by teko_ops.tk's own pass ----
+// A primitive converts to nothing but itself (§ 5), and a cast is the one
+// syntax that would say otherwise. `(i64) dt` is not a conversion at all: it
+// hands back the raw eight bytes, `Kind` bits included, which for a `Local`
+// date is a NEGATIVE number and never the tick count the writer meant --
+// exactly the silently wrong result this project refuses to ship. `(DateTime)
+// n` is its mirror: an integer that skipped every range check
+// `new DateTime(t)` makes.
+//
+// So both are refused where they are written, and the compiler's own identity
+// casts -- which are the same two nodes -- are told apart by the list above.
+// The check runs in the OPERATOR pass, which walks every node of every body
+// after the oracle has typed them and after every lowering has put its own
+// casts in the tree.
+void tk_prim_cast_check(i64 n) {
+    i64 tty = nd_type(n);
+    i64 ety = tk_ty_of(nd_a(n));
+    if (!tk_prim_is(tty) && !tk_prim_is(ety)) return;
+    if (tk_prim_own_cast_is(n)) return;
+    i64 pty = tty;
+    if (!tk_prim_is(pty)) pty = ety;
+    uptr nm = tk_prim_name(pty);
+    err_at(nd_file(n), nd_line(n),
+           tk_join3(tk_join3("teko: a ", nm, " does not cast; `.Ticks` reads it and `new "),
+                    nm, "(...)` builds it"));
+}
+
+// ...and the same check over what a BODY walk never reaches. `tk_ty_pass_walk`
+// (teko_typeof.tk) walks the inside of functions, because that is where a
+// scope exists; a global's own initializer is written outside every one of
+// them, and `DateTime g = (DateTime) 5;` would otherwise be the one spelling
+// that got through. The walk here is this file's own and looks for nothing but
+// a cast: it must not register a scope entry for a global, which is why it does
+// not reuse the pass walker.
+void tk_prim_cast_walk(i64 n) {
+    loop {
+        if (n == 0) break;
+        if (nd_kind(n) == N_CAST) tk_prim_cast_check(n);
+        tk_prim_cast_walk(nd_a(n));
+        tk_prim_cast_walk(nd_b(n));
+        tk_prim_cast_walk(nd_c(n));
+        tk_prim_cast_walk(nd_d(n));
+        n = nd_next(n);
+    }
+}
+
+void tk_prim_cast_globals(i64 root) {
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) != N_FUNC) {
+            tk_prim_cast_walk(nd_a(f));
+            tk_prim_cast_walk(nd_b(f));
+            tk_prim_cast_walk(nd_c(f));
+            tk_prim_cast_walk(nd_d(f));
+        }
+        f = nd_next(f);
+    }
 }
 
 // ---- the operators (§ 4), read by teko_ops.tk's own pass ----

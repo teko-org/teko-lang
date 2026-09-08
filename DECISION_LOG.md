@@ -1051,3 +1051,102 @@ byte-identical to `03189d92`; `FIXPOINT OK` (`teko2.o == teko3.o` on the first t
 predicted exactly that for the two that must not move. Thirty-two refusal probes and eleven
 run-time probes outside `tests/` (`build/refuse/*`, `build/panic/*`, not committed) prove
 every message and every panic this entry names, each with its exact text and exit code.
+
+### D41 · `DateTime`, the calendar, and the cast a source may not write (2026-09-08)
+`docs/specs/datetime.md`'s **C2**, the sixth crumb of the numeric-types sequence
+([`docs/specs/README.md`](docs/specs/README.md)) and the second primitive on D40's lowering
+table. No new module and no new pass: `teko_time.tk` grows the registrations,
+`teko_prim.tk` the three mechanism additions below, `lib/time.tk` the calendar, and
+`teko_array.tk`/`teko_ops.tk`/`teko_typeof.tk` one line each.
+
+**`DateTime` is C#'s, bits included.** `type_new("DateTime", 8, 8, TK_SINT)`, the ticks
+since `0001-01-01 00:00:00` in bits 0..61 and the `Kind` in bits 62..63 — C#'s own
+`dateData` packing, which the maximum tick value (`3155378975999999999`, 62 bits) leaves
+room for. It is kept OUT of `tk_is_int_ty` like `TimeSpan`, so it converts to nothing and
+nothing converts to it. **The raw value is not the tick count**, and that one fact decides
+the rest of this entry: a `Local` date is a NEGATIVE `i64`, so `.Ticks` is a call (where
+`TimeSpan.Ticks` is the identity cast), every comparison is a call that masks the two bits
+off, and the hand-written cast C1 left accepted had to be refused here. `DateTimeKind` is
+`type_alias("DateTimeKind", ty_i32)` plus a three-value handler, the spec's own § 1 shape;
+now that `enum` is taught (D39), turning it into one is N2c and a pure tightening.
+
+**The calendar is the proleptic Gregorian one, computed as C# computes it**, in
+`lib/time.tk` and in nothing else: the 400/100/4-year walk of `GetDatePart` with C#'s two
+`== 4` corrections, and the cumulative month table written as a FUNCTION of ifs rather than
+as the `const i64` array the spec's § 6 names — teko has no `const` array (`const i64 M[] =
+{...}` is `expected = after const`), and a mutable global table in a library is state a
+program can clobber. Every field is checked where a date is built, and a date that does not
+exist panics (`teko: a date does not exist`, exit 70): `new DateTime(2023, 2, 29)` is the
+fixture.
+
+**Six decisions the spec did not take, each C#'s own answer where C# has one:**
+
+1. **`AddDays`/`AddHours`/`AddMinutes`/`AddSeconds`/`AddMilliseconds` take an `f64` and
+   round to the nearest MILLISECOND**, which is C#'s `DateTime.Add(double, int)` to this
+   day — deliberately unlike `TimeSpan.From*`, which .NET 7 changed to full precision and
+   D40 followed. Two neighbouring functions with two roundings is C#'s own shape, not an
+   inconsistency this port invented. `AddTicks`, `AddMonths` and `AddYears` take whole
+   counts, and `AddMonths` clamps the day to the length of the target month
+   (`2024-01-31 + 1 month` is `2024-02-29`), with C#'s own ±120000 and ±10000 bounds.
+2. **`DateTime.UnixEpoch` carries `Kind` `Utc`**, as C# declares it; `.Ticks` still answers
+   `621355968000000000` because it masks. The arithmetic KEEPS the `Kind` it started from
+   and the comparisons IGNORE it, which is C#'s `Compare`.
+3. **`.Kind` answers `ty_i32`**, the id the alias resolves to, and the three constants are
+   ordinary calls (`tk_dtk_utc()` and its two siblings) rather than folded literals — D40's
+   own rule that every symbol in the surface has a body.
+4. **`DateTime.Now`, `UtcNow` and `Today` are refused BY NAME** through a new row kind,
+   `TK_PMSOON`: `teko: DateTime.Now is not taught yet`. The wall clock is `mc`'s to give
+   (§ 8/§ 14) and the ask stands; a row is what keeps the site from reading as an unknown
+   member.
+5. **`SpecifyKind` and `Subtract` are NOT taught** ([not-yet.md](docs/reference/not-yet.md)).
+   Both need a row whose parameters differ from each other in TYPE — a `DateTime` beside a
+   `DateTimeKind`, two overloads of one arity — and the row carries one parameter type and a
+   count (below). `SpecifyKind(d, k)` is `new DateTime(d.Ticks, k)` and `Subtract` is `-`.
+6. **The fixtures are two**, `tests/surface_datetime.tk` (42, 106 assertions) and
+   `tests/surface_datetime_panic.tk` (70), named for the `surface_*` family the repository
+   uses, rather than § 11's five older names.
+
+**Three additions to the mechanism, all in `teko_prim.tk`:**
+
+- **A member row's parameter list is a COUNT and ONE type.** `new DateTime(y, m, d)` is
+  three integers, `TimeSpan.FromHours(x)` one float; no member this table carries mixes
+  parameter types, and the day one does, that column becomes a list and nothing else moves.
+  **Rows of one name and different counts are the overload set of that name** —
+  `new DateTime(...)` is five rows and the site picks by how many arguments it wrote.
+- **`TK_PMSOON`**, decision 4 above.
+- **The list that tells a compiler-written cast from a hand-written one.** `(i64) dt` and
+  `(DateTime) n` are refused in the surface (§ 3) — the first answers the raw bits, `Kind`
+  included, and the second is an integer that skipped every range check — and the compiler
+  writes those very two nodes in every lowering. A MARK on the node was not available:
+  `--dump-ast` prints every field a node has, so marking would move the dump of code that
+  did not change. So `tk_cast` (teko_array.tk) records the casts it builds TOWARD a
+  primitive, `tk_prim_raw` the ones it builds AWAY from one, and `tk_prim_cast_check`
+  refuses every other cast touching a primitive. Two subtleties are load-bearing: a node
+  replaced in place (`node_assign`) keeps the PLACEHOLDER's index, so the deferred `.`
+  (teko_typeof.tk) and the operator rewrite (teko_ops.tk) hand the record over
+  (`tk_prim_own_cast_moved`); and the check rides the operator pass's walk, which covers
+  function bodies only, so a second small walk covers a global's own initializer. The
+  message is composed from the type name — ``teko: a DateTime does not cast; `.Ticks` reads
+  it and `new DateTime(...)` builds it`` — because the refusal belongs to every primitive
+  and not to dates alone; the spec's § 3 wording was `DateTime`-specific. The ceiling is
+  `TK_MAXPRIMC` 4096 casts per unit, the mechanism's fourth capacity message.
+
+**What C1 listed as accepted and is now refused:** `(i64) t` and `(TimeSpan) n` written by
+hand. That row of [not-yet.md](docs/reference/not-yet.md) is gone, which was C1's own plan
+(D40 § 5) and the reason it waited for the type whose bits make the cast wrong.
+
+Proof: `mc build . --config mc.macos.toml` clean on mc **0.15.23** (`MC_VERSION`);
+**51/51** fixtures at their `expect-exit` (the 49 existing plus the two new ones);
+`--dump-ast` of the 47 fixtures that do not include `lib/time.tk` byte-identical to
+`c13d7d84`, and the two that DO include it different only by INSERTION — the new library
+functions, zero deleted and zero changed lines, which is the file growing and not the
+accepted code moving; `FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm`
+diff empty over 205653 lines, 51/51 under the self-hosted `teko1`);
+`sh scripts/check-docs.sh` green (466 links, 356 diagnostics, 95 samples) — a first run
+reported `docs/reference/types.md` line 88 failing, which was the unpinned `mc` on the PATH
+(0.15.18, the `fa_cast` D37 fixed) building the sample; with the pinned 0.15.23 the sample
+passes on `c13d7d84` and on this branch alike; `mc limits . --config
+mc.macos.toml` verdict `ok`, `types` `10` → `11` and `alias` `17` → `19` (the `type_new`
+plus `DateTimeKind`'s `type_alias`), `syntax` `15`, `passes` `15/30` and `intrin` `8/16`
+**unmoved**. Thirty-two refusal probes outside `tests/` (`build/refuse/*`, not committed)
+prove every message this entry names with its exact text and exit code.

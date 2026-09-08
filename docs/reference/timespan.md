@@ -14,9 +14,9 @@ Everything on this page needs one include:
 A program that names `TimeSpan` without it is refused where the type word is used —
 `teko: TimeSpan needs #include "time.tk" before it is used` — rather than at the link.
 
-`DateTime` is [designed and not built](../specs/datetime.md); so are `TimeSpan.Parse`,
-`.ToString()` and the two operators listed at the bottom of this page
-([not-yet.md](not-yet.md)).
+[`DateTime`](datetime.md) is the other half of the same page and the same include.
+`TimeSpan.Parse`, `.ToString()` and the two operators listed at the bottom of this page are
+[not built](not-yet.md).
 
 ---
 
@@ -87,6 +87,13 @@ reference in a `TimeSpan` slot is `teko: a value of type i64 does not convert to
 and its siblings. The two spellings that DO cross are `.Ticks` (out) and
 `new TimeSpan(ticks)` (in), and both are free: the same eight bytes under the other type,
 with no instruction between them.
+
+**A cast does not cross either.** `(i64) t` and `(TimeSpan) n` written by hand are refused
+where they stand — ``teko: a TimeSpan does not cast; `.Ticks` reads it and `new
+TimeSpan(...)` builds it`` — so that the two spellings above are the only ones. The
+compiler writes that very cast in the lowering and knows its own
+([datetime.md](datetime.md) has the reason it matters: the raw bits of a `DateTime` are not
+its ticks).
 
 The nine slots this holds in are the nine [types.md](types.md#f32-and-f64) lists: an
 initializer, an assignment, a `return`, an argument of a free, method, virtual or
