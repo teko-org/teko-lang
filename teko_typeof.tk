@@ -184,6 +184,10 @@ i64 tk_ty_of(i64 n);
 // one node rule 1 does not judge -- a `null` this project wrote itself.
 i64 tk_nl_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown);
 i64 tk_nl_own_null_is(i64 n);
+// ...and, since Q1b, the two halves of the BOX: the verdict a value gets when
+// the slot is a nullable over a value type, and the wrap that writes the box.
+void tk_nl_check_value(i64 tty, i64 ti, i64 ety, i64 en, i64 line, uptr fl);
+i64 tk_nl_wrap(i64 tty, i64 ety, i64 e);
 
 // A composite expression answers by the CORE's own rule, the one codegen will
 // apply to the very same node (mc/src/gen_resolve.mc, res_binary and res_expr's
@@ -336,6 +340,16 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
         return;
     }
     if (ety < 0) return;
+    // Q1b (docs/specs/nullable.md § 4): a slot declared `T?` over a VALUE
+    // takes what `T` itself takes -- `i64? n = 5;`, `f64? x = 5;`,
+    // `Color? c = Color.Red;` -- and refuses everything else under the
+    // NULLABLE's own name, which is the slot the source actually wrote. The
+    // reference arm owns no clause here: its handle IS the pointer, so the row
+    // check does answer it.
+    if (tk_is_nl(ti) && tk_nl_boxes(nl_of_at(ti))) {
+        tk_nl_check_value(tty, ti, ety, en, line, fl);
+        return;
+    }
     if (type_kind(ety) == TK_FLOAT && type_kind(tty) != TK_FLOAT)
         tk_reject_compat(type_name(ety), type_name(tty), line, fl);
     if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT) {
@@ -422,6 +436,10 @@ void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     i64 ti = tk_struct_by_ty(tty);
     if (ti < 0) return;
     if (tk_is_null_lit(en)) return;
+    // Q1b: a boxed `T?` slot was judged in full above, by TYPE -- the row
+    // question below would ask about `i64`, which names no row, and would
+    // refuse the very value the slot takes.
+    if (tk_is_nl(ti) && tk_nl_boxes(nl_of_at(ti))) return;
     if (ety < 0) return;
     if (tty == ety) return;
     i64 ei = tk_struct_by_ty(ety);
@@ -443,7 +461,9 @@ i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     i64 vty = tk_pty_of(v);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
-    return tk_num_widen(fty, vty, v);
+    // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,
+    // the same way the widening beside it writes the float conversion.
+    return tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, v));
 }
 
 // ---- the walk a pass drives ----

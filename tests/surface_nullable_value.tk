@@ -1,0 +1,442 @@
+// surface_nullable_value.tk -- `T?` over a VALUE (Q1b,
+// docs/specs/nullable.md): the same one nullable mechanism, over `i64`,
+// `f64`, `i8`...`u64`, `bool`, `char`, an `enum`, `TimeSpan` and `DateTime`.
+// The handle still is a pointer and `null` still is 0, but what it points at
+// is an IMMUTABLE COUNTED BOX -- the object shape a `T[]` of heap already has
+// -- so every position a nullable travels through is a counted one the
+// reclaim already knew, with no rule of lifetime added anywhere.
+//
+// What each helper proves, in order:
+//
+//   1. `declcheck`  -- `i64? n;` is `i64? n = null;`; a store, and a second
+//                      store that gives the first box back; `== null`,
+//                      `!= null`, `HasValue`, `Value`, `GetValueOrDefault()`;
+//   2. `widthcheck` -- every width and both register files through the
+//                      payload at `+24`: `i8` negative (sign extended),
+//                      `i16`, `u8`, `i32`, `u64`, `bool`, `char`, `f64`,
+//                      and an integer widened into an `f64?`;
+//   3. `enumcheck`  -- `enum?` at three underlying widths, `i32`, `u8`
+//                      and a signed `i8`;
+//   4. `primcheck`  -- `TimeSpan?` and `DateTime?`, the raw eight bytes in
+//                      and the primitive's own type back out;
+//   5. `valuecheck` -- value semantics out of immutability: `b = a; b = 7;`
+//                      leaves `a` at its own value, and so does a box handed
+//                      to a function that stores over its own parameter;
+//   6. `fieldcheck` -- an `i64? count` field: zeroed to null, written,
+//                      overwritten, and released with the object;
+//   7. `arrcheck`   -- `i64?[]`, an array whose ELEMENT is a box: `new` zeroes
+//                      them, a store boxes, `null` goes back in, and the
+//                      array's own release walks the elements;
+//   8. `sigcheck`   -- `T?` as a parameter and a return, on a free function,
+//                      through an interface row and through a virtual call;
+//   9. `overcheck`  -- `pick(i64)` beside `pick(i64?)`: a literal and a value
+//                      pick the bare one, `null` picks the nullable one;
+//  10. `pmcheck`    -- `params i64?[]`, with a null element and real ones;
+//  11. `capcheck`   -- a box captured by value: the closure holds its own
+//                      reference, and the box outlives the declaring scope;
+//  12. `refcheck`   -- `ref i64?` and `out i64?`, written by the callee;
+//  13. `propcheck`  -- an `i64?` property, read and written;
+//  14. `rccheck`    -- the reclaim: `rt_live()` back to its floor after every
+//                      shape above, and `rt_peak()` FLAT across a churning
+//                      loop, because a 32-byte box comes straight back to the
+//                      32-byte free list.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+#include "../lib/time.tk"
+
+enum Color { Red, Green, Blue }
+enum Level : u8 { Low = 1, High = 200 }
+enum Signed : i8 { Down = 0 - 5, Up = 5 }
+
+public delegate i64 Get();
+
+// ---- 1. the declaration, the two tests, and the three members ----
+
+i64 declcheck() {
+    i64? n;                                       // no initializer: the slot is null
+    if (n != null) return 1;
+    if (n.HasValue) return 2;
+    if (n.GetValueOrDefault() != 0) return 3;
+
+    n = 5;                                        // ...and a value goes in the same slot
+    if (n == null) return 4;
+    if (!n.HasValue) return 5;
+    if (n.Value != 5) return 6;
+    if (n.GetValueOrDefault() != 5) return 7;
+
+    n = 7;                                        // a second store: a fresh box
+    if (n.Value != 7) return 8;
+    if (n.Value + 1 != 8) return 9;               // ...and the payload is an ordinary i64
+
+    i64? empty = null;                            // the explicit spelling
+    if (empty != null) return 10;
+    return 0;
+}
+
+// ---- 2. every width, and both register files ----
+
+i64 widthcheck() {
+    i8? a = 0 - 5;                                // a signed narrow load, sign extended
+    if (a.Value != 0 - 5) return 1;
+    i16? b = 0 - 300;
+    if (b.Value != 0 - 300) return 2;
+    u8? c = 200;
+    if (c.Value != 200) return 3;
+    i32? d = 0 - 70000;
+    if (d.Value != 0 - 70000) return 4;
+    u64? e = 9;
+    if (e.Value != 9) return 5;
+    bool? f = true;
+    if (!f.Value) return 6;
+    bool? g = false;
+    if (g.Value) return 7;
+    if (!g.HasValue) return 8;                    // false is a VALUE, not an absent one
+    char? h = 'z';
+    if (h.Value != 'z') return 9;
+    f64? i = 2.5;                                 // the other register file
+    if (i.Value != 2.5) return 10;
+    if (i.Value * 2.0 != 5.0) return 11;
+    f64? j = 5;                                   // an integer widened, then boxed
+    if (j.Value != 5.0) return 12;
+    i8? k = null;
+    if (k.GetValueOrDefault() != 0) return 13;
+    f64? l = null;
+    if (l.GetValueOrDefault() != 0.0) return 14;
+    return 0;
+}
+
+// ---- 3. an `enum?`, at three underlying widths ----
+
+i64 enumcheck() {
+    Color? a = Color.Blue;
+    if (a.Value != Color.Blue) return 1;
+    Level? b = Level.High;                        // u8 underneath
+    if (b.Value != Level.High) return 2;
+    Signed? c = Signed.Down;                      // i8 underneath, and negative
+    if (c.Value != Signed.Down) return 3;
+    Color? d = null;
+    if (d != null) return 4;
+    if (d.GetValueOrDefault() != Color.Red) return 5;
+    return 0;
+}
+
+// ---- 4. a primitive with members ----
+
+i64 primcheck() {
+    TimeSpan? a = TimeSpan.FromHours(2.0);
+    if (a.Value.Ticks != 72000000000) return 1;
+    if (a.Value.Hours != 2) return 2;             // ...and a member through it
+    DateTime? b = new DateTime(1000);
+    if (b.Value.Ticks != 1000) return 3;
+    TimeSpan? c = null;
+    if (c.GetValueOrDefault().Ticks != 0) return 4;
+    return 0;
+}
+
+// ---- 5. value semantics, out of immutability ----
+
+i64 spend(i64? n) {
+    i64? mine = 100;                              // a box of its own; the caller's stands
+    return mine.Value + n.Value;
+}
+
+i64 valuecheck() {
+    i64? a = 5;
+    i64? b = a;                                   // the same box, and it never changes
+    b = 7;                                        // ...so this is a NEW box
+    if (a.Value != 5) return 1;
+    if (b.Value != 7) return 2;
+
+    if (spend(a) != 105) return 3;
+    if (a.Value != 5) return 4;
+
+    i64?[] ns = new i64?[2];
+    ns[0] = a;                                    // the same box in a second slot
+    a = 9;                                        // ...and a store into `a` leaves it be
+    if (ns[0].Value != 5) return 5;
+    if (a.Value != 9) return 6;
+    return 0;
+}
+
+// ---- 6. a field of value-nullable type ----
+
+class Holder {
+    public i64? count;
+    public TimeSpan? span;
+
+    public Holder() { }
+}
+
+i64 fieldcheck() {
+    Holder h = new Holder();
+    if (h.count != null) return 1;                // the zeroed field is null
+    h.count = 5;
+    if (h.count.Value != 5) return 2;
+    h.count = 6;                                  // the old box is released at the store
+    if (h.count.Value != 6) return 3;
+    h.count = null;
+    if (h.count != null) return 4;
+
+    h.span = TimeSpan.FromHours(1.0);
+    if (h.span.Value.Ticks != 36000000000) return 5;
+    return 0;
+}
+
+// ---- 7. `i64?[]`, an array of boxes ----
+
+i64 arrcheck() {
+    i64?[] ns = new i64?[3];
+    if (ns.Length != 3) return 1;
+    if (ns[0] != null) return 2;                  // `new T[n]` zeroes the elements
+    ns[0] = 1;
+    ns[2] = 3;
+    if (ns[0].Value + ns[2].Value != 4) return 3;
+    ns[0] = null;                                 // ...and null goes back in
+    if (ns[0] != null) return 4;
+
+    i64 t = 0;
+    foreach (i64? e in ns) {
+        if (e != null) t = t + e.Value;
+    }
+    if (t != 3) return 5;
+    return 0;
+}
+
+// ---- 8. a parameter, a return, an interface row and a virtual call ----
+
+i64? twice(i64? n) {
+    if (n == null) return null;
+    return n.Value * 2;
+}
+
+interface IBump {
+    i64? bump(i64? n);
+}
+
+class Bumper : IBump {
+    public i64? bump(i64? n) {
+        if (n == null) return null;
+        return n.Value + 1;
+    }
+}
+
+class Base {
+    public virtual i64? one(i64? n) { return n; }
+}
+
+class Derived : Base {
+    public override i64? one(i64? n) { return n.Value + 100; }
+}
+
+i64 sigcheck() {
+    if (twice(4).Value != 8) return 1;            // implicit at the argument
+    if (twice(null) != null) return 2;
+
+    IBump ib = new Bumper();
+    if (ib.bump(1).Value != 2) return 3;          // through an interface row
+    if (ib.bump(null) != null) return 4;
+
+    Base b = new Derived();
+    if (b.one(1).Value != 101) return 5;          // ...and through a vtable slot
+    return 0;
+}
+
+// ---- 9. the overloads ----
+
+i64 pick(i64 n) {
+    return 1;
+}
+
+i64 pick(i64? n) {
+    if (n == null) return 3;
+    return 2;
+}
+
+i64 overcheck() {
+    if (pick(1) != 1) return 1;                   // a literal takes the bare signature
+    i64 k = 4;
+    if (pick(k) != 1) return 2;                   // ...and so does a value of that type
+    i64? q = 4;
+    if (pick(q) != 2) return 3;                   // a nullable takes the nullable one
+    if (pick(null) != 3) return 4;                // ...and so does `null`
+    return 0;
+}
+
+// ---- 10. `params i64?[]` ----
+
+i64 total(params i64?[] xs) {
+    i64 t = 0;
+    i64 i = 0;
+    loop {
+        if (i >= xs.Length) break;
+        if (xs[i] != null) t = t + xs[i].Value;
+        i = i + 1;
+    }
+    return t;
+}
+
+i64 pmcheck() {
+    if (total(1, 2, null, 4) != 7) return 1;
+    if (total(null, null) != 0) return 2;
+    if (total() != 0) return 3;
+    return 0;
+}
+
+// ---- 11. a box captured by a closure ----
+
+i64 capcheck() {
+    i64 floor = rt_live();
+    {
+        Get f;
+        {
+            i64? n = 5;
+            f = new Get(() use (n) => n.Value);
+            if (f() != 5) return 1;
+        }                                         // the box's own slot closes here
+        if (rt_live() != floor + 2) return 2;     // the closure keeps the box alive
+        if (f() != 5) return 3;
+    }                                             // ...and the closure's closes here
+    if (rt_live() != floor) return 4;
+    return 0;
+}
+
+// ---- 12. `ref i64?` and `out i64?` ----
+
+void fill(ref i64? n) {
+    n = 9;
+}
+
+void clear(ref i64? n) {
+    n = null;
+}
+
+void give(out i64? n) {
+    n = 8;
+}
+
+i64 refcheck() {
+    i64? n = null;
+    fill(ref n);
+    if (n.Value != 9) return 1;
+    clear(ref n);
+    if (n != null) return 2;
+
+    i64? m;
+    give(out m);
+    if (m.Value != 8) return 3;
+    return 0;
+}
+
+// ---- 13. a property of value-nullable type ----
+
+class Meter {
+    public i64? Reading { get; set; }
+
+    public Meter() { }
+}
+
+i64 propcheck() {
+    Meter m = new Meter();
+    if (m.Reading != null) return 1;
+    m.Reading = 5;
+    if (m.Reading.Value != 5) return 2;
+    m.Reading = null;
+    if (m.Reading != null) return 3;
+    return 0;
+}
+
+// ---- 14. the reclaim: the box is an object like any other ----
+
+i64 rccheck() {
+    i64 floor = rt_live();
+
+    {
+        i64? n = null;                            // a null handle owns nothing
+        if (rt_live() != floor) return 1;
+        n = 5;
+        if (rt_live() != floor + 1) return 2;     // `i64? n = 5;` ALLOCATES
+        n = 6;                                    // a fresh box, the old one released
+        if (rt_live() != floor + 1) return 3;
+    }                                             // the block closes: released
+    if (rt_live() != floor) return 4;
+
+    {
+        Holder h = new Holder();                  // the object + one box
+        h.count = 1;
+        if (rt_live() != floor + 2) return 5;
+        h.count = null;                           // the field's own box goes back
+        if (rt_live() != floor + 1) return 6;
+    }
+    if (rt_live() != floor) return 7;
+
+    {
+        i64?[] ns = new i64?[2];                  // the array + one live element
+        ns[0] = 1;
+        if (rt_live() != floor + 2) return 8;
+    }                                             // the array's release walks them
+    if (rt_live() != floor) return 9;
+
+    if (twice(4).Value != 8) return 10;           // a temporary, parked and swept
+    if (rt_live() != floor) return 11;
+
+    i64 peak = rt_peak();
+    i64 i = 0;
+    loop {                                        // a churn: one block, reused forever
+        if (i >= 10000) break;
+        i64? churn = i;
+        if (churn.Value != i) return 12;
+        i = i + 1;
+    }
+    if (rt_peak() != peak) return 13;
+    if (rt_live() != floor) return 14;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = declcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = widthcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = enumcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = primcheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = valuecheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = fieldcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = arrcheck();
+    if (bad != 0) return 90 + bad;
+
+    bad = sigcheck();
+    if (bad != 0) return 100 + bad;
+
+    bad = overcheck();
+    if (bad != 0) return 110 + bad;
+
+    bad = pmcheck();
+    if (bad != 0) return 120 + bad;
+
+    bad = capcheck();
+    if (bad != 0) return 130 + bad;
+
+    bad = refcheck();
+    if (bad != 0) return 140 + bad;
+
+    bad = propcheck();
+    if (bad != 0) return 150 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 160 + bad;
+
+    if (rt_live() != 0) return 200;
+    return 42;
+}

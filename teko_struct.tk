@@ -649,6 +649,19 @@ i64 tk_struct_by_ty(i64 ty) {
     return tk_fwd_row_by_ty(ty);
 }
 
+// 1 when `T?` over `ty` needs the counted BOX (Q1b, docs/specs/nullable.md
+// § 2): `ty` is a VALUE -- a scalar the machine carries in a register (`i64`,
+// `f64`, `bool`, `char`, `i8`...), an `enum`, or a primitive with members
+// (`TimeSpan`, `DateTime`) -- rather than a REFERENCE, whose own pointer IS
+// the handle and needs no box at all. The question is asked by row: everything
+// that has one is a reference (a class, an interface, a delegate, a `T[]`, a
+// `struct`) except an `enum`, which is a value whatever row it occupies (D39).
+i64 tk_nl_boxes(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    if (si < 0) return 1;
+    return tk_is_enum(si);
+}
+
 // 1 when a value of type `ty` is a COUNTED reference: a class, an interface, a
 // delegate or a T[] of heap (K3), whose object carries the vtable and the
 // count the reclaim works through. A struct is not one -- it has no vtable,
@@ -661,7 +674,13 @@ i64 tk_is_counted(i64 ty) {
     // null handle is 0 -- which `rc_dec`/`rt_own` already treat as a no-op --
     // so a nullable row answers exactly what the row it encloses answers, and
     // the whole reclaim serves it with no line of its own.
-    if (tk_is_nl(si)) return tk_is_counted(nl_of_at(si));
+    // Q1b: ...and for a VALUE it is the counted BOX itself (`tk_nl_boxes`
+    // above), an object with the very shape a `T[]` of heap already has, so
+    // the reclaim serves the box arm with no line of its own either.
+    if (tk_is_nl(si)) {
+        if (tk_nl_boxes(nl_of_at(si))) return 1;
+        return tk_is_counted(nl_of_at(si));
+    }
     if (tk_is_class(si)) return 1;
     if (tk_is_deleg(si)) return 1;
     if (tk_is_ha(si)) return 1;
@@ -1056,9 +1075,15 @@ i64 tk_row_fits(i64 ti, i64 ei) {
     // two directions it does NOT answer are stated here rather than left to
     // fall through: `T?` fits no `T` (write `.Value`), and one nullable row
     // fits no other (no covariance between them).
+    // Q1b: a nullable over a VALUE encloses no row at all, so no row fits it
+    // -- a class in an `i64?` slot is refused here, and the value that DOES
+    // fit is judged by type rather than by row (`tk_nl_check_value`,
+    // teko_null.tk, reached from the scalar half of the same check).
     if (tk_is_nl(ti)) {
         if (tk_is_nl(ei)) return 0;
-        return tk_row_fits(tk_struct_by_ty(nl_of_at(ti)), ei);
+        i64 pi = tk_struct_by_ty(nl_of_at(ti));
+        if (pi < 0) return 0;
+        return tk_row_fits(pi, ei);
     }
     if (tk_is_nl(ei)) return 0;
     if (tk_is_ha(ti) || tk_is_deleg(ti)) return 0;

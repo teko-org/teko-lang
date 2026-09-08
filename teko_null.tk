@@ -1,12 +1,14 @@
-// teko_null.tk -- Q1a (docs/specs/nullable.md): `T?`, teko's one nullable
-// mechanism, over a REFERENCE -- a class, an interface, a delegate, a `T[]` of
-// heap and a `struct`. The value arm (`i64?`, `f64?`, an `enum?`, a primitive
-// with members) is Q1b's counted box and is refused here by name.
+// teko_null.tk -- Q1a/Q1b (docs/specs/nullable.md): `T?`, teko's one nullable
+// mechanism, over ANY type -- a class, an interface, a delegate, a `T[]` of
+// heap and a `struct` (Q1a, the reference arm), and `i64`, `f64`, `i8`...,
+// `bool`, `char`, an `enum`, `TimeSpan` and `DateTime` (Q1b, the box).
 //
 //   Cell? c = null;        Cell? c;            // the same slot: `?` is the
 //   c = new Cell(1);       c == null           //   licence to hold nothing
-//   Cell? p = obj;         c.HasValue          // `T` -> `T?` is implicit and
-//   Cell  h = c.Value;     Cell?[] cs          //   IDENTICAL: the same pointer
+//   Cell? p = obj;         c.HasValue          // `T` -> `T?` is implicit
+//   Cell  h = c.Value;     Cell?[] cs
+//   i64?  n = 5;           i64 k = n.Value;    // a VALUE: the box, and the
+//   n = 7;                 n.GetValueOrDefault()  //   typed payload read
 //
 // REPRESENTATION (§ 2). A `T?` value is a pointer-width handle whose `0` is
 // the absent value. For a reference `T` the handle IS `T`'s own pointer: no
@@ -16,6 +18,19 @@
 // `rc_dec(0)` and `rt_own(0)` are already no-ops over the null handle, and
 // that is the whole reason `tk_null` (teko_type.tk) was written as an `N_INT`
 // of 0 in the first place.
+//
+// For a VALUE `T` the handle points at an IMMUTABLE COUNTED BOX with the very
+// object shape a `T[]` of heap already has (`TK_NLOBJSIZE` below), and the one
+// invariant holds unchanged: the handle is a pointer, `0` is absent, and
+// `tk_is_counted` answers 1 -- so a `T?` field, element, argument, return,
+// temporary and capture are the counted ones the reclaim already knows, with
+// ZERO new rule of lifetime. Value semantics come from immutability: every
+// store into a `T?` slot builds a FRESH box (`tk_nl_wrap`), so `b = a; b = 7;`
+// leaves `a` at its own value, and there is no way to reach a payload's
+// address from the surface (`.Value` is not a slot). The honest cost, stated
+// rather than hidden: `i64? x = 5;` ALLOCATES, and `rt_live()` counts it --
+// tests/surface_nullable_value.tk asserts the number rather than arguing it,
+// and a 32-byte box comes straight back to the 32-byte free list.
 //
 // THE ROW. One row of teko_struct.tk's type table per distinct `T`, made
 // lazily the first time `T?` is spelled (`tk_nl_row`, there), kind `TK_KNULL`,
@@ -46,29 +61,65 @@
 // still reaches a non-nullable slot through a zeroed field, an element of
 // `new T[n]` and a `struct` declared without `new` (§ 9).
 //
-// `HasValue` AND `Value` (§ 6). `x.HasValue` is `x != 0`, typed `i64`, and
-// allocates nothing. `x.Value` is `tk_nl_ck(x)` -- the guard, then the same
-// pointer -- and `tk_nl_ck` is GENERATED, once per unit that spells `.Value`,
-// rather than written into `lib/rt.tk`: everything in `lib/rt.tk` is parsed
-// into every program that includes it, so a function added there moves the
-// `--dump-ast` of every fixture, and this crumb's own gate is that the
-// fixtures which spell no `?` do not move at all. `GetValueOrDefault()` is
-// refused on a reference nullable on purpose (§ 6): C#'s answer is
-// `default(T)`, which for a reference is `null`, and handing a `null` to a `T`
-// slot is exactly what this crumb exists to stop.
+// `HasValue`, `Value` AND `GetValueOrDefault()` (§ 6). `x.HasValue` is
+// `x != 0`, typed `i64`, and allocates nothing. `x.Value` is `tk_nl_ck(x)` --
+// the guard, then the same pointer for a reference and `tk_ld(T, ... + 24)`
+// for a value. `x.GetValueOrDefault()` is the payload read through one address
+// that is the box's own or eight zero bytes, and it is refused on a REFERENCE
+// nullable on purpose (§ 6): C#'s answer is `default(T)`, which for a
+// reference is `null`, and handing a `null` to a `T` slot is exactly what this
+// crumb exists to stop.
 //
-// WHAT THIS MODULE DOES NOT DO. `??` and `?.` are Q2, the counted box is Q1b,
-// definite assignment is Q3 and the lifted `==` is Q4a; each refused form is a
-// row of docs/reference/not-yet.md. No new pass, no new intrinsic, no change
-// to `mc`.
+// EVERYTHING THIS MODULE GENERATES IS GENERATED, never written into
+// `lib/rt.tk`: everything there is parsed into every program that includes it,
+// so a function added there moves the `--dump-ast` of every fixture, and this
+// crumb's own gate is that a fixture which spells no `?` does not move at all.
+// `tk_nl_ck`, the box's vtable, its release, its allocator, its per-payload
+// writer and `tk_nl_dflt` are emitted through `tk_top_emit`, once per unit
+// that needs each, the discipline `tkarr_release_T` (K3) already follows.
+//
+// WHAT THIS MODULE DOES NOT DO. `??` and `?.` are Q2, definite assignment is
+// Q3 and the lifted `==` is Q4a; each refused form is a row of
+// docs/reference/not-yet.md. No new pass, no new intrinsic, no change to `mc`.
 
 // teko_heaparr.tk is included after this file: `Cell?[]` reads the `?` here
 // and hands the rest of the position to the array handler, which is the one
 // place `[]` is read.
 i64 tk_ha_type(i64 ty);
 
+// teko_prim.tk is included after this file as well: a PRIMITIVE WITH MEMBERS
+// (`TimeSpan`, `DateTime`) travels through the box as its raw eight bytes,
+// with the compiler's own cast on the way out -- the same standing D40/D41
+// gives every other lowering over one, so `tk_prim_cast_check` never mistakes
+// it for a cast a source wrote.
+i64 tk_prim_is(i64 ty);
+i64 tk_prim_ret(i64 ret, i64 call);
+
 i64 tk_nl_quest = 0;                   // the `?` lexeme, shared with the ternary's
 i64 tk_nl_ck_gen = 0;                  // 1 once `tk_nl_ck` has been emitted
+i64 tk_nl_box_gen = 0;                 // 1 once the box's own runtime is emitted
+i64 tk_nl_dflt_gen = 0;                // 1 once `tk_nl_dflt` has been emitted
+
+// THE BOX (Q1b, docs/specs/nullable.md § 2), the same object shape a `T[]` of
+// heap already has (teko_heaparr.tk):
+//
+//   +0   vtable pointer  ->  { +0 &tk_nl_release, +8 0 }
+//   +8   reference count
+//   +16  the payload width, in bytes
+//   +24  the payload: type_width(T) bytes
+//
+// so `rc_dec` frees a box it knows nothing about through word 0 of the vtable,
+// exactly as it frees a class or an array, and ONE release serves every value
+// nullable there is: a box holds no reference -- a counted `T` never reaches
+// the box arm, since a counted `T` is already a pointer and takes the handle
+// itself -- so the release is `rt_free(p, 24 + ld64(p + 16))` and nothing else.
+#define TK_NLOBJSIZE 24                // vtable + count + width, before the payload
+#define TK_NLVTSIZE  16                // release + an unused itab word (the shape a
+                                       //   delegate's and an array's vtable share)
+#define TK_MAXNLBOX  32                // distinct payload types boxed in one unit
+
+i64 nl_box[TK_MAXNLBOX];               // the payload types whose writer is emitted
+i64 tk_nnlbox = 0;
 
 // ---- `null` the COMPILER wrote ----
 // Rule 1 is a rule about what a SOURCE may write. A placeholder this project
@@ -115,6 +166,178 @@ void tk_nl_ensure_ck() {
     tk_top_emit(tk_func(TY_UPTR, "tk_nl_ck", param_new(TY_UPTR, p), tk_blk(st)));
 }
 
+// ---- the box's own runtime, GENERATED (Q1b) ----
+// Everything in `lib/rt.tk` is parsed into every program that includes it, so
+// a function added there moves the `--dump-ast` of every fixture -- and this
+// crumb's gate is that a fixture spelling no value `?` does not move at all.
+// The box's runtime is therefore emitted through `tk_top_emit`, once per unit
+// that spells one, the discipline `tk_nl_ck` (Q1a) and `tkarr_release_T` (K3)
+// already follow.
+//
+//   u8   tk_nl_vt[16];
+//   void tk_nl_release(uptr p) { rt_free(p, 24 + ld64(p + 16)); }
+//   uptr tk_nl_new(i64 w) { uptr p = rt_alloc(24 + w); vtable/count/width; return p; }
+//
+// The vtable is filled on every allocation, idempotently, the same way a
+// `T[]`'s own allocator fills it -- a BSS global has no initializer.
+void tk_nl_ensure_new() {
+    if (tk_nl_box_gen) return;
+    tk_nl_box_gen = 1;
+    tk_top_emit(tk_glb(TY_U8, "tk_nl_vt", TK_NLVTSIZE));
+
+    uptr p = "p";
+    i64 size = tk_bin(K_ADD, tk_int(TK_NLOBJSIZE),
+                      tk_call("ld64", tk_bin(K_ADD, tk_id(p), tk_int(16))));
+    i64 rel = tk_stmt(tk_call2("rt_free", tk_id(p), size));
+    tk_top_emit(tk_func(TY_VOID, "tk_nl_release", param_new(TY_UPTR, p), tk_blk(rel)));
+
+    i64 nsz = tk_bin(K_ADD, tk_int(TK_NLOBJSIZE), tk_id("w"));
+    i64 st = tk_var(TY_UPTR, p, tk_call("rt_alloc", nsz));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id("tk_nl_vt"), tk_addr("tk_nl_release"))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id(p), tk_id("tk_nl_vt"))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_bin(K_ADD, tk_id(p), tk_int(8)), tk_int(1))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_bin(K_ADD, tk_id(p), tk_int(16)), tk_id("w"))));
+    st = list_append(st, tk_ret(tk_id(p)));
+    tk_top_emit(tk_func(TY_UPTR, "tk_nl_new", param_new(TY_I64, "w"), tk_blk(st)));
+}
+
+// the symbol that writes a box of payload type `pty`. A generated SYMBOL may
+// carry no `?`, so the payload's own mangled name is what it is built from
+// (`tk_ty_mangle_name`, teko_struct.tk), the rule `tkarr_new_T` already lives
+// by.
+uptr tk_nl_boxname(i64 pty) { return tk_join("tk_nl_box_", tk_ty_mangle_name(pty)); }
+
+// `T? tk_nl_box_T(T v) { uptr p = tk_nl_new(W); stW(p + 24, v); return p; }`
+// -- one per distinct PAYLOAD TYPE, for the exact reason `tkarr_put_T`
+// (teko_heaparr.tk) is one per element type: `v` has to be DECLARED at that
+// type, because a float travels in the machine's other register file and an
+// `i64` parameter never receives it, and because an `enum` or a primitive with
+// members reaching a numeric slot is refused by D34/D40's own clause. `tk_stn`
+// (teko_struct.tk) is the one table that picks `st8`/`st16`/`st32`/`st64`/
+// `stf32`/`stf64`, so no runtime helper is needed for any width.
+//
+// OWNERSHIP. The box is born with the count `tk_nl_new` wrote, and the return
+// hands that one reference to the caller: registering the returned name as
+// OWNED is what says so, the same registration `tkarr_new_T`'s own `return p`
+// carries -- without it the reclaim would increment a value on its way out of
+// a counted return and the box would never be freed.
+i64 tk_nl_box_fn(i64 si, i64 pty, uptr name) {
+    uptr p = "p";
+    i64 st = tk_var(TY_UPTR, p, tk_call("tk_nl_new", tk_int(type_width(pty))));
+    i64 slot = tk_bin(K_ADD, tk_id(p), tk_int(TK_NLOBJSIZE));
+    st = list_append(st, tk_stmt(tk_call2(tk_stn(pty), slot, tk_id("v"))));
+    i64 r = tk_id(p);
+    tk_xt_add(r, si, 1, TK_OWNED);
+    st = list_append(st, tk_ret(r));
+    return tk_func(sr_ty_at(si), name, param_new(pty, "v"), tk_blk(st));
+}
+
+void tk_nl_ensure_box(i64 pty) {
+    if (!tk_nl_boxes(pty)) return;                // a reference needs no box at all
+    tk_nl_ensure_new();
+    i64 i = 0;
+    loop {
+        if (i >= tk_nnlbox) break;
+        if (ld64(nl_box + i * 8) == pty) return;
+        i = i + 1;
+    }
+    if (tk_nnlbox == TK_MAXNLBOX)
+        err_at(tk_file, tk_line, "teko: too many nullable value types in one unit");
+    st64(nl_box + tk_nnlbox * 8, pty);
+    tk_nnlbox = tk_nnlbox + 1;
+    i64 si = tk_struct_by_ty(tk_nl_row(pty));
+    tk_top_emit(tk_nl_box_fn(si, pty, tk_nl_boxname(pty)));
+}
+
+// `uptr tk_nl_dflt(uptr p) { if (p == 0) return tk_nl_zero; return p + 24; }`
+// -- the ADDRESS `GetValueOrDefault()` reads its payload from, which is the
+// box's own bytes when there is one and eight zero bytes when there is not.
+// One function for every payload type there is: `default(T)` is all-zero bits
+// for every value teko has -- `0`, `0.0`, `false`, `'\0'`, the zero member of
+// an `enum`, a `TimeSpan` of no ticks -- so the typed load reads the default
+// with no per-type code and no branch of its own in the tree.
+void tk_nl_ensure_dflt() {
+    if (tk_nl_dflt_gen) return;
+    tk_nl_dflt_gen = 1;
+    tk_nl_ensure_new();
+    tk_top_emit(tk_glb(TY_U8, "tk_nl_zero", 8));
+    uptr p = "p";
+    i64 st = tk_if(tk_bin(K_EQ, tk_id(p), tk_int(0)), tk_ret(tk_id("tk_nl_zero")));
+    st = list_append(st, tk_ret(tk_bin(K_ADD, tk_id(p), tk_int(TK_NLOBJSIZE))));
+    tk_top_emit(tk_func(TY_UPTR, "tk_nl_dflt", param_new(TY_UPTR, p), tk_blk(st)));
+}
+
+// the payload at `addr`, read at its own width: `tk_ld` (teko_struct.tk)
+// already picks `ld8`/`ld16`/`ld32`/`ld64`/`ldf32`/`ldf64` by width and
+// register file and already sign-extends a signed narrow load, so an `i8?` of
+// -5 answers -5 and an `f64?` answers a float. A primitive with members takes
+// the compiler's own cast back to its own type (`tk_prim_ret`), and an `enum`
+// takes the plain machine cast, so the value's static type at the site is the
+// payload's own and not the raw integer the load answers with.
+i64 tk_nl_payload(i64 pty, i64 addr) {
+    i64 r = tk_ld(pty, addr);
+    if (tk_prim_is(pty)) return tk_prim_ret(pty, r);
+    if (tk_is_enum(tk_struct_by_ty(pty)) && nd_kind(r) != N_CAST) return tk_cast(pty, r);
+    return r;
+}
+
+// ---- the implicit `T` -> `T?` (§ 4) ----
+// The wrap the nine slots D33 enumerated splice into their own tree, handed
+// BACK rather than written in place -- an argument is a link of a sibling list
+// and an initializer is a child, so the caller is the one that knows how to
+// put it back. It is the exact signature and the exact discipline
+// `tk_num_widen` (teko_typeof.tk) already has, and it is a no-op everywhere
+// except a boxed nullable slot holding a value of the type it encloses: for a
+// REFERENCE `T?` the conversion is identity and the tree does not move at all.
+//
+// The widening runs FIRST, so `f64? x = 5;` boxes one point zero rather than
+// the bit pattern of the integer five.
+i64 tk_nl_wrap(i64 tty, i64 ety, i64 e) {
+    if (e == 0) return e;
+    if (tty < 0 || ety < 0) return e;
+    if (tty == ety) return e;
+    if (tk_is_null_lit(e)) return e;              // `null` IS the handle 0
+    i64 ti = tk_struct_by_ty(tty);
+    if (!tk_is_nl(ti)) return e;
+    i64 pty = nl_of_at(ti);
+    if (!tk_nl_boxes(pty)) return e;
+    tk_line = nd_line(e);
+    tk_file = nd_file(e);
+    set_nd_next(e, 0);
+    e = tk_num_widen(pty, ety, e);
+    tk_nl_ensure_box(pty);
+    i64 r = tk_call(tk_nl_boxname(pty), e);
+    tk_xt_put(r, ti, tty, 0, TK_OWNED);           // a fresh box: the caller owns it
+    return r;
+}
+
+// 1 when a value of type `ety` lands in a box over `pty`, by the very rules a
+// slot declared `pty` itself is judged by (`tk_check_scalar_compat`,
+// teko_typeof.tk): a primitive with members and an `enum` take their own type
+// and nothing else, a float slot takes a float or an integer, an integer slot
+// takes any integer teko calls one and no float, and no reference lands in a
+// value box at all.
+i64 tk_nl_fits(i64 pty, i64 ety) {
+    if (pty == ety) return 1;
+    if (tk_prim_is(pty) || tk_prim_is(ety)) return 0;
+    if (tk_is_enum(tk_struct_by_ty(pty))) return 0;
+    if (tk_struct_by_ty(ety) >= 0) return 0;      // a class, an interface, a `T[]`, another `T?`
+    if (type_kind(pty) == TK_FLOAT) return 1;
+    return type_kind(ety) != TK_FLOAT;
+}
+
+// ...and the same rule, reported under the NULLABLE's own name: the slot the
+// source wrote is `i64?`, not `i64`, and a refusal that names the enclosed
+// type would name a slot nobody declared.
+void tk_nl_check_value(i64 tty, i64 ti, i64 ety, i64 en, i64 line, uptr fl) {
+    if (ety == tty) return;
+    if (tk_nl_fits(nl_of_at(ti), ety)) return;
+    uptr ename = type_name(ety);
+    i64 ei = tk_struct_by_ty(ety);
+    if (ei >= 0) ename = sr_name_at(ei);
+    tk_reject_compat(ename, sr_name_at(ti), line, fl);
+}
+
 // 1 when `m` is a member of the type the nullable encloses -- what tells
 // `c.v` (read the value through `.Value`) from `c.zz` (no such member at all),
 // which is the same distinction C# draws for `int?`.
@@ -131,15 +354,36 @@ void tk_nl_reject_member(i64 si, i64 ety, uptr m, i64 line, uptr fl) {
     err_at2(fl, line, tk_join("teko: unknown member of ", sr_name_at(si)), m);
 }
 
-// `x.Value` -- the guard, then the very pointer `x` already held. The node is
-// registered at the ENCLOSED row so `c.Value.get()` chains and the reclaim
-// reads it as a borrowed reference of that type; it is not pure, because
-// reading it again is another call to the guard.
+// `x.Value` -- the guard, then the value behind the handle: the very pointer
+// `x` already held for a REFERENCE, and the typed payload load at `+24` for a
+// VALUE (Q1b). The node is registered at the enclosed type so `c.Value.get()`
+// chains, `n.Value + 1` is arithmetic over an `i64` and the reclaim reads a
+// reference through it as borrowed; it is not pure, because reading it again
+// is another call to the guard.
 i64 tk_nl_value(i64 left, i64 ety, i64 line, uptr fl) {
     tk_nl_ensure_ck();
     tk_line = line;
     tk_file = fl;
     i64 r = tk_call("tk_nl_ck", left);
+    if (tk_nl_boxes(ety))
+        r = tk_nl_payload(ety, tk_bin(K_ADD, r, tk_int(TK_NLOBJSIZE)));
+    tk_xt_put(r, tk_struct_by_ty(ety), ety, 0, TK_BORROWED);
+    return r;
+}
+
+// `x.GetValueOrDefault()` -- the payload of the box, or the zero of its type
+// when the handle is 0, read through one address (`tk_nl_dflt`) so the
+// nullable is evaluated exactly once and no branch of its own reaches the
+// tree. Refused on a REFERENCE nullable, and that is the one place a rule of
+// this repository beats C# fidelity: C#'s answer is `default(T)`, which for a
+// reference is `null`, and handing a `null` to a slot typed `T` is exactly
+// what rule 1 forbids -- `??` (Q2) is the form that says which default it
+// means.
+i64 tk_nl_dflt_read(i64 left, i64 ety, i64 line, uptr fl) {
+    tk_nl_ensure_dflt();
+    tk_line = line;
+    tk_file = fl;
+    i64 r = tk_nl_payload(ety, tk_call("tk_nl_dflt", left));
     tk_xt_put(r, tk_struct_by_ty(ety), ety, 0, TK_BORROWED);
     return r;
 }
@@ -160,8 +404,18 @@ i64 tk_nl_member_of(i64 left, i64 si, uptr m, i64 line, uptr fl) {
         if (p_id() == K_LPAR) err_at2(fl, line, "teko: the member is a field, not a method", m);
         return tk_nl_value(left, ety, line, fl);
     }
-    if (str_eq(m, "GetValueOrDefault"))
-        err_at(fl, line, "teko: a reference nullable has no default");
+    if (str_eq(m, "GetValueOrDefault")) {
+        if (!tk_nl_boxes(ety)) err_at(fl, line, "teko: a reference nullable has no default");
+        if (p_id() != K_LPAR) err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+        p_next();                                 // the `(`
+        // C#'s one-argument overload (`x.GetValueOrDefault(fallback)`) is not
+        // taught: `??` is the form, and a member at an arity this type does
+        // not have is an unknown member, the wording every other receiver
+        // already gets.
+        if (p_id() != K_RPAR) tk_nl_reject_member(si, ety, m, line, fl);
+        p_next();                                 // the `)`
+        return tk_nl_dflt_read(left, ety, line, fl);
+    }
     tk_nl_reject_member(si, ety, m, line, fl);
     return 0;
 }
@@ -194,8 +448,16 @@ i64 tk_nl_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown) {
         st64(pown, TK_BORROWED);
         return tk_nl_value(recv, ety, tk_line, tk_file);
     }
-    if (str_eq(m, "GetValueOrDefault"))
-        err_at(tk_file, tk_line, "teko: a reference nullable has no default");
+    if (str_eq(m, "GetValueOrDefault")) {
+        if (!tk_nl_boxes(ety)) err_at(tk_file, tk_line, "teko: a reference nullable has no default");
+        if (form != TK_PCALL)
+            err_at2(tk_file, tk_line, "teko: the member is a method; call it with ()", m);
+        if (pd_na_at(pi) != 0) tk_nl_reject_member(si, ety, m, tk_line, tk_file);
+        st64(pty, ety);
+        st64(ppure, 0);
+        st64(pown, TK_BORROWED);
+        return tk_nl_dflt_read(recv, ety, tk_line, tk_file);
+    }
     tk_nl_reject_member(si, ety, m, tk_line, tk_file);
     return 0;
 }
@@ -218,10 +480,12 @@ i64 tk_nl_type(i64 ty) {
     if (ty == TY_UPTR) err_at(fl, line, "teko: a raw pointer has no nullable");
     i64 si = tk_struct_by_ty(ty);
     if (tk_is_nl(si)) err_at(fl, line, "teko: a nullable of a nullable is not taught");
-    if (si < 0 || tk_is_enum(si))
-        err_at(fl, line, "teko: a nullable of a value type is not taught yet");
     if (p_id() == tk_nl_quest) err_at(fl, line, "teko: a nullable of a nullable is not taught");
     i64 nt = tk_nl_row(ty);
+    // Q1b: the box's runtime is emitted where the suffix is SPELLED, not where
+    // a wrap happens to be spliced -- a wrap is written by a pass, and a
+    // declaration is the one place every value nullable passes through.
+    tk_nl_ensure_box(ty);
     if (p_id() != K_LBRACK) return nt;
     return tk_ha_type(nt);                        // `Cell?[]`: the array handler reads the rest
 }
