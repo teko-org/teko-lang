@@ -30,11 +30,15 @@
 //                      a parameter, and a field of one;
 //   8. `rccheck`    -- the reclaim: every box and every object either operator
 //                      builds is released, and `rt_live()` comes back to its
-//                      floor.
+//                      floor;
+//   9. `shapecheck` -- the other shapes a nullable encloses: a `struct?`
+//                      (not counted), a `T[]?` and its one member, and a
+//                      primitive with members (`TimeSpan?`).
 //
 // expect-exit: 42
 
 #include "../lib/rt.tk"
+#include "../lib/time.tk"
 
 i64 calls = 0;
 i64 cell_dtors = 0;
@@ -384,6 +388,39 @@ i64 rccheck() {
     return 0;
 }
 
+// ---- 9. the other shapes a nullable encloses ----
+
+struct Vec {
+    public i64 x;
+}
+
+i64 shapecheck() {
+    Vec? v = new Vec();                           // a `struct?`: not counted
+    Vec? nov = null;
+    i64? vx = v?.x;
+    if (vx.Value != 0) return 1;
+    if (nov?.x != null) return 2;
+    Vec w = nov ?? new Vec();
+    if (w.x != 0) return 3;
+
+    Cell[]? xs = new Cell[2];                     // a `T[]?`, and its one member
+    Cell[]? noxs = null;
+    i64? len = xs?.Length;
+    if (len.Value != 2) return 4;
+    if (noxs?.Length != null) return 5;
+    Cell[] hard = noxs ?? xs.Value;
+    if (hard.Length != 2) return 6;
+
+    TimeSpan? t = TimeSpan.FromHours(2.0);        // a primitive with members
+    TimeSpan? not = null;
+    i64? hours = t?.Hours;
+    if (hours.Value != 2) return 7;
+    if (not?.Hours != null) return 8;
+    TimeSpan span = not ?? TimeSpan.FromHours(1.0);
+    if (span.Hours != 1) return 9;
+    return 0;
+}
+
 i64 main() {
     i64 bad = refcheck();
     if (bad != 0) return 10 + bad;
@@ -408,6 +445,9 @@ i64 main() {
 
     bad = rccheck();
     if (bad != 0) return 110 + bad;
+
+    bad = shapecheck();
+    if (bad != 0) return 130 + bad;
 
     return 42;
 }
