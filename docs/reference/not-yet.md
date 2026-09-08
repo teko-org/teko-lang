@@ -124,11 +124,29 @@ crumbs of the same spec are not built yet:
 | written | what happens |
 |---|---|
 | `.ToString()`, `.Parse()`, `.TryParse()`, `.IsDefined()`, `.GetNames()`, `.GetValues()` (N2b) | not taught: an enum value converts to `str` no way at all yet |
-| `DateTimeKind` as an `enum` (N2c) | not applicable: `DateTime`/`TimeSpan` are not built either (`docs/specs/datetime.md`) |
+| `DateTimeKind` as an `enum` (N2c) | not applicable: `DateTime` is not built (`docs/specs/datetime.md`); `TimeSpan` is ([timespan.md](timespan.md)) and needs no `Kind` |
 | `[Flags]` | not taught: teko has no attribute grammar; the bitwise operators already work on every enum, `[Flags]` only changes `ToString` |
 | the bare member name inside a `switch` on that enum (`case Red:` instead of `case Color.Red:`) | an ordinary identifier, `mc: unknown name` — C# allows it, teko requires the qualified form everywhere |
 | `switch` on an enum **parameter**, directly (`switch (c)` with `Color c` the enclosing function's own parameter) | the switch's own hidden local is declared from the parser's best guess at the subject's type (`tk_pty_of`, teko_struct.tk), which sees a DECLARED LOCAL but not a parameter (a parameter carries no type the parser can read at that point, the same limitation this page's own "Numeric conversions" section already names for a virtual/interface call argument), so the hidden local stays `i64`; `$t == Color.Red` then has one enum-typed operand, which `teko_ops.tk`'s own enum guard (D39 § "the operators") refuses before the scalar-compat check is ever reached — `teko: no operator \`==\` takes these operands`, not a conversion refusal. Assign the parameter to a local first, `Color d = c; switch (d) { ... }` |
 | a unary `!`/`-`/`~` directly in front of a parenthesized expression that itself starts with a qualified constant (`!(Color.Red < Color.Green)`, `!(Shape.MAX < 10)`) | `mc: expected ) in cast` — the core's own cast detection, right after a unary prefix, does not backtrack past a type word followed by `.`; not this crumb's to fix (D2), and not new to `enum` (a plain class const in parens reproduces it too). Bind the qualified constant to a local first, or drop the outer parentheses when the operator allows it |
+
+## `TimeSpan`, and the rest of `docs/specs/datetime.md`
+
+`TimeSpan` is built ([timespan.md](timespan.md)) and with it the primitive-member
+mechanism; the rest of the page's own crumbs are not:
+
+| written | what happens |
+|---|---|
+| `DateTime`, `DateTimeKind` (C2) | not taught: the two words are ordinary identifiers, and `DateTime.Now` therefore reads as an unknown name rather than as the clock it will need (`docs/specs/datetime.md` § 8: blocked on a wall clock in `mc`'s `<sys>`) |
+| `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — text is a crumb of its own, shared with the `enum` page's N2b, and no primitive has a `str` member yet |
+| `t * 1.5`, `t / 1.5` (C#'s `operator *(TimeSpan, double)`) | ``teko: no operator `*` takes these operands`` — the spec's § 4 leaves the float multiply out |
+| `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
+| `+t` (C#'s unary plus) | ``teko: no operator `+` takes these operands`` — the unary minus is taught, its C# twin is not |
+| `new TimeSpan(h, m, s)` and the two longer constructors | `teko: wrong number of arguments for new` — one row, one argument: the tick constructor. Build it from `FromHours(h) + FromMinutes(m) + FromSeconds(s)` |
+| `(i64) t` and `(TimeSpan) n` written BY HAND | accepted, and they are the identity: a cast between two eight-byte slots. `docs/specs/datetime.md` § 3 wants both refused, so that `.Ticks` and `new TimeSpan(t)` are the only spellings; refusing them means telling a compiler-written cast from a source-written one, which is a crumb of its own and lands with `DateTime` (C2), the type whose raw bits (a `Kind` above the ticks) make the hand-written cast actually wrong |
+| a `TimeSpan` **global** as a `.` receiver (`g.Days` with `g` a global) | `teko: unknown member: Days` — the oracle types a local, a parameter, a `ref`/`out` pointee, a field and a call, and a scalar global is the one it does not see (the same gap `.Length` on a global fixed array already has, above), so the member falls through to the by-name search every type's members are asked about. Assign the global to a local first |
+| an **array element** as an operand (`xs[i] + t`) | neither refused nor checked: the oracle answers "not known" for an array element ([types.md](types.md)), so the operator table does not claim the node and the core's own `+` runs on the two tick counts. The value is right, and the OVERFLOW CHECK every other spelling gets is skipped. Bind the element to a local first |
+| `switch` on a `TimeSpan` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a `TimeSpan` takes no integer operand |
 
 ## Dependency injection
 

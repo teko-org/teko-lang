@@ -9,7 +9,8 @@ need it.
 
 | page | covers |
 |---|---|
-| [modules.md](modules.md) | the 31 module files, one entry each: what it teaches, what it registers, what it keeps |
+| [modules.md](modules.md) | the 33 module files, one entry each: what it teaches, what it registers, what it keeps |
+| [primitives.md](primitives.md) | a primitive with members: the lowering table, the two identity casts, the four sites that read it, and the P0 probes that measured the mechanism |
 | [passes.md](passes.md) | the fifteen `pass()` registrations, in order, and why the order is what it is |
 | [nodes-and-xt.md](nodes-and-xt.md) | the node table keyed by position, in-place rewriting, and the rule about which node carries the type |
 | [runtime.md](runtime.md) | [`lib/rt.tk`](../../lib/rt.tk) from the compiler's side: the layouts it assumes and the calls the passes emit into it |
@@ -26,7 +27,7 @@ makes is in force from then on. Three files decide what gets registered:
 
 | file | role |
 |---|---|
-| [`teko.tk`](../../teko.tk) | `#include`s the 30 `teko_*.tk` modules, defines `teko_init()` — every `syntax*`, `on_stmt`, `pass()` and lexer callback in one place — and holds the `build`/`limits` subcommand handlers |
+| [`teko.tk`](../../teko.tk) | `#include`s the 33 `teko_*.tk` modules, defines `teko_init()` — every `syntax*`, `on_stmt`, `pass()` and lexer callback in one place — and holds the `build`/`limits` subcommand handlers |
 | [`core_teko.mc`](../../core_teko.mc) | the taught compiler's own `main()`: the parts of the mc core teko links, and the two `subcommand()` entries that make the binary answer to `teko` rather than to `mc` |
 | [`user.mc`](../../user.mc) | the project's own `user_init()`, whose whole body is `teko_init()` |
 
@@ -102,7 +103,7 @@ the unit a registry validator compiles on its own — which is why it stays in c
 
 `mc limits . --config <config>` prints every table the taught compiler occupies against
 what mc reserves. The numbers that matter here are the hook tables: today
-`passes 15/30`, `syntax 14/28`, `alias 14/28`, `types 7/14`, `on_stmt 4/8`,
+`passes 15/30`, `syntax 15/30`, `alias 17/34`, `types 10/20`, `on_stmt 4/8`,
 `on_source 1/8`, `source_claim 1/8`, `syntax_param 1/8`, `syntax_type 1/8` — and
 `intrin 8/16`, all eight of them mc's `<float>` library's. Teko registers **no intrinsic of
 its own**: every function it emits a call to has surface code somewhere in this repository.

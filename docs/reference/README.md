@@ -12,7 +12,8 @@ CI legs run on every push.
 
 | page | covers |
 |---|---|
-| [types.md](types.md) | the scalars, teko's seven aliases, `f32`/`f64`, `ptr`/`uptr`/`str`, `struct`, `class`, members, modifiers, `static`, `const` |
+| [types.md](types.md) | the scalars, teko's seven aliases, `f32`/`f64`, `ptr`/`uptr`/`str`, `struct`, `class`, `enum`, members, modifiers, `static`, `const` |
+| [timespan.md](timespan.md) | `TimeSpan`: the tick, the builders, the components against the totals, the operators and what a primitive with members refuses |
 | [classes.md](classes.md) | inheritance, the implicit receiver, `base`, constructors and destructors, `abstract`, interfaces, traits, properties, operators, `partial`, free order of declaration |
 | [generics.md](generics.md) | `class Box<T, const N: i64>`, instantiation and mangling, inline array fields, partial generics |
 | [delegates.md](delegates.md) | `delegate`, contextual and explicit values, the null panic, lambdas, `use (...)` by value and by reference |

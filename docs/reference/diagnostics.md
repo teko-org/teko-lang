@@ -279,6 +279,51 @@ entry says what completes it.
   operator, and a mismatched or bare-integer operand on any of those six, is refused this
   way too.
 
+## Primitives with members (`TimeSpan`)
+
+A primitive is a type of eight bytes with no row in the type table — no field, no vtable,
+no method — whose members come from a lowering table instead
+([timespan.md](timespan.md), [the internals note](../internals/primitives.md)). The
+messages reuse the wordings a declared type already gets; only three are its own.
+
+- `"teko: "` — completed by *`TimeSpan` needs #include "time.tk" before it is used*: the
+  type word is reserved program-wide, but the functions its members lower to live in
+  `lib/time.tk`. Add the include.
+- `"teko: unknown member of "` / `"teko: unknown static member of "` — completed by the
+  type's name and then by the member: the name is not a row of that primitive's table.
+- `"teko: "` — completed by *`TimeSpan.Ticks` is an instance member; reach it through an
+  object* (a member read through the type word) and by *`TimeSpan.Zero` is static; reach it
+  through its type* (a static read through a value). The two wordings are the ones a class
+  already answers with.
+- `"teko: a member of "` — completed by *`TimeSpan` is read-only*, then by the member's
+  name: a member of a primitive is a value read out of its eight bytes, never a slot, so
+  `t.Ticks = 5;` has nothing to assign to.
+- `"teko: the member is a property; it is not called"` — `t.Ticks()`; drop the `()`.
+- `"teko: the member is a method; call it with ()"` — `t.Duration`; add them.
+- `"teko: wrong number of arguments for "` — completed by the member's name: every row of
+  the table takes one argument or none.
+- `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: a primitive
+  converts to nothing but itself, in either direction and in all nine slots — an integer, a
+  float, `null`, a class, a struct, a `T[]` or a different primitive into a `TimeSpan`
+  slot, and a `TimeSpan` into an `i64`, an `f64` or a slot of row type.
+- `` "teko: no operator `" `` — completed by *`X` takes these operands*: the operator table
+  claims every binary and unary with a primitive operand and refuses the ones with no row
+  (`t % t`, `t & t`, `t * t`, `t / t`, `t + 1`, `~t`, `!t`, `+t`).
+- ``"teko: the type of the left side of `+` is not known here"`` (also *right*) — the other
+  operand of an operator over a primitive is an expression the oracle cannot type, such as
+  an array element. Bind it to a local first; a primitive operand is exactly where leaving
+  the node to the core's raw arithmetic would answer a wrong number.
+- `"teko: this primitive has no constructor"` — `new` on a primitive whose table declares
+  no constructor row. `TimeSpan` declares one, so nothing in v0.4.0 reaches this; it is the
+  mechanism's own guard for the primitives the specs still have coming.
+- `"teko: a type name reaches its static members"` — the type word alone, with no `.`
+  after it, in expression position.
+- `"teko: the field is not an array"` — completed by the member's name: `t.Ticks[0]`.
+
+The three panics `lib/time.tk` raises at RUN time (`a time span overflowed`,
+`a time span divided by zero`, `a time span is out of range`) are exit 70 and are listed in
+[runtime.md](runtime.md#libtimetk).
+
 ## Properties
 
 - ``"teko: a property declares `get`, `set` or both"`` — an empty accessor list, or a word
@@ -622,6 +667,9 @@ truncation; the fix is to split the unit.
 | `"teko: too many switch expression arms"` | 64 |
 | `"teko: too many bare continues inside a switch"` | 128 |
 | `"teko: loops nested too deep"` | 32 open at one point of one function |
+| `"teko: too many primitive types"` | 8 primitives with a member table |
+| `"teko: too many primitive members"` | 96 rows, over every primitive |
+| `"teko: too many primitive operators"` | 32 rows, over every primitive |
 | `"teko: too many services"` | 32 marked classes |
 | ``"teko: too many `inject` sites"`` | 32 |
 | ``"teko: too many `scope` blocks"`` | 64, plus one per singleton |
