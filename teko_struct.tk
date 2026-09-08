@@ -153,6 +153,12 @@ void tk_top_emit(i64 n) {
 // kind check above (`tk_is_class`, `tk_is_counted`, `tk_op_row`'s own callers)
 // answers "no" for it by construction: none of them match TK_KENUM.
 #define TK_KENUM   5
+// docs/specs/nullable.md § 2: `T?` is a SIXTH row kind, made lazily the first
+// time a source spells the suffix -- the exact standing `T[]` already has. The
+// row records what it encloses (`nl_of` below) and carries the same 8-byte
+// handle a reference does, which is what lets `tk_is_counted` answer for a
+// nullable row whatever it answers for the row inside it.
+#define TK_KNULL   6
 
 // how much of a class has been read: one declared in one place is whole where
 // it stands, and a `partial` one stays OPEN until the first use of it closes.
@@ -191,6 +197,7 @@ i64  sr_off[TK_MAXSTRUCT];            // where the next field goes: carried acro
 i64  sr_hline[TK_MAXSTRUCT];          // where the FIRST part was written, which is where a
 uptr sr_hfile[TK_MAXSTRUCT];          // ...refusal at closing time is reported
 i64  ha_ety[TK_MAXSTRUCT];            // a TK_KARRAY row's own element type (K3, §41)
+i64  nl_of[TK_MAXSTRUCT];             // a TK_KNULL row's own enclosed type (Q1a)
 i64  tk_nstruct = 0;
 
 uptr fd_name[TK_MAXFIELD];
@@ -252,6 +259,8 @@ i64  sr_hline_at(i64 i) { return ld64(sr_hline + i * 8); }
 uptr sr_hfile_at(i64 i) { return ld64(sr_hfile + i * 8); }
 i64  ha_ety_at(i64 i)   { return ld64(ha_ety + i * 8); }
 void set_ha_ety_at(i64 i, i64 v) { st64(ha_ety + i * 8, v); }
+i64  nl_of_at(i64 i)    { return ld64(nl_of + i * 8); }
+void set_nl_of_at(i64 i, i64 v) { st64(nl_of + i * 8, v); }
 uptr fd_name_at(i64 i)  { return ld64(fd_name + i * 8); }
 i64  fd_cls_at(i64 i)   { return ld64(fd_cls + i * 8); }
 i64  fd_off_at(i64 i)   { return ld64(fd_off + i * 8); }
@@ -297,6 +306,7 @@ i64 tk_is_iface(i64 si) { return sr_kind_at(si) == TK_KIFACE; }
 i64 tk_is_deleg(i64 si) { return sr_kind_at(si) == TK_KDELEG; }
 i64 tk_is_ha(i64 si)    { return si >= 0 && sr_kind_at(si) == TK_KARRAY; }
 i64 tk_is_enum(i64 si)  { return si >= 0 && sr_kind_at(si) == TK_KENUM; }
+i64 tk_is_nl(i64 si)    { return si >= 0 && sr_kind_at(si) == TK_KNULL; }
 void set_fd_name_at(i64 i, uptr v)  { st64(fd_name + i * 8, v); }
 void set_fd_cls_at(i64 i, i64 v)    { st64(fd_cls + i * 8, v); }
 void set_fd_off_at(i64 i, i64 v)    { st64(fd_off + i * 8, v); }
@@ -398,6 +408,16 @@ i64 tk_int(i64 v) {
     i64 n = tk_nd(N_INT);
     set_nd_val(n, v);
     set_nd_type(n, TY_I64);
+    return n;
+}
+
+// the `null` VALUE with no token to read -- `tk_null` (teko_type.tk) is the
+// same node behind the WORD. An ordinary `N_INT` of 0 typed `TY_UPTR`, the one
+// shape `tk_is_null_lit` below recognizes.
+i64 tk_nullnode() {
+    i64 n = tk_nd(N_INT);
+    set_nd_val(n, 0);
+    set_nd_type(n, TY_UPTR);
     return n;
 }
 
@@ -637,6 +657,11 @@ i64 tk_struct_by_ty(i64 ty) {
 i64 tk_is_counted(i64 ty) {
     i64 si = tk_struct_by_ty(ty);
     if (si < 0) return 0;
+    // docs/specs/nullable.md § 2/§ 7: `Cell?` IS the `Cell` pointer, and the
+    // null handle is 0 -- which `rc_dec`/`rt_own` already treat as a no-op --
+    // so a nullable row answers exactly what the row it encloses answers, and
+    // the whole reclaim serves it with no line of its own.
+    if (tk_is_nl(si)) return tk_is_counted(nl_of_at(si));
     if (tk_is_class(si)) return 1;
     if (tk_is_deleg(si)) return 1;
     if (tk_is_ha(si)) return 1;
@@ -663,6 +688,33 @@ i64 tk_ha_row(i64 ety) {
     return ty;
 }
 
+// the row of `T?` for the enclosed type `ty`, one per distinct `T`, made the
+// first time the suffix is spelled (Q1a, docs/specs/nullable.md § 2) -- the
+// exact shape `tk_ha_row` above has. The identity is the `?` spelling, a
+// lexeme the lexer can never form, so it collides with no user name; a
+// GENERATED SYMBOL never uses it (`tk_ty_mangle_name` maps the row to
+// `opt_T`, the rule `T[]` already lives by).
+i64 tk_nl_row(i64 ty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (tk_is_nl(i) && nl_of_at(i) == ty) return sr_ty_at(i);
+        i = i + 1;
+    }
+    uptr name = tk_join(type_name(ty), "?");
+    i64 nt = type_new(name, 8, 8, TK_INT);
+    i64 si = tk_type_add(name, nt, 0 - 1, TK_KNULL, TK_TPUBLIC, 1);
+    set_nl_of_at(si, ty);
+    return nt;
+}
+
+// what `ty` encloses when it IS a nullable row, and -1 when it is not one
+i64 tk_nl_of(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    if (!tk_is_nl(si)) return 0 - 1;
+    return nl_of_at(si);
+}
+
 // 1 when the program spells at least one `T[]`
 i64 tk_ha_any() {
     i64 i = 0;
@@ -681,7 +733,8 @@ i64 tk_ha_any() {
 // instead (`teko_ref.tk`'s own `tk_ty_sfx`).
 uptr tk_ty_mangle_name(i64 ty) {
     i64 si = tk_struct_by_ty(ty);
-    if (tk_is_ha(si)) return tk_join("arr_", type_name(ha_ety_at(si)));
+    if (tk_is_nl(si)) return tk_join("opt_", tk_ty_mangle_name(nl_of_at(si)));
+    if (tk_is_ha(si)) return tk_join("arr_", tk_ty_mangle_name(ha_ety_at(si)));
     return type_name(ty);
 }
 
@@ -976,6 +1029,10 @@ i64 tk_struct_of_expr(i64 n) {
 // the same way every other early cross-file need already is here (§50 O1).
 i64 tk_impl_has(i64 ci, i64 fi);
 
+// teko_null.tk is included after this file too: 1 when a `null` node is the
+// COMPILER's own placeholder rather than one a source wrote (Q1a).
+i64 tk_nl_own_null_is(i64 n);
+
 // 1 when `n` is the `null` literal (teko_type.tk's tk_null): the one ordinary
 // N_INT this project ever types TY_UPTR, so a class, an interface, a struct,
 // a delegate or a T[] of heap all accept it without needing a zero of their
@@ -993,6 +1050,17 @@ i64 tk_is_null_lit(i64 n) {
 i64 tk_row_fits(i64 ti, i64 ei) {
     if (ti == ei) return 1;
     if (ei < 0) return 0;
+    // Q1a (docs/specs/nullable.md § 4): `T` fits `T?`, and so does everything
+    // that already fits `T` -- `D` into `B?`, `C` into `I?` -- because the
+    // nullable row asks the very same question about what it encloses. The
+    // two directions it does NOT answer are stated here rather than left to
+    // fall through: `T?` fits no `T` (write `.Value`), and one nullable row
+    // fits no other (no covariance between them).
+    if (tk_is_nl(ti)) {
+        if (tk_is_nl(ei)) return 0;
+        return tk_row_fits(tk_struct_by_ty(nl_of_at(ti)), ei);
+    }
+    if (tk_is_nl(ei)) return 0;
     if (tk_is_ha(ti) || tk_is_deleg(ti)) return 0;
     if (tk_is_class(ei)) {
         i64 b = sr_base_at(ei);
@@ -1019,7 +1087,16 @@ void tk_reject_compat(uptr ename, uptr tname, i64 line, uptr fl) {
 void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
     i64 ti = tk_struct_by_ty(fty);
     if (ti < 0) return;
-    if (tk_is_null_lit(v)) return;
+    // Q1a (docs/specs/nullable.md, rule 1): `null` lands only in a slot
+    // declared `T?`. This is the ELEMENT store's own road to the rule --
+    // `cs[i] = null` on a `Cell[]` (teko_heaparr.tk's `tk_ha_store`) reaches
+    // no other check, since `tk_field_store_val`'s scalar half serves the two
+    // `p.f = e` sites and not this one.
+    if (tk_is_null_lit(v)) {
+        if (!tk_is_nl(ti) && !tk_nl_own_null_is(v))
+            err_at(fl, line, tk_join3("teko: null needs a slot declared ", sr_name_at(ti), "?"));
+        return;
+    }
     i64 ei = tk_struct_of_expr(v);
     if (ei < 0) return;
     if (tk_row_fits(ti, ei)) return;
@@ -1126,6 +1203,11 @@ i64 tk_on_stmt(i64 n) {
     if (si >= 0) {
         tk_line = nd_line(n);
         tk_file = nd_file(n);
+        // docs/specs/nullable.md § 3: `Cell? c;` IS `Cell? c = null;`. The `?`
+        // is the licence to hold nothing, so the slot is written rather than
+        // left reading whatever the frame held. Every other declaration keeps
+        // the initializer the source gave it, or none.
+        if (tk_is_nl(si) && nd_a(n) == 0) set_nd_a(n, tk_nullnode());
         tk_local_add(nd_name(n), si);
     }
     return n;

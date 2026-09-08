@@ -484,12 +484,40 @@ i64 tk_dot_follows() {
     return ld8(p) == '.';
 }
 
+// the first character after the current token that is not a space, a tab, a
+// newline or a carriage return -- 0 at the end of the source. The one
+// lookahead this file needs, and the two predicates below are its readers.
+i64 tk_next_ch() {
+    uptr p = p_cp();
+    uptr e = p_src_end();
+    loop {
+        if (p >= e) return 0;
+        i64 c = ld8(p);
+        if (c != ' ' && c != 9 && c != 10 && c != 13) break;
+        p = p + 1;
+    }
+    return ld8(p);
+}
+
 // 1 when the token right after the current one is `[` -- `Op[] ops = ...;`
 // (K3's own heap array TYPE marker), never a scalar declaration K4b's own
 // reader below takes over
-i64 tk_bracket_follows() {
+i64 tk_bracket_follows() { return tk_next_ch() == '['; }
+
+// 1 when a `?` follows and a `[` follows THAT -- `Op?[] ops = ...;`, an array
+// whose element is a nullable delegate (Q1a). `Op? f = ...;` is NOT one: it is
+// a scalar declaration, and the delegate reader below keeps it so that a
+// lambda and the contextual wrap of a plain function still get their look.
+i64 tk_quest_bracket_follows() {
+    if (tk_next_ch() != '?') return 0;
     uptr p = p_cp();
     uptr e = p_src_end();
+    loop {
+        if (p >= e) return 0;
+        if (ld8(p) == '?') break;
+        p = p + 1;
+    }
+    p = p + 1;
     loop {
         if (p >= e) return 0;
         i64 c = ld8(p);
@@ -516,7 +544,8 @@ i64 tk_type_stmt() {
         uptr nm = p_name();
         i64 si = tk_struct_find_fwd(nm);              // a local's type: identity is enough (§50 O1)
         if (si < 0) err_at2(fl, line, "teko: unresolved name", nm);
-        if (tk_is_deleg(si) && !tk_bracket_follows()) return tk_deleg_var_stmt(si, line, fl);
+        if (tk_is_deleg(si) && !tk_bracket_follows() && !tk_quest_bracket_follows())
+            return tk_deleg_var_stmt(si, line, fl);
         return parse_var(line, fl, sr_ty_at(si));
     }
     i64 e = parse_expr(0);
