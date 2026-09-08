@@ -70,9 +70,9 @@ to `mc`. [`timespan.md`](../reference/timespan.md) and
 
 ## `null`, and the slot that may hold it
 
-`null` lands **only in a slot declared `T?`**. That is one rule for every reference — a
-class, an interface, a delegate, a `T[]`, a `struct` — and it is checked where the value is
-written, not where it is read.
+`null` lands **only in a slot declared `T?`**. That is one rule for every type — a class,
+an interface, a delegate, a `T[]`, a `struct`, and every value type too — and it is checked
+where the value is written, not where it is read.
 
 ```teko
 // no-run
@@ -87,9 +87,9 @@ i64 main() {
 }
 ```
 
-A `T?` is the same eight bytes a `T` is — the pointer itself, with `0` for "nothing" — so it
-costs nothing at run time and is reclaimed exactly as a `T` is. `T` goes into a `T?`
-implicitly; the way back is written down:
+A `T?` over a reference is the same eight bytes a `T` is — the pointer itself, with `0` for
+"nothing" — so it costs nothing at run time and is reclaimed exactly as a `T` is. `T` goes
+into a `T?` implicitly; the way back is written down:
 
 | written | means |
 |---|---|
@@ -104,8 +104,32 @@ implicitly; the way back is written down:
 
 Testing against `null` stays legal on a slot that is **not** nullable, and it has to: a
 field nobody assigned and an element of `new T[n]` both read as zero, so the defensive code
-that catches them must keep compiling. The whole account, with the conversions, the
-overload rule and what is not taught yet, is [nullable.md](../reference/nullable.md).
+that catches them must keep compiling.
+
+A **value** type takes the same suffix and the same three members, and the one thing that
+differs is the price: the handle points at a small counted box holding the bytes, so
+`i64? n = 5;` allocates one block and `rt_live()` counts it. The box is never written after
+it is built — every store makes a fresh one — which is what gives `b = a; b = 7;` the value
+semantics C# gives it.
+
+```teko
+// no-run
+enum Color { Red, Green, Blue }
+
+i64 main() {
+    i64?    n = 5;                           // allocates the box
+    i64     k = n.Value;                     // the checked read: 5
+    i64     z = n.GetValueOrDefault();       // 5, and 0 when it is empty
+    f64?    x = 5;                           // widened first, then boxed: 5.0
+    Color?  c = Color.Blue;
+    i64?    e = null;                        // no box at all
+    i64     j = n;                           // teko: a value of type i64? does not convert to i64
+    return 0;
+}
+```
+
+The whole account, with the conversions, the reclaim numbers, the overload rule and what is
+not taught yet, is [nullable.md](../reference/nullable.md).
 
 ## The two array shapes
 

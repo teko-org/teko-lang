@@ -79,12 +79,12 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 
 ## The nullable `T?`
 
-`T?` is taught over a REFERENCE — a class, an interface, a delegate, a `T[]` and a
-`struct` ([nullable.md](nullable.md)). What is not taught around it:
+`T?` is taught over ANY type — a class, an interface, a delegate, a `T[]`, a `struct`, and
+every value type through the counted box ([nullable.md](nullable.md)). What is not taught
+around it:
 
 | written | message |
 |---|---|
-| `i64?`, `f64?`, `bool?`, `char?`, an `enum?`, `TimeSpan?`, `DateTime?` | `teko: a nullable of a value type is not taught yet` — the counted box is a later crumb |
 | `T??` | `teko: a nullable of a nullable is not taught` |
 | `uptr?`, `ptr?`, `str?` | `teko: a raw pointer has no nullable` |
 | `void?` | `teko: void? is not a type` |
@@ -95,6 +95,11 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 | `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators) | ``teko: Cell? declares no operator `+` `` |
 | `T?` to `U?` where `T` converts to `U` | `teko: a value of type Circle? does not convert to Shape?` — no covariance between nullable rows; write `x.Value` |
 | `x.GetValueOrDefault()` on a reference nullable | `teko: a reference nullable has no default` — `default(T)` for a reference is `null`, which is the one value a `T` slot may not take |
+| `x.GetValueOrDefault(fallback)`, C#'s one-argument overload | `teko: unknown member of i64?: GetValueOrDefault` — an arity this type does not have. `??` (Q2) is the form that says which default it means |
+| `f(5)` where the only candidate that could take it is `f(i64?)` and another overload exists | `teko: no overload of f matches these arguments` — the overload rounds match by exact type, an integer literal and `null`; the implicit `T` → `T?` is not one of them. A name declared ONCE takes the wrap and needs no round at all |
+| `k > 0 ? 5 : null` in an `i64?` slot | `teko: the two arms of ?: have different types` — the ternary types its arms against each other, and `null` is a `uptr`. Write two arms of the same type, or two statements |
+| `n = 5;` on a PARAMETER declared `i64?` | `teko: a parameter of class type is borrowed; it is not reassigned` — a box is counted, so the rule every counted parameter already lives by (K2) reaches it. Declare a local |
+| `g.Value` on a GLOBAL nullable | `teko: unknown member: Value` — the oracle types no global but a `T[]` (G1), so a `.` on one falls to the by-name search. Pre-existing since Q1a, shared with every global of a taught row; bind it to a local first |
 | `x.Value = e` | `teko: .Value is not a slot` |
 | `c.v` on a `Cell?` (flow narrowing, C# 8's `if (c != null) { c.v }`) | `teko: a Cell? is read through .Value` — the analysis behind narrowing is a dominator pass this design does not buy |
 | `f(3, 4)` on an `Op?` local | `call to unknown function f`, from the core — a nullable delegate is a value to compare and to pass, not one to call, and `.Value(...)` is not taught either |

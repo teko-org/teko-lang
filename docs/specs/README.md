@@ -17,7 +17,7 @@ looking up a construct must never find a plan described as if it worked.
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
 | [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and the one function blocked on `mc` |
 | [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation blocked on `mc`'s lexer |
-| [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **the reference half is built** ([nullable.md](../reference/nullable.md), D43); what is left of the page is the box, the two operators and definite assignment |
+| [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **the handle and the box are built** ([nullable.md](../reference/nullable.md), D43/D44); what is left of the page is the two operators and definite assignment |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
@@ -37,7 +37,7 @@ fixes the order.
 | 5 | ~~**C1** `TimeSpan`, and the primitive-member mechanism~~ **landed**, D40 | `docs/specs/datetime.md` | L | P0 |
 | 5a | ~~**Q0** the nullable probes~~ **landed**, D43 | `docs/internals/nullable-probes.md` | S | — |
 | 5b | ~~**Q1a** `T?` over a reference, and `null` only in a `T?` slot~~ **landed**, D43 | `docs/reference/nullable.md` | M | Q0 |
-| 5c | **Q1b** `T?` over a value (the counted box) | nullable.md | M | Q1a |
+| 5c | ~~**Q1b** `T?` over a value (the counted box)~~ **landed**, D44 | `docs/reference/nullable.md` | M | Q1a |
 | 5d | **Q2** `??` and `?.` | nullable.md | M | Q1b |
 | 5e | **Q3** definite assignment | nullable.md | M | Q0 |
 | 6 | **N2b** `enum`: `ToString`, `Parse`, the statics | enum.md | S | N2a, C1 |
