@@ -179,9 +179,10 @@ argument. It is never reference counted, because there is no object to count
 
 Two places the type is not known are the two every scalar shares, and
 [not-yet.md](not-yet.md) carries both: a **global** as the receiver of a `.`
-(`teko: unknown member: Days`) and an **array element** as an operand (`xs[i] + t`, which
-the core's own `+` then runs on the raw ticks, right in value and without the overflow
-check). Bind either one to a local first.
+(`teko: unknown member: Days`) and an **array element** as an operand: beside a typed
+operand (`xs[i] + t`) it is refused, ``teko: the type of the left side of `+` is not known
+here``; with array elements on both sides (`xs[i] + xs[j]`) the core's own `+` runs on the
+raw ticks, right in value and without the overflow check. Bind either one to a local first.
 
 ## Under the hood
 
