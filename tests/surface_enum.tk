@@ -1,0 +1,113 @@
+// surface_enum.tk -- `enum` as C#'s own: the type, the members (implicit and
+// explicit values, the default underlying `i32`, an explicit `: u8` and an
+// explicit signed `: i16`), the six comparisons, the bitwise trio plus unary
+// `~`, both explicit conversions, an enum global/field/array element/
+// parameter/return, a duplicate value used as an alias, and a `switch` with
+// a fallthrough pair of case labels and a `default` (docs/specs/enum.md
+// N2a).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+enum Color { Red, Green, Blue }                  // default underlying: i32
+enum Level : u8 { Low = 10, Mid, High }          // 10, 11, 12
+enum Signed : i16 { Neg = 0 - 100, Zero = 0, Pos = 100 }
+enum Perm { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
+
+Color g_color = Color.Blue;                      // a global of enum type
+
+class Box {
+    public Signed s;                             // a field of a SIGNED narrow enum
+}
+
+// a parameter and a return of enum type; the switch reads a LOCAL copy of
+// the parameter (not the parameter itself), which is what the parse-time
+// oracle `tk_switch_stmt` leans on can already see (docs/specs/enum.md's
+// own not-yet row on this)
+i64 describe(Color c) {
+    Color d = c;
+    i64 r = 0;
+    switch (d) {
+        case Color.Red:
+        case Color.Green:
+            r = 1;
+            break;
+        case Color.Blue:
+            r = 2;
+            break;
+        default:
+            r = 3;
+            break;
+    }
+    return r;
+}
+
+i64 main() {
+    // implicit values, and the default underlying type
+    if (Color.Red != (Color) 0) return 1;
+    if (Color.Green != (Color) 1) return 2;
+    if (Color.Blue != (Color) 2) return 3;
+
+    // explicit values, u8 underlying
+    if ((i64) Level.Low != 10) return 4;
+    if ((i64) Level.Mid != 11) return 5;
+    if ((i64) Level.High != 12) return 6;
+
+    // the global
+    if (g_color != Color.Blue) return 7;
+
+    // the six comparisons -- `rc`/`gc`/`bc` are plain locals rather than
+    // `Color.Red`/`Color.Green`/`Color.Blue` spelled directly after `!(`:
+    // `mc`'s own cast-detection, right after a unary prefix, does not
+    // backtrack past a type word followed by `.` (a pre-existing core
+    // ambiguity, reproduced the same way with a plain class const in
+    // parens -- not this crumb's to fix, D2)
+    Color c = Color.Green;
+    Color rc = Color.Red;
+    Color gc = Color.Green;
+    Color bc = Color.Blue;
+    if (c != Color.Green) return 8;
+    if (c == Color.Red) return 9;
+    if (!(rc < gc)) return 10;
+    if (gc <= rc) return 11;
+    if (!(bc > gc)) return 12;
+    if (gc >= bc) return 13;
+
+    // a duplicate value used as an alias
+    if (Perm.Alias != Perm.All) return 14;
+
+    // flags: | & ^ ~
+    Perm p = Perm.Read | Perm.Write;
+    if (p != Perm.All) return 15;
+    if ((p & Perm.Read) == Perm.None) return 16;
+    if ((p ^ Perm.All) != Perm.None) return 17;
+    if (~(~Perm.None) != Perm.None) return 18;
+
+    // a field of a SIGNED narrow (i16) underlying enum -- sign preserved
+    // through the struct field's own indirect load (tk_ld, N0/D38)
+    Box b = new Box();
+    b.s = Signed.Neg;
+    if (b.s != Signed.Neg) return 19;
+    if ((i64) (b.s) != 0 - 100) return 20;        // the negative value round-trips --
+                                                    // parenthesized: a cast binds tighter
+                                                    // than `.` in this grammar, a pre-
+                                                    // existing ambiguity, not this crumb's
+    if (b.s >= Signed.Zero) return 21;             // a signed comparison, not unsigned
+
+    // an enum array element
+    Color tbl[3];
+    tbl[0] = Color.Red;
+    tbl[1] = Color.Green;
+    tbl[2] = Color.Blue;
+    if (tbl[0] != Color.Red) return 22;
+    if (tbl[2] != Color.Blue) return 23;
+
+    // a switch with a fallthrough pair of case labels and a default,
+    // through a parameter and a return of enum type
+    if (describe(Color.Red) != 1) return 24;
+    if (describe(Color.Green) != 1) return 25;
+    if (describe(Color.Blue) != 2) return 26;
+
+    return 42;
+}

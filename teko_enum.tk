@@ -1,0 +1,94 @@
+// teko_enum.tk -- `enum` as C#'s own (docs/specs/enum.md, N2a): a named set
+// of integer constants with an underlying type, a distinct type of its own
+// that no integer converts into without being told to, comparison and the
+// bitwise operators, and a `switch` that reads like a `switch` over the
+// names.
+//
+// teko already does every part of this for something else. A class is
+// `type_new(name, 8, 8, TK_INT)` plus `syntax_expr`/`syntax_stmt`, both at
+// parse time, in teko_struct.tk and teko_access.tk (`tk_type_add`,
+// `tk_type_expr`, `tk_type_stmt`) -- an `enum` reuses that exact road, with
+// ONE difference: its `type_new` carries the UNDERLYING type's own width,
+// align and kind (`i32` by default, C#'s own), not the pointer-width
+// `TK_INT` every object reference gets. A value of an enum type IS its
+// underlying integer at run time: no box, no tag, no indirection.
+//
+// A `const` member is a folded value in a table keyed by its qualified name,
+// in teko_const.tk today. An enum's members are written into that SAME
+// table (`tk_mconst_add`, under `Color__Red`) -- zero lines change there --
+// and `teko_access.tk`'s own `tk_static_member` (the `Name.member` road
+// every type's `syntax_expr` reaches) retags the folded `N_INT` it hands
+// back to the enum's own type, which is the one line that tells an enum
+// member apart from a plain `i64` constant.
+//
+// Kept OUT of `tk_is_int_ty` (teko_typeof.tk, by name, not by kind: D38's
+// own rule) and given the `tk_check_scalar_compat`/`teko_ops.tk` clauses
+// that make it convert from nothing but itself and compute only the two
+// operator groups C# gives every enum: docs/specs/enum.md § 4-5.
+
+// the eight underlying types C# allows, read through the core's own
+// `p_type()` -- so `: u8`/`: i16`/... resolve through the SAME registered
+// ids `tk_is_int_ty` already lists (teko_typeof.tk), with no separate word
+// table of its own here. `i32` (`ty_i32`, the core's own id) is the default,
+// C#'s own.
+i64 tk_enum_underlying(i64 line, uptr fl) {
+    if (!p_accept(K_COLON)) return ty_i32;
+    i64 uty = p_type();
+    if (!tk_is_int_ty(uty))
+        err_at(fl, line, "teko: an enum's underlying type is one of u8 u16 u32 u64 i8 i16 i32 i64");
+    return uty;
+}
+
+// `enum Name [: underlying] { Member [= const], ... [,] }` -- members take
+// the previous value plus one, starting at 0 (C#'s rule); an explicit value
+// is any expression the core's folder reduces, the same folding
+// `teko_const.tk`'s own top-level `const` does; duplicate VALUES are legal
+// (C#'s aliases), duplicate NAMES are refused; a trailing comma is accepted.
+void tk_enum() {
+    tk_line = p_line();
+    tk_file = p_file();
+    i64 head_line = tk_line;
+    uptr head_file = tk_file;
+    p_next();                                     // the `enum` word
+    i64 vis = tk_take_decl_vis();                 // the `public`/`internal` before the word
+    i64 proj = tk_take_decl_proj();
+    uptr name = tk_newname("enum");
+    name = tk_ns_qualify(name);                   // the current namespace, if any (§31 N1)
+    i64 uty = tk_enum_underlying(head_line, head_file);
+    i64 w = type_width(uty);
+    i64 k = type_kind(uty);
+    i64 ty = type_new(name, w, w, k);
+    syntax_expr(name, &tk_type_expr);
+    syntax_stmt(name, &tk_type_stmt);
+    i64 si = tk_type_add(name, ty, 0 - 1, TK_KENUM, vis, proj);
+    p_expect(K_LBRACE, "expected { in the enum body");
+    i64 next = 0;
+    i64 n = 0;
+    loop {
+        if (p_id() == K_RBRACE) break;
+        if (p_id() == T_EOF) err_at(head_file, head_line, "unterminated enum");
+        tk_line = p_line();
+        tk_file = p_file();
+        uptr m = p_ident();
+        if (tk_mconst_find(si, m) >= 0)
+            err_at2(tk_file, tk_line, "teko: duplicate enum member", m);
+        i64 v = next;
+        if (p_accept(K_ASSIGN)) {
+            i64 e = fold(parse_expr(0));
+            if (nd_kind(e) != N_INT)
+                err_at(tk_file, tk_line, "teko: an enum member value is a constant expression");
+            v = nd_val(e);
+        }
+        uptr sym = tk_join3(name, "__", m);
+        def_add(sym, v, tk_line, tk_file);
+        tk_mconst_add(si, m, sym, v, TK_VPUBLIC);
+        next = v + 1;
+        n = n + 1;
+        if (!p_accept(K_COMMA)) break;              // a trailing comma is accepted (loops back to `}`)
+    }
+    if (n == 0) err_at(head_file, head_line, "teko: an enum declares at least one member");
+    p_expect(K_RBRACE, "expected } after the enum body");
+    p_accept(K_SEMI);                              // a C programmer's trailing ;
+    tk_line = head_line;
+    tk_file = head_file;
+}

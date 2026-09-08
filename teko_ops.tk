@@ -635,6 +635,69 @@ void tk_ops_promote(i64 n) {
         set_nd_a(n, tk_num_widen(tb, ta, nd_a(n)));
 }
 
+// ---- docs/specs/enum.md § 4: an enum operand, claimed and refused rather
+// than lowered ----
+//
+// Two groups need no lowering at all, and the whole point of registering an
+// enum with its underlying type's own width and kind is that the core
+// already computes both correctly: the six comparisons, both operands the
+// SAME enum, answer `i64` (the core's own signed/unsigned compare, by the
+// underlying kind); `& | ^` and unary `~`, both operands the SAME enum,
+// answer that enum (`res_binary` types the result from the left operand,
+// which `tk_ty_binary`'s own non-comparison rule already gives it, no
+// registration needed here). Everything else -- a different enum, a bare
+// integer (the literal `0` included), `+ - * / % << >>` -- is refused by
+// name, the same guard `docs/specs/datetime.md` § 13 asks of every
+// `TK_SINT`/`TK_INT` id this project registers for something that is not a
+// number: an id the core is willing to run raw arithmetic over must never
+// reach the machine unclaimed.
+//
+// An operand the oracle could not type at all (`ta`/`tb` < 0 -- an array
+// element, `teko_array.tk`'s own `N_INDEX` gap, `docs/reference/types.md`'s
+// own "the oracle answers what it can") is left to the core exactly as an
+// untyped class/struct operand already is: this crumb only refuses what it
+// is SURE is wrong, never what it cannot see (the same rule
+// `tk_check_scalar_compat`'s own header states for `ety < 0`).
+i64 tk_enum_cmp_tok(i64 tok) {
+    if (tok == K_EQ || tok == K_NE) return 1;
+    if (tok == K_LT || tok == K_LE || tok == K_GT || tok == K_GE) return 1;
+    return 0;
+}
+
+i64 tk_enum_bit_tok(i64 tok) {
+    if (tok == K_AND || tok == K_OR || tok == K_XOR) return 1;
+    return 0;
+}
+
+void tk_enum_op_refuse(i64 tok, i64 line, uptr fl) {
+    uptr sp = tk_op_spell(tok);
+    if (sp == 0) err_at(fl, line, "teko: this operator cannot be overloaded");
+    err_at(fl, line, tk_join3("teko: no operator `", sp, "` takes these operands"));
+}
+
+// `sa`/`sb` are `tk_op_row`'s own answer (a struct-table row or -1); at
+// least one of them is already known to be an enum's own row when this runs.
+void tk_enum_binary_check(i64 n, i64 sa, i64 sb, i64 ta, i64 tb) {
+    i64 tok = nd_op(n);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    if (ta < 0 || tb < 0) {                       // one side the oracle cannot see: leave it
+        if (tk_enum_cmp_tok(tok) || tk_enum_bit_tok(tok)) return;
+        tk_enum_op_refuse(tok, line, fl);
+        return;
+    }
+    if (sa != sb) { tk_enum_op_refuse(tok, line, fl); return; }
+    if (tk_enum_cmp_tok(tok)) return;              // the core's own comparison, untouched
+    if (tk_enum_bit_tok(tok)) return;               // the core's own bitwise op, untouched
+    tk_enum_op_refuse(tok, line, fl);
+}
+
+void tk_enum_unary_check(i64 n) {
+    i64 tok = nd_op(n);
+    if (tok == K_TILDE) return;                    // the core's own bitwise NOT, untouched
+    tk_enum_op_refuse(tok, nd_line(n), nd_file(n));
+}
+
 // One node of the walk. A binary whose two operands are both of core types is
 // left exactly as it is -- the core owns it -- and that is the whole of the
 // no-op guarantee for a program that declares no operator. So is one where no
@@ -651,6 +714,7 @@ void tk_ops_binary(i64 n) {
     i64 tb = tk_ty_of(b);
     i64 sa = tk_op_row(ta);
     i64 sb = tk_op_row(tb);
+    if (tk_is_enum(sa) || tk_is_enum(sb)) { tk_enum_binary_check(n, sa, sb, ta, tb); return; }
     if (sa < 0 && sb < 0) return;
     i64 tok = nd_op(n);
     i64 line = nd_line(n);
@@ -679,6 +743,7 @@ void tk_ops_unary(i64 n) {
     i64 ta = tk_ty_of(a);
     i64 sa = tk_op_row(ta);
     i64 tok = nd_op(n);
+    if (tk_is_enum(sa)) { tk_enum_unary_check(n); return; }
     if (sa < 0) {
         if (tok == K_ADD) tk_ops_replace(n, a);
         return;
