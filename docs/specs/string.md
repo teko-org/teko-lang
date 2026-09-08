@@ -347,16 +347,12 @@ type"). Two roads, and the choice is the owner's, not C#'s:
 Recommendation: the first, and a `not-yet.md` row saying so. It lands after `string`,
 because `ToString` returning a `string` is the whole reason to want it.
 
-**`Nullable<T>` / `T?`** is not blocked on `mc` and not blocked on a law. It needs four
-things, and the first three are ordinary work:
-a generic `struct Nullable<T> { T value; bool has; }` — which
-[generics.md](../reference/generics.md) already supports for a value `T`; the `T?` sugar,
-one `syntax` position; the lifted operators, one rule per operator in `teko_ops.tk`; and
-`??` and `?.`, two `syntax_infix` registrations. What it really waits on is a decision
-about what `T?` means for a **reference** `T`, where C# 8's nullable reference types are an
-analysis and not a representation. It lands after `object` and it is not on this plan's
-critical path, because the road today is the one every `Parse` on every page of this plan
-already ships: `TryParse(s, out v)`.
+**`Nullable<T>` / `T?`** is designed, and on its own page: [nullable.md](nullable.md).
+The paragraph that stood here — a generic `struct Nullable<T>` for a value `T`, landing
+after `object`, with the reference half left open — is superseded by the owner's ruling of
+2026-09-08: one mechanism, `T?` over ANY type, a construct of the compiler rather than an
+instance of the generic one, and it lands **before** N7 so that `string? s = null;` is the
+spelling from this page's first day.
 
 ## 12. The hooks, by module
 

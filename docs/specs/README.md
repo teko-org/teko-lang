@@ -17,6 +17,7 @@ looking up a construct must never find a plan described as if it worked.
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
 | [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and the one function blocked on `mc` |
 | [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation blocked on `mc`'s lexer |
+| [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
@@ -56,8 +57,13 @@ expensive; they can be pulled forward at any point without moving anything else.
 first for a reason that is not its size**: it fixes the predicate that decides what an
 integer is, and it has to be right before a second `TK_SINT` type exists.
 
-`object` and `Nullable<T>` are outside this sequence and
-[string.md](string.md) § 11 says where they enter and what each one waits on.
+**`Nullable<T>` is no longer outside this sequence.** The owner's ruling of 2026-09-08 —
+one nullable mechanism, `T?` over any type — puts [nullable.md](nullable.md)'s crumbs
+(Q0, Q1a, Q1b, Q2, Q3) **ahead of every row above that has not landed**, and mandatorily
+ahead of **N7**: `string` is a counted class, so `string? s = null;` has to be the spelling
+from its first day rather than a second migration. `decimal?` and `Guid?` then cost C3 and
+N3 one row each. That supersedes [string.md](string.md) § 11 on `Nullable<T>`; on `object`,
+which runs into D4, § 11 still stands.
 
 
 What v0.4.0 **refuses** is not here: it is catalogued in
