@@ -44,7 +44,7 @@ and never a `cmp`.
 allocation** ([types.md](../reference/types.md) § `struct`): a `decimal` field would be a
 reference to sixteen bytes on the arena, copied by aliasing rather than by value, and every
 `decimal` in a loop would be a block to reclaim. C# gives it value semantics and no heap,
-`type_new` is the mechanism that gives exactly that, and D36 (below) is the ruling that
+`type_new` is the mechanism that gives exactly that, and the decision § 14 proposes is the ruling that
 lets teko use it.
 
 ### How sixteen bytes travel
@@ -343,7 +343,7 @@ one crumb whose CI matrix is the proof, because three machine tables are being d
 the other fixtures unchanged with `--dump-ast` byte-identical, `FIXPOINT OK`, `mc limits`
 verdict `ok` with `intrin` and `passes` unmoved. **Owes:** a `decimal` section in
 [types.md](../reference/types.md), the literal in the lexical part of the guide, the new
-module in [modules.md](../internals/modules.md), and the D36 amendment to
+module in [modules.md](../internals/modules.md), and the amendment § 14 proposes to
 [surface.md](surface.md) § "What is 'magic'".
 
 ### C4 — the arithmetic (L)
@@ -379,17 +379,17 @@ first row of § 13.
 
 | tension | recommended resolution |
 |---|---|
-| **The owner's ruling anticipated an `i128` on x86-64 as a dependency.** `mc`'s `<i128>` is AArch64 only, so teko would carry its own. | **The dependency dissolves.** With the arithmetic written in surface teko over 32-bit limbs (§ 8) and the value moved by address (§ 1), nothing in this design needs a 128-bit instruction on any leg — correctness lands on all five legs at once, and the native instructions become C7, a measurable speed crumb. The ruling stands where it matters: a primitive **may** use the ISA, and D36 records it. Whether the accelerator is teko's own module or a contribution of an x86-64 half to `mc`'s `<i128>` is a question for the `mc` channel and blocks nothing. |
-| **"Zero new intrinsics" against a machine primitive.** [surface.md](surface.md) states that teko registers no intrinsic and that the closed list is exactly what `mc` gives. | **D36**, below, and an amendment to that page in C3. The list stays closed as written: this design registers **no intrinsic at all** — the halves are read with `&`, `ld64` and `st64`, which are already on the list. What D36 adds is narrower and needs saying anyway: a type registered with `type_new` carries a **machine module for its own value movement**, and a machine table is not an intrinsic and not backend magic — it is where the sixteen bytes of a load are decided, and there is no surface code that could decide them instead. |
+| **The owner's ruling anticipated an `i128` on x86-64 as a dependency.** `mc`'s `<i128>` is AArch64 only, so teko would carry its own. | **The dependency dissolves.** With the arithmetic written in surface teko over 32-bit limbs (§ 8) and the value moved by address (§ 1), nothing in this design needs a 128-bit instruction on any leg — correctness lands on all five legs at once, and the native instructions become C7, a measurable speed crumb. The ruling stands where it matters: a primitive **may** use the ISA, and § 14 records it. Whether the accelerator is teko's own module or a contribution of an x86-64 half to `mc`'s `<i128>` is a question for the `mc` channel and blocks nothing. |
+| **"Zero new intrinsics" against a machine primitive.** [surface.md](surface.md) states that teko registers no intrinsic and that the closed list is exactly what `mc` gives. | **§ 14**, below, and an amendment to that page in C3. The list stays closed as written: this design registers **no intrinsic at all** — the halves are read with `&`, `ld64` and `st64`, which are already on the list. What § 14 adds is narrower and needs saying anyway: a type registered with `type_new` carries a **machine module for its own value movement**, and a machine table is not an intrinsic and not backend magic — it is where the sixteen bytes of a load are decided, and there is no surface code that could decide them instead. |
 | **Three derived tables are three chances to be wrong on one leg only.** A wrong `MTASK_PARAM` on Win64 is a wrong answer, not a diagnostic. | C3 is gated on the **five-leg matrix**, not on the local recipe, and its fixture reads the raw bytes back through `&` rather than trusting an arithmetic result. `lib/machine_probe.mc`'s trick — a derived machine that asserts the depth-type contract and changes no instruction — is worth one probe in P0. |
 | **The return buffer is one global.** Recursion and nesting depend on the call site copying out immediately. | It is a rule of one handler, in one place, with the recursive fixture as its oracle. The alternative — a return in a register pair — is three ABIs and was rejected for that reason. |
 | **The literal ordering.** If `tk_dec_init()` is ever registered after `tk_float_init()`, `1.5m` silently becomes an `f64` followed by an identifier. | The registration order is asserted by a fixture that puts `0.5m` and `0.5` in the same program and compares neither to the other, and by a comment at the call site in `teko.tk`. |
 | **Rounding rules are two, not one.** The operators round half away from zero; `Round` rounds half to even. | That is C#, and both are fixtures with values that only pass under the right rule (`Round(2.5m) == 2m` for the one, `1m/3m*3m` for the other). If an implementation diverges, the fixture is the oracle and C# is the reference. |
 | **`decimal` has no folded form**, so `const decimal RATE = 0.07m;` cannot work. | Refuse it by name and record the row in [not-yet.md](../reference/not-yet.md). A folded `TK_WIDE` constant would need the core's folder, which is `mc`'s and frozen. |
 
-## 14. D36, proposed
+## 14. The decision this design proposes (numbered when it enters the log)
 
-> **D36 · A primitive may be a machine type; the closed list stays closed.**
+> **A primitive may be a machine type; the closed list stays closed.**
 > A type teko registers with `type_new` carries whatever its representation needs to
 > **move**: a derived machine table per instruction set, deriving from the table in effect
 > and delegating everything else through a pristine copy. That is not an intrinsic and not
