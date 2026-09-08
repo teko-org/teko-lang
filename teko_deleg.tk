@@ -904,6 +904,40 @@ uptr tk_cap_writer(i64 ty) {
 i64 tk_prim_is(i64 ty);
 i64 tk_prim_raw(i64 e);
 
+// Q3 (D46): the N_IDENT a BY-VALUE capture reads the local through. Definite
+// assignment (teko_typeof.tk) counts a `use (...)` as an ASSIGNMENT rather
+// than as a read -- `docs/specs/nullable.md` § 8's own table -- because the
+// name crossing into a closure is the lambda's business and not that walk's,
+// and the node it crosses in is the only thing that tells it apart from an
+// ordinary read of the same name written on the same line. `use (&a)` needs no
+// row: it is already an `N_ADDR`, which that walk reads as an assignment.
+//
+// One row per by-value capture EMITTED, over the whole unit, and it is read
+// only by a walk that runs after the last one is written. The table is empty
+// for a unit with no lambda, which is every unit this compiler is itself made
+// of, so the lookup costs one compare there.
+#define TK_MAXCAPRD 256               // by-value captures emitted, over the whole unit
+
+i64 capread_node[TK_MAXCAPRD];
+i64 tk_ncapread = 0;
+
+void tk_capread_add(i64 n) {
+    if (tk_ncapread == TK_MAXCAPRD)
+        err_at(tk_file, tk_line, "teko: too many captures by value in one unit");
+    st64(capread_node + tk_ncapread * 8, n);
+    tk_ncapread = tk_ncapread + 1;
+}
+
+i64 tk_capread_is(i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ncapread) break;
+        if (ld64(capread_node + i * 8) == n) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
 // the value a BY-VALUE capture hands to `tk_cap_writer`'s own `i64` slot:
 // `tk_cap_put`'s `v` parameter (`lib/rt.tk`) is declared `i64`, the register
 // file plain data crosses in, and `tk_check_scalar_compat` (teko_typeof.tk,
@@ -922,6 +956,7 @@ i64 tk_prim_raw(i64 e);
 // slot check that refuses them -- so both take the machine cast here.
 i64 tk_cap_val(i64 ty, uptr name) {
     i64 v = tk_id(name);
+    tk_capread_add(v);
     if (tk_prim_is(ty)) return tk_prim_raw(v);
     if (tk_is_enum(tk_struct_by_ty(ty))) return tk_cast(TY_I64, v);
     return v;
