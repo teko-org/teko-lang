@@ -41,7 +41,9 @@ costs no instruction.
 
 `f32` and `f64` come from the `<float>` library the compiler loads, with their own
 literals (`2.0`, `0.5f`) and the intrinsics `ldf64`/`ldf32`/`stf64`/`stf32`/`sqrt_f64`/
-`fabs`/`fmin`/`fmax`.
+`fabs`/`fmin`/`fmax`. `i8` and `i16` (below, § "`i8` and `i16`") are neither of the eight
+core words nor an alias of one: they are two primitives of teko's own, C#'s `sbyte` and
+`short`.
 
 A type word is **reserved program-wide**: `i64 str = 1;` is refused, exactly as C#
 refuses a variable named `int`.
@@ -65,8 +67,68 @@ i64 main() {
 
 A cast is C-shaped and unambiguous, `(u32) x`, because a type word always follows the
 `(`. Narrowing masks; widening is by the type's own kind — zero for `u8`/`u16`/`u32`,
-**sign** for `i32`. Arithmetic is 64-bit on the widened value and wraps at the next store.
-A comparison yields `i64` `0` or `1`.
+**sign** for `i32`, `i8` and `i16`. Arithmetic is 64-bit on the widened value and wraps at
+the next store. A comparison yields `i64` `0` or `1`.
+
+teko does not teach C#'s integer promotion (`sbyte + sbyte` is an `int` in C#): `(i8) 100 +
+(i8) 100` is `200` while it is still in flight — an ordinary 64-bit value — and only
+narrows to `-56` at the next store into an `i8` slot, the same rule `u8`/`u16`/`u32`
+already had. Teaching promotion for the two newest types while the three older ones kept
+the old rule would be the real inconsistency, and it would change the base grammar (the
+`+` in `a + b` is `mc`'s own, D3).
+
+### `i8` and `i16`
+
+C#'s `sbyte` and `short`: signed, one and two bytes wide. Unlike the seven aliases above,
+each is its own primitive — `type_new("i8", 1, 1, TK_SINT)` and `type_new("i16", 2, 2,
+TK_SINT)` — because `mc`'s own `TK_SINT` kind already does the sign-extending load, the
+sign-extending cast, a signed `/`, `%` and `>>`, a signed comparison and a narrowed call
+result for a type registered with it; nothing here re-teaches any of that.
+
+```teko
+// expect-exit: 42
+i16 clamp16(i32 v) {
+    if (v > 32767) return 32767;
+    if (v < 0 - 32768) return 0 - 32768;
+    return (i16) v;
+}
+
+i64 main() {
+    i8  a = 0 - 5;
+    i16 b = 0 - 300;
+    if (a >> 1 != 0 - 3) return 1;               // an arithmetic shift, signed
+    if (b / 2 != 0 - 150) return 2;               // a signed divide
+    if (a >= 0) return 3;                         // a signed comparison
+    i64 wide = a;                                 // widens with its sign
+    if (wide != 0 - 5) return 4;
+    f64 f = a;                                    // an integer converts to a float (above)
+    if (f != 0.0 - 5.0) return 5;
+    if (clamp16(70000) != 32767) return 6;        // saturates, narrows explicitly
+    return 42;
+}
+```
+
+`i8`/`i16` convert to a wider integer or to `f64` the same way `i64` already does (the
+section above). The `f32` slot is the exception for now: on aarch64 the single-precision
+conversion of a NEGATIVE narrow signed value (`i8`, `i16`, `i32`) comes out wrong in mc's
+own backend — reported to `minicompiler/mc`, listed in [not-yet.md](not-yet.md#numeric-conversions)
+until the release that fixes it; nothing converts back without a cast, and a float, `null`, or a
+class/struct/interface/delegate/`T[]` value does not convert INTO an `i8`/`i16` slot
+either, with the same wording every other mismatched value already gets.
+
+```teko
+// no-run
+i64 main() {
+    i8 a = 1;
+    i8 b = 2.5;                   // teko: a value of type f64 does not convert to i8
+    i8 c = null;                  // teko: a value of type uptr does not convert to i8
+    return 0;
+}
+```
+
+`sbyte` and `short` are not taught: teko never inherited C#'s `int`/`long` either, and
+registering half of the C# alias family while `int` does not exist would be worse than
+neither half ([not-yet.md](not-yet.md)).
 
 ### `bool`, `true` and `false`
 

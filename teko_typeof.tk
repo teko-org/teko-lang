@@ -240,11 +240,8 @@ void tk_reject_scalar_member(uptr fl, i64 line, i64 ty, uptr m) {
 
 // the ids a slot of INTEGER type can have. Every integer word teko teaches
 // down to `TY_I64` is an alias collapsing to one of the core's five raw ids
-// (teko_type.tk), and `TY_MAX` is the core's own `i32` (`hooks.md` § "the id
-// a registration returns" -- `core_types_init()` runs before `user_init()`,
-// so `i32` is always the FIRST registration and always answers `TY_MAX`,
-// before a byte of teko's own source registers a class). `TY_VOID` sits below
-// the five and `TY_UPTR` above them, and neither is a number.
+// (teko_type.tk). `TY_VOID` sits below the five and `TY_UPTR` above them, and
+// neither is a number.
 //
 // The KIND cannot answer this question on its own: a class, an interface, a
 // delegate and `ref`/`out`/`params` are all registered `TK_INT` too
@@ -252,11 +249,28 @@ void tk_reject_scalar_member(uptr fl, i64 line, i64 ty, uptr m) {
 // because the core carries a pointer-sized value the same way it carries an
 // integer), and every core type -- `TY_VOID` and `TY_UPTR` included --
 // answers `TK_INT` from `type_kind` as well (`hooks.md`, "every core type
-// answers `TK_INT`"). `TK_SINT` alone would miss `i32`'s own sign correctly
-// but still says nothing about `TY_VOID`/`TY_UPTR`, which are the core's five
-// raw ids' own neighbours, not a kind question. So the ID is what is asked,
-// widened by exactly the one id kind alone cannot place: `i32`'s.
-i64 tk_is_int_ty(i64 t) { return (t >= TY_U8 && t <= TY_I64) || t == TY_MAX; }
+// answers `TK_INT`"). `TK_SINT` is not the right question EITHER, and not
+// merely an approximation of one: it is the kind `docs/specs/datetime.md`
+// registers `TimeSpan`/`DateTime` with and every `enum` on `docs/specs/enum.md`
+// is registered with, none of which is a number, so `type_kind(t) == TK_SINT`
+// here would silently widen a `DateTime` into `f64` and accept a bare `i64`
+// into a `Color` slot the moment either lands (D20: no silently wrong
+// result). So this is a POSITIVE LIST, by ID, not by kind, and the rule that
+// keeps it one: **a `type_new` id joins `tk_is_int_ty` only when the module
+// that registered it says so by name, here.** `i32` is the core's own
+// registration (`ty_i32`, `src/hooks.mc` -- `core_types_init()` runs before
+// any module's `user_init()`, so it is always the FIRST registration,
+// `hooks.md` § "the id a registration returns"); `i8`/`i16` are this
+// project's own (`tk_ty_i8`/`tk_ty_i16`, teko_type.tk,
+// `docs/specs/small-ints.md` § 2). `decimal`, `DateTime`, `TimeSpan`, `Guid`,
+// every `enum`, `ref`, `out`, `params` and every class/struct/interface/
+// delegate teko registers stay outside it by construction, with nothing to
+// list for them.
+i64 tk_is_int_ty(i64 t) {
+    return (t >= TY_U8 && t <= TY_I64)
+        || t == ty_i32
+        || t == tk_ty_i8 || t == tk_ty_i16;
+}
 
 // the half of the compatibility check that needs no row of the type table.
 // `tk_check_compat` below opens with it, and so does the field store, which
@@ -529,7 +543,7 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
     st64(pty, fty);
     st64(ppure, 1);
     st64(pown, TK_BORROWED);
-    return tk_call(tk_ldn(fty), addr);
+    return tk_ld(fty, addr);
 }
 
 // the call itself, once the declaration is known: the declaration's own symbol

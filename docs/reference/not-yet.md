@@ -25,6 +25,7 @@ Nothing here is a promise about a later version; what is designed and not built 
 | a standalone `when` | `teko: when not taught yet` |
 | `type X = ...` | not taught: there is no type alias in the surface |
 | a variant / discriminated union | not taught |
+| `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong` | not taught: ordinary identifiers, because teko registers none of the seven C# alias words — `i8`/`i16` are `type_new` primitives of their own, spelled `mc`'s way, not C#'s ([types.md](types.md#i8-and-i16)) |
 
 Interfaces have no covariance and no contravariance, and a `struct` has no reference count
 of its own ([memory.md](memory.md)).
@@ -36,6 +37,7 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 
 | written | what happens |
 |---|---|
+| a negative `i8`/`i16`/`i32` in an `f32` slot, on aarch64 | a wrong value: mc's single-precision `scvtf` path (`lib/machine_arm64_float.mc`, `fa_cast`) mishandles a narrow signed source; the `f64` path was fixed in mc 0.15.23 (D37) and this is its sibling, reported to `minicompiler/mc`. Widen to `f64` in the meantime |
 | `f64 d = s;` with an `f32` `s` | neither converted nor refused: the four bytes are read as eight, so the value is wrong. The two float widths convert to each other in neither direction |
 | `7 % 2.5` | the remainder is not promoted — the integer operand stays one, and the float's bit pattern is read as an integer. `2.5 % 7` is `mc: no float remainder`, the backend having no float remainder instruction at all |
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
