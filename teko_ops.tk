@@ -84,6 +84,13 @@
 // member (teko_access.tk's tk_check_member): a `private` operator answers only
 // inside the type that wrote it.
 
+// docs/specs/datetime.md § 4: teko_prim.tk is included before this file and
+// registers the operator rows of every primitive; these two are what this
+// pass calls once it has typed the operands.
+void tk_prim_binary(i64 n, i64 ta, i64 tb);
+void tk_prim_unary(i64 n, i64 ta);
+i64 tk_prim_is(i64 ty);
+
 // the number of operator declarations one program may hold
 #define TK_MAXOP 64
 
@@ -715,6 +722,12 @@ void tk_ops_binary(i64 n) {
     i64 sa = tk_op_row(ta);
     i64 sb = tk_op_row(tb);
     if (tk_is_enum(sa) || tk_is_enum(sb)) { tk_enum_binary_check(n, sa, sb, ta, tb); return; }
+    // docs/specs/datetime.md § 4: a PRIMITIVE operand claims the node before
+    // anything else looks at it. Unlike an enum, whose two legal groups the
+    // core computes correctly on its own, EVERY row here is a call into
+    // `lib/` -- the raw `+` the core would emit does not panic on overflow --
+    // so the claim both lowers and refuses (teko_prim.tk's own `tk_prim_binary`).
+    if (tk_prim_is(ta) || tk_prim_is(tb)) { tk_prim_binary(n, ta, tb); return; }
     if (sa < 0 && sb < 0) return;
     i64 tok = nd_op(n);
     i64 line = nd_line(n);
@@ -744,6 +757,7 @@ void tk_ops_unary(i64 n) {
     i64 sa = tk_op_row(ta);
     i64 tok = nd_op(n);
     if (tk_is_enum(sa)) { tk_enum_unary_check(n); return; }
+    if (tk_prim_is(ta)) { tk_prim_unary(n, ta); return; }   // `-t` (datetime.md § 4)
     if (sa < 0) {
         if (tok == K_ADD) tk_ops_replace(n, a);
         return;

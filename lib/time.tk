@@ -1,0 +1,144 @@
+// time.tk -- the surface code every `TimeSpan` member and operator lowers to
+// (docs/specs/datetime.md, crumb C1). Program code, not compiler code:
+// `#include "time.tk"` from the `.tk` source, exactly like `rt.tk`, which this
+// file includes for `panic`.
+//
+// EVERY FUNCTION HERE IS WRITTEN OVER THE RAW TICKS, an ordinary `i64`. The
+// compiler writes `(i64) t` on the way in and `(TimeSpan) r` on the way out
+// (teko_prim.tk § "the two casts"), so nothing in this file names the type,
+// nothing here needs an operator of its own, and there is no recursion between
+// a lowered `a - b` and the function it lowers to.
+//
+// A tick is 100 nanoseconds and a `TimeSpan` is a signed 64-bit count of them,
+// C#'s own representation: the whole range is about ±10675199 days.
+//
+// OVERFLOW PANICS. C# raises `OverflowException` on every one of these, and a
+// teko program has no exceptions, so the answer is `panic` -- the arena's own
+// `rt_panic`, exit 70, the same road an index past the end of an array takes
+// (docs/reference/memory.md). Wrapping silently is the one thing that is not on
+// the table: the core's raw `+` over two tick counts is exactly what the
+// operator table exists to keep off the machine.
+#include "rt.tk"
+
+const i64 TICKS_PER_MILLISECOND = 10000;
+const i64 TICKS_PER_SECOND      = 10000000;
+const i64 TICKS_PER_MINUTE      = 600000000;
+const i64 TICKS_PER_HOUR        = 36000000000;
+const i64 TICKS_PER_DAY         = 864000000000;
+
+// the two ends of the range, spelled the way an i64 can hold them
+const i64 TIMESPAN_MAX_TICKS = 9223372036854775807;
+const i64 TIMESPAN_MIN_TICKS = 0 - 9223372036854775807 - 1;
+
+// ---- the constants the table reads as static members ----
+i64 tk_ts_zero() { return 0; }
+i64 tk_ts_min()  { return TIMESPAN_MIN_TICKS; }
+i64 tk_ts_max()  { return TIMESPAN_MAX_TICKS; }
+
+i64 tk_ts_per_day()    { return TICKS_PER_DAY; }
+i64 tk_ts_per_hour()   { return TICKS_PER_HOUR; }
+i64 tk_ts_per_minute() { return TICKS_PER_MINUTE; }
+i64 tk_ts_per_second() { return TICKS_PER_SECOND; }
+i64 tk_ts_per_ms()     { return TICKS_PER_MILLISECOND; }
+
+// ---- the builders ----
+// C#'s `TimeSpan.From*(double)`: the value is scaled to ticks in double and
+// truncated toward zero, which is what `(i64)` lowers to (`fcvtzs`/`cvttsd2si`).
+// .NET 7 dropped the older rounding to the nearest millisecond, and this is the
+// modern behaviour, so `FromSeconds(0.0000001)` is one tick and not zero.
+//
+// The range test is also the NaN test, and deliberately so: `>=` and `<=` are
+// both FALSE for a NaN operand on either backend (an unordered compare clears
+// the flags both conditions read), so the negation below is what a NaN reaches.
+// Writing `t != t` instead would answer differently on the two machines.
+i64 tk_ts_scaled(f64 value, f64 scale) {
+    f64 t = value * scale;
+    if (!(t >= 0.0 - 9223372036854775808.0 && t <= 9223372036854774784.0))
+        panic("a time span is out of range");
+    return (i64) t;
+}
+
+i64 tk_ts_from_days(f64 v)    { return tk_ts_scaled(v, 864000000000.0); }
+i64 tk_ts_from_hours(f64 v)   { return tk_ts_scaled(v, 36000000000.0); }
+i64 tk_ts_from_minutes(f64 v) { return tk_ts_scaled(v, 600000000.0); }
+i64 tk_ts_from_seconds(f64 v) { return tk_ts_scaled(v, 10000000.0); }
+i64 tk_ts_from_ms(f64 v)      { return tk_ts_scaled(v, 10000.0); }
+i64 tk_ts_from_ticks(i64 t)   { return t; }
+
+// ---- the components, C#'s own ----
+// `.Hours` is the hour OF the span, 0..23, and `.TotalHours` below is the whole
+// span as an f64. A negative span answers negative components, as C# does: the
+// core's `/` and `%` on an `i64` truncate toward zero.
+i64 tk_ts_days(i64 t)    { return t / TICKS_PER_DAY; }
+i64 tk_ts_hours(i64 t)   { return (t / TICKS_PER_HOUR) % 24; }
+i64 tk_ts_minutes(i64 t) { return (t / TICKS_PER_MINUTE) % 60; }
+i64 tk_ts_seconds(i64 t) { return (t / TICKS_PER_SECOND) % 60; }
+i64 tk_ts_ms(i64 t)      { return (t / TICKS_PER_MILLISECOND) % 1000; }
+
+f64 tk_ts_total_days(i64 t)    { f64 x = t; return x / 864000000000.0; }
+f64 tk_ts_total_hours(i64 t)   { f64 x = t; return x / 36000000000.0; }
+f64 tk_ts_total_minutes(i64 t) { f64 x = t; return x / 600000000.0; }
+f64 tk_ts_total_seconds(i64 t) { f64 x = t; return x / 10000000.0; }
+f64 tk_ts_total_ms(i64 t)      { f64 x = t; return x / 10000.0; }
+
+// ---- the arithmetic ----
+// The overflow test is the sign one C has always used: an addition overflowed
+// when both operands share a sign the result does not.
+i64 tk_ts_add(i64 a, i64 b) {
+    i64 r = a + b;
+    if (((a ^ r) & (b ^ r)) < 0) panic("a time span overflowed");
+    return r;
+}
+
+i64 tk_ts_sub(i64 a, i64 b) {
+    i64 r = a - b;
+    if (((a ^ b) & (a ^ r)) < 0) panic("a time span overflowed");
+    return r;
+}
+
+i64 tk_ts_neg(i64 a) {
+    if (a == TIMESPAN_MIN_TICKS) panic("a time span overflowed");
+    return 0 - a;
+}
+
+i64 tk_ts_duration(i64 a) {
+    if (a == TIMESPAN_MIN_TICKS) panic("a time span overflowed");
+    if (a < 0) return 0 - a;
+    return a;
+}
+
+// `-1` is taken out of the way BEFORE the division that checks the product:
+// `MIN / -1` is the one signed division that overflows, and on x86_64 it traps
+// in hardware rather than answering.
+i64 tk_ts_mul(i64 a, i64 n) {
+    if (a == 0 || n == 0) return 0;
+    if (n == 0 - 1) return tk_ts_neg(a);
+    i64 r = a * n;
+    if (r / n != a) panic("a time span overflowed");
+    return r;
+}
+
+i64 tk_ts_div(i64 a, i64 n) {
+    if (n == 0) panic("a time span divided by zero");
+    if (n == 0 - 1) return tk_ts_neg(a);
+    return a / n;
+}
+
+// ---- the comparisons ----
+// Each answers 0 or 1, the shape every teko condition already has. They are
+// calls and not the core's own `cmp` because the table is one mechanism: the
+// same rows carry `DateTime`, whose `Kind` bits sit above its ticks and whose
+// comparison therefore cannot be a bare compare (docs/specs/datetime.md § 4).
+i64 tk_ts_eq(i64 a, i64 b) { return a == b; }
+i64 tk_ts_ne(i64 a, i64 b) { return a != b; }
+i64 tk_ts_lt(i64 a, i64 b) { return a < b; }
+i64 tk_ts_le(i64 a, i64 b) { return a <= b; }
+i64 tk_ts_gt(i64 a, i64 b) { return a > b; }
+i64 tk_ts_ge(i64 a, i64 b) { return a >= b; }
+
+// C#'s own `CompareTo`: -1, 0 or 1.
+i64 tk_ts_cmp(i64 a, i64 b) {
+    if (a < b) return 0 - 1;
+    if (a > b) return 1;
+    return 0;
+}

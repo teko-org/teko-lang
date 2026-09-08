@@ -1,6 +1,6 @@
 # The module map
 
-Thirty-two files: [`teko.tk`](../../teko.tk) and the thirty-one `teko_*.tk` modules it
+Thirty-four files: [`teko.tk`](../../teko.tk) and the thirty-three `teko_*.tk` modules it
 `#include`s. The order of those includes is not cosmetic — a module may forward-declare a
 **function** a later module defines, but a **global** has to already exist where it is
 read, so a file that touches another's tables is included after it. `teko_type.tk` opens
@@ -37,6 +37,8 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_ternary.tk` | `c ? a : b` | `syntax_infix("?")` | the placeholder calls the pass rewrites |
 | `teko_stmt.tk` | every `{` block, and the honest stops for `var`, `match`, `when`, a local `const` | `syntax_stmt("{")` and one per stopped word | — |
 | `teko_expr.tk` | `new`, `.` as field/method/property access | `syntax_expr("new")`, `syntax_infix(".")` | forward-deferred `new` sites |
+| `teko_prim.tk` | nothing of the surface on its own: the lowering table a PRIMITIVE gets members from, and the `syntax_expr`/`syntax_stmt` handlers a primitive's type word is registered with | nothing: the owner module registers | one row per member and per operator of every primitive |
+| `teko_time.tk` | `TimeSpan` — the type word, its members and its operators | one `type_new`, one `syntax_expr` and one `syntax_stmt`, then the rows of `teko_prim.tk`'s two tables | the type id |
 | `teko_params.tk` | `params T[]`, the array built at the call site | `syntax_infix("[")` | the parameters the modifier marked, and the declarations carrying one, each shared or not |
 | `teko_default.tk` | `i64 add(i64 a, i64 b = 10)` | `syntax_param` — the one in this compiler | one row per free declaration with a parameter list |
 | `teko_over.tk` | overload of a top-level function by signature | nothing: one `pass()` | every declaration of the unit, and the names declared more than once |

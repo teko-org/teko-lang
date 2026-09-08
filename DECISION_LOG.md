@@ -936,3 +936,118 @@ to Color`), neither accepted and caught later. A
 `switch` on an enum PARAMETER stays refused (``teko: no operator `==` takes these
 operands``): a parameter has no type at parse time, and giving it one is a crumb of its own
 (not-yet.md).
+
+### D40 · `TimeSpan`, and the mechanism that gives a primitive members (2026-09-08)
+`docs/specs/datetime.md`'s **P0** (the probes) and **C1**, the fifth crumb of the
+numeric-types sequence ([`docs/specs/README.md`](docs/specs/README.md)). Two new modules,
+`teko_prim.tk` (the mechanism, 0 registrations of its own) and `teko_time.tk` (the type and
+its rows), one new library file `lib/time.tk`, and small additions to five existing modules.
+`TimeSpan` is C#'s: a signed 64-bit count of 100-nanosecond ticks, registered
+`type_new("TimeSpan", 8, 8, TK_SINT)` and kept OUT of `tk_is_int_ty` (D38's rule: a
+`type_new` id joins that predicate only when the module that registered it says so, by
+name, there), so it is a type of its own that no integer converts into and that converts
+into no number.
+
+**The mechanism is a LOWERING TABLE, not a vtable.** A `type_new` type has no row in
+teko_struct.tk's type table, hence no field, no method and no constructor. `teko_prim.tk`
+gives it members from data instead: a member row is `(type id, name, kind, parameter type,
+symbol, result type)` over five kinds (a static value, a static call, an instance property,
+an instance method, the value constructor) and an operator row is `(token, arity, left,
+right, symbol, result, swap)`. Every symbol names an ordinary teko function of `lib/time.tk`
+written over the RAW ticks — `i64` in, `i64` out — and **the compiler writes the two
+casts**: `(i64) t` on the way in, `(TimeSpan) r` on the way out, neither an instruction
+(both slots are eight bytes; `walk_narrow`, mc/src/gen_walk.mc, answers 0 for a width-8
+`TK_SINT`). That is what keeps `lib/time.tk` from recursing into the operator it implements,
+and what keeps every existing check honest: the argument `tk_rc_call_args` (teko_rc.tk) sees
+IS an `i64`, and the value the oracle sees IS a `TimeSpan`. Zero new intrinsics, zero new
+passes, nothing changed in `mc` (D2, D21).
+
+**Four sites read the table, and all four already existed**: the type word in
+expression/statement position (`syntax_expr`/`syntax_stmt` on the word, the same pair a
+class name gets, teko_access.tk's `tk_type_word`); `new Name(args)` (teko_expr.tk's
+`tk_new`); `.` on a receiver the PARSER can type (teko_expr.tk's `tk_dot`, through
+`tk_pty_of`); and `.` on a receiver only the PASS can type (teko_typeof.tk's `tk_pend_do`,
+at the exact line `tk_reject_scalar_member` answered before). The operator side is
+teko_ops.tk's own pass, claiming ahead of the class-operator path exactly as the enum guard
+does (D39).
+
+**The P0 probes, measured before a line of `TimeSpan` was written** (recorded in full in
+[`docs/internals/primitives.md`](docs/internals/primitives.md)): the word is a type in
+every position with no further code, and `--dump-ast` prints it BY NAME, which is why
+registering it moves no existing dump; `syntax_expr` reaches the handler ahead of the core's
+"a type word is no expression" (parse_primary consults the table first) and `syntax_stmt`
+wins over the core's own declaration path (parse_stmt_core), so the statement handler calls
+`parse_var` itself with the type word UNREAD; the conversion clause leaves all 47 fixtures
+byte-identical; and — the load-bearing one — **with no operator claim the core compiles and
+RUNS raw arithmetic over two values of the new type**: `mk(10) * mk(4)` answered 40. The
+spec's § 13 resolution is therefore measured and not precautionary: the pass claims every
+binary and unary with a primitive operand and refuses the rows that do not exist.
+
+**Five deltas from the spec's own text**, each a decision this entry takes:
+
+1. **`.Ticks` and `new TimeSpan(t)` are rows with NO symbol**, which the emitter reads as
+   the identity cast — the spec § 2 asks for exactly that lowering, and a symbol-less row is
+   how the table says it without a special case per member.
+2. **The `From*` family is .NET 7's, not .NET Framework's**: the value is scaled at full
+   double precision and truncated toward zero, so `FromSeconds(0.0000001)` is one tick.
+   The older rounding to the nearest millisecond is the behaviour C# itself dropped, and the
+   spec named neither. The domain check is `!(t >= MIN && t <= MAX)`, which is also the NaN
+   check: `>=` and `<=` are both false for an unordered compare on BOTH backends, while
+   `t != t` answers differently on x86_64 (`comisd`+`setne` reads ZF) than on aarch64.
+3. **C#'s five `TicksPer*` statics are taught** (`TimeSpan.TicksPerDay` and its four
+   siblings). The spec's § 6 table does not list them and C# has them; D3 decides it.
+   `new TimeSpan()` with no argument is C#'s parameterless value constructor and answers
+   the zero span, for the same reason.
+4. **`tk_ty_binary` (teko_typeof.tk) had to ask the operator table.** The core types a
+   binary from its LEFT operand and the oracle copies that rule — but a reversed row makes
+   it false: `3 * hour` is a `TimeSpan`, and `(3 * hour).Ticks` is resolved by the oracle
+   BEFORE teko_ops.tk has rewritten the node into the call whose declared return type would
+   say so. The question is asked only when an operand IS a primitive, so every other binary
+   keeps the rule it had.
+5. **Text and the hand-written cast refusal are NOT in C1.** `ToString`/`Parse` need the
+   text machinery the `enum` page's N2b also waits for; `(i64) t` and `(TimeSpan) n` written
+   by hand stay ACCEPTED as the identity they are (the value is exactly what `.Ticks` and
+   `new TimeSpan(t)` give), because refusing them means telling a compiler-written cast from
+   a source-written one, and that is C2's to build — with `DateTime`, whose `Kind` bits
+   above the ticks make the hand-written cast actually wrong. Both are in
+   [not-yet.md](docs/reference/not-yet.md).
+
+**Two gaps this crumb's own refusal surfaced, both fixed here rather than deferred.**
+A `ref`/`out` parameter's READ is rewritten into `tk_arr_load(pointee, name)` (teko_ref.tk),
+a raw `ld64` the oracle cannot type — harmless while every consumer read "not known" as
+"refuse nothing", and not harmless for a primitive operand, where "not known" is exactly
+what the operator pass must refuse: `t = t + a` inside `f(ref TimeSpan t)` was
+``teko: the type of the left side of `+` is not known here``. The load now registers the
+pointee's own type (`tk_xt_put`, pure and borrowed, the two answers a field load already
+gives), for every pointee alike. And the ternary's hidden local (teko_ternary.tk) is
+initialized with a placeholder `0` typed `i64`, which a primitive slot refuses by this
+crumb's own clause; the placeholder is now that same zero under the slot's type, the
+identity cast again. Neither changes any existing fixture's `--dump-ast`.
+
+**The conversion clause** is `tk_check_scalar_compat`'s (teko_typeof.tk), one `if` beside
+D39's enum clause and shared with it in intent: a primitive converts to nothing but itself,
+in either direction, in the nine slots D33 enumerated — an integer, a float, `null`, a
+class, a struct, a `T[]` or a second primitive into a `TimeSpan` slot, and a `TimeSpan` into
+an `i64`, an `f64` or a slot of row type. Every one of them reuses `tk_reject_compat`'s own
+wording; the crumb adds five NEW `teko:` strings in all
+(`a member of X is read-only`, `this primitive has no constructor`, and the three capacity
+messages), plus one composed refusal the spec asks for: **the include is part of the
+surface**, so a program that names `TimeSpan` without `#include "time.tk"` is told which
+file it forgot (`teko: TimeSpan needs #include "time.tk" before it is used`) instead of
+reaching `mc: call to unknown function` two phases later.
+
+**`docs/specs/decimal.md` § 14's proposed decision is NOT taken here.** It is about a
+primitive that needs a derived MACHINE table to move sixteen bytes; `TimeSpan` needs no
+machine at all, so C1 does not exercise it and it stays unnumbered for C3, which does.
+
+Proof: `mc build . --config mc.macos.toml` clean; **49/49** fixtures at their
+`expect-exit` (the 47 existing plus `tests/surface_timespan.tk` at 42 and
+`tests/surface_timespan_overflow.tk` at 70); `--dump-ast` of the 47 existing fixtures
+byte-identical to `03189d92`; `FIXPOINT OK` (`teko2.o == teko3.o` on the first turn,
+`--dump-asm` diff empty over 203801 lines, 49/49 under the self-hosted `teko1`);
+`sh scripts/check-docs.sh` green; `mc limits . --config mc.macos.toml` verdict `ok`,
+`types` `9` → `10` and `alias` `16` → `17` (a `type_new` moves both, D38's own finding),
+`syntax` `15`, `passes` `15/30` and `intrin` `8/16` **unmoved** — the spec's § 10 table
+predicted exactly that for the two that must not move. Thirty-two refusal probes and eleven
+run-time probes outside `tests/` (`build/refuse/*`, `build/panic/*`, not committed) prove
+every message and every panic this entry names, each with its exact text and exit code.

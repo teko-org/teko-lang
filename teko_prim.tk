@@ -1,0 +1,550 @@
+// teko_prim.tk -- a PRIMITIVE WITH MEMBERS (docs/specs/datetime.md § 2), the
+// mechanism `TimeSpan` brings and `DateTime`, `decimal`, `Guid` and every
+// `enum` static are meant to reuse without a line of their own here.
+//
+// A type registered with `type_new` is a primitive: it has no row in
+// teko_struct.tk's type table, so it has no field, no vtable, no constructor
+// and no method, and `t.Ticks` reaches `teko: TimeSpan has no members` (P0
+// probe, docs/internals/primitives.md). A primitive gets its members from a
+// LOWERING TABLE instead of from a vtable: one row per member --
+//
+//     (type id, member name, kind, parameter type, symbol, result type)
+//
+// -- registered by the module that owns the primitive (teko_time.tk) and read
+// by the four places the question is already asked: `.` at parse time
+// (teko_expr.tk's `tk_dot`), `.` at pass time (teko_typeof.tk's `tk_pend_do`,
+// the deferred access a parameter's receiver takes), `new Name(args)`
+// (teko_expr.tk's `tk_new`) and the type word in expression/statement position
+// (this file's own `tk_prim_expr`/`tk_prim_stmt`, registered by the owner
+// module through `syntax_expr`/`syntax_stmt` -- the same two registrations a
+// class name already gets, teko_access.tk's `tk_type_word`).
+//
+// A member access becomes an ORDINARY CALL to an ORDINARY FUNCTION with
+// surface code in `lib/` (D21: zero new intrinsics):
+//
+//     t.Days                 ->  tk_ts_days((i64) t)
+//     t.Duration()           ->  (TimeSpan) tk_ts_duration((i64) t)
+//     TimeSpan.FromHours(2)  ->  (TimeSpan) tk_ts_from_hours((f64) 2)
+//     new TimeSpan(n)        ->  (TimeSpan) n
+//     a - b                  ->  (TimeSpan) tk_ts_sub((i64) a, (i64) b)
+//
+// THE TWO CASTS ARE THE SPEC'S OWN (§ 2). Every symbol a row names is written
+// over the RAW eight bytes -- `i64` ticks in, `i64` ticks out -- so `lib/time.tk`
+// is ordinary teko that never mentions the primitive type and never needs an
+// operator of its own; the compiler writes `(i64) t` on the way in and
+// `(TimeSpan) r` on the way out. Neither cast is an instruction: both slots are
+// eight bytes and `walk_narrow` (mc/src/gen_walk.mc) answers 0 for a width-8
+// `TK_SINT`, which the P0 probe measured. The same pair is what keeps every
+// existing check honest: the argument teko_rc.tk's own pass sees is an `i64`,
+// because it IS an `i64` by the time it reaches the call.
+//
+// Four properties make it fit the laws this repository holds:
+//
+//   * it is STATICALLY TYPED -- every row names its result type, so the oracle
+//     types `t.Days` as `i64` and `a - b` as `TimeSpan` with no run-time tag;
+//   * it adds NO PASS -- the instance side rides teko_typeof.tk's existing
+//     deferred-member resolution, the operator side teko_ops.tk's existing pass;
+//   * it adds NO INTRINSIC -- every symbol is a teko function with a body;
+//   * it adds NO MESSAGE where one exists -- "unknown member of", "is static;
+//     reach it through its type", "wrong number of arguments for" are the
+//     wordings teko_expr.tk and teko_access.tk already emit for a declared type.
+
+// teko_ops.tk is included AFTER this file (it is the pass that reads the
+// operator rows below), so the three helpers this file borrows from it -- the
+// spelling of an operator token, the "side is not known" wording and the
+// in-place replacement hooks.md § pass() demands -- are forward-declared here,
+// the same way teko_typeof.tk forward-declares `tk_args`.
+uptr tk_op_spell(i64 tok);
+uptr tk_op_side_msg(uptr side, uptr sp);
+void tk_ops_replace(i64 n, i64 with);
+
+#define TK_MAXPRIMT 8                 // primitive types carrying a member table
+#define TK_MAXPRIMM 96                // member rows, over every primitive
+#define TK_MAXPRIMO 32                // operator rows, over every primitive
+
+// what a row is reached as, and therefore what the site may write after it
+#define TK_PMSVAL 0                   // Type.Name           a static value, no ()
+#define TK_PMSFUN 1                   // Type.Name(args)     a static call
+#define TK_PMPROP 2                   // x.Name              an instance property, no ()
+#define TK_PMFUN  3                   // x.Name(args)        an instance method
+#define TK_PMCTOR 4                   // new Type(arg)       the value constructor
+
+// ---- the primitives themselves ----
+i64  pt_ty[TK_MAXPRIMT];
+uptr pt_name[TK_MAXPRIMT];
+uptr pt_inc[TK_MAXPRIMT];             // the include its lowering symbols live in
+i64  tk_nprimt = 0;
+
+i64  pt_ty_at(i64 i)   { return ld64(pt_ty + i * 8); }
+uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
+uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
+
+// ---- the member rows ----
+i64  pmr_ty[TK_MAXPRIMM];
+uptr pmr_name[TK_MAXPRIMM];
+i64  pmr_kind[TK_MAXPRIMM];
+i64  pmr_p0[TK_MAXPRIMM];              // the type of the ONE argument, or -1 for none
+uptr pmr_sym[TK_MAXPRIMM];             // the lib function the row lowers to
+i64  pmr_ret[TK_MAXPRIMM];
+i64  tk_nprimm = 0;
+
+i64  pmr_ty_at(i64 i)   { return ld64(pmr_ty + i * 8); }
+uptr pmr_name_at(i64 i) { return ld64(pmr_name + i * 8); }
+i64  pmr_kind_at(i64 i) { return ld64(pmr_kind + i * 8); }
+i64  pmr_p0_at(i64 i)   { return ld64(pmr_p0 + i * 8); }
+uptr pmr_sym_at(i64 i)  { return ld64(pmr_sym + i * 8); }
+i64  pmr_ret_at(i64 i)  { return ld64(pmr_ret + i * 8); }
+
+// ---- the operator rows ----
+i64  po_tok[TK_MAXPRIMO];
+i64  po_np[TK_MAXPRIMO];              // 1 unary, 2 binary
+i64  po_t0[TK_MAXPRIMO];
+i64  po_t1[TK_MAXPRIMO];              // -1 for a unary row
+uptr po_sym[TK_MAXPRIMO];
+i64  po_ret[TK_MAXPRIMO];
+i64  po_swap[TK_MAXPRIMO];            // 1 when the call takes (b, a): `n * t`
+i64  tk_nprimo = 0;
+
+i64  po_tok_at(i64 i)  { return ld64(po_tok + i * 8); }
+i64  po_np_at(i64 i)   { return ld64(po_np + i * 8); }
+i64  po_t0_at(i64 i)   { return ld64(po_t0 + i * 8); }
+i64  po_t1_at(i64 i)   { return ld64(po_t1 + i * 8); }
+uptr po_sym_at(i64 i)  { return ld64(po_sym + i * 8); }
+i64  po_ret_at(i64 i)  { return ld64(po_ret + i * 8); }
+i64  po_swap_at(i64 i) { return ld64(po_swap + i * 8); }
+
+// ---- registration, called from the owner module's own `_init()` ----
+// `inc` is the include the lowering symbols are written in, named in the
+// refusal a program that forgot it gets (§ 9: the include is part of the
+// surface).
+void tk_prim_type(i64 ty, uptr name, uptr inc) {
+    if (tk_nprimt == TK_MAXPRIMT) err_at(tk_file, tk_line, "teko: too many primitive types");
+    st64(pt_ty + tk_nprimt * 8, ty);
+    st64(pt_name + tk_nprimt * 8, name);
+    st64(pt_inc + tk_nprimt * 8, inc);
+    tk_nprimt = tk_nprimt + 1;
+}
+
+void tk_prim_member(i64 ty, uptr name, i64 kind, i64 p0, uptr sym, i64 ret) {
+    if (tk_nprimm == TK_MAXPRIMM) err_at(tk_file, tk_line, "teko: too many primitive members");
+    st64(pmr_ty + tk_nprimm * 8, ty);
+    st64(pmr_name + tk_nprimm * 8, name);
+    st64(pmr_kind + tk_nprimm * 8, kind);
+    st64(pmr_p0 + tk_nprimm * 8, p0);
+    st64(pmr_sym + tk_nprimm * 8, sym);
+    st64(pmr_ret + tk_nprimm * 8, ret);
+    tk_nprimm = tk_nprimm + 1;
+}
+
+void tk_prim_op(i64 tok, i64 np, i64 t0, i64 t1, uptr sym, i64 ret, i64 swap) {
+    if (tk_nprimo == TK_MAXPRIMO) err_at(tk_file, tk_line, "teko: too many primitive operators");
+    st64(po_tok + tk_nprimo * 8, tok);
+    st64(po_np + tk_nprimo * 8, np);
+    st64(po_t0 + tk_nprimo * 8, t0);
+    st64(po_t1 + tk_nprimo * 8, t1);
+    st64(po_sym + tk_nprimo * 8, sym);
+    st64(po_ret + tk_nprimo * 8, ret);
+    st64(po_swap + tk_nprimo * 8, swap);
+    tk_nprimo = tk_nprimo + 1;
+}
+
+// ---- the lookups ----
+// 1 when `ty` is a primitive this project registered members for. Read by
+// `tk_check_scalar_compat` (teko_typeof.tk) for the conversion clause and by
+// teko_ops.tk for the operator claim, both of which need the QUESTION and not
+// the row.
+i64 tk_prim_is(i64 ty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimt) break;
+        if (pt_ty_at(i) == ty) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+i64 tk_prim_slot(i64 ty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimt) break;
+        if (pt_ty_at(i) == ty) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_prim_by_name(uptr nm) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimt) break;
+        if (str_eq(pt_name_at(i), nm)) return pt_ty_at(i);
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_prim_find(i64 ty, uptr m) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimm) break;
+        if (pmr_ty_at(i) == ty && str_eq(pmr_name_at(i), m)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// 1 when an operand of type `t` lands on a row column declared `pt`. A column
+// naming a PRIMITIVE takes that primitive and nothing else -- which is the
+// whole of `docs/specs/datetime.md` § 5 on the operator side. A column naming
+// `i64` takes any integer teko calls one (`tk_is_int_ty`, D38's own positive
+// list, so `i8`/`i16`/`i32`/`u8`... all reach `t * n`), and one naming a float
+// takes a float or an integer, which `tk_num_widen` then converts at the site.
+i64 tk_prim_slot_fits(i64 pt, i64 t) {
+    if (pt == t) return 1;
+    if (t < 0) return 0;
+    if (tk_prim_is(pt) || tk_prim_is(t)) return 0;
+    if (pt == TY_I64) return tk_is_int_ty(t);
+    if (type_kind(pt) == TK_FLOAT) return tk_is_int_ty(t) || type_kind(t) == TK_FLOAT;
+    return 0;
+}
+
+i64 tk_prim_op_find(i64 tok, i64 np, i64 ta, i64 tb) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimo) break;
+        if (po_tok_at(i) == tok && po_np_at(i) == np && tk_prim_slot_fits(po_t0_at(i), ta)) {
+            if (np == 1 || tk_prim_slot_fits(po_t1_at(i), tb)) return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the type a binary over a primitive ANSWERS with, or -1 when no row takes
+// those operands. The oracle (`tk_ty_binary`, teko_typeof.tk) asks it because
+// the core's own rule -- a binary is typed from its LEFT operand -- is wrong
+// for a reversed row: `3 * hour` answers a `TimeSpan`, not an `i64`, and a
+// `.Ticks` on it is resolved by the oracle BEFORE teko_ops.tk's pass has
+// rewritten the node into the call whose declared return type would say so.
+i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb) {
+    i64 ri = tk_prim_op_find(tok, 2, ta, tb);
+    if (ri < 0) return 0 - 1;
+    return po_ret_at(ri);
+}
+
+// ---- the two casts the lowering is written with (§ 2) ----
+// the raw eight bytes, for a call into `lib/`: `(i64) t`. Not an instruction --
+// both slots are eight bytes -- and not a licence the SURFACE has: it is the
+// compiler's own cast, the same way `tk_num_widen` is.
+i64 tk_prim_raw(i64 e) { return tk_cast(TY_I64, e); }
+
+// ...and the way back, `(TimeSpan) r`, for a row whose result is the primitive
+// itself. A row whose result is `i64` or `f64` needs neither: the call's own
+// declared return type is what every oracle already reads.
+i64 tk_prim_ret(i64 ret, i64 call) {
+    if (tk_prim_is(ret)) return tk_cast(ret, call);
+    return call;
+}
+
+// ---- the refusals ----
+uptr tk_prim_name(i64 ty) { return type_name(ty); }
+
+void tk_prim_no_member(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at2(fl, line, tk_join("teko: unknown member of ", tk_prim_name(ty)), m);
+}
+
+void tk_prim_no_static(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at2(fl, line, tk_join("teko: unknown static member of ", tk_prim_name(ty)), m);
+}
+
+void tk_prim_is_static(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at(fl, line, tk_join3("teko: ", tk_join3(tk_prim_name(ty), ".", m),
+                              " is static; reach it through its type"));
+}
+
+void tk_prim_is_instance(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at(fl, line, tk_join3("teko: ", tk_join3(tk_prim_name(ty), ".", m),
+                              " is an instance member; reach it through an object"));
+}
+
+// a member of a primitive is a value read out of the eight bytes, never a slot:
+// there is nothing to assign to
+void tk_prim_readonly(i64 ty, uptr m, i64 line, uptr fl) {
+    err_at2(fl, line, tk_join3("teko: a member of ", tk_prim_name(ty), " is read-only"), m);
+}
+
+// § 9: the include is part of the surface. Every row names a symbol that lives
+// in the owner module's own include, so a program that named the type without
+// it is told which file it forgot instead of reaching the core's own
+// `call to unknown function` two phases later.
+void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl) {
+    if (decl_find(sym) >= 0) return;
+    i64 pi = tk_prim_slot(ty);
+    err_at(fl, line, tk_join3(tk_join3("teko: ", tk_prim_name(ty), " needs #include "),
+                              pt_inc_at(pi), " before it is used"));
+}
+
+// ---- one argument, checked and converted ----
+// `atpass` picks the oracle: the parser's own (`tk_pty_of`, teko_struct.tk) at
+// a site the parser resolves, and the pass's (`tk_ty_of`, teko_typeof.tk) at a
+// deferred one. Both answer -1 for what they cannot see, which
+// `tk_check_scalar_compat` reads as "refuse nothing" -- and a pass-time
+// argument of the wrong type is still caught, by `tk_rc_call_args`
+// (teko_rc.tk), against the very declaration this row names.
+i64 tk_prim_ty_of(i64 n, i64 atpass) {
+    if (atpass) return tk_ty_of(n);
+    return tk_pty_of(n);
+}
+
+// the value as the lowered call takes it: the raw eight bytes for a primitive
+// column, and C# 10.2.3's own widening (`tk_num_widen`, teko_typeof.tk) for an
+// integer landing on a float one -- `TimeSpan.FromHours(2)` is `FromHours(2.0)`.
+i64 tk_prim_conv(i64 pty, i64 e, i64 ety) {
+    if (tk_prim_is(pty)) return tk_prim_raw(e);
+    return tk_num_widen(pty, ety, e);
+}
+
+i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
+    i64 aty = tk_prim_ty_of(a, atpass);
+    tk_check_scalar_compat(pty, aty, a, line, fl);
+    return tk_prim_conv(pty, a, aty);
+}
+
+// the argument list of a row, checked position by position. Every row this
+// mechanism carries takes one argument or none (§ 6), which is what lets the
+// parameter type be one column; a row that ever needs two takes a list here.
+i64 tk_prim_args(i64 ri, i64 args, i64 na, i64 atpass, uptr m, i64 line, uptr fl) {
+    i64 want = 0;
+    if (pmr_p0_at(ri) >= 0) want = 1;
+    if (na != want) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+    if (want == 0) return 0;
+    return tk_prim_arg(pmr_p0_at(ri), args, atpass, line, fl);
+}
+
+// ---- the emission ----
+// `recv` is 0 for a static row and the receiver's node for an instance one; the
+// receiver is the first argument of the lowered call, exactly as a method's
+// mangled `Owner_method` already takes it.
+i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 na, i64 atpass, i64 line, uptr fl) {
+    i64 ty = pmr_ty_at(ri);
+    uptr m = pmr_name_at(ri);
+    uptr sym = pmr_sym_at(ri);
+    i64 kind = pmr_kind_at(ri);
+    i64 a = tk_prim_args(ri, args, na, atpass, m, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    // A row with NO SYMBOL is the identity (§ 2): `new TimeSpan(t)` is
+    // `(TimeSpan) t` and `t.Ticks` is `(i64) t`, the same eight bytes under the
+    // other type, no call and no instruction. The surface may not write either
+    // cast by hand and the compiler writes both, exactly as `tk_num_widen` is
+    // the compiler's own cast and not a licence to narrow.
+    if (sym == 0) {
+        if (kind == TK_PMCTOR) return tk_cast(pmr_ret_at(ri), a);
+        return tk_cast(pmr_ret_at(ri), recv);
+    }
+    tk_prim_need_include(ty, sym, line, fl);
+    i64 list = 0;
+    if (recv != 0) list = tk_prim_raw(recv);
+    if (a != 0) list = list_append(list, a);
+    tk_line = line;
+    tk_file = fl;
+    return tk_prim_ret(pmr_ret_at(ri), tk_call(sym, list));
+}
+
+// ---- `Type.member`, the type word in expression position ----
+// The word is registered with `syntax_expr` by the owner module, which is what
+// puts this handler ahead of the core's own "a type word is no expression"
+// (parse_primary, mc/src/parse.mc) -- measured by the P0 probe.
+i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
+    uptr nm = tk_prim_name(ty);
+    if (!p_accept(tk_dot_tok)) err_at2(fl, line, "teko: a type name reaches its static members", nm);
+    uptr m = p_ident();
+    i64 ri = tk_prim_find(ty, m);
+    if (ri < 0) tk_prim_no_static(ty, m, line, fl);
+    i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMPROP || kind == TK_PMFUN) tk_prim_is_instance(ty, m, line, fl);
+    if (kind == TK_PMCTOR) tk_prim_no_static(ty, m, line, fl);
+    i64 args = 0;
+    i64 na = 0;
+    if (kind == TK_PMSFUN) {
+        if (p_id() != K_LPAR)
+            err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+        args = tk_args(&na);
+    }
+    else if (p_id() == K_LPAR)
+        err_at2(fl, line, "teko: the member is a property; it is not called", m);
+    return tk_prim_emit(ri, 0, args, na, 0, line, fl);
+}
+
+i64 tk_prim_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 ty = tk_prim_by_name(p_name());
+    p_next();                                    // the type word
+    return tk_prim_static(ty, line, fl);
+}
+
+// the same word in STATEMENT position: a declaration is the core's own
+// `parse_var`, entered with the type word still unread (the shape
+// teko_access.tk's `tk_type_stmt` already has), and a static access is the
+// ordinary expression the handler above builds.
+i64 tk_prim_stmt() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    if (!tk_dot_follows()) return parse_var(line, fl, tk_prim_by_name(p_name()));
+    i64 e = parse_expr(0);
+    p_expect(K_SEMI, "expected ; after the static member");
+    tk_line = line;
+    tk_file = fl;
+    return tk_stmt(e);
+}
+
+// ---- `new Type(arg)`: C#'s value-type constructor ----
+// Reached from teko_expr.tk's `tk_new` with the type word already read and the
+// arguments not yet. It allocates nothing: `new TimeSpan(t)` IS `(TimeSpan) t`.
+i64 tk_prim_new(i64 ty, i64 line, uptr fl) {
+    i64 ri = tk_prim_find(ty, "new");
+    if (ri < 0) err_at2(fl, line, "teko: this primitive has no constructor", tk_prim_name(ty));
+    i64 na = 0;
+    i64 args = 0;
+    if (p_id() == K_LPAR) args = tk_args(&na);
+    // `new TimeSpan()` is C#'s own parameterless value constructor: the default
+    // value of a primitive, which for every one of them is the zero bit pattern
+    // (`TimeSpan.Zero`, `DateTime.MinValue`).
+    if (na == 0) {
+        tk_line = line;
+        tk_file = fl;
+        return tk_cast(ty, tk_int(0));
+    }
+    return tk_prim_emit(ri, 0, args, na, 0, line, fl);
+}
+
+// ---- `x.member`, the instance side, at PARSE time ----
+// The form is read from the token stream, exactly as `tk_member_of`
+// (teko_expr.tk) reads it for a receiver of class type.
+i64 tk_prim_dot(i64 left, i64 ty, uptr m, i64 line, uptr fl) {
+    i64 ri = tk_prim_find(ty, m);
+    if (ri < 0) tk_prim_no_member(ty, m, line, fl);
+    i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMSVAL || kind == TK_PMSFUN) tk_prim_is_static(ty, m, line, fl);
+    if (kind == TK_PMCTOR) tk_prim_no_member(ty, m, line, fl);
+    i64 args = 0;
+    i64 na = 0;
+    if (kind == TK_PMFUN) {
+        if (p_id() != K_LPAR)
+            err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+        args = tk_args(&na);
+    } else {
+        if (p_id() == K_LPAR)
+            err_at2(fl, line, "teko: the member is a property; it is not called", m);
+        if (p_id() == K_ASSIGN) tk_prim_readonly(ty, m, line, fl);
+    }
+    return tk_prim_emit(ri, left, args, na, 0, line, fl);
+}
+
+// ---- ...and at PASS time, for a receiver only the oracle could type ----
+// The deferred access teko_expr.tk recorded (a parameter, a chain through one)
+// carries the form and the arguments the parser already read
+// (teko_typeof.tk's `pd_*` tables), so the same emitter answers both sites.
+i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown) {
+    uptr m = pd_name_at(pi);
+    i64 line = pd_line_at(pi);
+    uptr fl = pd_file_at(pi);
+    i64 form = pd_form_at(pi);
+    if (form == TK_PSTORE) tk_prim_readonly(ty, m, line, fl);
+    if (form == TK_PIXLOAD || form == TK_PIXSTORE)
+        err_at2(fl, line, "teko: the field is not an array", m);
+    i64 ri = tk_prim_find(ty, m);
+    if (ri < 0) tk_prim_no_member(ty, m, line, fl);
+    i64 kind = pmr_kind_at(ri);
+    if (kind == TK_PMSVAL || kind == TK_PMSFUN) tk_prim_is_static(ty, m, line, fl);
+    if (kind == TK_PMCTOR) tk_prim_no_member(ty, m, line, fl);
+    if (kind == TK_PMFUN && form != TK_PCALL)
+        err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+    if (kind == TK_PMPROP && form == TK_PCALL)
+        err_at2(fl, line, "teko: the member is a property; it is not called", m);
+    i64 args = 0;
+    i64 na = 0;
+    if (form == TK_PCALL) {
+        args = pd_arg_at(pi);
+        na = pd_na_at(pi);
+    }
+    st64(pty, pmr_ret_at(ri));
+    st64(ppure, 0);
+    st64(pown, TK_OWNED);
+    return tk_prim_emit(ri, pd_recv_at(pi), args, na, 1, line, fl);
+}
+
+// ---- the operators (§ 4), read by teko_ops.tk's own pass ----
+// The rule the spec's § 13 states, and the one the P0 probe proved is needed:
+// the pass CLAIMS every binary and unary where either operand is a primitive
+// and refuses the ones with no row. A `TK_SINT` id the core is willing to add,
+// subtract and multiply raw must never reach the machine unclaimed -- measured
+// on the probe, `a * b` over two `TimeSpan` values compiled and answered 40.
+//
+// An operand the oracle could not type at all is not guessed at either: the
+// site is refused with the wording every unresolved operand already gets
+// (`teko: the type of the left side of \`+\` is not known here`), because a
+// primitive operand is exactly where the core's own arithmetic would be wrong.
+void tk_prim_op_refuse(i64 tok, i64 line, uptr fl) {
+    uptr sp = tk_op_spell(tok);
+    if (sp == 0) err_at(fl, line, "teko: this operator cannot be overloaded");
+    err_at(fl, line, tk_join3("teko: no operator `", sp, "` takes these operands"));
+}
+
+// `n` is the N_BINARY itself: the call replaces it in place (teko_ops.tk's own
+// `tk_ops_replace`), and the result type is registered so an enclosing operator
+// and the reclaim both read it.
+void tk_prim_binary(i64 n, i64 ta, i64 tb) {
+    i64 tok = nd_op(n);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    uptr sp = tk_op_spell(tok);
+    if (sp == 0) err_at(fl, line, "teko: this operator cannot be overloaded");
+    if (ta < 0) err_at(fl, line, tk_op_side_msg("left", sp));
+    if (tb < 0) err_at(fl, line, tk_op_side_msg("right", sp));
+    i64 ri = tk_prim_op_find(tok, 2, ta, tb);
+    if (ri < 0) tk_prim_op_refuse(tok, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    i64 a = tk_prim_conv(po_t0_at(ri), nd_a(n), ta);
+    i64 b = tk_prim_conv(po_t1_at(ri), nd_b(n), tb);
+    // an operand was a CHILD and becomes a link of an argument list: whatever
+    // `nd_next` it carried belongs to the tree it is leaving
+    set_nd_next(a, 0);
+    set_nd_next(b, 0);
+    uptr sym = po_sym_at(ri);
+    i64 owner = ta;
+    if (!tk_prim_is(owner)) owner = tb;
+    tk_prim_need_include(owner, sym, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    i64 ret = po_ret_at(ri);
+    // `n * t` is `tk_ts_mul(t, n)`: the row is keyed by the order the SOURCE
+    // wrote the operands in, and `swap` is what the reversed C# declaration
+    // (`operator *(double, TimeSpan)`) becomes without a second lib function.
+    // The list is built ONCE, in the order the row asks for: `list_append`
+    // LINKS the two nodes, so building both orders and keeping the second
+    // would leave the first link in place and make each argument the other's
+    // `nd_next` -- a cycle every later walk follows forever.
+    i64 call = 0;
+    if (po_swap_at(ri)) call = tk_call2(sym, b, a);
+    else                call = tk_call2(sym, a, b);
+    tk_ops_replace(n, tk_prim_ret(ret, call));
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
+}
+
+void tk_prim_unary(i64 n, i64 ta) {
+    i64 tok = nd_op(n);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 ri = tk_prim_op_find(tok, 1, ta, 0 - 1);
+    if (ri < 0) tk_prim_op_refuse(tok, line, fl);
+    uptr sym = po_sym_at(ri);
+    tk_prim_need_include(ta, sym, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    i64 ret = po_ret_at(ri);
+    tk_ops_replace(n, tk_prim_ret(ret, tk_call(sym, tk_prim_raw(nd_a(n)))));
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
+}

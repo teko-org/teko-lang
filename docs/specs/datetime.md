@@ -1,8 +1,15 @@
 # `DateTime` and `TimeSpan`
 
-**Designed, not built.** Nothing on this page compiles today; every sample carries
-`// no-run` for that reason. What runs is [the type reference](../reference/types.md), and
-this page is kept apart from it on purpose ([the specs index](README.md)).
+**Two of this page's crumbs have landed: P0 (the probes) and C1 (`TimeSpan`, and the
+primitive-member mechanism under it), D40.** What `TimeSpan` actually does today is
+[the reference page](../reference/timespan.md) and the mechanism is
+[the internals note](../internals/primitives.md); the samples below still carry `// no-run`
+because each of them names `DateTime`, which is **not** built. Everything on this page
+about `DateTime`, about text (`ToString`/`Parse`) and about `Now`/`UtcNow` is design and
+nothing more.
+
+The rest of the page is unchanged, and deliberately: it is the design C1 was built from,
+and C2 is built from the same words.
 
 The two types share one page because they share one number. A `TimeSpan` is a count of
 ticks, a `DateTime` is a count of ticks since an origin, `DateTime - DateTime` **is** a
@@ -350,7 +357,18 @@ success and a small distinct number per failed assertion, which is the conventio
 
 Both are independent landings; C2 depends on C1 for the mechanism and on nothing else.
 
-### P0 — the probes (S)
+### P0 — the probes (S) — **landed (D40)**
+
+The measurements are [`docs/internals/primitives.md`](../internals/primitives.md) § "The P0
+probes". In short: the word is a type in every position and `--dump-ast` prints it BY NAME
+(so registering it moves no existing dump); `syntax_expr` reaches the handler ahead of the
+core's own type-word rule, and `syntax_stmt` wins over the core's declaration path, so the
+handler calls `parse_var` itself; the conversion clause left all 47 fixtures byte-identical;
+the registration costs `types 9 → 10` and `alias 16 → 17`, with `syntax`, `passes` and
+`intrin` unmoved. The fourth answer is the load-bearing one: with **no** operator claim the
+core compiles and runs raw arithmetic over two values of the new type (`a * b` answered
+40), which is why § 13's resolution — claim every binary, refuse the rows that do not
+exist — is the design and not a precaution.
 
 No product module. Four questions answered on the tree, with throwaway programs under
 `build/`, and the numbers recorded in [`docs/internals/`](../internals/README.md):
@@ -367,7 +385,17 @@ No product module. Four questions answered on the tree, with throwaway programs 
 **Gate:** 45/45 fixtures at their `expect-exit`, `--dump-ast` byte-identical, `FIXPOINT
 OK`, `mc limits` verdict `ok`. No documentation owed beyond the internals note.
 
-### C1 — `TimeSpan`, and the mechanism under it (L)
+### C1 — `TimeSpan`, and the mechanism under it (L) — **landed (D40)**
+
+Built as designed, with four deltas the work measured and the log records (D40): the
+lowering table lives in `teko_prim.tk` and the registrations in `teko_time.tk` (the split
+this section already asks for); `.Ticks` and `new TimeSpan(t)` are the identity cast, which
+made a symbol-less row worth having; `tk_ty_binary` had to ask the operator table, because
+the core types a binary from its LEFT operand and `3 * hour` is a `TimeSpan`; and the two
+fixtures are `tests/surface_timespan.tk` (42) and `tests/surface_timespan_overflow.tk`
+(70), named for the `surface_*` family the repository already uses. Text and the hand-
+written cast refusal are NOT in it ([not-yet.md](../reference/not-yet.md)).
+
 
 `teko_prim.tk` and `teko_time.tk` as far as `TimeSpan` needs them; the member lowering in
 teko_expr.tk/teko_typeof.tk/teko_access.tk; the operator rows in teko_ops.tk; the

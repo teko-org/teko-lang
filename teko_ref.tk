@@ -512,7 +512,22 @@ void tk_ref_walk(i64 n) {
         } else if (k == N_IDENT) {
             i64 pn = tk_ref_param_named(nd_name(n));
             if (pn >= 0) {
-                tk_ref_replace(n, tk_arr_load(tk_param_ty(pn), tk_id(nd_name(n))));
+                i64 pty = tk_param_ty(pn);
+                tk_ref_replace(n, tk_arr_load(pty, tk_id(nd_name(n))));
+                // the read IS a value of the POINTEE's type, and nothing said
+                // so: the node it becomes is a raw `ld64`, which the oracle
+                // reads as an intrinsic call it cannot type
+                // (`tk_ty_of`, teko_typeof.tk). Harmless while every consumer
+                // treated "not known" as "refuse nothing"; not harmless for a
+                // PRIMITIVE pointee (docs/specs/datetime.md § 2), where an
+                // untyped operand is exactly what teko_ops.tk has to refuse
+                // rather than leave to the core's raw arithmetic -- so
+                // `t = t + a` inside `f(ref TimeSpan t)` was
+                // ``teko: the type of the left side of `+` is not known here``.
+                // Registered here, where the pointee is in hand, for every
+                // pointee type alike: a load is pure and borrowed, the same
+                // two answers a field load registers (teko_expr.tk).
+                tk_xt_put(n, tk_struct_by_ty(pty), pty, 1, TK_BORROWED);
                 n = nd_next(n);
                 continue;
             }

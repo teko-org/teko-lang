@@ -474,6 +474,42 @@ least one member. [diagnostics.md](diagnostics.md) has every one of these messag
 
 ---
 
+## `TimeSpan`
+
+A length of time as a signed 64-bit count of 100-nanosecond ticks, C#'s own, behind one
+include:
+
+```
+#include "time.tk"
+```
+
+It is a **primitive with members**: eight bytes like an `i64`, a distinct type no integer
+converts into, and a table of members — `.Ticks`, `.Days`, `.TotalHours`,
+`TimeSpan.FromHours(x)`, `new TimeSpan(ticks)` — that lower to ordinary functions of
+[`lib/time.tk`](runtime.md#the-time-library). `+ - * /`, the unary minus and the six comparisons
+are calls with an overflow check; every other operator is refused.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    TimeSpan day = TimeSpan.FromDays(1.0);
+    TimeSpan two = TimeSpan.FromHours(2.0);
+    TimeSpan both = day + two;
+    if (both.Ticks != 936000000000) return 1;
+    if (both.Hours != 2) return 2;               // the component, 0..23
+    if (both.TotalHours != 26.0) return 3;       // ...and the whole span
+    if (both <= day) return 4;
+    return 42;
+}
+```
+
+[timespan.md](timespan.md) is the whole type: every member, every operator, every refusal.
+`DateTime` is [designed and not built](../specs/datetime.md).
+
+---
+
 ## Members
 
 The same member grammar serves a struct and a class.

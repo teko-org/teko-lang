@@ -1,5 +1,10 @@
 # The runtime
 
+Two library files, both **program** code compiled under the same taught vocabulary as the
+program that includes them: `lib/rt.tk`, the runtime every program links against, and
+[`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` member and operator lowers
+to.
+
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
 the compiler injects, the guards behind an index and an interface call, and a handful of
 primitives over `str` and `f64`. It is **program** code, compiled under the same taught
@@ -136,6 +141,50 @@ i64 main() {
     return 40 + 2;
 }
 ```
+
+---
+
+## The time library
+
+`lib/time.tk`, what [`TimeSpan`](timespan.md) lowers to. It includes `rt.tk` for `panic`, so a program
+that includes it has both:
+
+```
+#include "time.tk"          // brings rt.tk with it
+```
+
+**Nothing here is called by hand.** Every function takes and answers the RAW tick count as
+an `i64`, and the compiler writes the two casts around it — `(i64) t` on the way in,
+`(TimeSpan) r` on the way out — so `t.Days` IS `tk_ts_days((i64) t)` and `a + b` IS
+`(TimeSpan) tk_ts_add((i64) a, (i64) b)`. Calling one directly works and is not a supported
+spelling: the surface is the member, not the symbol.
+
+| signature | is |
+|---|---|
+| `i64 tk_ts_zero()` `tk_ts_min()` `tk_ts_max()` | `TimeSpan.Zero`, `MinValue`, `MaxValue` |
+| `i64 tk_ts_per_day()` `tk_ts_per_hour()` `tk_ts_per_minute()` `tk_ts_per_second()` `tk_ts_per_ms()` | the five `TicksPer*` constants |
+| `i64 tk_ts_scaled(f64 value, f64 scale)` | the shared builder: scale, range-check (a NaN included) and truncate toward zero |
+| `i64 tk_ts_from_days(f64)` `tk_ts_from_hours(f64)` `tk_ts_from_minutes(f64)` `tk_ts_from_seconds(f64)` `tk_ts_from_ms(f64)` | the `From*` family |
+| `i64 tk_ts_from_ticks(i64)` | `TimeSpan.FromTicks` |
+| `i64 tk_ts_days(i64)` `tk_ts_hours(i64)` `tk_ts_minutes(i64)` `tk_ts_seconds(i64)` `tk_ts_ms(i64)` | the components |
+| `f64 tk_ts_total_days(i64)` `tk_ts_total_hours(i64)` `tk_ts_total_minutes(i64)` `tk_ts_total_seconds(i64)` `tk_ts_total_ms(i64)` | the totals |
+| `i64 tk_ts_add(i64, i64)` `tk_ts_sub(i64, i64)` `tk_ts_mul(i64, i64)` `tk_ts_div(i64, i64)` `tk_ts_neg(i64)` | the arithmetic, each with its overflow check |
+| `i64 tk_ts_duration(i64)` | `.Duration()` |
+| `i64 tk_ts_eq(i64, i64)` `tk_ts_ne` `tk_ts_lt` `tk_ts_le` `tk_ts_gt` `tk_ts_ge` | the six comparisons, 0 or 1 |
+| `i64 tk_ts_cmp(i64, i64)` | `.CompareTo()`: `-1`, `0` or `1` |
+
+Five constants come with the file, and a program may read them: `TICKS_PER_MILLISECOND`,
+`TICKS_PER_SECOND`, `TICKS_PER_MINUTE`, `TICKS_PER_HOUR`, `TICKS_PER_DAY`, plus
+`TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS`. They are ordinary top-level `const i64`, so
+a program that declares one of those names itself collides with it.
+
+Three panics live here, all exit **70**:
+
+| panic | when |
+|---|---|
+| `teko: a time span overflowed` | `+ - * /`, the unary minus and `.Duration()` past the range |
+| `teko: a time span divided by zero` | `t / 0` |
+| `teko: a time span is out of range` | a `From*` value that scales past the range, or a NaN |
 
 ---
 

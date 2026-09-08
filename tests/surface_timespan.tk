@@ -1,0 +1,176 @@
+// surface_timespan.tk -- `TimeSpan` as C# spells it (docs/specs/datetime.md,
+// crumb C1), and with it the whole primitive-member mechanism: a `type_new`
+// primitive whose members come from a lowering table instead of a vtable
+// (teko_prim.tk), reached at every site the language has one --
+//
+//   TimeSpan.FromHours(2)      a static, through the type word
+//   TimeSpan.TicksPerDay       a static value, no parentheses
+//   new TimeSpan(864000000000) the value constructor: the identity, no call
+//   t.Ticks  t.Days  t.Hours   an instance property on a LOCAL
+//   t.TotalHours               ...answering an f64, not the component
+//   t.Duration()  t.Negate()   an instance method
+//   span(a)                    ...and every one of them on a PARAMETER, which
+//                              is the deferred road (teko_typeof.tk's pass)
+//   a + b   a - b   -a         the operators, each a call with an overflow
+//   a * 3   a / 2              check, none of them the core's raw arithmetic
+//   a < b   a == b   ...       the six comparisons
+//
+// Every tick count below is exact: `FromDays(1).Ticks` is 864000000000 and
+// nothing else, which is what makes the fixture an oracle rather than a
+// smoke test.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+class Box {
+    public TimeSpan span;
+    public Box() { span = TimeSpan.Zero; }
+}
+
+TimeSpan g_span;                                   // a global of primitive type
+
+// the receiver the PARSER cannot type: a parameter, deferred to the oracle's
+// own pass and lowered there against the very same table
+i64 hours_of(TimeSpan t) { return t.Hours; }
+i64 ticks_of(TimeSpan t) { return t.Ticks; }
+TimeSpan twice(TimeSpan t) { return t + t; }
+
+// a `ref` pointee read through the table: the pass types the pointee, so
+// `t + a` is the TimeSpan `+` (overflow-checked), not the core's raw one
+void grow(ref TimeSpan t, TimeSpan a) { t = t + a; }
+void take_half(out TimeSpan t, TimeSpan a) { t = a / 2; }
+// the ternary's hidden local, zero under the slot's own type
+TimeSpan longer(TimeSpan a, TimeSpan b) { return a > b ? a : b; }
+
+i64 main() {
+    // ---- the builders, exact to the tick ----
+    TimeSpan day = TimeSpan.FromDays(1.0);
+    if (day.Ticks != 864000000000) return 1;
+    if (TimeSpan.FromHours(1.0).Ticks != 36000000000) return 2;
+    if (TimeSpan.FromMinutes(1.0).Ticks != 600000000) return 3;
+    if (TimeSpan.FromSeconds(1.0).Ticks != 10000000) return 4;
+    if (TimeSpan.FromMilliseconds(1.0).Ticks != 10000) return 5;
+    if (TimeSpan.FromTicks(7).Ticks != 7) return 6;
+    // an integer at an `f64` parameter converts, C# 10.2.3
+    if (TimeSpan.FromHours(2).Ticks != 72000000000) return 7;
+
+    // ---- the constructor and the statics ----
+    TimeSpan built = new TimeSpan(864000000000);
+    if (built.Ticks != day.Ticks) return 8;
+    if (TimeSpan.Zero.Ticks != 0) return 9;
+    if (TimeSpan.TicksPerDay != 864000000000) return 10;
+    if (TimeSpan.TicksPerHour != 36000000000) return 11;
+    if (TimeSpan.TicksPerMillisecond != 10000) return 12;
+    if (TimeSpan.MaxValue.Ticks != 9223372036854775807) return 13;
+    if (TimeSpan.MinValue.Ticks != 0 - 9223372036854775807 - 1) return 14;
+    TimeSpan empty = new TimeSpan();
+    if (empty.Ticks != 0) return 15;
+
+    // ---- + - and the exact sum ----
+    TimeSpan hour = TimeSpan.FromHours(1.0);
+    TimeSpan half = TimeSpan.FromMinutes(30.0);
+    TimeSpan sum = hour + half;
+    if (sum.Ticks != 54000000000) return 16;
+    if (sum.Minutes != 30) return 17;
+    if (sum.Hours != 1) return 18;
+    TimeSpan back = sum - half;
+    if (back.Ticks != hour.Ticks) return 19;
+
+    // ---- the component against the total, the difference C# users get wrong
+    TimeSpan two = TimeSpan.FromHours(2.0);
+    TimeSpan long_span = day + two;
+    if (long_span.Hours != 2) return 20;           // the hour OF the span
+    if (long_span.TotalHours != 26.0) return 21;   // ...and the whole span
+    if (long_span.Days != 1) return 22;
+    if (long_span.TotalMinutes != 1560.0) return 23;
+
+    // ---- a composite span, component by component ----
+    // 1 day, 2 hours, 3 minutes, 4 seconds and 5 milliseconds
+    TimeSpan mixed = new TimeSpan(937840050000);
+    if (mixed.Days != 1) return 24;
+    if (mixed.Hours != 2) return 25;
+    if (mixed.Minutes != 3) return 26;
+    if (mixed.Seconds != 4) return 27;
+    if (mixed.Milliseconds != 5) return 28;
+    if (mixed.TotalMilliseconds != 93784005.0) return 29;
+
+    // ---- negative spans: the unary minus, the components, Duration ----
+    TimeSpan neg = -mixed;
+    if (neg.Ticks != 0 - 937840050000) return 30;
+    if (neg.Days != 0 - 1) return 31;
+    if (neg.Hours != 0 - 2) return 32;
+    if (neg.Duration().Ticks != mixed.Ticks) return 33;
+    if (neg.Negate().Ticks != mixed.Ticks) return 34;
+    if (mixed.Negate().Ticks != neg.Ticks) return 35;
+
+    // ---- * and /, by an integer on either side ----
+    if ((hour * 3).Ticks != 108000000000) return 36;
+    if ((3 * hour).Ticks != 108000000000) return 37;
+    if ((day / 2).Ticks != 432000000000) return 38;
+    TimeSpan back_half = day / (0 - 2);
+    if (back_half.Ticks != 0 - 432000000000) return 39;
+
+    // ---- the six comparisons ----
+    if (!(half < hour)) return 40;
+    if (!(hour > half)) return 41;
+    if (!(half <= hour)) return 43;
+    if (!(hour >= half)) return 44;
+    if (!(hour <= hour)) return 45;
+    if (!(hour == TimeSpan.FromMinutes(60.0))) return 46;
+    if (hour != TimeSpan.FromSeconds(3600.0)) return 47;
+    if (half >= hour) return 48;
+    if (hour < half) return 49;
+
+    // ---- CompareTo / Equals ----
+    if (half.CompareTo(hour) != 0 - 1) return 50;
+    if (hour.CompareTo(half) != 1) return 51;
+    if (hour.CompareTo(hour) != 0) return 52;
+    if (!hour.Equals(TimeSpan.FromMinutes(60.0))) return 53;
+    if (hour.Equals(half)) return 54;
+
+    // ---- a parameter, a return, a field, an array element, a global ----
+    if (hours_of(long_span) != 2) return 55;
+    if (ticks_of(hour) != 36000000000) return 56;
+    if (twice(hour).Ticks != 72000000000) return 57;
+
+    Box b = new Box();
+    if (b.span.Ticks != 0) return 58;
+    b.span = mixed;
+    TimeSpan fromfield = b.span;
+    if (fromfield.Minutes != 3) return 59;
+
+    TimeSpan table[3];
+    table[0] = hour;
+    table[1] = half;
+    table[2] = hour + half;
+    TimeSpan e2 = table[2];
+    if (e2.Ticks != 54000000000) return 60;
+
+    g_span = day;
+    TimeSpan fromglobal = g_span;
+    if (fromglobal.Days != 1) return 61;
+
+    // ---- the value survives a `switch`-free control flow and a loop ----
+    TimeSpan acc = TimeSpan.Zero;
+    i64 i = 0;
+    while (i < 4) {
+        acc = acc + hour;
+        i = i + 1;
+    }
+    if (acc.TotalHours != 4.0) return 62;
+
+    // ---- `ref`/`out` pointees and the ternary, typed as TimeSpan ----
+    TimeSpan grown = hour;
+    grow(ref grown, half);
+    if (grown.Minutes != 30 || grown.Hours != 1) return 63;
+    TimeSpan halved;
+    take_half(out halved, hour);
+    if (halved.Minutes != 30) return 64;
+    if (longer(half, hour).Ticks != hour.Ticks) return 65;
+    if (longer(hour, half) != hour) return 66;
+    TimeSpan pick = grown > hour ? grown : hour;
+    if (pick.Minutes != 30) return 67;
+
+    return 42;
+}
