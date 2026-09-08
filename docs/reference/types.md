@@ -1,8 +1,8 @@
 # Types
 
 What a teko program can name: the scalars it inherits from the `mc` core, the seven words
-teko adds on top of them, and the two declarations that build a type of your own —
-`struct` and `class`.
+teko adds on top of them, and the three declarations that build a type of your own —
+`struct`, `class` and `enum`.
 
 Every example on this page is a whole program, compiled and run by
 [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh); the exit code is the
@@ -375,6 +375,102 @@ A class value is a reference. Assigning one to another name copies the reference
 object is released when the last reference to it dies ([memory.md](memory.md)); everything
 a class can carry — inheritance, `virtual`, interfaces, traits, properties, operators,
 constructors and destructors — is [classes.md](classes.md).
+
+---
+
+## `enum`
+
+A named set of integer constants with an underlying type, C#'s own: `Color.Red` is the
+integer `0`, `Color` is a distinct type from `i64` that no integer converts into without
+being told to, and the six comparisons plus `& | ^ ~` are the only operators it computes.
+There is no box, no tag and no indirection — a value of an enum type IS its underlying
+integer, in a frame slot, a field, an array element, a parameter or a return.
+
+```
+[public|internal] enum Name [: underlying] { Member [= const], ... [,] }
+```
+
+Members take the previous value plus one, starting at `0`; an explicit value is any
+expression that folds to a constant, the same folding a top-level `const` does. The
+underlying type is one of eight, `i32` by default (C#'s own `int`):
+
+| written | width | signed |
+|---|---|---|
+| (nothing), `i32` | 4 | yes |
+| `u8`, `u16`, `u32`, `u64` | 1, 2, 4, 8 | no |
+| `i8`, `i16`, `i64` | 1, 2, 8 | yes |
+
+```teko
+// expect-exit: 42
+enum Color { Red, Green, Blue }
+enum Level : u8 { Low = 10, Mid, High }          // 10, 11, 12
+enum Perm { None = 0, Read = 1, Write = 2, All = 3 }
+
+i64 describe(Color c) {
+    if (c == Color.Red) return 1;
+    return 2;
+}
+
+i64 main() {
+    Color c = Color.Green;
+    if (c == Color.Red) return 1;                // the six comparisons
+    if (describe(c) != 2) return 2;
+
+    if (Level.Mid != (Level) 11) return 3;        // an explicit cast, both ways
+    if ((i64) Level.High != 12) return 4;
+
+    Perm p = Perm.Read | Perm.Write;              // the bitwise trio, over the same enum
+    if (p != Perm.All) return 5;
+    if ((p & Perm.Read) == Perm.None) return 6;
+
+    Color tbl[3];                                 // an enum array, field and parameter/
+    tbl[0] = Color.Blue;                          // return all carry the same one word
+    if (tbl[0] != Color.Blue) return 7;
+
+    Color d = c;
+    i64 r = 0;
+    switch (d) {                                  // `case Color.Green:` is a qualified
+        case Color.Red:   r = 8;  break;           // constant, the same road `case N:` on
+        case Color.Green: r = 42; break;           // a top-level `const` already takes
+        default:          r = 9;  break;
+    }
+    return r;
+}
+```
+
+Two explicit conversions, a plain machine cast, unchecked: `(i64) c` (an enum to its
+underlying type or any other integer) and `(Color) n` (any integer to an enum). Nothing
+else converts — not a bare integer, not the literal `0`, not a different enum, not `null` —
+implicitly, in either direction:
+
+```teko
+// no-run
+enum Color { Red, Green }
+
+i64 main() {
+    Color c = Color.Red;
+    i64 n = c;                    // teko: a value of type Color does not convert to i64
+    Color d = 0;                  // teko: a value of type i64 does not convert to Color
+    return n;
+}
+```
+
+```teko
+// no-run
+enum Color { Red, Green }
+enum Size  { Small, Big }
+
+i64 main() {
+    Color c = Color.Red;
+    if (c == Size.Small) return 1;   // teko: no operator `==` takes these operands
+    Color e = c + Color.Green;       // teko: no operator `+` takes these operands
+    return 0;
+}
+```
+
+An `enum` is a type declared at the top level, exactly as a `struct`/`class` is — there is
+no `enum` inside a class or struct body, and `enum Empty { }` is refused: it declares at
+least one member. [diagnostics.md](diagnostics.md) has every one of these messages in full.
 
 ---
 

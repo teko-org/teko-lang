@@ -166,13 +166,20 @@ void tk_arr_add(uptr name, i64 ty, i64 nel) {
 // on_stmt's own view of a local `N_VAR`: `nd_val` is the element count, 0 for
 // a scalar (teko_struct.tk's `tk_on_stmt` skips those the other way around).
 // A struct/class element has no name of its own for `teko_rc.tk` to track --
-// refused here, at the declaration, rather than left to leak silently.
+// refused here, at the declaration, rather than left to leak silently. An
+// `enum` element is exempt (docs/specs/enum.md N2a): it is a row of the same
+// table only because `Name.Member` reaches it over the identical
+// `syntax_expr` road a class name does, it is never counted
+// (`tk_is_counted` answers "no" for it), and `tk_arr_load`/`tk_arr_store`
+// below already move it by width alone -- the same raw bytes an `i64`/`u8`
+// element already is, with nothing for `teko_rc.tk`'s pass to own.
 i64 tk_arr_on_stmt(i64 n) {
     if (n == 0) return n;
     if (nd_kind(n) != N_VAR) return n;
     if (nd_val(n) == 0) return n;
     i64 ety = nd_type(n);
-    if (tk_struct_by_ty(ety) >= 0)
+    i64 esi = tk_struct_by_ty(ety);
+    if (esi >= 0 && !tk_is_enum(esi))
         err_at(nd_file(n), nd_line(n), "teko: an array of objects is not taught yet; use a field array or wait for T[]");
     tk_line = nd_line(n);
     tk_file = nd_file(n);
@@ -199,13 +206,17 @@ void tk_gv_add(uptr name, i64 ty, i64 nel, i64 line, uptr fl) {
     tk_ngv = tk_ngv + 1;
 }
 
+// docs/specs/enum.md N2a: an `enum` element is exempt from the same refusal
+// `tk_arr_on_stmt` above spells out in full -- it owns no object slot for
+// `teko_rc.tk` to walk.
 void tk_garr_collect() {
     i64 n = 1;
     loop {
         if (n >= nnodes) break;
         if (nd_kind(n) == N_GLOBAL && nd_val(n) != 0) {
             i64 ety = nd_type(n);
-            if (tk_struct_by_ty(ety) >= 0)
+            i64 esi = tk_struct_by_ty(ety);
+            if (esi >= 0 && !tk_is_enum(esi))
                 err_at(nd_file(n), nd_line(n), "teko: an array of objects is not taught yet; use a field array or wait for T[]");
             tk_gv_add(nd_name(n), ety, nd_val(n), nd_line(n), nd_file(n));
         }

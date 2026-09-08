@@ -377,10 +377,16 @@ i64 tk_ov_arg_ty(i64 a) {
 // value 0 -- and it is a REFERENCE, not a number: it lands on a parameter that
 // is a row of the type table or a raw pointer, never on an integer, in this
 // round and in every other, which is C#'s rule for the null literal and the
-// one `tk_pm_elem_fits` already applies. `stop` is how many arguments to read:
-// all of them for a round that matches arity exactly, and only the FIXED ones
-// for the expanded form, whose tail is the list's own elements and is judged
-// against the element type instead (`tk_pm_tail_fits`, teko_params.tk).
+// one `tk_pm_elem_fits` already applies. An `enum` member is an N_INT too
+// (`teko_enum.tk`'s own declaration retags the folded node's type to the
+// enum's row, D39) -- and it is not that untyped literal either: its `nd_type`
+// names a row of the type table (`tk_struct_by_ty(nd_type(a)) >= 0`, true for
+// no plain integer or float, since neither ever registers one), so it is
+// judged as a TYPED value, the same arm every non-literal argument already
+// takes below. `stop` is how many arguments to read: all of them for a round
+// that matches arity exactly, and only the FIXED ones for the expanded form,
+// whose tail is the list's own elements and is judged against the element
+// type instead (`tk_pm_tail_fits`, teko_params.tk).
 i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose, i64 stop) {
     i64 a = args;
     i64 i = 0;
@@ -389,8 +395,12 @@ i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose, i64 stop) {
         i64 pt = tk_decl_param_ty(d, i);
         if (tk_rp_kind(tk_decl_param_node(d, i)) != tk_rfarg_kind(a)) return 0;   // K2: `ref`/`out` kind must match too
         if (tk_is_null_lit(a)) {
-            if (pt != TY_UPTR && tk_struct_by_ty(pt) < 0) return 0;
-        } else if (nd_kind(a) == N_INT && type_kind(nd_type(a)) != TK_FLOAT) {
+            // a reference lands on a raw pointer or on a row that is not an
+            // enum -- an enum is a value whatever row it occupies (D39)
+            i64 pi = tk_struct_by_ty(pt);
+            if (pt != TY_UPTR && (pi < 0 || tk_is_enum(pi))) return 0;
+        } else if (nd_kind(a) == N_INT && type_kind(nd_type(a)) != TK_FLOAT
+                   && tk_struct_by_ty(nd_type(a)) < 0) {
             if (loose) {
                 if (!tk_ov_int_ty(pt)) return 0;
             } else {

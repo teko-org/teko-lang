@@ -275,13 +275,27 @@ i64 tk_static_call(i64 si, uptr m, i64 line, uptr fl) {
 // the member half of `Name.member`, with the type word already read --
 // `Name.MAX` (D218, delivery 5's own `const` crumb, teko_const.tk) is checked
 // first: a const takes no slot at all, so neither the field table nor the
-// method table has a row for it to be found through
+// method table has a row for it to be found through.
+//
+// docs/specs/enum.md N2a: `Color.Red` is a qualified constant like any other
+// (`tk_mconst_find`/`tk_mconst_use`, written by `teko_enum.tk`'s own
+// declaration handler into the very table a class const uses), retagged to
+// the enum's own type -- the one line that tells an enum member apart from a
+// plain `i64` one (§ 2). An enum declares no field, property or method, so a
+// name this table does not know is refused here, by the enum's own wording,
+// rather than falling through to "unknown static member".
 i64 tk_static_member(i64 si, i64 line, uptr fl) {
     if (!p_accept(tk_dot_tok)) err_at2(fl, line, "teko: a type name reaches its static members", sr_name_at(si));
     tk_check_type_use(si, line, fl);
     uptr m = p_ident();
     i64 mci = tk_mconst_find(si, m);
-    if (mci >= 0) return tk_mconst_use(mci, line, fl);
+    if (mci >= 0) {
+        i64 n = tk_mconst_use(mci, line, fl);
+        if (tk_is_enum(si)) set_nd_type(n, sr_ty_at(si));
+        return n;
+    }
+    if (tk_is_enum(si))
+        err_at(fl, line, tk_join3("teko: ", sr_name_at(si), tk_join(" has no member ", m)));
     if (p_id() == K_LPAR) return tk_static_call(si, m, line, fl);
     if (tk_prop_find(si, m) >= 0) return tk_prop_static_use(si, m, line, fl);
     i64 fi = tk_static_field_of(si, m, line, fl);
@@ -547,6 +561,12 @@ void tk_reject_class_only(i64 abst, i64 part, i64 line, uptr fl) {
 // forward-declared in teko_struct.tk for the reverse ordering need
 void tk_delegate();
 
+// docs/specs/enum.md N2a: `enum` is declared in teko_enum.tk, included after
+// this file for the same reason (it needs `tk_type_expr`/`tk_type_stmt`,
+// this file's own) -- forward-declared the same way `tk_delegate` is, just
+// above, so `public enum Color { ... }` reaches it here too.
+void tk_enum();
+
 // the modifiers of one top-level declaration, entered ON the first of them
 void tk_decl_head(i64 vis, i64 abst, i64 part) {
     i64 line = p_line();
@@ -568,7 +588,8 @@ void tk_decl_head(i64 vis, i64 abst, i64 part) {
     if (tk_word("interface")) { tk_interface(); return; }
     if (tk_word("trait"))     { tk_trait();     return; }
     if (tk_word("delegate"))  { tk_delegate();  return; }
-    err_at2(fl, line, "teko: the modifier opens a class, a struct, an interface, a trait or a delegate", p_name());
+    if (tk_word("enum"))      { tk_enum();      return; }
+    err_at2(fl, line, "teko: the modifier opens a class, a struct, an interface, a trait, a delegate or an enum", p_name());
 }
 
 void tk_public()   { tk_decl_head(TK_TPUBLIC, 0, 0); }
