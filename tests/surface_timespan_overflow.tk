@@ -1,0 +1,33 @@
+// surface_timespan_overflow.tk -- the other half of `TimeSpan`'s arithmetic
+// (docs/specs/datetime.md § 4): C# raises `OverflowException` where the core's
+// raw `+` would wrap, and a teko program has no exceptions, so every operator
+// row panics -- `teko: a time span overflowed`, exit 70, the road
+// `lib/rt.tk`'s own `rt_panic` takes for an index past the end of an array.
+//
+// The checks BELOW the panic are the ones that must not fire: each is an
+// operation at the very edge of the range that C# accepts, and reaching the
+// panic through one of them would be a false positive, not a proof. The
+// program therefore returns 42 from every one of them and only then overflows,
+// which is why `expect-exit` is 70 and not 42.
+//
+// expect-exit: 70
+
+#include "../lib/time.tk"
+
+i64 main() {
+    TimeSpan max = TimeSpan.MaxValue;
+    TimeSpan min = TimeSpan.MinValue;
+
+    // the edge that does NOT overflow: MaxValue is reachable and comparable
+    if (max.Ticks != 9223372036854775807) return 1;
+    if (!(max > min)) return 2;
+    if ((max - max).Ticks != 0) return 3;
+    if ((min + max).Ticks != 0 - 1) return 4;
+    if ((max / 2).Ticks != 4611686018427387903) return 5;
+    if (min.Ticks != 0 - 9223372036854775807 - 1) return 6;
+
+    // ...and the edge that does: one tick past the end, C#'s own
+    // `TimeSpan.MaxValue + TimeSpan.FromTicks(1)`
+    TimeSpan over = max + TimeSpan.FromTicks(1);
+    return over.Days;                             // never reached: the add panicked
+}

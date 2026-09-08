@@ -71,6 +71,14 @@ i64 tk_fill_defaults(i64 args, i64 na, i64 np, i64 nreq, i64 d0);
 void tk_pick_refuse(i64 mi, uptr m, i64 line, uptr fl);
 void tk_loose_refuse(i64 mi, uptr m, i64 line, uptr fl);
 
+// docs/specs/datetime.md § 2: the primitive-member mechanism (teko_prim.tk,
+// included after this file because it reads the `pd_*` tables below). Two
+// questions only: is this type id a primitive, and what does the deferred
+// access on one become.
+i64 tk_prim_is(i64 ty);
+i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown);
+i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb);
+
 // D226 compat crumb: `tk_pend_field`'s own store branch resolves the value
 // early when it is itself a deferred access, the same way a receiver already
 // does below
@@ -180,7 +188,16 @@ i64 tk_ty_binary(i64 n) {
     i64 op = nd_op(n);
     if (op == K_ANDAND || op == K_OROR) return TY_I64;
     if (cmp_cond(op) >= 0) return TY_I64;
-    return tk_ty_of(nd_a(n));
+    i64 ta = tk_ty_of(nd_a(n));
+    // docs/specs/datetime.md § 4: a binary with a PRIMITIVE operand answers
+    // what its own row answers, which is the one place the core's left-operand
+    // rule is not the truth -- `3 * hour` is a `TimeSpan`. The row is asked
+    // only when an operand IS a primitive, so every other binary in the
+    // language keeps the rule it had, byte for byte.
+    if (tk_prim_is(ta)) return tk_prim_op_ret(op, ta, tk_ty_of(nd_b(n)));
+    i64 tb = tk_ty_of(nd_b(n));
+    if (tk_prim_is(tb)) return tk_prim_op_ret(op, ta, tb);
+    return ta;
 }
 
 // a `ref`/`out` call argument is an ADDRESS (`p + offset`, `base + idx*width`,
@@ -301,7 +318,7 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     i64 ti = tk_struct_by_ty(tty);
     i64 tenum = tk_is_enum(ti);
     if (tk_is_null_lit(en)) {
-        if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT || tenum)
+        if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT || tenum || tk_prim_is(tty))
             tk_reject_compat(type_name(TY_UPTR), type_name(tty), line, fl);
         return;
     }
@@ -323,6 +340,23 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
         i64 ei = tk_struct_by_ty(ety);
         if (ei >= 0) ename = sr_name_at(ei);
         tk_reject_compat(ename, sr_name_at(ti), line, fl);
+    }
+    // docs/specs/datetime.md § 5, the same clause one type table lower: a
+    // PRIMITIVE with members (`TimeSpan`, and `DateTime`/`decimal`/`Guid`
+    // after it -- teko_prim.tk) converts to nothing but itself either. It is
+    // a `type_new` id outside `tk_is_int_ty` (D38's own rule) and outside the
+    // struct table, so neither the enum clause above nor D34's row clause
+    // reaches it: `i64 n = span;`, `f64 x = span;`, `TimeSpan t = 5;` and a
+    // second primitive in the slot are all refused with the wording every
+    // mismatched value already gets.
+    if (tk_prim_is(tty) || tk_prim_is(ety)) {
+        if (tty == ety) return;
+        uptr ename = type_name(ety);
+        i64 ei = tk_struct_by_ty(ety);
+        if (ei >= 0) ename = sr_name_at(ei);
+        uptr tname = type_name(tty);
+        if (ti >= 0) tname = sr_name_at(ti);
+        tk_reject_compat(ename, tname, line, fl);
     }
 }
 
@@ -761,7 +795,12 @@ void tk_pend_do(i64 pi) {
     i64 pure = 0;
     i64 own = TK_OWNED;
     i64 r = 0;
-    if (si >= 0)            r = tk_pend_emit(pi, si, &rty, &pure, &own);
+    if (si >= 0)                        r = tk_pend_emit(pi, si, &rty, &pure, &own);
+    // docs/specs/datetime.md § 2: a receiver of PRIMITIVE type, which is
+    // exactly the case `tk_reject_scalar_member` answered for before the
+    // member table existed (the P0 probe measured it:
+    // `teko: TimeSpan has no members: Ticks`)
+    else if (tk_prim_is(recv_ty)) r = tk_prim_pend(pi, recv_ty, &rty, &pure, &own);
     else if (recv_ty >= 0)  tk_reject_scalar_member(tk_file, tk_line, recv_ty, pd_name_at(pi));
     else                    r = tk_pend_by_name(pi, &rty, &pure, &own);
     i64 n = pd_node_at(pi);

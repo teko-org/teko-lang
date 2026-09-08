@@ -23,6 +23,15 @@
 // member's name: a name that only ANOTHER type declares is not this receiver's
 // member, and calling it would be a call to a foreign type's method.
 
+// docs/specs/datetime.md § 2: the primitive-member mechanism (teko_prim.tk,
+// included after this file). `new TimeSpan(t)` and `t.Days` are the two sites
+// this file owns; the type word's own static access is teko_prim.tk's
+// `syntax_expr` handler, and the deferred `.` is teko_typeof.tk's.
+i64 tk_prim_is(i64 ty);
+i64 tk_prim_by_name(uptr nm);
+i64 tk_prim_new(i64 ty, i64 line, uptr fl);
+i64 tk_prim_dot(i64 left, i64 ty, uptr m, i64 line, uptr fl);
+
 // the allocator `new Name(args)` calls: the one of the constructor the arguments
 // pick, or the plain `Name_new()` when the class declares none. A constructor is
 // not inherited, so only the class's own are candidates, and `new Name` with no
@@ -141,6 +150,8 @@ i64 tk_new() {
     else         name = tk_ns_walk(name);
     i64 di = tk_deleg_find(name);                 // `new Op(add)` (K1, D221 §41)
     if (di >= 0) return tk_new_deleg(di, line, fl);
+    i64 pty = tk_prim_by_name(name);              // `new TimeSpan(t)`: C#'s value
+    if (pty >= 0) return tk_prim_new(pty, line, fl);   // constructor, which allocates nothing
     i64 si = tk_struct_find(name);
     if (si < 0 && tk_trait_find(name) >= 0)
         err_at2(fl, line, "teko: a trait is not a type; `new` needs a struct or a class", name);
@@ -504,6 +515,13 @@ i64 tk_dot(i64 left) {
     i64 si = tk_struct_of_expr(left);
     if (si >= 0 && sr_part_at(si) == TK_PFWD) return tk_defer_member(left, m, line, fl);
     if (si >= 0) return tk_member_of(left, si, m, line, fl);
+    // docs/specs/datetime.md § 2: a receiver of PRIMITIVE type, as far as the
+    // PARSER can tell -- a local, a cast, a call the unit already declared
+    // (`tk_pty_of`, teko_struct.tk). What it cannot tell (a parameter, a
+    // receiver built by another deferred `.`) falls through to the same defer
+    // every other receiver takes, and teko_typeof.tk's pass lowers it there.
+    i64 lty = tk_pty_of(left);
+    if (tk_prim_is(lty)) return tk_prim_dot(left, lty, m, line, fl);
     i64 ty = tk_xt_ty(left);                      // a scalar this module already typed:
     if (ty >= 0) {                                // a field load, not a struct/class/interface
         tk_reject_scalar_member(fl, line, ty, m);
