@@ -93,7 +93,8 @@ exists.
 every internal link of every page it wrote, then spawns `site/tools/checkhtml.py` (structure,
 accessibility, the three Content-Security-Policy rules) and `site/tools/contrast.py` (WCAG
 ratios read out of the stylesheet). A page that breaks the site is caught before the merge.
-The artifact carries `public/CNAME`, so a deployment cannot drop the custom domain.
+The custom domain is DNS on the Cloudflare side, not a file in the tree: nothing a publish
+writes can drop it.
 
 `docs` (in `ngen.yml`) and `site` prove different things and neither replaces the other: the
 first compiles and runs the samples, the second checks the pages they end up on.
