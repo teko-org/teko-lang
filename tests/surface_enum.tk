@@ -7,7 +7,9 @@
 // on an enum member (docs/specs/enum.md N2a; the overload half is the fix
 // for `teko-org/teko-lang#685`'s review, `tk_ov_args_fit`/`tk_pm_elem_fits`
 // treating every `N_INT` as the untyped integer literal without asking
-// whether its own `nd_type` names a row of the type table first).
+// whether its own `nd_type` names a row of the type table first), and a
+// lambda's by-value capture of an enum (teko_deleg.tk's `tk_cap_val`, the
+// same fix `TimeSpan`/`DateTime` needed).
 //
 // expect-exit: 42
 
@@ -20,6 +22,10 @@ enum Perm { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias alias
 enum Other { X }                                 // a second, unrelated enum
 
 Color g_color = Color.Blue;                      // a global of enum type
+
+delegate Color ColorOp();
+delegate Level LevelOp();
+delegate Signed SignedOp();
 
 class Box {
     public Signed s;                             // a field of a SIGNED narrow enum
@@ -147,6 +153,29 @@ i64 main() {
 
     // `params Color[]` with enum members (`tk_pm_elem_fits`)
     if (sum_colors(Color.Red, Color.Green, Color.Blue) != 3) return 32;
+
+    // ---- a lambda's by-value capture of an `enum` (the fix: the raw bits
+    // crossing into the closure went through `tk_cap_put`'s `i64` slot
+    // untyped, and `tk_check_scalar_compat` refused the enum on sight --
+    // `tk_cap_val`, teko_deleg.tk)
+    Color cap_src = Color.Green;
+    ColorOp cap_f = () use (cap_src) => cap_src;
+    Color cap_r = cap_f();
+    if (cap_r != Color.Green) return 33;
+    // the closure's copy is frozen at construction
+    cap_src = Color.Red;
+    cap_r = cap_f();
+    if (cap_r != Color.Green) return 34;
+    // ...and an enum over an UNSIGNED underlying type is an enum to that
+    // slot too (its kind is TK_INT, its row says enum), and a signed narrow
+    // one keeps its sign across the closure's i64 slot
+    Level cap_lv = Level.Mid;
+    LevelOp cap_lf = () use (cap_lv) => cap_lv;
+    if (cap_lf() != Level.Mid) return 35;
+    if ((i64) cap_lf() != 11) return 36;
+    Signed cap_sg = Signed.Neg;
+    SignedOp cap_sf = () use (cap_sg) => cap_sg;
+    if ((i64) cap_sf() != 0 - 100) return 37;
 
     return 42;
 }

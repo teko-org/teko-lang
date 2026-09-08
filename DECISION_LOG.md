@@ -1150,3 +1150,79 @@ mc.macos.toml` verdict `ok`, `types` `10` → `11` and `alias` `17` → `19` (th
 plus `DateTimeKind`'s `type_alias`), `syntax` `15`, `passes` `15/30` and `intrin` `8/16`
 **unmoved**. Thirty-two refusal probes outside `tests/` (`build/refuse/*`, not committed)
 prove every message this entry names with its exact text and exit code.
+
+### D42 · Two pre-existing defects: capturing an 8-byte primitive, and a struct with no `new` (2026-09-08)
+Two verifier findings, fixed in one crumb because both are the SAME class of bug —
+compiler-generated code reading or writing a value at a width the surface's own
+compatibility check was never told about.
+
+**Defect 1 — `use (a)` of a `TimeSpan`/`DateTime`/`enum` refused the value it had just
+read.** A lambda's by-value capture writes into the closure through `tk_cap_put(p, off,
+i64 v)` (`lib/rt.tk`), the ONE writer every non-float, non-counted capture shares
+(`tk_cap_writer`, teko_deleg.tk) — correct for `i64`/`i8`/`u8` (already `tk_is_int_ty`,
+D38), and wrong for the three `TK_SINT` ids that are NOT ordinary integers by that same
+rule (D38's own list: `TimeSpan`/`DateTime`, and every `enum`). The captured NAME crossed
+into the argument list untouched, `tk_ty_of` answered its own row type, and
+`tk_check_scalar_compat` (D34/D40's own clause) refused it on sight — `teko: a value of
+type TimeSpan does not convert to i64` — reported at the CAPTURED LOCAL's own declaration
+line rather than the `use (...)` site, because `tk_call3` (teko_struct.tk) stamps a
+synthetic node with `tk_line`/`tk_file` as they stand at that instant, and
+`tk_deleg_var_stmt` (teko_deleg.tk) only restores them to the DECLARATION's own line AFTER
+parsing the whole initializer — the misleading line was a symptom, not the defect.
+
+The read side (`tk_lambda_prologue`'s own `tk_ld`) was never the problem: an eight-byte
+`TK_SINT` load returns the raw `ld64` call unwrapped (D38's own rule, `type_width(ty) < 8`
+being false for these three), and that raw call's `TY_I64` tag is read by nothing —
+`tk_ty_of` types an `N_CALL` by `decl_find`, which does not know a fixed core intrinsic
+like `ld64` at all, so it answers `-1` and every compat check downstream reads that as
+"not known" and steps aside. Only the WRITE side, where the compiler hands the CAPTURED
+NAME (typed by the ordinary scope table, not a raw call) to `tk_cap_put`'s `i64` parameter,
+ever reached a check that had an opinion.
+
+The fix is `tk_cap_val` (teko_deleg.tk): the value a by-value capture hands to
+`tk_cap_writer`'s own slot, computed once and shared by both writers (`tk_cap_put`,
+`tk_cap_own`'s float/counted siblings are untouched). A primitive-with-members goes through
+`tk_prim_raw` (teko_prim.tk) — the SAME compiler-authored raw view a row's own argument
+already takes (D40 § 2/D41 § 3), so the cast is remembered on the "compiler wrote this"
+list and the later refusal (`tk_prim_cast_check`) never mistakes it for a hand-written one.
+An `enum` takes a plain `tk_cast(TY_I64, v)` — `docs/specs/enum.md` § 5 states both explicit
+directions of an enum cast are "a machine cast and nothing more", so no hand-written-cast
+refusal exists to sidestep. `tk_prim_is`/`tk_prim_raw` (teko_prim.tk, included AFTER
+teko_deleg.tk) are forward-declared at the call site, the same way `tk_lambda_build` already
+is at the top of the same file. Zero new intrinsics, zero changes to `mc` (D2/D21): the fix
+is the same cast the surface already writes elsewhere, built where one site did not write
+it. By-reference captures (`use (&a)`) were never affected — they hand `tk_addr(...)`, an
+address, to `tk_cap_put`'s OWN `ref` writer, not through `tk_cap_val` at all.
+
+**Defect 2 — `struct P p;` with no initializer crashed the run.** A struct value IS a
+pointer to an allocation ([types.md](docs/reference/types.md) § struct), produced by `new`
+alone, and a struct is NOT reference-counted, so a bare local of struct type never receives
+the zero-to-`null` a counted local gets (`tk_rc_var`, K2b): `p` reaches the run holding
+whatever the stack held, and `p.x = 4` writes through it — a `SIGBUS`/`SIGSEGV`, never a
+`teko:` line. A bare CLASS local is the same one level down (a deterministic null
+dereference, no guard on any field access), and a global struct with no initializer the
+same one level up (BSS zeroes it to `null`, unguarded).
+
+**The owner's ruling: this is the developer's error, documented, not the language's.** A
+struct is not a primitive with a default value; a declaration without `new` is not
+initialized, and the reference page says so in as many words. No compile-time refusal
+(declaring first and building in a branch is legitimate code, and deciding that a name is
+definitely assigned is the nullable design's job, not a statement hook's), and no runtime
+guard (it would sit on the one lowering every field access shares and move `--dump-ast` on
+nearly every fixture). What makes the case sound in the end is nullability by declaration:
+no type is nullable unless written `T?`, and `T?` is sugar for `Nullable<T>` over ANY type,
+reference or value — a spec of its own, ahead of `string`, where the compiler learns that a
+name declared without `?` must be built before it is read.
+
+The enum arm of `tk_cap_val` first asked the KIND (`TK_SINT` outside `tk_is_int_ty`), which
+covers `enum Color` (`i32` underneath) and misses `enum Level : u8` (`TK_INT`); the verifier
+caught it, and the arm now asks the row (`tk_is_enum`), which is what the slot check that
+refused the value asks. `tests/surface_enum.tk` captures `Level` and `Signed` as well.
+
+**Proof:** the taught compiler builds on mc 0.15.23; 51/51 fixtures at their `expect-exit`;
+`--dump-ast` of the 48 fixtures this crumb does not touch byte-identical to `1d195e1d`, the
+three it extends differing by insertion (and the gensym renumbering an insertion causes);
+`FIXPOINT OK`; `sh scripts/check-docs.sh` green (466 links, 356 diagnostics, 95 samples);
+`mc limits` unmoved (`types` 11, `alias` 19, `syntax` 15, `passes` 15/30, `intrin` 8/16);
+`mc pkg hash .` in the pull request.
+

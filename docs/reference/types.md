@@ -277,7 +277,10 @@ i64 main() {
 A struct is a block of fields with no header of its own: the first field sits at offset 0.
 A value of struct type is a **pointer to the allocation**, eight bytes wide, produced by
 `new`; `new Name` and `new Name()` both hand out zeroed bytes, so a field nobody assigned
-reads as `0` and a reference field reads as null.
+reads as `0` and a reference field reads as null. **A struct has no default value of its
+own**: `Name p;` with no `new` is not initialized — it is not null, it is whatever the slot
+held — and reading or writing a field through it is the developer's error, not a refusal or
+a panic the compiler makes for you. Build it (`Name p = new Name;`) before you touch it.
 
 ```
 struct Name { [modifier] type field; ... methods ... }
