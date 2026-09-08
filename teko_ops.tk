@@ -89,6 +89,9 @@
 // pass calls once it has typed the operands.
 void tk_prim_binary(i64 n, i64 ta, i64 tb);
 void tk_prim_unary(i64 n, i64 ta);
+void tk_prim_cast_check(i64 n);
+void tk_prim_cast_globals(i64 root);
+void tk_prim_own_cast_moved(i64 from, i64 to);
 i64 tk_prim_is(i64 ty);
 
 // the number of operator declarations one program may hold
@@ -589,6 +592,9 @@ void tk_ops_replace(i64 n, i64 with) {
     i64 keep = nd_next(n);
     node_assign(n, with);
     set_nd_next(n, keep);
+    // ...and a cast the lowering wrote travels with it: the node the walk
+    // checks is `n` now, not the one teko_prim.tk built (§ 3's own list).
+    tk_prim_own_cast_moved(with, n);
 }
 
 // the call the site becomes. Its type is registered because an enclosing
@@ -786,7 +792,16 @@ void tk_ops_visit(i64 n) {
         tk_ops_binary(n);
         return;
     }
-    if (k == N_UNARY) tk_ops_unary(n);
+    if (k == N_UNARY) {
+        tk_ops_unary(n);
+        return;
+    }
+    // docs/specs/datetime.md § 3: a cast over a primitive is the compiler's to
+    // write and not the source's, and this walk is where the difference is
+    // read (teko_prim.tk's own `tk_prim_cast_check`). It rides here for the
+    // same reason the operator rows do -- one walk, after the oracle, over
+    // every node of every body -- and adds no pass of its own.
+    if (k == N_CAST) tk_prim_cast_check(n);
 }
 
 // the `+` prefix `mc`'s own table does not hold: `syntax_expr("+")` puts the
@@ -809,6 +824,9 @@ i64 tk_unary_plus() {
 
 i64 tk_ops_pass(i64 root) {
     tk_op_check_pairs();
+    // docs/specs/datetime.md § 3, the half of the cast check the body walk
+    // below does not reach: a global's own initializer (teko_prim.tk).
+    tk_prim_cast_globals(root);
     tk_ty_pass_walk(root, &tk_ops_visit);
     return root;
 }
