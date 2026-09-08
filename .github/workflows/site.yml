@@ -1,6 +1,9 @@
 name: site
 
-# Builds teko-lang.org out of `docs/` and deploys it to GitHub Pages.
+# Builds teko-lang.org out of `docs/` and publishes the rendered pages to the
+# `site` branch, which the VPS that serves the domain pulls every five minutes
+# (DECISION_LOG.md D37): no deploy credential leaves this repository, because
+# the repository is public and the server only ever reads it.
 #
 # THE GENERATOR IS NOT VENDORED. `mcsite` is `minicompiler/mc`'s own site
 # generator, written in mc: this workflow checks that repository out at the TAG
@@ -18,9 +21,7 @@ name: site
 # deploying, so a documentation page that breaks the site is caught before the
 # merge and not after it.
 #
-# `actions/configure-pages` is deliberately absent: `[site] base_url` is `/`,
-# this site is served at the root of its own domain, and nothing here needs the
-# base path that action computes.
+# `[site] base_url` is `/`: the site is served at the root of its own domain.
 
 on:
   push:
@@ -37,12 +38,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # the build job force-pushes the `site` branch
 
-# One deployment at a time, and never cancel one halfway: `pages` is the group
-# GitHub's own Pages actions expect.
+# One publish at a time, and never cancel one halfway: two force-pushes of the
+# `site` branch racing each other would leave the server with whichever won.
 concurrency:
-  group: pages
+  group: site
   cancel-in-progress: false
 
 jobs:
@@ -118,31 +119,22 @@ jobs:
           set -eu
           rm -rf public
           cp -R site/public public
-          # The custom domain, carried in the artifact so a deployment cannot
-          # drop it (DECISION_LOG.md D28).
-          echo teko-lang.org > public/CNAME
           find public -maxdepth 2 | sort | head -40
 
-      - name: upload the Pages artifact
+      - name: publish public/ to the site branch
         if: github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-  deploy:
-    name: deploy
-    needs: build
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # An orphan commit holding exactly the rendered tree: the branch carries
+          # no history on purpose, one commit per publish, force-pushed. The
+          # server's puller checks the branch out and serves it as it is.
+          cd public
+          git init -q -b site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "site: ${GITHUB_SHA} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" site:site
+          echo "published $(git rev-parse --short HEAD) to the site branch"

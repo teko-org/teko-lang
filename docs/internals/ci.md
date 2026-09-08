@@ -65,7 +65,7 @@ sysroot action, so they cannot assemble different sysroots.
 
 | workflow | runs on | does |
 |---|---|---|
-| `site.yml` | a push to `main`, a pull request touching `docs/**` or `site/**`, a dispatch | renders `docs/` into the website and deploys it to GitHub Pages |
+| `site.yml` | a push to `main`, a pull request touching `docs/**` or `site/**`, a dispatch | renders `docs/` into the website and publishes it to the `site` branch, which the server behind teko-lang.org pulls |
 | `branch-policy.yml` | every pull request | refuses an ungated source namespace against a protected base. The head branch name is read through `env:`, never interpolated into a `run:` — it is text the opener of the pull request controls |
 | `codeql.yml` | pull requests only | the `actions` analyzer. There is no analyzer for `.tk` or `.mc`, and what is left to scan is CI that downloads a toolchain, creates a release with `contents: write` and interpolates branch names. No `paths:` filter: a required check that stops **reporting** goes pending forever rather than red |
 | `release.yml` | a `v*` tag, or a dispatch on one | promotes what the gate proved |
@@ -75,9 +75,12 @@ sysroot action, so they cannot assemble different sysroots.
 `site.yml` has two jobs. `build` obtains the pinned `mc` through `setup-mc`, checks
 `minicompiler/mc` out at **the tag that action resolved** into `_mc/`, builds `mcsite` there
 (`mc build site --config site/mc.linux.toml`, mc's own ELF writer, no linker), and runs
-`_mc/build/mcsite site --check` from the repository root. `deploy` uploads what `build`
-produced to GitHub Pages, with `pages: write` and `id-token: write` granted to that job
-alone.
+`_mc/build/mcsite site --check` from the repository root. On a push to `main` the same
+job commits what it rendered as an orphan commit on the `site` branch and force-pushes it
+with the workflow's own token (`contents: write`); the VPS that serves teko-lang.org pulls
+that branch every five minutes and hands it to nginx behind Traefik, the same server and
+the same rite as mc's own domain (D36). No deploy credential exists: the repository is
+public and the server only reads it.
 
 Nothing of the generator is vendored here, so it cannot drift from the compiler the fixtures
 were proved on: raising `MC_VERSION` moves both at once. Everything `mcsite` reads at run
