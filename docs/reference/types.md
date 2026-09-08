@@ -221,6 +221,15 @@ the checked read and `i64 j = n;` is refused —
 `teko: a value of type i64? does not convert to i64`. The whole rule, the cost and what it
 does not do are [nullable.md](nullable.md).
 
+Two operators read a nullable, both C#'s own: **`a ?? b`** answers `a`'s own value when the
+handle is not 0 and `b` when it is (`i64 n = count ?? 5;`, `Cell c = maybe ?? new Cell(3);`),
+evaluating `a` exactly once and `b` only when it is needed; **`a?.m`** and **`a?.m(x)`** read
+a member only when `a` has a value and answer `M?`, so `a?.b?.c` chains and every link that
+is empty makes the whole read `null`. `??` is right-associative and ties with `||` at the
+Pratt table's floor, which is the one divergence it carries — `a || b ?? c` reads as
+`(a || b) ?? c` ([not-yet.md](not-yet.md)). Both are [nullable.md](nullable.md)'s
+own section.
+
 ```teko
 // no-run
 i64 solo(i64 a) { return a; }

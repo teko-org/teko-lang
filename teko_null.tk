@@ -78,14 +78,39 @@
 // writer and `tk_nl_dflt` are emitted through `tk_top_emit`, once per unit
 // that needs each, the discipline `tkarr_release_T` (K3) already follows.
 //
-// WHAT THIS MODULE DOES NOT DO. `??` and `?.` are Q2, definite assignment is
-// Q3 and the lifted `==` is Q4a; each refused form is a row of
+// `??` AND `?.` (Q2, § 5). Both are read by a `syntax_infix` handler into a
+// PLACEHOLDER call -- `tk_coalesce(a, b)` and `tk_qdot(a, args...)`, names
+// nothing declares -- and both are rewritten by `tk_tern_scan`
+// (teko_ternary.tk), the walk that already hoists a ternary, at the moment it
+// reaches one. That is where the rewrite has to happen and it is what buys the
+// laziness: the right side of `??` and everything behind a `?.` land in a
+// BRANCH of the `if` the rewrite builds, so they run only when the handle
+// says so, and the hoisting, the fencing of a lone statement and the
+// right-associative nesting all come from the walk that already has them.
+// NO PASS OF ITS OWN is registered -- `mc limits` moves by `infix` +2 (the
+// `syntax_infix` table) and by nothing else.
+//
+// WHAT THIS MODULE DOES NOT DO. Definite assignment is Q3 and the lifted `==`
+// is Q4a; `??=` and the lifted operators are rows of
 // docs/reference/not-yet.md. No new pass, no new intrinsic, no change to `mc`.
 
 // teko_heaparr.tk is included after this file: `Cell?[]` reads the `?` here
 // and hands the rest of the position to the array handler, which is the one
 // place `[]` is read.
 i64 tk_ha_type(i64 ty);
+
+// teko_expr.tk is included after this file: the argument list of `a?.m(x, y)`
+// is read by the very reader every other call site uses.
+i64 tk_args(uptr pn);
+
+// teko_ternary.tk is included after this file too. Q2's rewrite runs INSIDE
+// its walk -- `tk_tern_scan` calls the two lowerings below the moment it
+// reaches a placeholder -- so the three shapes it already builds are shared
+// rather than copied: the assignment into a hoisted temporary, the zero a
+// temporary is declared with, and the walk itself.
+void tk_tern_scan(i64 n, uptr dst);
+i64  tk_tern_assign(uptr name, i64 val);
+i64  tk_tern_zero(i64 ty);
 
 // teko_prim.tk is included after this file as well: a PRIMITIVE WITH MEMBERS
 // (`TimeSpan`, `DateTime`) travels through the box as its raw eight bytes,
@@ -513,6 +538,270 @@ i64 tk_nl_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown) {
     }
     tk_nl_reject_member(si, ety, m, tk_line, tk_file);
     return 0;
+}
+
+// ---- Q2: `??` and `?.` ----
+// `??` sits at precedence 1, tied with `||` and with the ternary: `mc`'s Pratt
+// table starts at 1 (`syntax_infix` refuses anything outside 1..100, mc
+// docs/reference/hooks.md), so there is no room between them. Reading the
+// right side at the SAME floor is what makes it right-associative --
+// `a ?? b ?? c` is `a ?? (b ?? c)`, measured in
+// docs/internals/nullable-probes.md probe 4 -- and the tie is the one
+// divergence from C# this operator carries: `a || b ?? c` reads as
+// `(a || b) ?? c` where C# reads `a || (b ?? c)`, a row of
+// docs/reference/not-yet.md. `?.` sits at 12, the row `.` itself occupies.
+#define TK_CO_PREC 1
+#define TK_QD_PREC 12
+#define TK_MAXQD   64                  // `?.` accesses in one unit
+
+i64 tk_nl_nops = 0;                    // `??`/`?.` placeholders the parser built
+
+i64 qd_node[TK_MAXQD];                 // the placeholder the rewrite replaces
+uptr qd_name[TK_MAXQD];                // the member on the right of the `?.`
+i64 qd_form[TK_MAXQD];                 // TK_PLOAD or TK_PCALL
+i64 qd_na[TK_MAXQD];                   // a call's own argument count
+i64 tk_nqd = 0;
+
+i64  qd_node_at(i64 i) { return ld64(qd_node + i * 8); }
+uptr qd_name_at(i64 i) { return ld64(qd_name + i * 8); }
+i64  qd_form_at(i64 i) { return ld64(qd_form + i * 8); }
+i64  qd_na_at(i64 i)   { return ld64(qd_na + i * 8); }
+
+i64 tk_qd_at(i64 n) {
+    i64 i = tk_nqd - 1;
+    loop {
+        if (i < 0) break;
+        if (qd_node_at(i) == n) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// 1 when `n` is one of this file's two placeholders. Read by `tk_tern_scan`
+// (the rewrite) and by `tk_dot` (teko_expr.tk), which refuses a plain `.` on
+// one rather than reading it: `a?.b.c` is `a?.(b.c)` in C# -- the whole chain
+// short-circuits -- and a table where `.` and `?.` share precedence 12 would
+// silently read `(a?.b).c` instead. The form teko takes is `a?.b?.c`.
+i64 tk_nl_is_op(i64 n) {
+    if (n == 0) return 0;
+    if (nd_kind(n) != N_CALL) return 0;
+    if (str_eq(nd_name(n), "tk_coalesce")) return 1;
+    return str_eq(nd_name(n), "tk_qdot");
+}
+
+// `a ?? b`, `left` already parsed: a placeholder holding both operands as its
+// own children, so every pass that runs BEFORE the rewrite -- the oracle
+// first of all -- walks them exactly as it walks any other argument list.
+i64 tk_co_infix(i64 left) {
+    i64 line = p_line();
+    uptr fl = p_file();
+    tk_line = line;
+    tk_file = fl;
+    // `a ??= b` lexes as `??` then `=`, since `??=` is a lexeme nothing
+    // registers: it is refused by name here instead of failing inside the
+    // expression the core would try to read (docs/reference/not-yet.md).
+    if (p_id() == K_ASSIGN) err_at(fl, line, "teko: ??= is not taught");
+    i64 b = parse_expr(TK_CO_PREC);
+    tk_line = line;
+    tk_file = fl;
+    i64 n = tk_call2("tk_coalesce", left, b);
+    tk_nl_nops = tk_nl_nops + 1;
+    return n;
+}
+
+// `a?.m`, `a?.m(x)`: the member NAME and the FORM are what the parser has to
+// read (the same half `tk_defer_member` reads at its own `.`), and the
+// arguments are read by `tk_args` and kept as children of the placeholder.
+// The type of the member -- and therefore of the whole access -- is a question
+// only the rewrite can ask, so nothing here guesses at one.
+i64 tk_qd_infix(i64 left) {
+    i64 base = tk_unary_base(left);
+    if (base != left) return tk_unary_rewrap(left, tk_qd_infix(base));
+    i64 line = p_line();
+    uptr fl = p_file();
+    tk_line = line;
+    tk_file = fl;
+    uptr m = p_ident();
+    i64 form = TK_PLOAD;
+    i64 args = 0;
+    i64 na = 0;
+    if (p_id() == K_LPAR) {
+        form = TK_PCALL;
+        args = tk_args(&na);
+    } else if (p_id() == K_ASSIGN) {
+        err_at(fl, line, "teko: ?. is not a slot");
+    } else if (p_id() == K_LBRACK) {
+        err_at2(fl, line, "teko: ?. reads a member, not an element", m);
+    }
+    tk_line = line;
+    tk_file = fl;
+    i64 n = tk_call("tk_qdot", list_append(left, args));
+    if (tk_nqd == TK_MAXQD) err_at(fl, line, "teko: too many ?. accesses in one unit");
+    st64(qd_node + tk_nqd * 8, n);
+    st64(qd_name + tk_nqd * 8, m);
+    st64(qd_form + tk_nqd * 8, form);
+    st64(qd_na + tk_nqd * 8, na);
+    tk_nqd = tk_nqd + 1;
+    tk_nl_nops = tk_nl_nops + 1;
+    return n;
+}
+
+// the nullable row `e` stands in, refused BY NAME when it is not one: `??` and
+// `?.` are the two operators of `T?` and nothing else answers them. The
+// message is handed in whole rather than joined from the operator's spelling,
+// so `scripts/check-docs.sh` reads the same literal a reader looks up.
+i64 tk_nl_op_recv(i64 e, uptr msg, i64 line, uptr fl) {
+    i64 ty = tk_ty_of(e);
+    i64 si = tk_struct_by_ty(ty);
+    tk_line = line;
+    tk_file = fl;
+    if (!tk_is_nl(si)) err_at(fl, line, msg);
+    return si;
+}
+
+// the temporary the left side is bound to, so it is evaluated EXACTLY once:
+// `T? $t = a;` hoisted into the list the operator itself joins, which is the
+// list that runs unconditionally. `tk_ty_scope_add` is what lets the oracle
+// answer for the name while the rest of the rewrite is being built.
+uptr tk_nl_op_bind(i64 e, i64 ty, uptr dst, i64 line, uptr fl) {
+    uptr t = gensym_new();
+    tk_ty_scope_add(t, ty);
+    tk_line = line;
+    tk_file = fl;
+    st64(dst, list_append(ld64(dst), tk_var(ty, t, e)));
+    return t;
+}
+
+// `$t != null` -- the handle against 0, the very comparison `x != null`
+// already lowers to. It is written with the `null` NODE rather than a plain
+// zero on purpose: `tk_ops_pass`'s own claim over a nullable operand
+// (teko_ops.tk's `tk_nl_binary_check`) lets `==`/`!=` through against a null
+// literal, so the condition needs no mark of its own.
+i64 tk_nl_op_test(uptr t) {
+    return tk_bin(K_NE, tk_id(t), tk_nullnode());
+}
+
+// the `if` both operators end in, and the temporary that carries the result
+// out of it: the shape `tk_tern_lower` builds for `c ? a : b`. `thenOut` and
+// `elseOut` are what each arm hoisted for itself, and `thenVal`/`elseVal` are
+// the two values -- each assigned INSIDE its own branch, which is what makes
+// the operator lazy. The placeholder is overwritten in place by a read of the
+// temporary, `tk_tern_lower`'s own "build fresh, rewrite the original" shape.
+void tk_nl_op_close(i64 n, uptr dst, uptr t, i64 rty, i64 thenOut, i64 thenVal,
+                    i64 elseOut, i64 elseVal, i64 line, uptr fl) {
+    tk_line = line;
+    tk_file = fl;
+    uptr r = gensym_new();
+    tk_ty_scope_add(r, rty);
+    st64(dst, list_append(ld64(dst), tk_var(rty, r, tk_tern_zero(rty))));
+    thenOut = list_append(thenOut, tk_tern_assign(r, thenVal));
+    elseOut = list_append(elseOut, tk_tern_assign(r, elseVal));
+    i64 ifn = tk_if(tk_nl_op_test(t), tk_blk(thenOut));
+    set_nd_c(ifn, tk_blk(elseOut));
+    st64(dst, list_append(ld64(dst), ifn));
+    i64 keep = nd_next(n);
+    node_assign(n, tk_id(r));
+    set_nd_next(n, keep);
+}
+
+// `a ?? b` (§ 5). `a` is bound once and tested; `b` is reduced into the ELSE
+// branch, so it runs only when `a` is empty, which is C#'s own rule.
+//
+// The RESULT TYPE is the one place the two operands both speak: `b` of the
+// same `T?` row gives `T?` and `a` itself is the other arm, while `b` of the
+// enclosed type -- or of anything that converts to it, a derived class and an
+// integer in a float slot included -- gives `T`, and the arm is `a.Value`,
+// which for a boxed value nullable is the payload read (Q1b) and for a
+// reference is the same pointer. `a ?? null` keeps the row.
+void tk_nl_co_lower(i64 n, uptr dst) {
+    i64 a = nd_a(n);
+    i64 b = nd_next(a);
+    set_nd_next(a, 0);
+    set_nd_next(b, 0);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+
+    tk_tern_scan(a, dst);                         // the left runs either way
+    i64 si = tk_nl_op_recv(a, "teko: ?? needs a nullable on the left", line, fl);
+    i64 ety = nl_of_at(si);
+    i64 aty = sr_ty_at(si);
+    uptr t = tk_nl_op_bind(a, aty, dst, line, fl);
+
+    i64 elseOut = 0;
+    tk_tern_scan(b, &elseOut);                    // ...and the right, only empty
+    i64 bty = tk_ty_of(b);
+
+    i64 rty = ety;
+    i64 then = 0;
+    if (bty == aty || tk_is_null_lit(b)) {
+        rty = aty;
+        then = tk_id(t);
+    } else {
+        tk_check_compat(ety, bty, b, line, fl);
+        b = tk_num_widen(ety, bty, b);
+        then = tk_nl_value(tk_id(t), ety, line, fl);
+    }
+    tk_nl_op_close(n, dst, t, rty, 0, then, elseOut, b, line, fl);
+}
+
+// the row `U?` a `?.` answers with, given the type `U` the member itself has:
+// a value `U` is BOXED (Q1b), a reference `U` is its own pointer, and a member
+// already declared `U?` keeps its row rather than nesting one -- `a?.next` on
+// a `Node? next` field is a `Node?`, which is what makes `a?.next?.v` chain.
+i64 tk_nl_qd_row(i64 mty, i64 line, uptr fl) {
+    tk_line = line;
+    tk_file = fl;
+    if (mty == TY_VOID) err_at(fl, line, "teko: ?. needs a value");
+    if (mty < 0) err_at(fl, line, "teko: ?. needs a value");
+    if (mty == TY_UPTR) err_at(fl, line, "teko: a raw pointer has no nullable");
+    if (tk_is_nl(tk_struct_by_ty(mty))) return mty;
+    i64 nt = tk_nl_row(mty);
+    tk_nl_ensure_box(mty);                        // a value member: its own writer
+    return nt;
+}
+
+// `a?.m` / `a?.m(x)` (§ 5). `a` is bound and tested exactly as `??` binds and
+// tests it; everything to the right of the `?.` lands in the THEN branch, the
+// arguments included, so a null handle runs none of it.
+//
+// The member itself is resolved by the road every OTHER member on a receiver
+// the parser could not type already takes: a pending record and `tk_pend_do`
+// (teko_typeof.tk), which answers a field, a property, a virtual method, an
+// interface row and a primitive's own member alike. The value it resolves
+// against is a local of its own -- `T $v = $t.Value;` -- and not the guard's
+// call spliced in place, because a virtual call needs a name or a field on the
+// left, which is that pass's own rule and not a special case of this one.
+void tk_nl_qd_lower(i64 n, uptr dst) {
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 qi = tk_qd_at(n);
+    // a `tk_qdot(...)` call the SOURCE wrote reaches this walk with no row of
+    // its own: the name is the compiler's, never a function a program calls
+    if (qi < 0) err_at(fl, line, "teko: tk_qdot is the compiler's own name");
+    i64 a = nd_a(n);
+    i64 args = nd_next(a);
+    set_nd_next(a, 0);
+
+    tk_tern_scan(a, dst);                         // the receiver runs either way
+    i64 si = tk_nl_op_recv(a, "teko: ?. needs a nullable on the left", line, fl);
+    i64 ety = nl_of_at(si);
+    uptr t = tk_nl_op_bind(a, sr_ty_at(si), dst, line, fl);
+
+    i64 thenOut = 0;
+    tk_tern_scan(args, &thenOut);                 // ...the arguments, only full
+    uptr v = gensym_new();
+    tk_ty_scope_add(v, ety);
+    tk_line = line;
+    tk_file = fl;
+    thenOut = list_append(thenOut, tk_var(ety, v, tk_nl_value(tk_id(t), ety, line, fl)));
+
+    i64 m = tk_call("tk_unresolved_member", 0);
+    tk_pend_add(m, tk_id(v), qd_name_at(qi), args, qd_na_at(qi), qd_form_at(qi), line, fl);
+    tk_pend_do(tk_pend_at(m));
+    i64 rty = tk_nl_qd_row(tk_ty_of(m), line, fl);
+
+    tk_nl_op_close(n, dst, t, rty, thenOut, tk_nl_wrap(rty, tk_ty_of(m), m),
+                   0, tk_nullnode(), line, fl);
 }
 
 // `syntax_type`: the `?` suffix, at every position the core reads a type at.

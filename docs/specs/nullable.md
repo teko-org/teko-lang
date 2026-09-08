@@ -1,14 +1,14 @@
 # `T?` — the nullable, over any type
 
-**Mostly built.** Q0, Q1a (D43) and Q1b (D44) landed: the row, the `?` suffix at every
-declaration position it reaches, `HasValue`/`Value`/`GetValueOrDefault()`, the reclaim, the
-rule that `null` needs a slot declared `T?`, and the counted box that carries a VALUE
-nullable. What runs is [the reference page](../reference/nullable.md), and the ten probes
-behind it are [nullable-probes.md](../internals/nullable-probes.md); D43 and D44 record the
-places this page was measured wrong and what replaced them. The rest — `??` and `?.` (Q2),
-definite assignment (Q3) and the lifted `==` (Q4a) — is still a plan, and every fenced
-sample stays `// no-run` because the page describes the whole design rather than the part
-that runs.
+**Mostly built.** Q0, Q1a (D43), Q1b (D44) and Q2 (D45) landed: the row, the `?` suffix at
+every declaration position it reaches, `HasValue`/`Value`/`GetValueOrDefault()`, the
+reclaim, the rule that `null` needs a slot declared `T?`, the counted box that carries a
+VALUE nullable, and the two operators `??` and `?.`. What runs is
+[the reference page](../reference/nullable.md), and the ten probes behind it are
+[nullable-probes.md](../internals/nullable-probes.md); D43, D44 and D45 record the places
+this page was measured wrong and what replaced them. The rest — definite assignment (Q3)
+and the lifted `==` (Q4a) — is still a plan, and every fenced sample stays `// no-run`
+because the page describes the whole design rather than the part that runs.
 
 `T?` is teko's one nullable mechanism. It is sugar for `Nullable<T>` over **any** type —
 a class, an interface, a delegate, a `struct`, a `T[]`, `string` when it lands, and every
@@ -299,21 +299,28 @@ renumbering `mc`'s own table, which is the base grammar (D3). Mixing the two wit
 parentheses is also a type error in almost every program that writes it: `||`'s operands are
 truth values and `??`'s left operand is a nullable.
 
-### `??` and `?.` are lowered into the ternary
+### `??` and `?.` are lowered inside the ternary's own walk
 
 Neither needs a hoisting rule of its own. Both are parsed into a placeholder call and
-rewritten by a pass that runs **immediately ahead of `tk_ternary_pass`** into the
-placeholder that pass already unpacks:
+rewritten into the shape below:
 
 ```
-a ?? b       ->  tk_ternary($t != 0, $t.Value, b)      // $t binds `a` once
-a?.m         ->  tk_ternary($t != 0, (M?) $t.Value.m, (M?) null)
+a ?? b       ->  T? $t = a;  R $r;  if ($t != null) $r = $t.Value; else $r = b;   // $r
+a?.m         ->  T? $t = a;  M? $r;  if ($t != null) { T $v = $t.Value; $r = $v.m; }
+                                     else $r = null;                             // $r
 ```
 
-so laziness, the hoist into the enclosing statement list, the fencing of a lone branch and
-the right-associative nesting all come from the operator that already has them. `b` is
-evaluated only when `a` is empty, which is C#'s rule and the reason the rewrite has to land
-before the ternary pass rather than build `if`s of its own.
+**As built (D45), the rewrite runs from inside `tk_tern_scan` rather than from a pass of
+its own**, at the same instant a pass ahead of `tk_ternary_pass` would have reached the
+node — so laziness, the hoist into the enclosing statement list, the fencing of a lone
+branch, the re-hoist into a loop's body and the inside-out reduction of a nested operator
+all come from the walk that already has them, and `passes` does not move. It builds the
+`if` directly rather than a `tk_ternary` placeholder for one reason: the ternary types its
+two arms against each other, and which arm `??` needs (`$t` for a right side of the same
+`T?` row, `$t.Value` for a right side of type `T`) is a question about the right side's own
+type, which is known only once that side has itself been reduced. `b` is evaluated only
+when `a` is empty, which is C#'s rule, and so are the member and the arguments behind a
+`?.`.
 
 `?.` on a method that returns `void` is refused — `teko: ?. needs a value` — because the
 lowering is an expression and a `void` arm has no type. `a?.b?.c` chains, each link
@@ -496,6 +503,9 @@ Each row is a `not-yet.md` entry the crumb that lands it owes.
 | `ref T?`, `out T?` | `teko: a ref or out of a nullable is not taught yet` |
 | `T?` → `U?` where `T` → `U` | `teko: a value of type Circle? does not convert to Shape?` — no covariance between nullable rows; write `x.Value` |
 | `x?.m()` where `m` returns `void` | `teko: ?. needs a value` |
+| `a ??= b` | `teko: ??= is not taught` — `??=` is no lexeme of its own; `a = a ?? b;` is the form |
+| `a?[i]` (C#'s null-conditional index), `a?.items[i]` | `expression expected` from the core, since `?` and `[` are two tokens; and `teko: ?. reads a member, not an element` |
+| `(a ?? b).m`, `a?.b.c` — a plain `.` on either operator's result | `teko: bind the ?? or ?. result to a variable before reading a member`. `.` and `?.` share precedence 12, so `a?.b.c` would read as `(a?.b).c` where C# short-circuits the whole chain |
 | `x.GetValueOrDefault(fallback)` (C#'s one-argument overload) | `teko: unknown member of i64?: GetValueOrDefault` at that arity — `x ?? fallback` is the form |
 | `x.Value = e`, `ref x.Value` | `teko: .Value is not a slot` |
 | `x is null`, `case null:` | there is no `is`, and a switch takes no nullable subject |
@@ -508,12 +518,13 @@ Each row is a `not-yet.md` entry the crumb that lands it owes.
 
 | module | what it grows |
 |---|---|
-| **`teko_null.tk`** (new) | `tk_nl_type` (the `syntax_type` handler reading the `?` suffix), `tk_nl_row`/`tk_nl_of` (the row and its enclosed type), `tk_nl_wrap` (the implicit `T` → `T?`), the member lowering for `HasValue`/`Value`/`GetValueOrDefault`, the `??`/`?.` handlers and the pass that rewrites them into `tk_ternary`, and every refusal on this page |
+| **`teko_null.tk`** (new) | `tk_nl_type` (the `syntax_type` handler reading the `?` suffix), `tk_nl_row`/`tk_nl_of` (the row and its enclosed type), `tk_nl_wrap` (the implicit `T` → `T?`), the member lowering for `HasValue`/`Value`/`GetValueOrDefault`, the `??`/`?.` handlers and the two rewrites `tk_tern_scan` calls (D45: no pass of their own), and every refusal on this page |
 | `teko_struct.tk` | `TK_KNULL` beside the five row kinds; `tk_is_nl`; one clause in `tk_is_counted` (a nullable row answers for what it encloses, `1` for a box); one clause in `tk_row_fits` (`T` and its bases/interfaces fit `T?`); one row in `tk_ty_mangle_name` (`opt_T`) |
 | `teko_typeof.tk` | one clause in `tk_check_scalar_compat` (`null` refused unless the target is a nullable row, a raw `uptr` or a `T?`-shaped slot); the `tk_nl_wrap` call at the field store it owns; `tk_ty_of` answering the nullable row for a `.Value`-free nullable node |
 | `teko_rc.tk` | the `tk_nl_wrap` call at the six slots it owns — an initializer, an assignment, a `return`, and the three call-argument kinds — each one line beside the `tk_num_widen` call already there |
 | `teko_expr.tk`, `teko_iface.tk`, `teko_params.tk` | one `tk_nl_wrap` call each, at the slot each already owns |
-| `teko_expr.tk` | one branch in `tk_dot`/`tk_member_of`: a receiver whose type is a nullable row takes the three members and refuses everything else |
+| `teko_expr.tk` | one branch in `tk_dot`/`tk_member_of`: a receiver whose type is a nullable row takes the three members and refuses everything else; and one clause (Q2) refusing a plain `.` on the result of a `??`/`?.` |
+| `teko_ternary.tk` | two clauses in `tk_tern_scan` calling Q2's own rewrites, `tk_tern_zero` extracted so both share the temporary's placeholder value, and the pass guard reading Q2's counter as well |
 | `teko_typeof.tk` | the same branch at `tk_pend_do`, the deferred access a parameter receiver takes |
 | `teko_access.tk` | `tk_quest_follows()` beside `tk_bracket_follows()`, so `Cell? c = …;` reaches `parse_var` (which calls `take_type`, which runs the hook) rather than the delegate reader |
 | `teko_deleg.tk` | `tk_deleg_var_stmt` reads a `?` before its own initializer (`Op? f = null;`) |
@@ -522,7 +533,7 @@ Each row is a `not-yet.md` entry the crumb that lands it owes.
 | `teko_ops.tk` | one guard: a nullable operand takes `==`/`!=` against `null` and nothing else (Q4a relaxes it to the lifted pair) |
 | `teko_generic.tk` | nothing: `tk_gen_ty` already falls back to `p_type()`, which runs the chain |
 | `lib/rt.tk` | `tk_nl_new(i64 w)` (allocate, install the vtable, count 1, record the width), `tknl_release(uptr p)` (`rt_free(p, 24 + ld64(p + 16))`), `tk_nl_ck(uptr p)` (the guard and the panic), and one vtable global. About thirty lines |
-| `teko.tk` | one `#include`, one `_init()` call, two `syntax_infix` registrations (`??` at 1, `?.` at 12), one `pass` registration ahead of the ternary's |
+| `teko.tk` | one `#include`, one `_init()` call, two `syntax_infix` registrations (`??` at 1, `?.` at 12). No `pass` registration: D45's rewrite runs inside `tk_tern_scan` |
 | `core_teko.mc`, `user.mc` | **nothing** |
 
 The definite-assignment analysis (Q3) rides
@@ -541,8 +552,9 @@ Measured against D42's own baseline (`types` 11, `alias` 19, `syntax` 15, `passe
 | row | moves | why |
 |---|---|---|
 | `types`, `alias` | **not at all** | the compiler registers no new primitive. A nullable row is `type_new` called **while compiling a program that spells `T?`**, and the compiler's own sources spell none |
-| `syntax` | **+2** (Q2) | the two operator words, `??` and `?.` |
-| `passes` | **+1** (Q2) | the rewrite that runs ahead of `tk_ternary_pass`. 16/30 |
+| `syntax` | **not at all** | measured (D45): the table `syntax_infix` moves is `infix`, not `syntax` |
+| `infix` | **+2** (Q2) | the two operator words, `??` and `?.`. 22 -> 24 of 64 |
+| `passes` | **not at all** | measured (D45): Q2's rewrite runs from inside `tk_tern_scan`, at the instant a pass ahead of `tk_ternary_pass` would have reached the node, so it registers none. 15/30 |
 | `intrin` | **not at all** | every function has surface code: three in `lib/rt.tk`, and the loads and stores are `tk_ld`/`tk_stn`, which are the core's own fixed intrinsics already in use |
 | `nodes`, `funcs`, `globals` | up | one module of roughly 600 lines, and one vtable global |
 | a **compiled program**'s `types` | **+1 per distinct `T?` spelled** | exactly what `T[]` costs, and the registry doubles rather than dies |
@@ -636,16 +648,17 @@ in every reclaim fixture; `mc limits` unmoved. **Owes:** the box in
 [memory.md](../reference/memory.md) § "The object" and § "Reading the numbers", and the value
 half of the [types.md](../reference/types.md) section.
 
-### Q2 — `??` and `?.` (M)
+### Q2 — `??` and `?.` (M) — LANDED, D45
 
-Two `syntax_infix` registrations, one pass ahead of `tk_ternary_pass`, the rewrite into
-`tk_ternary`, the single evaluation of the left side, the `void` refusal.
+Two `syntax_infix` registrations and the two rewrites, called from `tk_tern_scan` itself
+rather than from a pass of their own (D45.1): the single evaluation of the left side, the
+lazy right side, the lazy member and arguments behind a `?.`, and the `void` refusal.
 Depends on Q1b (a `?.` on a value member produces a boxed nullable).
 
-**Gate:** `surface_nullable_ops.tk` at `42`; everything above; `mc limits` with `syntax`
-+2 and `passes` +1 and **nothing else moved**. **Owes:** the operator rows in
-[types.md](../reference/types.md) and the precedence divergence in
-[not-yet.md](../reference/not-yet.md).
+**Gate as met:** `surface_nullable_ops.tk` at `42`; everything above, with `--dump-ast`
+byte-identical on the fifty-five; `mc limits` with **`infix` +2** (22 → 24, the table
+`syntax_infix` actually moves) and `syntax`, `passes`, `intrin`, `alias` and `types`
+unmoved.
 
 ### Q3 — definite assignment (M)
 

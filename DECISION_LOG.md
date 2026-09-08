@@ -1462,3 +1462,88 @@ outside `tests/` covering every operator (`+ - * / % < <= > >= & | ^ << >>` and 
 compared, `HasValue` as a bare condition (both a local and a PARAMETER, the two lowering
 paths), and `bool?`/`Cell?` bare in `if`/the ternary/`while` — each refusing or compiling as
 the rule states.
+
+### D45 · `??` and `?.` — the two operators of `T?` (2026-09-08)
+[`docs/specs/nullable.md`](docs/specs/nullable.md) § 5's operators and § 15's Q2, on top of
+D43 and D44. `a ?? b` and `a?.m` / `a?.m(x)` are taught with C#'s own rules: the left side
+is evaluated exactly once, the right side only when the handle is 0, and everything behind
+a `?.` — the member, and the arguments of a call — runs only when the receiver has a value.
+
+**1. Both are rewritten inside the ternary's own walk, and register no pass.** § 5 promised
+"a pass that runs immediately ahead of `tk_ternary_pass`" and § 13 budgeted `passes` +1;
+what runs is the same rewrite at the same instant, called from `tk_tern_scan`
+([`teko_ternary.tk`](teko_ternary.tk)) the moment it reaches one of the two placeholders the
+parser left. The walk is the thing worth having — it already hoists into the enclosing
+statement list, fences a lone `if`/`return` branch into a block of its own, re-hoists into a
+loop's body so a condition is read again every turn, and reduces the inside out so a nested
+operator is lowered first — and reaching it from inside costs one `else if` and no pass at
+all. The two lowerings live in [`teko_null.tk`](teko_null.tk); `tk_tern_zero` is the one
+shape they share with the ternary, extracted from `tk_tern_lower` with the node it builds
+unchanged.
+
+**2. The rewrite is an `if`, not a `tk_ternary` placeholder.** § 5 wrote it as
+`tk_ternary($t != 0, $t.Value, b)`. It cannot be: the ternary types its two arms against
+EACH OTHER, and which arm `??` needs — `$t` itself for a right side of the same `T?` row,
+`$t.Value` for a right side of type `T` — depends on the right side's own type, which is
+known only after the right side has itself been reduced. So each lowering builds the `if`
+directly, with the same three pieces `tk_tern_lower` builds it from (a hidden local for the
+value, a hidden local for the result, and an assignment inside each branch), and the
+laziness is the same laziness: what an arm hoisted goes into that arm's own list.
+
+**3. The result type, spelled out.** `a ?? b` where `b` is the SAME `T?` row answers `T?`
+and unwraps nothing; where `b` is a value that fits `T` — the enclosed type itself, a
+derived class, an integer into a float — it answers `T`, through `.Value`, which for a boxed
+value is the payload read and for a reference is the same pointer; `a ?? null` keeps the
+row. Anything else is refused by the wording every mismatched value already gets, including
+a nullable of another row on the right: there is no covariance between nullable rows here
+either. `a?.m` answers `M?` — a value member boxed, a reference member as the nullable of
+its own type, and a member already declared `U?` keeping its row, which is what makes
+`a?.b?.c` chain — and `void` is refused, `teko: ?. needs a value`.
+
+**4. The member behind a `?.` is resolved by the road every deferred `.` already takes.**
+The lowering binds `T $v = $t.Value;` inside the taken branch and hands `$v`, the member's
+name and the form the parser read to `tk_pend_add`/`tk_pend_do`
+([`teko_typeof.tk`](teko_typeof.tk)) — the same pair that answers a `.` on a receiver only
+the oracle can type. A field, a property, a virtual call, an interface call and a
+primitive's own member all come back without a line of their own here, and the local is what
+makes the virtual case work at all: that pass refuses a virtual call whose left side is not
+a name or a field.
+
+**5. A plain `.` on either operator's result is refused.** `.` and `?.` share precedence 12,
+so `a?.b.c` would read as `(a?.b).c` where C# short-circuits the whole chain — and the
+placeholder has no type until the rewrite, so the `.` would resolve by member name alone.
+`teko: bind the ?? or ?. result to a variable before reading a member`; `a?.b?.c` is the
+form. `??=` is refused by name (`teko: ??= is not taught`), since `??=` is no lexeme of its
+own and `a = a ?? b;` is the form.
+
+**6. The precedence divergence is real and is recorded rather than fixed.** `??` sits at 1,
+tied with `||` and the ternary, because `mc`'s Pratt table starts there and `syntax_infix`
+refuses anything outside 1..100; renumbering it is `mc`'s base grammar (D3). So
+`a || b ?? c` reads as `(a || b) ?? c` where C# reads `a || (b ?? c)`, and what a program
+that writes it actually gets is `teko: ?? needs a nullable on the left` — `||` answers a
+truth value. It is a row of [`docs/reference/not-yet.md`](docs/reference/not-yet.md), and
+right-associativity (`a ?? b ?? c` is `a ?? (b ?? c)`) is what the same floor buys.
+
+**7. One pre-existing defect fixed on the way, because Q2 walks into it.** A ternary — and
+now a `??` — whose type is an `enum` was refused with `teko: a value of type uptr does not
+convert to Color`, for a `null` no source wrote: the hidden temporary is declared with a
+placeholder value, and an enum row is a row of the struct table, so it got the compiler's
+own `null` (D43's exemption covers the row check, not the enum clause, and an enum converts
+from nothing but itself). `tk_tern_zero` now gives an enum slot the zero of its OWN type —
+the very node `Color.Red` is, an `N_INT` retagged — so `Color j = c ? Color.Red :
+Color.Blue;` and `Color j = k ?? Color.Blue;` both compile.
+
+**8. `mc limits`, measured, and the spec's own row corrected.** § 13 wrote the cost as
+`syntax` +2. The table that `syntax_infix` moves is **`infix`**, 22 → 24 of 64 reserved;
+`syntax` is unmoved at 15, and so are `passes` 15/30, `intrin` 8/16, `syntax_type` 2/8,
+`alias` 19 and `types` 11. No new intrinsic, no new pass, no change to `mc` (D2/D21).
+
+**Proof.** 56/56 fixtures at their `expect-exit`, `tests/surface_nullable_ops.tk` (the new
+one) at 42 with a counter proving both evaluation rules and `rt_live()` back to its floor
+after every shape; `--dump-ast` of the 55 pre-existing fixtures byte-identical to
+`726a0724`; `FIXPOINT OK`; `sh scripts/check-docs.sh` green, the reference page's own sample
+built and run; and a probe matrix outside `tests/` covering `??` with a non-nullable left,
+with incompatible operands and with a foreign nullable row, `?.` on a non-nullable, on a
+`void` method, as a slot and with an index, `??=`, `a?[i]`, `a || b ?? c` and a plain `.` on
+either result — each refusing with the message documented in
+[`docs/reference/diagnostics.md`](docs/reference/diagnostics.md).

@@ -109,6 +109,39 @@ void tk_tern_at(i64 n) {
     tk_file = nd_file(n);
 }
 
+// what a hoisted temporary is DECLARED with, before either branch overwrites
+// it. D226 compat crumb: the placeholder never survives to be read (both
+// branches assign to it before anything else touches it), but a teko-typed one
+// is `null` rather than a plain `0` -- the one shape the assignment-
+// compatibility check already knows fits any such slot. Q1a: it is the
+// COMPILER's own null, registered as such (teko_null.tk), since rule 1 refuses
+// a null a SOURCE writes outside a `T?` slot and this temporary is not the
+// source's. A PRIMITIVE slot (docs/specs/datetime.md § 5) takes neither: it
+// converts from nothing but itself, the plain `0` included, so the placeholder
+// is that same zero under the slot's own type -- the identity cast
+// teko_prim.tk writes everywhere else for the same reason.
+//
+// docs/specs/enum.md § 5: an ENUM row is a row of the same table and is NOT a
+// reference -- it converts from nothing but itself, `null` included -- so the
+// placeholder is the zero of its own type, the very node `Color.Red` is
+// (`tk_static_member`, teko_access.tk: an `N_INT` retagged to the enum). Before
+// this clause `Color j = c ? Color.Red : Color.Blue;` was refused with
+// "a value of type uptr does not convert to Color", for a `null` the source
+// never wrote.
+//
+// Q2 shares it: `??` and `?.` declare their own result temporary the same way
+// (teko_null.tk).
+i64 tk_tern_zero(i64 ty) {
+    if (tk_prim_is(ty)) return tk_cast(ty, tk_int(0));
+    if (tk_is_enum(tk_struct_by_ty(ty))) {
+        i64 z = tk_int(0);
+        set_nd_type(z, ty);
+        return z;
+    }
+    if (tk_struct_by_ty(ty) >= 0) return tk_nl_own_null();
+    return tk_int(0);
+}
+
 void tk_tern_scan(i64 n, uptr dst);
 
 // docs/specs/datetime.md § 2: teko_prim.tk is included after this file (it
@@ -154,21 +187,7 @@ void tk_tern_lower(i64 n, uptr dst) {
     i64 ifn = tk_if(c, tk_blk(thenOut));
     set_nd_c(ifn, tk_blk(elseOut));
 
-    // D226 compat crumb: the placeholder never survives to be read (both
-    // branches of `ifn` overwrite it before anything else touches `t`), but
-    // a teko-typed one is `null` rather than a plain `0` -- the one shape the
-    // assignment-compatibility check already knows fits any such slot. Q1a:
-    // it is the COMPILER's own null, registered as such (teko_null.tk), since
-    // rule 1 refuses a null a SOURCE writes outside a `T?` slot and this
-    // temporary is not the source's.
-    i64 init = tk_int(0);
-    if (tk_struct_by_ty(ty) >= 0) init = tk_nl_own_null();
-    // ...and a PRIMITIVE slot (docs/specs/datetime.md § 5) takes neither: it
-    // converts from nothing but itself, the plain `0` included, so the
-    // placeholder is that same zero under the slot's own type -- the identity
-    // cast teko_prim.tk writes everywhere else for the same reason.
-    if (tk_prim_is(ty)) init = tk_cast(ty, tk_int(0));
-    st64(dst, list_append(ld64(dst), tk_var(ty, t, init)));
+    st64(dst, list_append(ld64(dst), tk_var(ty, t, tk_tern_zero(ty))));
     st64(dst, list_append(ld64(dst), ifn));
 
     i64 keep = nd_next(n);
@@ -187,6 +206,16 @@ void tk_tern_scan(i64 n, uptr dst) {
         if (n == 0) break;
         if (nd_kind(n) == N_CALL && str_eq(nd_name(n), "tk_ternary")) {
             tk_tern_lower(n, dst);
+        // Q2 (docs/specs/nullable.md § 5): `??` and `?.` are rewritten HERE,
+        // at the moment this walk reaches the placeholder the parser left --
+        // ahead of any lowering of the ternary itself and with the same `dst`
+        // in hand, which is what hands both operators the hoisting, the
+        // laziness and the fencing this file already has, for no pass of
+        // their own (teko_null.tk owns the two rewrites).
+        } else if (nd_kind(n) == N_CALL && str_eq(nd_name(n), "tk_coalesce")) {
+            tk_nl_co_lower(n, dst);
+        } else if (nd_kind(n) == N_CALL && str_eq(nd_name(n), "tk_qdot")) {
+            tk_nl_qd_lower(n, dst);
         } else if (nd_kind(n) == N_VAR) {
             tk_tern_hoist_var(n, dst);
         } else {
@@ -293,10 +322,11 @@ void tk_tern_fn(i64 f) {
     tk_nscope = 0;
 }
 
-// a unit that never writes `?` leaves untouched -- `tk_ntern` counts what the
-// parser built, and nothing here runs without at least one
+// a unit that never writes `?`, `??` or `?.` leaves untouched -- the two
+// counters count what the parser built, and nothing here runs without at
+// least one of them (Q2 rides this walk, teko_null.tk)
 i64 tk_ternary_pass(i64 root) {
-    if (tk_ntern == 0) return root;
+    if (tk_ntern == 0 && tk_nl_nops == 0) return root;
     i64 f = root;
     loop {
         if (f == 0) break;

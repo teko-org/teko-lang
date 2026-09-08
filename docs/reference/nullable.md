@@ -9,8 +9,8 @@ an `enum`, `TimeSpan` and `DateTime`.
 This is a deliberate divergence from C#, and the only one made on purpose: C# has two
 unrelated mechanisms — `Nullable<T>` for value types and `string?` for reference types, an
 annotation the runtime never sees. teko has one mechanism, one spelling and one rule.
-Everything else follows C#: `HasValue`, `Value`, the implicit `T` → `T?` and the refused
-`T?` → `T`.
+Everything else follows C#: `HasValue`, `Value`, `??`, `?.`, the implicit `T` → `T?` and
+the refused `T?` → `T`.
 
 ---
 
@@ -331,7 +331,8 @@ exists to catch (`tk_ops_binary`/`tk_ops_unary`, [teko_ops.tk](../../teko_ops.tk
 | `-a`, `!a`, `~a`, `+a` | refused, the same wording, unary: ``teko: i64? declares no operator `-` `` |
 | `if (a)`, `a ? x : y` | refused: ``teko: i64? is not a condition`` (named by the row; a `bool?` prints as `u8?`, `bool` being an alias of `u8`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` (a `bool`) is the form |
 | `while (a)`, `for (…; a; …)`, `do … while (a);` | refused too, as ``teko: i64? declares no operator `!` ``: a loop's guard is `!(cond)`, and the `!` on a nullable is the unary refusal above, reached before the condition check |
-| `a ?? b`, `a?.m` | not taught yet ([not-yet.md](not-yet.md)) |
+| `a ?? b`, `a?.m`, `a?.m(x)` | taught — the section below |
+| `a ??= b` | not taught: `teko: ??= is not taught`. `a = a ?? b;` is the form ([not-yet.md](not-yet.md)) |
 | `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no nullable subject |
 
 `a.Value + b.Value` (and `a.Value` alone, in any position) is unaffected: `.Value` answers
@@ -339,6 +340,114 @@ the ENCLOSED type, not the nullable row, so ordinary arithmetic and ordinary con
 it are exactly what they are over a `T`. So is `a.HasValue`, `a.GetValueOrDefault()` and
 `?.`/`.Value` chained (`a.Value.get()`), none of which is a binary or a unary over `a`
 itself.
+
+---
+
+## `??` and `?.`
+
+**`a ?? b` answers `a`'s own value when the handle is not 0, and `b` when it is.** `a` is
+evaluated exactly once and `b` only when it is needed, which is C#'s rule.
+
+| written | `a` | `b` | the result | the arm taken when `a` has a value |
+|---|---|---|---|---|
+| `Cell c = maybe ?? new Cell(3);` | `Cell?` | `Cell` | `Cell` | the pointer itself |
+| `i64 n = count ?? 5;` | `i64?` | `i64` | `i64` | the payload out of the box |
+| `f64 x = ratio ?? 2;` | `f64?` | `i64` | `f64` | the payload; the right side widens to `f64`, exactly as an `f64` slot already widens it |
+| `Shape s = shape ?? new Circle(4);` | `Shape?` | `Circle` | `Shape` | a derived class on the right converts, as it does at any other slot |
+| `Cell? c = maybe ?? other;` | `Cell?` | `Cell?` | `Cell?` | the handle itself, unwrapped by nothing |
+| `Cell? c = maybe ?? null;` | `Cell?` | `null` | `Cell?` | the handle itself |
+
+The two sides have to meet: the right side is either the **same `T?` row** — and then the
+result is that row, and no `.Value` is taken — or a value that fits `T` itself, and then
+the result is `T`. Anything else is refused where it is written, with the wording every
+mismatched value gets: `Cell c = maybe ?? 7;` is
+`teko: a value of type i64 does not convert to Cell`, and a nullable of another row on the
+right is `teko: a value of type i64? does not convert to Cell` — there is no covariance
+between nullable rows, here or anywhere else.
+
+The left side has to be a nullable: `k ?? 7` on a plain `i64` is
+`teko: ?? needs a nullable on the left`.
+
+**`a?.m` reads a member only when `a` has a value, and answers `M?`.** A member of value
+type comes back boxed (`i64` → `i64?`), a member of reference type comes back as the
+nullable of its own type, and a member already declared `U?` keeps its row rather than
+nesting one — which is what makes `a?.b?.c` chain. On a null receiver the whole access is
+`null`, and nothing behind the dot runs: not the member, not the arguments of a call.
+
+| written | answers |
+|---|---|
+| `a?.v` on `public i64 v` | `i64?` |
+| `a?.get()`, `a?.times(3)` | `i64?` — a method, its arguments evaluated only when `a` has a value |
+| `a?.Doubled` | `i64?` — a property, through its accessor |
+| `a?.area()` on a `Shape?` / an `IArea?` | `i64?` — the virtual call, and the interface call |
+| `a?.next` on a `Cell? next` field | `Cell?` — the row is kept, not nested |
+| `a?.next?.v` | `i64?`, `null` as soon as any link is empty |
+| `a?.bump()` where `bump` returns `void` | refused: `teko: ?. needs a value` |
+| `a?.v = 3` | refused: `teko: ?. is not a slot` |
+| `h?.v` on a plain `Cell` | refused: `teko: ?. needs a nullable on the left` |
+
+`?.` sits on `.`'s own precedence row, and a plain `.` on the result of either operator is
+refused — `teko: bind the ?? or ?. result to a variable before reading a member` — because
+`a?.b.c` would read as `(a?.b).c` where C# short-circuits the whole chain. `a?.b?.c` is the
+form, and a local of its own is the form for anything else.
+
+`??` is **right-associative**, so `a ?? b ?? c` is `a ?? (b ?? c)`; it sits at the Pratt
+table's own floor, tied with `||` and the ternary, which is the one divergence it carries:
+`a || b ?? c` reads as `(a || b) ?? c` where C# reads `a || (b ?? c)`
+([not-yet.md](not-yet.md)). Write the parentheses.
+
+Neither operator allocates anything of its own: `??` over a reference picks between two
+pointers, and the box a `?.` writes for a value member is the same counted box `i64? n = 5;`
+writes, released with the block that holds it.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+class Cell {
+    public i64 v;
+    public Cell? next;
+    public Cell(i64 x) { v = x; }
+    public i64 times(i64 k) { return v * k; }
+}
+
+i64 calls = 0;
+
+i64 counted(i64 v) {
+    calls = calls + 1;
+    return v;
+}
+
+i64 main() {
+    Cell? empty = null;
+    Cell? full = new Cell(7);
+
+    Cell a = empty ?? new Cell(3);                // the handle is 0: the right side
+    if (a.v != 3) return 1;
+    Cell b = full ?? new Cell(3);                 // ...and the value itself otherwise
+    if (b.v != 7) return 2;
+
+    i64? none = null;
+    if ((none ?? counted(5)) != 5) return 3;      // the right side runs: one call
+    i64? five = 5;
+    if ((five ?? counted(9)) != 5) return 4;      // ...and here it does not
+    if (calls != 1) return 5;
+
+    i64? read = full?.v;                          // a field, boxed into an `i64?`
+    if (read.Value != 7) return 6;
+    if (empty?.v != null) return 7;               // ...and null all the way out
+    i64? scaled = full?.times(3);
+    if (scaled.Value != 21) return 8;
+
+    full.Value.next = new Cell(2);
+    i64? chained = full?.next?.v;                 // chained, link by link
+    if (chained.Value != 2) return 9;
+    if (empty?.next?.v != null) return 10;
+
+    if ((empty?.v ?? 11) != 11) return 11;
+    return 42;
+}
+```
 
 ---
 
@@ -367,7 +476,7 @@ were already there.
 
 ## What it does not do
 
-`??`, `?.`, a lifted `==`, flow narrowing (`if (c != null) { c.v }`), `T?` as a generic
+`??=`, a lifted `==`, flow narrowing (`if (c != null) { c.v }`), `T?` as a generic
 argument, calling a nullable delegate, `T?` on a short type name inside a `namespace`,
 `x.GetValueOrDefault(fallback)`, a ternary whose arms are a value and `null`, an overload
 picked through the implicit `T` → `T?`, a member on a GLOBAL nullable and an assignment to

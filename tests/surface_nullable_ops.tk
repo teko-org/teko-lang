@@ -1,0 +1,453 @@
+// surface_nullable_ops.tk -- `??` and `?.` (Q2, docs/specs/nullable.md § 5):
+// the two operators of `T?`, both rewritten into the `if` the ternary already
+// hoists, so the right side of `??` and everything behind a `?.` run only when
+// the handle says so.
+//
+// What each helper proves, in order:
+//
+//   1. `refcheck`   -- `??` over a REFERENCE nullable: the default when the
+//                      handle is 0, the value itself when it is not, a derived
+//                      class on the right, and `T?` on the right keeping the
+//                      row instead of unwrapping;
+//   2. `valcheck`   -- `??` over a VALUE nullable: the payload out of the box
+//                      for `i64`, `f64` (an integer right side widened),
+//                      `bool`, `char` and an `enum`, and `i64? ?? i64?`;
+//   3. `lazycheck`  -- the right side is evaluated ONLY when the left is
+//                      empty, and the left is evaluated EXACTLY once: a
+//                      counter proves both, and a `?.` argument proves that
+//                      nothing behind the dot runs on a null receiver;
+//   4. `chaincheck` -- `a ?? b ?? c`, right-associative, over three shapes;
+//   5. `dotcheck`   -- `?.` on a field, a property, a method with an argument,
+//                      a virtual method, an interface method and a `T?` field
+//                      (whose row is kept, not nested), each with a value and
+//                      with a null receiver;
+//   6. `mixcheck`   -- `a?.f ?? 7`, `??` inside a `return`, inside an
+//                      argument, inside a loop condition and inside a ternary
+//                      arm, and the `a || (b ?? c)` C# reads without the
+//                      parentheses (docs/reference/not-yet.md records why teko
+//                      needs them);
+//   7. `paramcheck` -- both operators on a receiver only the oracle can type:
+//                      a parameter, and a field of one;
+//   8. `rccheck`    -- the reclaim: every box and every object either operator
+//                      builds is released, and `rt_live()` comes back to its
+//                      floor;
+//   9. `shapecheck` -- the other shapes a nullable encloses: a `struct?`
+//                      (not counted), a `T[]?` and its one member, and a
+//                      primitive with members (`TimeSpan?`).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+#include "../lib/time.tk"
+
+i64 calls = 0;
+i64 cell_dtors = 0;
+
+enum Color { Red, Green, Blue }
+
+class Cell {
+    public i64 v;
+    public Cell? next;
+
+    public Cell(i64 x) {
+        v = x;
+    }
+
+    ~Cell() {
+        cell_dtors = cell_dtors + 1;
+    }
+
+    public i64 get() { return v; }
+    public i64 times(i64 k) { return v * k; }
+    public i64 Doubled { get { return v * 2; } }
+}
+
+class Shape {
+    public virtual i64 area() { return 1; }
+}
+
+class Circle : Shape {
+    public i64 r;
+    public Circle(i64 x) { r = x; }
+    public override i64 area() { return r * r; }
+}
+
+interface IArea {
+    i64 area();
+}
+
+class Square : IArea {
+    public i64 s;
+    public Square(i64 x) { s = x; }
+    public i64 area() { return s * s; }
+}
+
+// every call is counted, so laziness is measured and not argued
+i64 bump(i64 x) {
+    calls = calls + 1;
+    return x;
+}
+
+Cell? made(i64 k) {
+    calls = calls + 1;
+    if (k == 0) return null;
+    return new Cell(k);
+}
+
+// ---- 1. `??` over a reference ----
+
+i64 refcheck() {
+    Cell? empty = null;
+    Cell? full = new Cell(7);
+
+    Cell a = empty ?? new Cell(3);                // the handle is 0: the right side
+    if (a.v != 3) return 1;
+
+    Cell b = full ?? new Cell(3);                 // ...and the value itself otherwise
+    if (b.v != 7) return 2;
+
+    Shape? s = null;
+    Shape sh = s ?? new Circle(4);                // a DERIVED class on the right
+    if (sh.area() != 16) return 3;
+
+    Cell? keep = empty ?? full;                   // `T?` on the right keeps the ROW
+    if (keep == null) return 4;
+    if (keep.Value.v != 7) return 5;
+
+    Cell? gone = empty ?? null;                   // ...and so does `null`
+    if (gone != null) return 6;
+
+    Cell? still = full ?? null;
+    if (still.Value.v != 7) return 7;
+    return 0;
+}
+
+// ---- 2. `??` over a value ----
+
+i64 valcheck() {
+    i64? n = null;
+    if ((n ?? 5) != 5) return 1;
+    i64? m = 9;
+    if ((m ?? 5) != 9) return 2;
+
+    f64? f = null;
+    if ((f ?? 2) != 2.0) return 3;                // an integer right side widens
+    f64? g = 1.5;
+    if ((g ?? 2.5) != 1.5) return 4;
+
+    bool? t = null;
+    if (t ?? true) { } else { return 5; }
+    bool? u = false;
+    if (u ?? true) return 6;                      // `false` is a live box, not absent
+
+    char? c = null;
+    if ((c ?? 'y') != 'y') return 7;
+    char? d = 'x';
+    if ((d ?? 'y') != 'x') return 8;
+
+    Color? k = null;
+    if ((k ?? Color.Blue) != Color.Blue) return 9;
+    Color? l = Color.Green;
+    if ((l ?? Color.Blue) != Color.Green) return 10;
+
+    i64? both = n ?? m;                           // two boxes: the row is kept
+    if (both.Value != 9) return 11;
+    return 0;
+}
+
+// ---- 3. the two evaluation rules ----
+
+i64 lazycheck() {
+    calls = 0;
+    Cell? full = new Cell(1);
+    i64 x = full.Value.v + bump(0);               // the counter itself works
+    if (calls != 1) return 1;
+    if (x != 1) return 2;
+
+    calls = 0;
+    i64? five = 5;
+    i64 y = five ?? bump(7);                      // the left has a value: no call
+    if (calls != 0) return 3;
+    if (y != 5) return 4;
+
+    i64? none = null;
+    i64 z = none ?? bump(7);                      // ...and now it runs, once
+    if (calls != 1) return 5;
+    if (z != 7) return 6;
+
+    calls = 0;
+    Cell w = made(4) ?? new Cell(0);              // the LEFT runs exactly once
+    if (calls != 1) return 7;
+    if (w.v != 4) return 8;
+
+    calls = 0;
+    Cell? empty = null;
+    i64? q = empty?.times(bump(3));               // nothing behind the dot runs
+    if (calls != 0) return 9;
+    if (q != null) return 10;
+
+    i64? r = full?.times(bump(3));
+    if (calls != 1) return 11;
+    if (r.Value != 3) return 12;
+    return 0;
+}
+
+// ---- 4. `a ?? b ?? c` ----
+
+i64 chaincheck() {
+    i64? a = null;
+    i64? b = null;
+    i64? c = null;
+    if ((a ?? b ?? 3) != 3) return 1;             // right-associative, all empty
+
+    b = 2;
+    if ((a ?? b ?? 3) != 2) return 2;             // the middle answers
+    a = 1;
+    if ((a ?? b ?? 3) != 1) return 3;
+
+    Cell? p = null;
+    Cell? q = null;
+    Cell r = p ?? q ?? new Cell(8);
+    if (r.v != 8) return 4;
+
+    q = new Cell(5);
+    Cell s = p ?? q ?? new Cell(8);
+    if (s.v != 5) return 5;
+
+    i64? t = a ?? b ?? c;                         // ...and a chain of pure rows
+    if (t.Value != 1) return 6;
+    return 0;
+}
+
+// ---- 5. `?.` ----
+
+i64 dotcheck() {
+    Cell? full = new Cell(7);
+    Cell? empty = null;
+
+    i64? f = full?.v;                             // a FIELD: `i64` boxed into `i64?`
+    if (f.Value != 7) return 1;
+    if (empty?.v != null) return 2;
+
+    i64? g = full?.get();                         // a METHOD
+    if (g.Value != 7) return 3;
+    if (empty?.get() != null) return 4;
+
+    i64? h = full?.times(3);                      // ...with an argument
+    if (h.Value != 21) return 5;
+    if (empty?.times(3) != null) return 6;
+
+    i64? i = full?.Doubled;                       // a PROPERTY
+    if (i.Value != 14) return 7;
+    if (empty?.Doubled != null) return 8;
+
+    Shape? sh = new Circle(4);
+    i64? j = sh?.area();                          // a VIRTUAL call
+    if (j.Value != 16) return 9;
+    Shape? nosh = null;
+    if (nosh?.area() != null) return 10;
+
+    IArea? ia = new Square(5);
+    i64? k = ia?.area();                          // an INTERFACE call
+    if (k.Value != 25) return 11;
+    IArea? noia = null;
+    if (noia?.area() != null) return 12;
+
+    full.Value.next = new Cell(2);
+    Cell? nx = full?.next;                        // a `T?` member keeps its row
+    if (nx.Value.v != 2) return 13;
+
+    i64? ch = full?.next?.v;                      // ...which is what makes it chain
+    if (ch.Value != 2) return 14;
+    if (empty?.next?.v != null) return 15;
+
+    Cell? tail = new Cell(1);
+    if (tail?.next?.v != null) return 16;         // the SECOND link is the empty one
+    return 0;
+}
+
+// ---- 6. the two operators where an expression is read ----
+
+i64 pick(i64? n) {
+    return n ?? 11;                               // inside a `return`
+}
+
+i64 twice(i64 k) {
+    return k * 2;
+}
+
+i64 mixcheck() {
+    Cell? full = new Cell(7);
+    Cell? empty = null;
+
+    if ((full?.v ?? 3) != 7) return 1;            // `?.` behind `??`
+    if ((empty?.v ?? 3) != 3) return 2;
+
+    i64? n = null;
+    if (pick(n) != 11) return 3;
+    if (pick(4) != 4) return 4;
+
+    if (twice(n ?? 5) != 10) return 5;            // inside an ARGUMENT
+
+    i64 i = 0;
+    i64? step = null;
+    loop {                                        // inside a LOOP CONDITION, read
+        if (!(i < (step ?? 3))) break;            //   again on every turn
+        i = i + 1;
+        if (i == 2) step = 5;
+    }
+    if (i != 5) return 6;
+
+    i64 k = 1;
+    i64 t = k > 0 ? (n ?? 8) : 0;                 // inside a TERNARY arm
+    if (t != 8) return 7;
+
+    bool? b = null;
+    i64 z = 0;
+    if (z != 0 || (b ?? true)) { } else { return 8; }   // C#'s own reading, spelled
+    return 0;
+}
+
+// ---- 7. a receiver only the oracle can type ----
+
+class Holder {
+    public Cell? cell;
+    public i64? count;
+}
+
+i64 through(Cell? c, i64? n) {
+    i64 a = 0;
+    if (c?.v != null) a = c?.v ?? 0;              // a PARAMETER on the left
+    return a + (n ?? 100);
+}
+
+i64 held(Holder h) {
+    return (h.cell?.v ?? 50) + (h.count ?? 60);   // ...and a FIELD of one
+}
+
+i64 paramcheck() {
+    if (through(null, null) != 100) return 1;
+    if (through(new Cell(3), null) != 103) return 2;
+    if (through(new Cell(3), 7) != 10) return 3;
+
+    Holder h = new Holder();
+    if (held(h) != 110) return 4;                 // both fields are zero: null
+    h.cell = new Cell(1);
+    h.count = 2;
+    if (held(h) != 3) return 5;
+    return 0;
+}
+
+// ---- 8. the reclaim ----
+
+i64 rccheck() {
+    i64 floor = rt_live();
+    i64 seen = cell_dtors;
+
+    {
+        Cell? empty = null;
+        Cell c = empty ?? new Cell(1);            // one object, and the temporary
+        if (c.v != 1) return 1;
+    }
+    if (cell_dtors != seen + 1) return 2;
+    if (rt_live() != floor) return 3;
+
+    {
+        Cell? full = new Cell(2);
+        Cell d = full ?? new Cell(3);             // the right side never allocates
+        if (d.v != 2) return 4;
+        if (rt_live() != floor + 1) return 5;
+    }
+    if (cell_dtors != seen + 2) return 6;
+    if (rt_live() != floor) return 7;
+
+    {
+        Cell? full = new Cell(4);
+        i64? boxed = full?.v;                     // the object and one box
+        if (boxed.Value != 4) return 8;
+        if (rt_live() != floor + 2) return 9;
+    }
+    if (rt_live() != floor) return 10;
+
+    {
+        i64? n = null;
+        i64? m = n ?? 5;                          // the box the right side wrote
+        if (m.Value != 5) return 11;
+    }
+    if (rt_live() != floor) return 12;
+
+    i64 i = 0;
+    loop {                                        // a churn: the block is recycled
+        if (i >= 20) break;
+        i64? n = null;
+        i64 k = n ?? i;
+        if (k != i) return 13;
+        i = i + 1;
+    }
+    if (rt_live() != floor) return 14;
+    return 0;
+}
+
+// ---- 9. the other shapes a nullable encloses ----
+
+struct Vec {
+    public i64 x;
+}
+
+i64 shapecheck() {
+    Vec? v = new Vec();                           // a `struct?`: not counted
+    Vec? nov = null;
+    i64? vx = v?.x;
+    if (vx.Value != 0) return 1;
+    if (nov?.x != null) return 2;
+    Vec w = nov ?? new Vec();
+    if (w.x != 0) return 3;
+
+    Cell[]? xs = new Cell[2];                     // a `T[]?`, and its one member
+    Cell[]? noxs = null;
+    i64? len = xs?.Length;
+    if (len.Value != 2) return 4;
+    if (noxs?.Length != null) return 5;
+    Cell[] hard = noxs ?? xs.Value;
+    if (hard.Length != 2) return 6;
+
+    TimeSpan? t = TimeSpan.FromHours(2.0);        // a primitive with members
+    TimeSpan? not = null;
+    i64? hours = t?.Hours;
+    if (hours.Value != 2) return 7;
+    if (not?.Hours != null) return 8;
+    TimeSpan span = not ?? TimeSpan.FromHours(1.0);
+    if (span.Hours != 1) return 9;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = refcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = valcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = lazycheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = chaincheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = dotcheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = mixcheck();
+    if (bad != 0) return 90 + bad;
+
+    bad = paramcheck();
+    if (bad != 0) return 100 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 110 + bad;
+
+    bad = shapecheck();
+    if (bad != 0) return 130 + bad;
+
+    return 42;
+}
