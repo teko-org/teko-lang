@@ -193,7 +193,8 @@ unambiguous:
 |---|---|
 | `held(null)` against `held(Cell)` and `held(Cell?)` | `held(Cell?)` |
 | `held(obj)` against the same pair | `held(Cell)` — an object prefers the exact signature |
-| `held(null)` against `held(Cell)` alone | refused: `teko: no overload of held matches these arguments` |
+| `held(null)` against `held(Cell)` alone | refused where it stands, `teko: null needs a slot declared Cell?` — a name declared once is judged by the slot, not by an overload search |
+| `held(null)` against `held(Cell)` and `held(i64)` | refused: `teko: no overload of held matches these arguments` — neither candidate takes `null` |
 
 ---
 
