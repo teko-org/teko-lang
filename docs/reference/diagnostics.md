@@ -503,6 +503,26 @@ Every one of these is [nullable.md](nullable.md)'s.
   with members take their own type and nothing else — inside a box as outside one.
 - `"teko: a nullable with no value"` — a run-time **panic**, exit 70: `.Value` on a handle
   of 0 ([memory.md](memory.md)).
+- `"teko: ?? needs a nullable on the left"` — `k ?? 7` where `k` is not a `T?`. It is also
+  what `a || b ?? c` prints: that reads as `(a || b) ?? c`, the precedence divergence
+  [not-yet.md](not-yet.md) records, and `||`'s result is a truth value. Write the
+  parentheses.
+- `"teko: ??= is not taught"` — `a ??= b`. `??=` is no lexeme of its own; `a = a ?? b;` is
+  the form.
+- `"teko: ?. needs a nullable on the left"` — `h?.v` where `h` is a plain `Cell`. A member
+  of a value that cannot be absent is read with `.`.
+- `"teko: ?. needs a value"` — `a?.m()` where `m` returns `void`. The lowering is an
+  expression and a `void` arm has no type; write `if (a != null) a.Value.m();`.
+- `"teko: ?. is not a slot"` — `a?.v = e`. A member is written through `.Value`, once the
+  nullable is known to have one.
+- `"teko: ?. reads a member, not an element"` — completed by the member's own name:
+  `a?.items[0]`. Bind the member first.
+- `"teko: bind the ?? or ?. result to a variable before reading a member"` — a plain `.` on
+  what either operator answers. `.` and `?.` share precedence 12, so `a?.b.c` would read as
+  `(a?.b).c` where C# short-circuits the whole chain; `a?.b?.c`, or a local of its own, is
+  the form.
+- `"teko: too many ?. accesses in one unit"` — more than 64 `?.` in one source. Each one
+  remembers the member name and the form its rewrite needs; the table is this ceiling.
 
 ## Namespaces, `using` and `import`
 

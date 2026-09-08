@@ -23,7 +23,7 @@ about a static type a deferred access does not carry.
 | 6 | `tk_typeof_pass` | `teko_typeof.tk` | the oracle: rewrites every deferred `.` into the load, store or call it stands for, now that the whole unit can be asked about |
 | 7 | `tk_ref_pass` | `teko_ref.tk` | a `ref`/`out` parameter reads and writes through its pointer |
 | 8 | `tk_deleg_pass` | `teko_deleg.tk` | a call on a delegate-typed name becomes a typed `callp` through the object's code pointer |
-| 9 | `tk_ternary_pass` | `teko_ternary.tk` | the `?:` placeholder becomes a local plus an `if`, hoisted above the statement that used it |
+| 9 | `tk_ternary_pass` | `teko_ternary.tk` | the `?:` placeholder becomes a local plus an `if`, hoisted above the statement that used it — and, from inside the same walk, so do the `??` and `?.` placeholders (`teko_null.tk`, D45), which is why neither operator registers a pass |
 | 10 | `tk_switch_guard_pass` | `teko_switch.tk` | checks the level a bare `continue` reaches once every `N_LOOP` is in the tree |
 | 11 | `tk_ops_pass` | `teko_ops.tk` | an operator over operands of declared type becomes the call to the static member that declares it |
 | 12 | `tk_params_pass` | `teko_params.tk` | builds the `T[]` of a `params` call site out of its arguments, for a name declared once, and refuses an index nothing resolved |
