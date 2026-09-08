@@ -10,13 +10,13 @@ looking up a construct must never find a plan described as if it worked.
 | [packages.md](packages.md) | one integrated registry with `mc`, what makes a package a teko package, and how a consumer pins the compiler and the library |
 | [self-hosting.md](self-hosting.md) | the single unit, and why the criterion is the object rather than the executable |
 | [dependency-injection.md](dependency-injection.md) | the DI model as decided, including the parts that are not built |
-| [datetime.md](datetime.md) | `DateTime` and `TimeSpan`: the tick, the members a primitive gets, and the one piece blocked on a clock in `mc`'s `<sys>` — **both types and the mechanism are built** ([timespan.md](../reference/timespan.md), [datetime.md](../reference/datetime.md)); what is left of the page is the text half and `Now` |
+| [datetime.md](datetime.md) | `DateTime` and `TimeSpan`: the tick, the members a primitive gets, and `Now` as teko's own `extern` per host — **both types and the mechanism are built** ([timespan.md](../reference/timespan.md), [datetime.md](../reference/datetime.md)); what is left of the page is the text half and `Now` |
 | [decimal.md](decimal.md) | `decimal`: C#'s 128-bit exact base-ten number, as a sixteen-byte primitive that moves by address |
 | [params-typed.md](params-typed.md) | `params T[]`, the typed variadic list — **built**, the reference describes it; the page is kept for the steps still open and for what the flip measured |
 | [small-ints.md](small-ints.md) | `i8`, `i16`, `i128` and `u128` — the integers C# has and teko does not, and the `tk_is_int_ty` predicate they change |
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
-| [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and the one function blocked on `mc` |
-| [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation blocked on `mc`'s lexer |
+| [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and `NewGuid` over teko's own entropy `extern` |
+| [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation over the `$` token `mc` 0.15.25 lets a module claim |
 | [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **the handle and the box are built** ([nullable.md](../reference/nullable.md), D43/D44); what is left of the page is the two operators and definite assignment |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
@@ -30,9 +30,9 @@ fixes the order.
 
 | # | crumb | page | size | depends on |
 |---|---|---|---|---|
-| 1 | **N0** `i8`/`i16` and the `tk_is_int_ty` predicate | small-ints.md | S | — |
+| 1 | ~~**N0** `i8`/`i16` and the `tk_is_int_ty` predicate~~ **landed**, D38 | small-ints.md | S | — |
 | 2 | **N1b** a constant that does not fit its slot (optional) | small-ints.md | S | N0 |
-| 3 | **N2a** `enum`: the type, the operators, the `switch` | enum.md | M | N0 |
+| 3 | ~~**N2a** `enum`: the type, the operators, the `switch`~~ **landed**, D39 | enum.md | M | N0 |
 | 4 | ~~**P0** the probes~~ **landed**, D40 | `docs/specs/datetime.md` | S | — |
 | 5 | ~~**C1** `TimeSpan`, and the primitive-member mechanism~~ **landed**, D40 | `docs/specs/datetime.md` | L | P0 |
 | 5a | ~~**Q0** the nullable probes~~ **landed**, D43 | `docs/internals/nullable-probes.md` | S | — |
@@ -52,9 +52,9 @@ fixes the order.
 | 15 | **N6** `i128` and `u128` | small-ints.md | L | C3, C4 |
 | 16 | **N7** `string`, the value | string.md | L | — |
 | 17 | **N8** `string`, the methods and the index | string.md | L | N7 |
-| 18 | **C6** `DateTime.Now`, `UtcNow`, `Today` | `docs/specs/datetime.md` | S | **blocked**: a wall clock in `mc`'s `<sys>` |
-| 19 | **N9** `Guid.NewGuid` | guid.md | S | **blocked**: an entropy source in `mc`'s `<sys>` |
-| 20 | **N10** `$"..."` interpolation | string.md | M | **blocked**: `mc`'s lexer refusing `$` before `"` |
+| 18 | **C6** `DateTime.Now`, `UtcNow`, `Today` | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |
+| 19 | **N9** `Guid.NewGuid` | guid.md | S | N3 — an entropy `extern` per target host and a `bcrypt.def` in teko's Windows sysroot, teko's own |
+| 20 | **N10** `$"..."` interpolation | string.md | M | N8, and a pin at `mc` ≥ 0.15.25, where `$` before `"` is a token a module claims with `syntax_expr("$", …)` |
 | 21 | **C7** the native wide instructions (optional, speed only) | `docs/specs/decimal.md` | S | C4 |
 
 **N7 and N8 depend on nothing** and are placed late only because they are the most
