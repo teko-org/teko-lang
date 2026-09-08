@@ -297,6 +297,7 @@ i64 tk_is_iface(i64 si) { return sr_kind_at(si) == TK_KIFACE; }
 i64 tk_is_deleg(i64 si) { return sr_kind_at(si) == TK_KDELEG; }
 i64 tk_is_ha(i64 si)    { return si >= 0 && sr_kind_at(si) == TK_KARRAY; }
 i64 tk_is_enum(i64 si)  { return si >= 0 && sr_kind_at(si) == TK_KENUM; }
+i64 tk_is_struct(i64 si) { return si >= 0 && sr_kind_at(si) == TK_KSTRUCT; }
 void set_fd_name_at(i64 i, uptr v)  { st64(fd_name + i * 8, v); }
 void set_fd_cls_at(i64 i, i64 v)    { st64(fd_cls + i * 8, v); }
 void set_fd_off_at(i64 i, i64 v)    { st64(fd_off + i * 8, v); }
@@ -1117,6 +1118,21 @@ i64 tk_pty_of(i64 n) {
 // Nothing is rewritten -- the node that arrives is the node that leaves.
 // `nd_val` is the array length, so `Point tbl[4];` (four pointers, not one
 // object) is skipped.
+//
+// A STRUCT is not reference-counted (types.md's own "not reference-counted"
+// clause), so it carries none of the machinery a class local's bare
+// declaration rides for free: `tk_rc_var` (teko_rc.tk, K2b bug 1a) zeroes an
+// uninitialized COUNTED local to the borrowed `null` every other reference
+// slot already gets, but its own guard (`tk_is_counted`) reads `false` for a
+// struct on purpose, and skips it. `Point p;` with no initializer therefore
+// reaches the run holding whatever bit pattern the stack frame already had --
+// not `null`, GARBAGE -- and `p.x = 4` is a store through it: an aligned
+// address SIGSEGVs, a misaligned one SIGBUS, and either way the exit code is
+// the OS's, never `teko`'s. A struct value IS a pointer (types.md § struct),
+// produced by `new` alone; a declaration with no initializer names an
+// allocation that is never going to exist, so it is refused right here,
+// where the row already answers whether `si` is a struct one -- before
+// `tk_local_add` ever lets `p.x` parse as a field access at all.
 i64 tk_on_stmt(i64 n) {
     if (n == 0) return n;
     if (nd_kind(n) != N_VAR) return n;
@@ -1126,6 +1142,8 @@ i64 tk_on_stmt(i64 n) {
     if (si >= 0) {
         tk_line = nd_line(n);
         tk_file = nd_file(n);
+        if (tk_is_struct(si) && nd_a(n) == 0)
+            err_at(tk_file, tk_line, "teko: a struct is built by new");
         tk_local_add(nd_name(n), si);
     }
     return n;

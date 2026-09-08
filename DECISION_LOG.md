@@ -1150,3 +1150,117 @@ mc.macos.toml` verdict `ok`, `types` `10` → `11` and `alias` `17` → `19` (th
 plus `DateTimeKind`'s `type_alias`), `syntax` `15`, `passes` `15/30` and `intrin` `8/16`
 **unmoved**. Thirty-two refusal probes outside `tests/` (`build/refuse/*`, not committed)
 prove every message this entry names with its exact text and exit code.
+
+### D42 · Two pre-existing defects: capturing an 8-byte primitive, and a struct with no `new` (2026-09-08)
+Two verifier findings, fixed in one crumb because both are the SAME class of bug —
+compiler-generated code reading or writing a value at a width the surface's own
+compatibility check was never told about.
+
+**Defect 1 — `use (a)` of a `TimeSpan`/`DateTime`/`enum` refused the value it had just
+read.** A lambda's by-value capture writes into the closure through `tk_cap_put(p, off,
+i64 v)` (`lib/rt.tk`), the ONE writer every non-float, non-counted capture shares
+(`tk_cap_writer`, teko_deleg.tk) — correct for `i64`/`i8`/`u8` (already `tk_is_int_ty`,
+D38), and wrong for the three `TK_SINT` ids that are NOT ordinary integers by that same
+rule (D38's own list: `TimeSpan`/`DateTime`, and every `enum`). The captured NAME crossed
+into the argument list untouched, `tk_ty_of` answered its own row type, and
+`tk_check_scalar_compat` (D34/D40's own clause) refused it on sight — `teko: a value of
+type TimeSpan does not convert to i64` — reported at the CAPTURED LOCAL's own declaration
+line rather than the `use (...)` site, because `tk_call3` (teko_struct.tk) stamps a
+synthetic node with `tk_line`/`tk_file` as they stand at that instant, and
+`tk_deleg_var_stmt` (teko_deleg.tk) only restores them to the DECLARATION's own line AFTER
+parsing the whole initializer — the misleading line was a symptom, not the defect.
+
+The read side (`tk_lambda_prologue`'s own `tk_ld`) was never the problem: an eight-byte
+`TK_SINT` load returns the raw `ld64` call unwrapped (D38's own rule, `type_width(ty) < 8`
+being false for these three), and that raw call's `TY_I64` tag is read by nothing —
+`tk_ty_of` types an `N_CALL` by `decl_find`, which does not know a fixed core intrinsic
+like `ld64` at all, so it answers `-1` and every compat check downstream reads that as
+"not known" and steps aside. Only the WRITE side, where the compiler hands the CAPTURED
+NAME (typed by the ordinary scope table, not a raw call) to `tk_cap_put`'s `i64` parameter,
+ever reached a check that had an opinion.
+
+The fix is `tk_cap_val` (teko_deleg.tk): the value a by-value capture hands to
+`tk_cap_writer`'s own slot, computed once and shared by both writers (`tk_cap_put`,
+`tk_cap_own`'s float/counted siblings are untouched). A primitive-with-members goes through
+`tk_prim_raw` (teko_prim.tk) — the SAME compiler-authored raw view a row's own argument
+already takes (D40 § 2/D41 § 3), so the cast is remembered on the "compiler wrote this"
+list and the later refusal (`tk_prim_cast_check`) never mistakes it for a hand-written one.
+An `enum` takes a plain `tk_cast(TY_I64, v)` — `docs/specs/enum.md` § 5 states both explicit
+directions of an enum cast are "a machine cast and nothing more", so no hand-written-cast
+refusal exists to sidestep. `tk_prim_is`/`tk_prim_raw` (teko_prim.tk, included AFTER
+teko_deleg.tk) are forward-declared at the call site, the same way `tk_lambda_build` already
+is at the top of the same file. Zero new intrinsics, zero changes to `mc` (D2/D21): the fix
+is the same cast the surface already writes elsewhere, built where one site did not write
+it. By-reference captures (`use (&a)`) were never affected — they hand `tk_addr(...)`, an
+address, to `tk_cap_put`'s OWN `ref` writer, not through `tk_cap_val` at all.
+
+**Defect 2 — `struct P p;` with no initializer crashed the run instead of the compiler.**
+A struct value IS a pointer to an allocation ([types.md](docs/reference/types.md) § struct),
+produced by `new` alone, and a struct is NOT reference-counted (the same page, same
+section) — so a bare declaration gets none of the K2b compensation a counted local's does
+(`tk_rc_var`, teko_rc.tk: `if (!tk_is_counted(nd_type(n))) return;` skips it by name before
+the zero-to-`null` fill ever runs). `Point p;` reaches the run holding whatever bit pattern
+the stack frame already had — not `null`, GARBAGE — and `p.x = 4` stores through it: the
+probe crashed `SIGBUS` (exit 138) on one stack layout and `SIGSEGV` on another, never a
+`teko:` diagnostic, and a bare CLASS local (`C c;`) turned out to be no better in practice —
+it IS deterministically `null` (K2b's own fix reaches it, being counted), but a field access
+on it is an unguarded `ld64`/`st64` with no null check anywhere in that path either, so it
+segfaults at address 0 just as rawly, only more predictably. Adding a null-check to every
+field access (struct and class share the one lowering) would move `--dump-ast` on nearly
+every existing fixture for a construct this crumb was not asked to touch — out of scope,
+reported below instead.
+
+The chosen fix is a compile-time refusal, `` `"teko: a struct is built by new"` ``, at
+`tk_on_stmt` (teko_struct.tk, M21.5's own statement hook): a `struct`-typed local
+(`tk_is_struct(si)`, the new predicate beside `tk_is_class`/`tk_is_enum`) with `nd_a(n) ==
+0` — no initializer at all — is refused right where the row already answers whether `si`
+names a struct, before `tk_local_add` lets `p.x` parse as a field access. Ternary/`foreach`
+locals of struct type are unaffected: both ALWAYS build their hidden local WITH an
+initializer (`tk_null()` for a struct slot, `tk_tern_lower`, teko_ternary.tk) and neither
+one is even seen by `tk_on_stmt`, which only fires for a genuine parsed statement. No
+existing fixture declares a bare struct local — a grep of every `Type name;` shape in
+`tests/` found only counted types (`C c;`, `Box x;`, DI service locals), each followed
+immediately by an `out` parameter or a resolver call that fills it before any read — so the
+refusal moves nothing.
+
+**Adjacent finding, not fixed here (reported, not a new crumb):** a bare CLASS local's
+field access is ALSO an unguarded raw pointer dereference (`C c; c.x;` segfaults at address
+0, `SIGSEGV`, exit 139) rather than a `teko:`-style panic — the vtable path a delegate CALL
+checks (`tk_deleg_code`, `lib/rt.tk`) has no analogue on a plain field load/store, for a
+class OR a struct. This crumb declined to add one because the guard would sit on the ONE
+lowering every field access in the language shares, moving `--dump-ast` on effectively
+every existing fixture for a question ("does a null-check belong on every field access, at
+what cost") this crumb was not asked to settle. A GLOBAL struct with no initializer
+(`P g_p;`) is the same danger by the same root cause, one level up — BSS zeroes it to a
+genuine `null` (a deterministic `SIGSEGV`, not the local's raw-garbage `SIGBUS`), but it is
+just as wrong, and `tk_on_stmt` never sees a top-level declaration (its own header names the
+gap: "there is no public hook over a top-level declaration") — closing it needs a small
+walk over `root`'s own `N_GLOBAL` siblings, the shape `tk_prim_cast_globals` (teko_prim.tk)
+already has for a different check, left for a crumb that wants it.
+
+No `tests/*.tk` fixture panics for defect 2 — the chosen fix is a REFUSAL, and every
+`tests/*.tk` fixture is built `--entry-only` and RUN (`CLAUDE.md`'s own recipe), which a
+compile error breaks by construction; a refusal is proven by a probe outside `tests/`
+instead (`build/refuse/struct_no_new.tk`, not committed, `teko: a struct is built by new`
+at the declaration's own line) and documented in
+[diagnostics.md](docs/reference/diagnostics.md).
+
+Proof: `mc build . --config mc.macos.toml` clean on mc **0.15.23**; **51/51** fixtures at
+their `expect-exit` (three existing ones — `surface_timespan`, `surface_datetime`,
+`surface_enum` — grew a lambda-capture case each, no fixture added or removed); `--dump-ast`
+of the 48 untouched fixtures byte-identical to `1d195e1d`, and the three that grew a case
+differ ONLY by the new statements inserted and the trailing gensym renumber that insertion
+causes in the SAME function (`$g13` → `$g15` in `surface_timespan`'s `main`, the same shape
+in the other two) — no existing branch, call or literal moved; `FIXPOINT OK` (`teko1.o ==
+teko2.o == teko3.o` on the first turn, `--dump-asm` diff empty over 205772 lines — 205653
+plus this crumb's own code — 51/51 under the self-hosted `teko1`); `sh
+scripts/check-docs.sh` green (467 links, 357 diagnostics, 95 samples); `mc limits . --config
+mc.macos.toml` over `tests/hello.tk` (the number every prior entry reports) unchanged —
+`types` `11`, `alias` `19`, `syntax` `15`, `passes` `15/30`, `intrin` `8/16`, all
+**unmoved**; the FIRST table `mc limits` also prints, `build/teko.mc` analyzed by stock
+`mc`'s own generic estimator before teko exists as a binary, shows `passes`/`alias`/`types`
+"grew" and exits 3 on `1d195e1d` UNCHANGED TOO (verified on a freshly-bootstrapped base
+before touching anything) — a pre-existing mismatch between that estimator's generic
+defaults and teko's own registration count, reported as the same kind of adjacent finding
+as the class-field-access gap above, not this crumb's to fix. `mc pkg hash .`:
+`d674f980a5ba9863c8724a53d78fb12ea0a398bb4decc81c96579c3e5f84648f`.
