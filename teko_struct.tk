@@ -548,6 +548,29 @@ uptr tk_stn(i64 ty) {
     return "st64";
 }
 
+// `tk_ldn`'s raw load is always ZERO-extending -- `ld8`/`ld16`/`ld32` are the
+// core's own fixed intrinsics (mc's language.md § 2: "the signed read of raw
+// memory ... spelled `(i32) ld32(p)`"), correct for every UNSIGNED narrow
+// type this project already had (`u8`/`u16`/`u32`) and wrong for a SIGNED one
+// narrower than the word -- `i8`/`i16`, and `i32` before them -- whose sign
+// bit a raw load reads as an ordinary high bit instead of extending it.
+// `tk_cast` (teko_array.tk) is the one surface form that DOES sign-extend by
+// kind (`MTASK_CAST`, the machine contract, `docs/specs/small-ints.md` § 1's
+// table), so wrapping the raw value in an explicit cast to its own type
+// re-reads it through `sxtb`/`sxth` and gives an indirect load the same
+// value a declared local of that type already gets for free from the core's
+// own `walk_narrow`. `teko_array.tk`'s own `tk_arr_load` already carries
+// this exact two-line shape, for `i32`, its only signed narrow element
+// before this crumb; this is the same check, factored out once so every
+// OTHER indirect load this module builds -- a field, a `ref`/`out` pointee,
+// a delegate capture, a property getter, a pending field access -- shares it
+// rather than repeating it at each site.
+i64 tk_ld(i64 ty, i64 addr) {
+    i64 r = tk_call(tk_ldn(ty), addr);
+    if (type_kind(ty) == TK_SINT && type_width(ty) < 8) return tk_cast(ty, r);
+    return r;
+}
+
 // ---- lookups, linear and in declaration order (mc docs/determinism.md rule 1) ----
 // the scan alone, no namespace resolution: what a name ALREADY qualified (a
 // declaration's own exact-match check, or a candidate teko_ns.tk constructed
@@ -1302,7 +1325,7 @@ i64 tk_array_index(i64 addr, i64 x) {
         tk_file = fl;
         return tk_os_mark(tk_call2(tk_stn(ety), at, v), ety);
     }
-    i64 r = tk_call(tk_ldn(ety), at);
+    i64 r = tk_ld(ety, at);
     i64 es = tk_struct_by_ty(ety);
     if (es >= 0) tk_xt_add(r, es, 1, TK_BORROWED);
     return r;

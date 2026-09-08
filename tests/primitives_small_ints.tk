@@ -1,0 +1,187 @@
+// primitives_small_ints.tk -- `i8`/`i16` (mc's own `TK_SINT` kind, since M45):
+// the two `type_new` lines in teko_type.tk and the predicate `tk_is_int_ty`
+// (teko_typeof.tk) that names them by id, never by kind
+// (docs/specs/small-ints.md).
+//
+// The core does the sign-extending load, cast, `/ % >>` and comparison for
+// any DECLARED local, parameter, global or array element of a `TK_SINT`
+// type, at no cost to this project (docs/specs/small-ints.md § 1's table).
+// What is NOT free is every INDIRECT load this project generates for itself
+// -- a struct/class field, a `ref`/`out` pointee, a static field, a property
+// getter, a delegate capture, an inline array field -- because each of those
+// reads through the fixed core intrinsics `ld8`/`ld16` (`tk_ldn`,
+// teko_struct.tk), which are always ZERO-extending. `teko_array.tk`'s own
+// `tk_arr_load` already wrapped that raw load in a sign-extending `tk_cast`
+// for `i32`, its only signed narrow element before this crumb; `tk_ld`
+// (teko_struct.tk) is the same two-line check, factored out once so every
+// one of the sites above shares it rather than repeating it. `check_fields`
+// below is the fixture that would have failed silently (a stored `-9`
+// reading back as `247`) without it.
+//
+// `wrap_check` proves § 4's own rule: teko does not teach C#'s integer
+// promotion (`sbyte + sbyte` stays `int` in C#), so `(i8) 100 + (i8) 100` is
+// `200` while it is still in flight -- an ordinary 64-bit `i64` -- and only
+// narrows to `-56` at the next STORE into an `i8` slot, the same rule
+// `u8`/`u16`/`u32` already had (docs/reference/types.md § "Casts, width and
+// sign").
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+// ---- declarations the checks below share ----
+
+delegate i64 BoxOp();
+
+struct Box {
+    public i8  v;
+    public i16 w;
+}
+
+struct Items {
+    public i8 tbl[3];
+}
+
+class Cell {
+    public i8 raw;
+    public i8 Value { get => raw; set => raw = value; }
+    public i8 read() { return raw; }
+}
+
+i8  g8  = 0 - 7;
+i16 g16 = 0 - 700;
+
+void set8(out i8 w)   { w = 0 - 100; }
+void bump16(ref i16 w) { w = w - 1; }
+
+i16 clamp16(i32 v) {
+    if (v > 32767) return 32767;
+    if (v < 0 - 32768) return 0 - 32768;
+    return (i16) v;
+}
+
+f64 twice(f64 x) { return x + x; }
+
+// ---- the checks ----
+
+// negative locals, sign-extending `>>`, `/`, and a signed comparison -- all
+// three of which the core does BY KIND for a declared `TK_SINT` local, no
+// line of teko's (docs/specs/small-ints.md § 1's table)
+i64 locals_check() {
+    i8  a = 0 - 5;
+    i16 b = 0 - 300;
+    if (a >> 1 != 0 - 3) return 1;               // an arithmetic shift
+    if (b / 2 != 0 - 150) return 2;               // a signed divide
+    if (b % 7 != 0 - 6) return 3;                 // a signed remainder
+    if (a >= 0) return 4;                         // a signed comparison
+    if (!(a < 0)) return 5;
+    i64 wide = a;                                 // widens with its sign
+    if (wide != 0 - 5) return 6;
+    if (clamp16(70000) != 32767) return 7;        // saturates, narrows explicitly
+    if (clamp16(0 - 70000) != 0 - 32768) return 8;
+    return 0;
+}
+
+// a LOCAL array is core grammar (`T x[N]`), narrowed and widened by the same
+// kind-aware machinery a scalar local gets -- proving the baseline the
+// indirect loads below are held to
+i64 local_array_check() {
+    i8 tbl[4];
+    tbl[0] = 0 - 1;
+    tbl[1] = 0 - 128;                             // `i8`'s own minimum
+    if (tbl[0] != 0 - 1) return 1;
+    if (tbl[1] != 0 - 128) return 2;
+    return 0;
+}
+
+// every INDIRECT load this project generates for itself: a struct field, an
+// inline array field, a class field read through `this`, a `ref`/`out`
+// pointee, a static field, a property accessor and a delegate capture --
+// the `tk_ld` fix this crumb adds
+i64 indirect_check() {
+    Box box = new Box();
+    box.v = 0 - 9;
+    box.w = 0 - 900;
+    if (box.v != 0 - 9) return 1;                 // a struct field
+    if (box.w != 0 - 900) return 2;
+
+    Items it = new Items();
+    it.tbl[0] = 0 - 3;
+    it.tbl[2] = 127;                              // `i8`'s own maximum
+    if (it.tbl[0] != 0 - 3) return 3;              // an inline array field
+    if (it.tbl[2] != 127) return 4;
+
+    i8 lo = 1;
+    set8(out lo);
+    if (lo != 0 - 100) return 5;                  // an `out` pointee
+
+    i16 hi = 0 - 32768;
+    bump16(ref hi);
+    if (hi != 32767) return 6;                    // a `ref` pointee, and a wrap
+
+    if (g8 != 0 - 7) return 7;                    // a global
+    if (g16 != 0 - 700) return 8;
+
+    Cell c = new Cell();
+    c.Value = 0 - 55;
+    if (c.Value != 0 - 55) return 9;              // a property accessor
+    if (c.read() != 0 - 55) return 10;            // a class field through `this`
+
+    i8 cap = 0 - 11;
+    BoxOp f = new BoxOp(() use (cap) => cap);
+    if (f() != 0 - 11) return 11;                 // a delegate capture
+
+    i8[] heap = new i8[2];
+    heap[0] = 0 - 7;
+    if (heap[0] != 0 - 7) return 12;              // a heap array element
+
+    return 0;
+}
+
+// C# §10.2.3's implicit numeric conversion, over the predicate this crumb
+// widens (docs/specs/small-ints.md § 2): `i8`/`i16` reach an `f64` slot the
+// same way an `i64` already does, and nothing narrows back without a cast.
+i64 convert_check() {
+    i8  a = 0 - 5;
+    i16 b = 12345;
+    f64 fa = a;                                   // a variable initializer
+    if (fa != 0.0 - 5.0) return 1;
+    f64 fb = 0.0;
+    fb = b;                                       // an assignment
+    if (fb != 12345.0) return 2;
+    if (twice(a) != 0.0 - 10.0) return 3;         // a free call's argument
+    i64 back = (i64) fa;                          // narrowing back, explicit
+    if (back != 0 - 5) return 4;
+    return 0;
+}
+
+// `(i8) 100 + (i8) 100` is `200` in flight and `-56` the moment it is
+// stored back into an `i8` slot; `(i16) 32767 + (i16) 1` wraps the same way.
+i64 wrap_check() {
+    i8 a = (i8) 100;
+    i8 b = (i8) 100;
+    i64 mid = a + b;
+    if (mid != 200) return 1;
+    i8 c = a + b;
+    if (c != 0 - 56) return 2;
+
+    i16 sa = (i16) 32767;
+    i16 sb = (i16) 1;
+    i16 sc = sa + sb;
+    if (sc != 0 - 32768) return 3;
+    return 0;
+}
+
+i64 main() {
+    i64 r = locals_check();
+    if (r != 0) return r;
+    r = local_array_check();
+    if (r != 0) return r + 10;
+    r = indirect_check();
+    if (r != 0) return r + 20;
+    r = convert_check();
+    if (r != 0) return r + 40;
+    r = wrap_check();
+    if (r != 0) return r + 50;
+    return 42;
+}
