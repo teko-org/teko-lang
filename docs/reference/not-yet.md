@@ -104,7 +104,8 @@ around it:
 | `c.v` on a `Cell?` (flow narrowing, C# 8's `if (c != null) { c.v }`) | `teko: a Cell? is read through .Value` — the analysis behind narrowing is a dominator pass this design does not buy |
 | `f(3, 4)` on an `Op?` local | `call to unknown function f`, from the core — a nullable delegate is a value to compare and to pass, not one to call, and `.Value(...)` is not taught either |
 | `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no reference subject at all |
-| `if (a)`, `a ? x : y`, `while (a)`, `for (…; a; …)`, `do … while (a);` on a bare `T?` | `teko: bool? is not a condition` (named by the row) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` is the form |
+| `if (a)`, `a ? x : y` on a bare `T?` | `teko: i64? is not a condition` (named by the row; `bool?` prints as `u8?`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` is the form |
+| `while (a)`, `for (…; a; …)`, `do … while (a);` on a bare `T?` | ``teko: i64? declares no operator `!` `` — a loop's guard is `!(cond)`, and the unary refusal is reached first |
 | `x.ToString()` on a nullable | deferred with all text |
 | a `switch` whose subject is a `Cell` or a `Cell?` | **accepted and compared as a pointer**, which no `case` label can match. Pre-existing for every reference, not a nullable's own |
 

@@ -329,7 +329,8 @@ exists to catch (`tk_ops_binary`/`tk_ops_unary`, [teko_ops.tk](../../teko_ops.tk
 | `a < b`, `a <= b`, `a > b`, `a >= b` | refused, the same wording — C#'s lifted ordering stays out |
 | `a & b`, `a \| b`, `a ^ b`, `a << b`, `a >> b` | refused, the same wording |
 | `-a`, `!a`, `~a`, `+a` | refused, the same wording, unary: ``teko: i64? declares no operator `-` `` |
-| `if (a)`, `a ? x : y`, `while (a)`, `for (…; a; …)`, `do … while (a);` | refused: ``teko: bool? is not a condition`` (and by the row's own name for any other `T?`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` (a `bool`) is the form |
+| `if (a)`, `a ? x : y` | refused: ``teko: i64? is not a condition`` (named by the row; a `bool?` prints as `u8?`, `bool` being an alias of `u8`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` (a `bool`) is the form |
+| `while (a)`, `for (…; a; …)`, `do … while (a);` | refused too, as ``teko: i64? declares no operator `!` ``: a loop's guard is `!(cond)`, and the `!` on a nullable is the unary refusal above, reached before the condition check |
 | `a ?? b`, `a?.m` | not taught yet ([not-yet.md](not-yet.md)) |
 | `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no nullable subject |
 

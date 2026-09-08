@@ -481,9 +481,10 @@ Every one of these is [nullable.md](nullable.md)'s.
   value: `a == 5` would compare the box's own address against five, always false, which is
   the mistake this claim exists to catch (`tk_op_none_msg`, [teko_ops.tk](../../teko_ops.tk),
   the same wording an ordinary type that declares no operator already gets).
-- `"teko: "` — completed by *`bool?` is not a condition* (the row's own name): a nullable
-  used bare as `if`'s condition, the ternary's, or `while`/`for`/`do`'s (their own guard is
-  `!(cond)`, and `!` on a nullable is the unary form of the operator refusal above).
+- `"teko: "` — completed by *`i64?` is not a condition* (the row's own name; a `bool?`
+  prints as `u8?`): a nullable used bare as `if`'s condition or the ternary's. A
+  `while`/`for`/`do` guard is `!(cond)`, so there the `!` on a nullable meets the unary
+  form of the operator refusal above first, ``declares no operator `!` ``.
   `a.HasValue`, `a == null` or `a.Value` is the form.
 - `"teko: too many HasValue reads in one unit"` — more than 64 `.HasValue` reads in one
   source. `HasValue`'s own lowering (`left != 0`) is marked so the operator claim above does

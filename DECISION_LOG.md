@@ -1445,7 +1445,9 @@ fallback, and takes `==`/`!=` against `null` (`tk_is_null_lit`, either side) and
 else; every other operator, and `==`/`!=` against anything but `null`, is refused by the
 existing `tk_op_none_msg` wording. The same claim reaches unary `- ! ~ +`, and a new one at
 `N_IF` (the ternary's own node by the time this pass runs) refuses a nullable used bare as a
-condition — `teko: bool? is not a condition` — since a boxed value's handle answers
+condition — `teko: i64? is not a condition`, named by the row (a `bool?` prints as `u8?`,
+`bool` being an alias of `u8`); a `while`/`for`/`do` guard is `!(cond)` and meets the unary
+refusal first, ``declares no operator `!` `` — since a boxed value's handle answers
 `HasValue`, not the value inside it, and `false` is still a live box. `HasValue`'s own
 lowering (`left != 0`) would have been caught by the new claim as well — `left` IS a
 nullable operand — so it is MARKED (`tk_nl_hv_mark`, on the RECEIVER node rather than the
