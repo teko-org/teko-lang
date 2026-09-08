@@ -506,7 +506,39 @@ i64 main() {
 ```
 
 [timespan.md](timespan.md) is the whole type: every member, every operator, every refusal.
-`DateTime` is [designed and not built](../specs/datetime.md).
+
+---
+
+## `DateTime`
+
+A point in time behind the same include: a tick count from `0001-01-01 00:00:00` with a
+`Kind` (`Unspecified`, `Utc`, `Local`) in the two bits above it, C#'s own packing. It is a
+primitive with members like `TimeSpan`, and the two share every mechanism — but **the raw
+bits are not the ticks**, so `.Ticks` is a call, a hand-written `(i64) d` is refused, and
+every comparison masks the `Kind` off.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    DateTime leap = new DateTime(2024, 2, 29);
+    if (leap.Year != 2024 || leap.Day != 29) return 1;
+    if (leap.DayOfWeek != 4) return 2;           // a Thursday, 0 is Sunday
+    DateTime next = leap.AddDays(1);
+    if (next.Month != 3 || next.Day != 1) return 3;
+    if ((next - leap).TotalDays != 1.0) return 4;
+    if (new DateTime(2024, 1, 31).AddMonths(1).Day != 29) return 5;   // C# clamps
+    if (DateTime.IsLeapYear(1900) != 0) return 6;
+    if (leap.Kind != DateTimeKind.Unspecified) return 7;
+    return 42;
+}
+```
+
+`DateTimeKind` is an alias of `i32` with three values. A date that does not exist panics
+where it is built (`new DateTime(2023, 2, 29)` is `teko: a date does not exist`, exit 70),
+and `DateTime.Now` is refused by name until `mc`'s `<sys>` carries a wall clock.
+[datetime.md](datetime.md) is the whole type.
 
 ---
 

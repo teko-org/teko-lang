@@ -279,12 +279,13 @@ entry says what completes it.
   operator, and a mismatched or bare-integer operand on any of those six, is refused this
   way too.
 
-## Primitives with members (`TimeSpan`)
+## Primitives with members (`TimeSpan`, `DateTime`)
 
 A primitive is a type of eight bytes with no row in the type table — no field, no vtable,
 no method — whose members come from a lowering table instead
-([timespan.md](timespan.md), [the internals note](../internals/primitives.md)). The
-messages reuse the wordings a declared type already gets; only three are its own.
+([timespan.md](timespan.md), [datetime.md](datetime.md),
+[the internals note](../internals/primitives.md)). The
+messages reuse the wordings a declared type already gets; only a handful are its own.
 
 - `"teko: "` — completed by *`TimeSpan` needs #include "time.tk" before it is used*: the
   type word is reserved program-wide, but the functions its members lower to live in
@@ -300,8 +301,9 @@ messages reuse the wordings a declared type already gets; only three are its own
   `t.Ticks = 5;` has nothing to assign to.
 - `"teko: the member is a property; it is not called"` — `t.Ticks()`; drop the `()`.
 - `"teko: the member is a method; call it with ()"` — `t.Duration`; add them.
-- `"teko: wrong number of arguments for "` — completed by the member's name: every row of
-  the table takes one argument or none.
+- `"teko: wrong number of arguments for "` — completed by the member's name: no row of
+  that name takes as many arguments as the site wrote. `new DateTime(...)` takes 1, 2, 3, 6
+  or 7 of them and nothing else.
 - `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: a primitive
   converts to nothing but itself, in either direction and in all nine slots — an integer, a
   float, `null`, a class, a struct, a `T[]` or a different primitive into a `TimeSpan`
@@ -319,10 +321,26 @@ messages reuse the wordings a declared type already gets; only three are its own
 - `"teko: a type name reaches its static members"` — the type word alone, with no `.`
   after it, in expression position.
 - `"teko: the field is not an array"` — completed by the member's name: `t.Ticks[0]`.
+- `"teko: a "` — completed by *`X` does not cast; `.Ticks` reads it and `new X(...)` builds
+  it*: `(i64) d` and `(DateTime) n` written by hand, and the same pair over a `TimeSpan`.
+  A cast is the one syntax that would convert what converts to nothing but itself, and over
+  a `DateTime` it would answer a wrong number rather than refuse — the `Kind` sits in the
+  two bits above the ticks. The compiler writes both casts itself, in the lowering, and
+  knows its own.
+- `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
+  `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
+  to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
+  the site says so, instead of reading as a member nobody declared.
+- `"teko: unknown static member of DateTimeKind"` — completed by the member: the three
+  values are `Unspecified`, `Utc` and `Local`.
 
-The three panics `lib/time.tk` raises at RUN time (`a time span overflowed`,
-`a time span divided by zero`, `a time span is out of range`) are exit 70 and are listed in
-[runtime.md](runtime.md#the-time-library).
+The three panics `lib/time.tk` raises for a `TimeSpan` at RUN time (`a time span
+overflowed`, `a time span divided by zero`, `a time span is out of range`) and the eleven it
+raises for a `DateTime` (`a date does not exist`, `a date is out of range`, `a year is out
+of range`, `a month is out of range`, `an hour is out of range`, `a minute is out of
+range`, `a second is out of range`, `a millisecond is out of range`, `a date kind is out of
+range`, `a month count is out of range`, `a year count is out of range`) are exit 70 and
+are listed in [runtime.md](runtime.md#the-time-library).
 
 ## Properties
 
@@ -670,6 +688,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many primitive types"` | 8 primitives with a member table |
 | `"teko: too many primitive members"` | 96 rows, over every primitive |
 | `"teko: too many primitive operators"` | 32 rows, over every primitive |
+| `"teko: too many casts over a primitive in one unit"` | 4096 casts the compiler wrote itself, in one compilation unit |
 | `"teko: too many services"` | 32 marked classes |
 | ``"teko: too many `inject` sites"`` | 32 |
 | ``"teko: too many `scope` blocks"`` | 64, plus one per singleton |

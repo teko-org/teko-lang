@@ -10,7 +10,7 @@ looking up a construct must never find a plan described as if it worked.
 | [packages.md](packages.md) | one integrated registry with `mc`, what makes a package a teko package, and how a consumer pins the compiler and the library |
 | [self-hosting.md](self-hosting.md) | the single unit, and why the criterion is the object rather than the executable |
 | [dependency-injection.md](dependency-injection.md) | the DI model as decided, including the parts that are not built |
-| [datetime.md](datetime.md) | `DateTime` and `TimeSpan`: the tick, the members a primitive gets, and the one piece blocked on a clock in `mc`'s `<sys>` — **`TimeSpan` and the mechanism are built** ([the reference](../reference/timespan.md)); `DateTime` is not |
+| [datetime.md](datetime.md) | `DateTime` and `TimeSpan`: the tick, the members a primitive gets, and the one piece blocked on a clock in `mc`'s `<sys>` — **both types and the mechanism are built** ([timespan.md](../reference/timespan.md), [datetime.md](../reference/datetime.md)); what is left of the page is the text half and `Now` |
 | [decimal.md](decimal.md) | `decimal`: C#'s 128-bit exact base-ten number, as a sixteen-byte primitive that moves by address |
 | [params-typed.md](params-typed.md) | `params T[]`, the typed variadic list — **built**, the reference describes it; the page is kept for the steps still open and for what the flip measured |
 | [small-ints.md](small-ints.md) | `i8`, `i16`, `i128` and `u128` — the integers C# has and teko does not, and the `tk_is_int_ty` predicate they change |
@@ -35,7 +35,7 @@ fixes the order.
 | 4 | ~~**P0** the probes~~ **landed**, D40 | `docs/specs/datetime.md` | S | — |
 | 5 | ~~**C1** `TimeSpan`, and the primitive-member mechanism~~ **landed**, D40 | `docs/specs/datetime.md` | L | P0 |
 | 6 | **N2b** `enum`: `ToString`, `Parse`, the statics | enum.md | S | N2a, C1 |
-| 7 | **C2** `DateTime` | `docs/specs/datetime.md` | L | C1 |
+| 7 | ~~**C2** `DateTime`~~ **landed**, D41 | `docs/specs/datetime.md` | L | C1 |
 | 8 | **N2c** `DateTimeKind` becomes an `enum` | enum.md | S | N2a, C2 |
 | 9 | **N4** `DateOnly` and `TimeOnly` | datetime-extras.md | M | C2 |
 | 10 | **C3** the sixteen-byte value and `teko_wide.tk` | `docs/specs/decimal.md` | M | C1 |

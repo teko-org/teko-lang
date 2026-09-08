@@ -2,8 +2,8 @@
 
 Two library files, both **program** code compiled under the same taught vocabulary as the
 program that includes them: `lib/rt.tk`, the runtime every program links against, and
-[`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` member and operator lowers
-to.
+[`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` and `DateTime` member
+and operator lowers to.
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
 the compiler injects, the guards behind an index and an interface call, and a handful of
@@ -146,7 +146,8 @@ i64 main() {
 
 ## The time library
 
-`lib/time.tk`, what [`TimeSpan`](timespan.md) lowers to. It includes `rt.tk` for `panic`, so a program
+`lib/time.tk`, what [`TimeSpan`](timespan.md) and [`DateTime`](datetime.md) lower to. It
+includes `rt.tk` for `panic`, so a program
 that includes it has both:
 
 ```
@@ -173,18 +174,62 @@ spelling: the surface is the member, not the symbol.
 | `i64 tk_ts_eq(i64, i64)` `tk_ts_ne` `tk_ts_lt` `tk_ts_le` `tk_ts_gt` `tk_ts_ge` | the six comparisons, 0 or 1 |
 | `i64 tk_ts_cmp(i64, i64)` | `.CompareTo()`: `-1`, `0` or `1` |
 
+...and the same for a `DateTime`, whose raw eight bytes are the ticks in bits 0..61 and the
+`Kind` in the two above them. Every function below masks the `Kind` off before it computes
+and puts it back when it answers a date, which is exactly why `.Ticks` is a call here and
+not the identity cast `TimeSpan.Ticks` is:
+
+| signature | is |
+|---|---|
+| `i64 tk_dt_ticks(i64)` `i64 tk_dt_kind_of(i64)` | the two halves of the eight bytes |
+| `i32 tk_dt_kind(i64)` | `.Kind`, as a `DateTimeKind` |
+| `i32 tk_dtk_unspecified()` `tk_dtk_utc()` `tk_dtk_local()` | the three `DateTimeKind` values |
+| `i64 tk_dt_pack(i64 ticks, i64 kind)` | the two halves back into one value, range-checked |
+| `i64 tk_dt_days_before(i64 month, i64 leap)` | the cumulative month table, as a function |
+| `i64 tk_dt_is_leap(i64 y)` `i64 tk_dt_days_in_month(i64 y, i64 m)` | the two calendar statics |
+| `i64 tk_dt_days_from_ymd(i64 y, i64 m, i64 d)` | the days since `0001-01-01` of a civil date, every field checked |
+| `i64 tk_dt_time_ticks(i64 h, i64 mi, i64 s, i64 ms)` | the ticks of a time of day, every field checked |
+| `i64 tk_dt_part(i64 d, i64 part)` | the 400/100/4-year walk: year, month, day or day of year |
+| `i64 tk_dt_year(i64)` `tk_dt_month(i64)` `tk_dt_day(i64)` `tk_dt_doy(i64)` `tk_dt_dow(i64)` | the civil components |
+| `i64 tk_dt_hour(i64)` `tk_dt_minute(i64)` `tk_dt_second(i64)` `tk_dt_ms(i64)` | the time of day |
+| `i64 tk_dt_date(i64)` `i64 tk_dt_tod(i64)` | `.Date` and `.TimeOfDay` |
+| `i64 tk_dt_min()` `tk_dt_max()` `tk_dt_epoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
+| `i64 tk_dt_from_ticks(i64)` `i64 tk_dt_from_ticks_kind(i64, i64)` | the two raw constructors |
+| `i64 tk_dt_ymd(i64, i64, i64)` `tk_dt_ymdhms(...)` `tk_dt_ymdhmsms(...)` | the three calendar constructors |
+| `i64 tk_dt_add_ticks(i64, i64)` | `.AddTicks`, and what every other `Add*` ends in |
+| `i64 tk_dt_scaled(i64 d, f64 value, f64 scale)` | the shared `double` builder: C#'s own rounding to the nearest millisecond |
+| `i64 tk_dt_add_days(i64, f64)` `tk_dt_add_hours` `tk_dt_add_minutes` `tk_dt_add_seconds` `tk_dt_add_ms` | the `Add*` family that takes a `double` |
+| `i64 tk_dt_add_months(i64, i64)` `i64 tk_dt_add_years(i64, i64)` | the calendar ones, day clamped to the target month |
+| `i64 tk_dt_add(i64, i64)` `tk_dt_sub_ts(i64, i64)` `tk_dt_sub(i64, i64)` | `d + t`, `d - t` and `d - d` |
+| `i64 tk_dt_eq(i64, i64)` `tk_dt_ne` `tk_dt_lt` `tk_dt_le` `tk_dt_gt` `tk_dt_ge` | the six comparisons, `Kind` masked off |
+| `i64 tk_dt_cmp(i64, i64)` | `.CompareTo()`: `-1`, `0` or `1` |
+
 Five constants come with the file, and a program may read them: `TICKS_PER_MILLISECOND`,
 `TICKS_PER_SECOND`, `TICKS_PER_MINUTE`, `TICKS_PER_HOUR`, `TICKS_PER_DAY`, plus
-`TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS`. They are ordinary top-level `const i64`, so
+`TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS` — and the date half adds
+`DATETIME_MAX_TICKS`, `UNIX_EPOCH_TICKS`, `DATETIME_TICK_MASK`, `DAYS_PER_YEAR`,
+`DAYS_PER_4_YEARS`, `DAYS_PER_100_YEARS`, `DAYS_PER_400_YEARS` and the four `DT_*`
+selectors. They are ordinary top-level `const i64`, so
 a program that declares one of those names itself collides with it.
 
-Three panics live here, all exit **70**:
+Fourteen panics live here, all exit **70**:
 
 | panic | when |
 |---|---|
 | `teko: a time span overflowed` | `+ - * /`, the unary minus and `.Duration()` past the range |
 | `teko: a time span divided by zero` | `t / 0` |
 | `teko: a time span is out of range` | a `From*` value that scales past the range, or a NaN |
+| `teko: a date does not exist` | a day past the end of its own month: `new DateTime(2023, 2, 29)` |
+| `teko: a date is out of range` | a tick count outside `0 .. 3155378975999999999`, and every `Add*` that lands outside it |
+| `teko: a year is out of range` | a year outside `1..9999`, `DateTime.IsLeapYear` included |
+| `teko: a month is out of range` | a month outside `1..12` |
+| `teko: an hour is out of range` | an hour outside `0..23` |
+| `teko: a minute is out of range` | a minute outside `0..59` |
+| `teko: a second is out of range` | a second outside `0..59` |
+| `teko: a millisecond is out of range` | a millisecond outside `0..999` |
+| `teko: a date kind is out of range` | a `Kind` outside `0..2` at `new DateTime(ticks, kind)` |
+| `teko: a month count is out of range` | `AddMonths` outside ±120000, C#'s own bound |
+| `teko: a year count is out of range` | `AddYears` outside ±10000 |
 
 ---
 

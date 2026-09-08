@@ -1,15 +1,21 @@
 # `DateTime` and `TimeSpan`
 
-**Two of this page's crumbs have landed: P0 (the probes) and C1 (`TimeSpan`, and the
-primitive-member mechanism under it), D40.** What `TimeSpan` actually does today is
-[the reference page](../reference/timespan.md) and the mechanism is
-[the internals note](../internals/primitives.md); the samples below still carry `// no-run`
-because each of them names `DateTime`, which is **not** built. Everything on this page
-about `DateTime`, about text (`ToString`/`Parse`) and about `Now`/`UtcNow` is design and
-nothing more.
+**Three of this page's crumbs have landed: P0 (the probes), C1 (`TimeSpan`, and the
+primitive-member mechanism under it) — D40 — and C2 (`DateTime`, `DateTimeKind` and the
+calendar), D41.** What the two types actually do today is
+[timespan.md](../reference/timespan.md) and [datetime.md](../reference/datetime.md), and
+the mechanism is [the internals note](../internals/primitives.md). What is left of this
+page as design and nothing more is the TEXT half (§ 7: `ToString`, `Parse`, `TryParse`)
+and `Now`/`UtcNow`/`Today` (§ 8, blocked on `mc`). The samples below still carry `// no-run`
+because each of them names one of those.
 
-The rest of the page is unchanged, and deliberately: it is the design C1 was built from,
-and C2 is built from the same words.
+The rest of the page is unchanged, and deliberately: it is the design C1 and C2 were built
+from. Where the built type differs from the words below, D41 is the ruling and this page is
+the older text — the tick constant in § 3's sample is `2024-02-23T16:00`, not the leap day
+it is labelled; the fixtures are `tests/surface_datetime.tk` and
+`tests/surface_datetime_panic.tk` rather than § 11's five names; and `SpecifyKind`,
+`Subtract` and the six `TicksPer*`-style extras of § 6 that need a row with two parameter
+TYPES are [not taught](../reference/not-yet.md).
 
 The two types share one page because they share one number. A `TimeSpan` is a count of
 ticks, a `DateTime` is a count of ticks since an origin, `DateTime - DateTime` **is** a

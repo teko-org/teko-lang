@@ -7,7 +7,7 @@ Five workflows and three composite actions. Everything a change has to pass runs
 
 | job | count | proves |
 |---|---|---|
-| `ngen (<os>/<arch>)` | 5 | the taught compiler builds on that pair, and all 45 fixtures compile **and run** there with the right exit code |
+| `ngen (<os>/<arch>)` | 5 | the taught compiler builds on that pair, and all 51 fixtures compile **and run** there with the right exit code |
 | `fixpoint (<os>/<arch>)` | 5 | the ladder closes on the same five pairs ([bootstrap.md](bootstrap.md)) |
 | `docs` | 1 | `sh scripts/check-docs.sh`, on one pair — it proves a documentation tree, not a platform |
 | `mc build ngen && run` | 1 | the aggregator: green only when every one of the five legs is |
@@ -133,7 +133,7 @@ package has to be registered once by hand before it can be announced; until the 
 `MC_VERSION` is one line, without a leading `v`, and it is the answer to "which mc does CI
 use". Raising it is its own change, in this order:
 
-1. download the new release and run the whole local recipe against it — 45/45 fixtures;
+1. download the new release and run the whole local recipe against it — 51/51 fixtures;
 2. `sh scripts/bootstrap.sh` against the new release has to print `FIXPOINT OK`;
 3. **only then** write the new version into `MC_VERSION`.
 
