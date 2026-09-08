@@ -1214,3 +1214,15 @@ no type is nullable unless written `T?`, and `T?` is sugar for `Nullable<T>` ove
 reference or value — a spec of its own, ahead of `string`, where the compiler learns that a
 name declared without `?` must be built before it is read.
 
+The enum arm of `tk_cap_val` first asked the KIND (`TK_SINT` outside `tk_is_int_ty`), which
+covers `enum Color` (`i32` underneath) and misses `enum Level : u8` (`TK_INT`); the verifier
+caught it, and the arm now asks the row (`tk_is_enum`), which is what the slot check that
+refused the value asks. `tests/surface_enum.tk` captures `Level` and `Signed` as well.
+
+**Proof:** the taught compiler builds on mc 0.15.23; 51/51 fixtures at their `expect-exit`;
+`--dump-ast` of the 48 fixtures this crumb does not touch byte-identical to `1d195e1d`, the
+three it extends differing by insertion (and the gensym renumbering an insertion causes);
+`FIXPOINT OK`; `sh scripts/check-docs.sh` green (466 links, 356 diagnostics, 95 samples);
+`mc limits` unmoved (`types` 11, `alias` 19, `syntax` 15, `passes` 15/30, `intrin` 8/16);
+`mc pkg hash .` in the pull request.
+
