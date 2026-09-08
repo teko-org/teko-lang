@@ -142,3 +142,289 @@ i64 tk_ts_cmp(i64 a, i64 b) {
     if (a > b) return 1;
     return 0;
 }
+
+// ============================================================================
+// `DateTime` (docs/specs/datetime.md, crumb C2)
+// ============================================================================
+//
+// The eight bytes are C#'s own `dateData`: the ticks since `0001-01-01
+// 00:00:00` in bits 0..61, and the `Kind` in bits 62 and 63. The maximum tick
+// value, `9999-12-31 23:59:59.9999999`, is 3155378975999999999 and needs 62
+// bits, which is what leaves the two above it free.
+//
+// THE RAW VALUE IS NOT THE TICK COUNT, and every function below starts by
+// masking: a `Local` date has bit 63 set and is a NEGATIVE `i64`, so raw
+// arithmetic and a raw comparison over it are both wrong. That is the whole
+// reason `.Ticks` is a call here where `TimeSpan.Ticks` is the identity, and
+// the reason a hand-written `(i64) dt` is refused (teko_prim.tk).
+//
+// The calendar is the proleptic Gregorian one C# uses, computed the way C#
+// computes it: a days-to-year walk over the 400/100/4 cycles and a cumulative
+// month table. Every date this file builds is checked -- a year outside
+// 1..9999, a month outside 1..12, a day past the end of ITS month, a tick
+// count outside the range -- and a date that does not exist panics where it is
+// built, exit 70, the same road `lib/rt.tk`'s own `rt_panic` takes for an
+// index past the end of an array.
+
+const i64 DATETIME_MAX_TICKS = 3155378975999999999;
+const i64 UNIX_EPOCH_TICKS   = 621355968000000000;
+
+// bits 0..61: the ticks. Bits 62..63 are the `Kind`.
+const i64 DATETIME_TICK_MASK = 4611686018427387903;
+
+const i64 DAYS_PER_YEAR      = 365;          // a non-leap year
+const i64 DAYS_PER_4_YEARS   = 1461;         // 365 * 4 + 1
+const i64 DAYS_PER_100_YEARS = 36524;        // 1461 * 25 - 1
+const i64 DAYS_PER_400_YEARS = 146097;       // 36524 * 4 + 1
+
+// which component `tk_dt_part` is asked for
+const i64 DT_YEAR  = 0;
+const i64 DT_MONTH = 1;
+const i64 DT_DAY   = 2;
+const i64 DT_DOY   = 3;
+
+// ---- the two halves of the eight bytes ----
+i64 tk_dt_ticks(i64 d) { return d & DATETIME_TICK_MASK; }
+
+// the `Kind` as a number, for this file's own use; the member `.Kind` answers
+// the same value under `DateTimeKind`, which is an `i32`
+i64 tk_dt_kind_of(i64 d) { return (d >> 62) & 3; }
+
+i32 tk_dt_kind(i64 d) { return (i32) tk_dt_kind_of(d); }
+
+i32 tk_dtk_unspecified() { return (i32) 0; }
+i32 tk_dtk_utc()         { return (i32) 1; }
+i32 tk_dtk_local()       { return (i32) 2; }
+
+// ...and the way back: a tick count and a `Kind` in one value. The range is
+// checked here, so no path in this file can build a date the surface could not
+// have written.
+i64 tk_dt_pack(i64 ticks, i64 kind) {
+    if (ticks < 0 || ticks > DATETIME_MAX_TICKS) panic("a date is out of range");
+    return ticks | (kind << 62);
+}
+
+// ---- the calendar ----
+// The days of the year BEFORE month `m` (1..13), which is C#'s own cumulative
+// table read as a function: the twelve lengths are 31, 28/29, 31, 30, 31, 30,
+// 31, 31, 30, 31, 30, 31, and `m` 13 answers the length of the whole year.
+i64 tk_dt_days_before(i64 m, i64 leap) {
+    i64 b = 0;
+    if (m == 2)  b = 31;
+    if (m == 3)  b = 59;
+    if (m == 4)  b = 90;
+    if (m == 5)  b = 120;
+    if (m == 6)  b = 151;
+    if (m == 7)  b = 181;
+    if (m == 8)  b = 212;
+    if (m == 9)  b = 243;
+    if (m == 10) b = 273;
+    if (m == 11) b = 304;
+    if (m == 12) b = 334;
+    if (m == 13) b = 365;
+    if (leap && m >= 3) b = b + 1;
+    return b;
+}
+
+// C#'s `DateTime.IsLeapYear`, refusal included: a year outside 1..9999 is not
+// a year this calendar has.
+i64 tk_dt_is_leap(i64 y) {
+    if (y < 1 || y > 9999) panic("a year is out of range");
+    if (y % 4 != 0) return 0;
+    if (y % 100 != 0) return 1;
+    return y % 400 == 0;
+}
+
+i64 tk_dt_days_in_month(i64 y, i64 m) {
+    i64 leap = tk_dt_is_leap(y);                 // ...which checks the year
+    if (m < 1 || m > 12) panic("a month is out of range");
+    return tk_dt_days_before(m + 1, leap) - tk_dt_days_before(m, leap);
+}
+
+// the days since 0001-01-01 of a civil date, C#'s own `DateToTicks` without
+// the multiply. Every field is checked: this is where `new DateTime(2023, 2,
+// 29)` panics.
+i64 tk_dt_days_from_ymd(i64 y, i64 m, i64 d) {
+    i64 leap = tk_dt_is_leap(y);                 // ...which checks the year
+    if (m < 1 || m > 12) panic("a month is out of range");
+    if (d < 1 || d > tk_dt_days_before(m + 1, leap) - tk_dt_days_before(m, leap))
+        panic("a date does not exist");
+    i64 py = y - 1;
+    return py * DAYS_PER_YEAR + py / 4 - py / 100 + py / 400
+         + tk_dt_days_before(m, leap) + d - 1;
+}
+
+// the ticks of a time of day, C#'s own `TimeToTicks`
+i64 tk_dt_time_ticks(i64 h, i64 mi, i64 s, i64 ms) {
+    if (h < 0 || h > 23) panic("an hour is out of range");
+    if (mi < 0 || mi > 59) panic("a minute is out of range");
+    if (s < 0 || s > 59) panic("a second is out of range");
+    if (ms < 0 || ms > 999) panic("a millisecond is out of range");
+    return ((h * 3600 + mi * 60 + s) * 1000 + ms) * TICKS_PER_MILLISECOND;
+}
+
+// ---- the components ----
+// One walk answers all four, exactly as C#'s own `GetDatePart` does: the 400,
+// 100 and 4-year cycles are subtracted in turn, the two `== 4` corrections are
+// the last day of a leap cycle (31 December of year 400, 800, ...), and what
+// is left is the day OF the year.
+i64 tk_dt_part(i64 dd, i64 part) {
+    i64 n = tk_dt_ticks(dd) / TICKS_PER_DAY;
+    i64 y400 = n / DAYS_PER_400_YEARS;
+    n = n - y400 * DAYS_PER_400_YEARS;
+    i64 y100 = n / DAYS_PER_100_YEARS;
+    if (y100 == 4) y100 = 3;                     // the last day of a 400-year cycle
+    n = n - y100 * DAYS_PER_100_YEARS;
+    i64 y4 = n / DAYS_PER_4_YEARS;
+    n = n - y4 * DAYS_PER_4_YEARS;
+    i64 y1 = n / DAYS_PER_YEAR;
+    if (y1 == 4) y1 = 3;                         // ...and of a 4-year one
+    if (part == DT_YEAR) return y400 * 400 + y100 * 100 + y4 * 4 + y1 + 1;
+    n = n - y1 * DAYS_PER_YEAR;
+    if (part == DT_DOY) return n + 1;
+    i64 leap = 0;
+    if (y1 == 3 && (y4 != 24 || y100 == 3)) leap = 1;
+    i64 m = 1;
+    while (m < 12 && n >= tk_dt_days_before(m + 1, leap)) m = m + 1;
+    if (part == DT_MONTH) return m;
+    return n - tk_dt_days_before(m, leap) + 1;
+}
+
+i64 tk_dt_year(i64 d)  { return tk_dt_part(d, DT_YEAR); }
+i64 tk_dt_month(i64 d) { return tk_dt_part(d, DT_MONTH); }
+i64 tk_dt_day(i64 d)   { return tk_dt_part(d, DT_DAY); }
+i64 tk_dt_doy(i64 d)   { return tk_dt_part(d, DT_DOY); }
+
+i64 tk_dt_hour(i64 d)   { return (tk_dt_ticks(d) / TICKS_PER_HOUR) % 24; }
+i64 tk_dt_minute(i64 d) { return (tk_dt_ticks(d) / TICKS_PER_MINUTE) % 60; }
+i64 tk_dt_second(i64 d) { return (tk_dt_ticks(d) / TICKS_PER_SECOND) % 60; }
+i64 tk_dt_ms(i64 d)     { return (tk_dt_ticks(d) / TICKS_PER_MILLISECOND) % 1000; }
+
+// C#'s `DayOfWeek`: 0 is Sunday, and 0001-01-01 was a Monday.
+i64 tk_dt_dow(i64 d) { return (tk_dt_ticks(d) / TICKS_PER_DAY + 1) % 7; }
+
+// the date at midnight, `Kind` kept -- and the time since it, a `TimeSpan`
+i64 tk_dt_date(i64 d) {
+    i64 t = tk_dt_ticks(d);
+    return tk_dt_pack(t - t % TICKS_PER_DAY, tk_dt_kind_of(d));
+}
+
+i64 tk_dt_tod(i64 d) { return tk_dt_ticks(d) % TICKS_PER_DAY; }
+
+// ---- the statics ----
+i64 tk_dt_min() { return 0; }
+i64 tk_dt_max() { return DATETIME_MAX_TICKS; }
+
+// C# declares it `new DateTime(621355968000000000, DateTimeKind.Utc)`, so the
+// two top bits carry `Utc` -- and `.Ticks` still answers the constant, because
+// it masks them off.
+i64 tk_dt_epoch() { return tk_dt_pack(UNIX_EPOCH_TICKS, 1); }
+
+// ---- the constructors ----
+i64 tk_dt_from_ticks(i64 t) { return tk_dt_pack(t, 0); }
+
+i64 tk_dt_from_ticks_kind(i64 t, i64 k) {
+    if (k < 0 || k > 2) panic("a date kind is out of range");
+    return tk_dt_pack(t, k);
+}
+
+i64 tk_dt_ymd(i64 y, i64 m, i64 d) {
+    return tk_dt_pack(tk_dt_days_from_ymd(y, m, d) * TICKS_PER_DAY, 0);
+}
+
+i64 tk_dt_ymdhms(i64 y, i64 m, i64 d, i64 h, i64 mi, i64 s) {
+    return tk_dt_pack(tk_dt_days_from_ymd(y, m, d) * TICKS_PER_DAY
+                      + tk_dt_time_ticks(h, mi, s, 0), 0);
+}
+
+i64 tk_dt_ymdhmsms(i64 y, i64 m, i64 d, i64 h, i64 mi, i64 s, i64 ms) {
+    return tk_dt_pack(tk_dt_days_from_ymd(y, m, d) * TICKS_PER_DAY
+                      + tk_dt_time_ticks(h, mi, s, ms), 0);
+}
+
+// ---- the arithmetic ----
+// Every one of these keeps the `Kind` of the date it started from, which is
+// C#'s rule, and panics where C# raises: the sum is checked as an `i64` first
+// (the sign test `tk_ts_add` uses) and then against the range of a date.
+i64 tk_dt_add_ticks(i64 d, i64 t) {
+    i64 a = tk_dt_ticks(d);
+    i64 r = a + t;
+    if (((a ^ r) & (t ^ r)) < 0) panic("a date is out of range");
+    return tk_dt_pack(r, tk_dt_kind_of(d));
+}
+
+// C#'s own `DateTime.Add(double value, int scale)`: the value is scaled to
+// MILLISECONDS, rounded to the nearest one (away from zero) and only then
+// turned into ticks. That rounding is C#'s and is why
+// `d.AddSeconds(0.0000001)` is `d` -- unlike `TimeSpan.FromSeconds`, which
+// .NET 7 changed to full precision (D40).
+//
+// The range test is also the NaN test: `>` and `<` are both false for an
+// unordered compare on both backends, so a NaN reaches the panic. The bound
+// is C#'s own `MaxMillis`, the whole range of a date in milliseconds.
+i64 tk_dt_scaled(i64 d, f64 value, f64 scale) {
+    f64 millis = value * scale;
+    if (value >= 0.0) millis = millis + 0.5;
+    else              millis = millis - 0.5;
+    if (!(millis > 0.0 - 315537897600000.0 && millis < 315537897600000.0))
+        panic("a date is out of range");
+    return tk_dt_add_ticks(d, ((i64) millis) * TICKS_PER_MILLISECOND);
+}
+
+i64 tk_dt_add_days(i64 d, f64 v)    { return tk_dt_scaled(d, v, 86400000.0); }
+i64 tk_dt_add_hours(i64 d, f64 v)   { return tk_dt_scaled(d, v, 3600000.0); }
+i64 tk_dt_add_minutes(i64 d, f64 v) { return tk_dt_scaled(d, v, 60000.0); }
+i64 tk_dt_add_seconds(i64 d, f64 v) { return tk_dt_scaled(d, v, 1000.0); }
+i64 tk_dt_add_ms(i64 d, f64 v)      { return tk_dt_scaled(d, v, 1.0); }
+
+// C#'s `AddMonths`, clamping included: the day is cut to the length of the
+// TARGET month, so `2024-01-31` plus one month is `2024-02-29` and not a date
+// that does not exist. The bounds are C#'s own, plus or minus 120000 months.
+i64 tk_dt_add_months(i64 d, i64 months) {
+    if (months < 0 - 120000 || months > 120000) panic("a month count is out of range");
+    i64 y = tk_dt_year(d);
+    i64 m = tk_dt_month(d);
+    i64 day = tk_dt_day(d);
+    i64 i = m - 1 + months;
+    if (i >= 0) {
+        m = i % 12 + 1;
+        y = y + i / 12;
+    } else {
+        m = 12 + (i + 1) % 12;
+        y = y + (i - 11) / 12;
+    }
+    if (y < 1 || y > 9999) panic("a date is out of range");
+    i64 last = tk_dt_days_in_month(y, m);
+    if (day > last) day = last;
+    return tk_dt_pack(tk_dt_days_from_ymd(y, m, day) * TICKS_PER_DAY
+                      + tk_dt_ticks(d) % TICKS_PER_DAY, tk_dt_kind_of(d));
+}
+
+// C#'s `AddYears` IS `AddMonths(years * 12)`, which is what makes
+// `2000-02-29` plus one year `2001-02-28`.
+i64 tk_dt_add_years(i64 d, i64 years) {
+    if (years < 0 - 10000 || years > 10000) panic("a year count is out of range");
+    return tk_dt_add_months(d, years * 12);
+}
+
+// ---- the operators ----
+// `d + t` and `t + d` are one function (the row's swap flag), `d - t` its
+// mirror, and `d - d` the one that answers a `TimeSpan` -- raw ticks out, as
+// every `lib/time.tk` function answers.
+i64 tk_dt_add(i64 d, i64 t)    { return tk_dt_add_ticks(d, t); }
+i64 tk_dt_sub_ts(i64 d, i64 t) { return tk_dt_add_ticks(d, tk_ts_neg(t)); }
+
+i64 tk_dt_sub(i64 a, i64 b) { return tk_ts_sub(tk_dt_ticks(a), tk_dt_ticks(b)); }
+
+// ---- the comparisons ----
+// C#'s own `Compare`: the TICKS, with the `Kind` masked off. Two dates of
+// different `Kind` compare by their ticks and do not convert, which C# says is
+// the program's business and not the type's.
+i64 tk_dt_eq(i64 a, i64 b) { return tk_dt_ticks(a) == tk_dt_ticks(b); }
+i64 tk_dt_ne(i64 a, i64 b) { return tk_dt_ticks(a) != tk_dt_ticks(b); }
+i64 tk_dt_lt(i64 a, i64 b) { return tk_dt_ticks(a) <  tk_dt_ticks(b); }
+i64 tk_dt_le(i64 a, i64 b) { return tk_dt_ticks(a) <= tk_dt_ticks(b); }
+i64 tk_dt_gt(i64 a, i64 b) { return tk_dt_ticks(a) >  tk_dt_ticks(b); }
+i64 tk_dt_ge(i64 a, i64 b) { return tk_dt_ticks(a) >= tk_dt_ticks(b); }
+
+i64 tk_dt_cmp(i64 a, i64 b) { return tk_ts_cmp(tk_dt_ticks(a), tk_dt_ticks(b)); }
