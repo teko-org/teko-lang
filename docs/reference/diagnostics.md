@@ -521,6 +521,7 @@ Every one of these is [nullable.md](nullable.md)'s.
   what either operator answers. `.` and `?.` share precedence 12, so `a?.b.c` would read as
   `(a?.b).c` where C# short-circuits the whole chain; `a?.b?.c`, or a local of its own, is
   the form.
+- `"teko: tk_qdot is the compiler's own name"` — a call spelled `tk_qdot(...)` in the source: that name is the placeholder `?.` lowers through, and a program never calls it.
 - `"teko: too many ?. accesses in one unit"` — more than 64 `?.` in one source. Each one
   remembers the member name and the form its rewrite needs; the table is this ceiling.
 
