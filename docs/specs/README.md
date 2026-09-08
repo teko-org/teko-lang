@@ -35,6 +35,11 @@ fixes the order.
 | 3 | **N2a** `enum`: the type, the operators, the `switch` | enum.md | M | N0 |
 | 4 | ~~**P0** the probes~~ **landed**, D40 | `docs/specs/datetime.md` | S | — |
 | 5 | ~~**C1** `TimeSpan`, and the primitive-member mechanism~~ **landed**, D40 | `docs/specs/datetime.md` | L | P0 |
+| 5a | **Q0** the nullable probes | nullable.md | S | — |
+| 5b | **Q1a** `T?` over a reference, and `null` only in a `T?` slot | nullable.md | M | Q0 |
+| 5c | **Q1b** `T?` over a value (the counted box) | nullable.md | M | Q1a |
+| 5d | **Q2** `??` and `?.` | nullable.md | M | Q1b |
+| 5e | **Q3** definite assignment | nullable.md | M | Q0 |
 | 6 | **N2b** `enum`: `ToString`, `Parse`, the statics | enum.md | S | N2a, C1 |
 | 7 | ~~**C2** `DateTime`~~ **landed**, D41 | `docs/specs/datetime.md` | L | C1 |
 | 8 | **N2c** `DateTimeKind` becomes an `enum` | enum.md | S | N2a, C2 |
@@ -59,7 +64,7 @@ integer is, and it has to be right before a second `TK_SINT` type exists.
 
 **`Nullable<T>` is no longer outside this sequence.** The owner's ruling of 2026-09-08 —
 one nullable mechanism, `T?` over any type — puts [nullable.md](nullable.md)'s crumbs
-(Q0, Q1a, Q1b, Q2, Q3) **ahead of every row above that has not landed**, and mandatorily
+(rows 5a–5e above: Q0, Q1a, Q1b, Q2, Q3) **ahead of every row that has not landed**, and mandatorily
 ahead of **N7**: `string` is a counted class, so `string? s = null;` has to be the spelling
 from its first day rather than a second migration. `decimal?` and `Guid?` then cost C3 and
 N3 one row each. That supersedes [string.md](string.md) § 11 on `Nullable<T>`; on `object`,

@@ -498,7 +498,7 @@ Each row is a `not-yet.md` entry the crumb that lands it owes.
 
 | module | what it grows |
 |---|---|
-| **`teko_null.tk`** (new, the 32nd module) | `tk_nl_type` (the `syntax_type` handler reading the `?` suffix), `tk_nl_row`/`tk_nl_of` (the row and its enclosed type), `tk_nl_wrap` (the implicit `T` → `T?`), the member lowering for `HasValue`/`Value`/`GetValueOrDefault`, the `??`/`?.` handlers and the pass that rewrites them into `tk_ternary`, and every refusal on this page |
+| **`teko_null.tk`** (new) | `tk_nl_type` (the `syntax_type` handler reading the `?` suffix), `tk_nl_row`/`tk_nl_of` (the row and its enclosed type), `tk_nl_wrap` (the implicit `T` → `T?`), the member lowering for `HasValue`/`Value`/`GetValueOrDefault`, the `??`/`?.` handlers and the pass that rewrites them into `tk_ternary`, and every refusal on this page |
 | `teko_struct.tk` | `TK_KNULL` beside the five row kinds; `tk_is_nl`; one clause in `tk_is_counted` (a nullable row answers for what it encloses, `1` for a box); one clause in `tk_row_fits` (`T` and its bases/interfaces fit `T?`); one row in `tk_ty_mangle_name` (`opt_T`) |
 | `teko_typeof.tk` | one clause in `tk_check_scalar_compat` (`null` refused unless the target is a nullable row, a raw `uptr` or a `T?`-shaped slot); the `tk_nl_wrap` call at the field store it owns; `tk_ty_of` answering the nullable row for a `.Value`-free nullable node |
 | `teko_rc.tk` | the `tk_nl_wrap` call at the six slots it owns — an initializer, an assignment, a `return`, and the three call-argument kinds — each one line beside the `tk_num_widen` call already there |
