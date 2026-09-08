@@ -21,8 +21,8 @@ entry says what completes it.
 ## Declarations and types
 
 - `"teko: a type is declared at top level; there is no type inside a type"` — a `class`,
-  `struct`, `interface` or `trait` inside another type's body. Move it out; there is no
-  nested type.
+  `struct`, `interface`, `trait` or `enum` inside another type's body. Move it out; there
+  is no nested type.
 - `"teko: the name is already a type"` — the name is already a `class`, `struct`,
   `interface`, `trait` or `delegate` in this namespace.
 - `"teko: the name is already a generic"` — the name belongs to a generic declaration.
@@ -51,8 +51,8 @@ entry says what completes it.
 - `"teko: an array field size is positive"` — the size is `> 0`.
 - `"teko: a member declaration needs a name"` — a member's type was read and no name
   followed.
-- `"teko: the modifier opens a class, a struct, an interface, a trait or a delegate"` —
-  `public`/`internal` at top level must be followed by one of those five words.
+- `"teko: the modifier opens a class, a struct, an interface, a trait, a delegate or an enum"`
+  — `public`/`internal` at top level must be followed by one of those six words.
 - `"teko: only a class is abstract"` — `abstract` on a `struct`, an `interface` or a
   `trait`.
 - `"teko: only a class is partial"` — `partial` on anything but a class.
@@ -254,6 +254,30 @@ entry says what completes it.
 - `"teko: trait cycle"` — a trait that uses itself, directly or through another.
 - `"teko: unknown trait"` — the name in `use` is no trait.
 - `"teko: unterminated trait"` — the file ended inside the trait's body.
+
+## Enums
+
+- `"teko: an enum's underlying type is one of u8 u16 u32 u64 i8 i16 i32 i64"` — the eight
+  types C# allows after `:` in `enum Name : underlying { ... }`; anything else, `f64`
+  included, is refused.
+- `"teko: an enum declares at least one member"` — `enum Empty { }`.
+- `"teko: duplicate enum member"` — completed by the member's name: two members of one
+  enum share a name. Two members sharing a VALUE is legal (C#'s aliases).
+- `"teko: an enum member value is a constant expression"` — the value after `=` has to
+  fold to an integer at compile time, the same rule a top-level `const` follows.
+- `"teko: "` — completed by *`Name` has no member `Member`*: the member on the right of
+  `Name.` is not one this enum declares. The bare member name (`Red` without `Color.`) is
+  an ordinary identifier and resolves to nothing, `mc`'s own "unknown name".
+- `"teko: a value of type "` — an enum converts from and to nothing but itself, implicitly:
+  a bare integer (the literal `0` included), a different enum, `null`, and any reference
+  type all refuse a slot of enum type this way, and an enum refuses a numeric slot the
+  same way, from the other direction (`i64 n = c;`, `Color c = 0;`,
+  [types.md](types.md#enum)). The two explicit conversions this refusal does not cover —
+  `(i64) c` and `(Color) n`, a plain machine cast, unchecked — are C#'s own escape hatch.
+- `` "teko: no operator `" `` — completed by *`X` takes these operands*: an enum computes
+  only the six comparisons and `& | ^ ~`, and only against the SAME enum; every other
+  operator, and a mismatched or bare-integer operand on any of those six, is refused this
+  way too.
 
 ## Properties
 

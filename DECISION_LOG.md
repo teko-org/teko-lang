@@ -798,3 +798,123 @@ verdict `ok` on both `build/teko.mc` and `tests/hello.tk`, `types` `7/14` to `9/
 measured, a `type_new` registration moves it the same as `types`, by the count of new
 words, not just the estimator's `types` row — `passes` `15/30` and `intrin` `8/16`
 unmoved, exactly as the spec's table also said. `mc pkg hash .` reported in the PR.
+
+### D39 · `enum`: the type, the members, the operators, the `switch` (2026-09-08)
+`docs/specs/enum.md`'s N2a, the first crumb of the `enum` sequence
+([`docs/specs/README.md`](docs/specs/README.md)): a new module, `teko_enum.tk`, and small
+additions to five existing ones, over the exact mechanism the spec names — a class is
+`type_new` plus `syntax_expr`/`syntax_stmt`, both at parse time, and a `const` member is a
+folded row in `teko_const.tk`'s own qualified-constant table; an `enum` is those two,
+pointed at each other, with one new kind (`TK_KENUM`, teko_struct.tk) so every existing
+check that answers "is this a reference" (`tk_is_counted`, `tk_op_row`'s callers) keeps
+answering "no" for it by construction.
+
+**The declaration** (`teko_enum.tk`) reads the eight underlying types through the core's
+own `p_type()`, filtered by `tk_is_int_ty` (teko_typeof.tk, D38) — the exact positive list
+that predicate already carries, so no separate word table duplicates it — and registers
+`type_new(name, width, align, kind)` at the underlying type's OWN width/align/kind (`i32`,
+`(4,4,TK_SINT)`, by default, C#'s own), not the pointer-width `TK_INT` every class/struct
+gets. Members take the previous value plus one, fold through the core's own `fold()` for an
+explicit one, and are written into `teko_const.tk`'s existing member-const table
+(`tk_mconst_add`), which is what makes a duplicate member NAME refuse for free
+(`tk_mconst_find`'s own scan) and is what the spec calls "zero lines in teko_const.tk".
+
+**`Color.Red` in expression position** (teko_access.tk's `tk_static_member`, the same
+`Type.member` road a class const reaches) is the qualified-const lookup UNCHANGED, plus one
+line: the folded `N_INT` node is retagged `set_nd_type(n, sr_ty_at(si))` when the row is an
+enum — the one difference between an enum member and a plain `i64` constant. A member not
+found this way is refused `teko: <Name> has no member <Member>` before falling through to
+the field/property/method dispatch a class const would take next, since an enum declares
+none of those.
+
+**The two scalar-compat clauses** (teko_typeof.tk's `tk_check_scalar_compat`, D33/D34's own
+function): the existing D34 clause ("a class/struct/enum value reaching a numeric slot
+refuses") already covers enum→int/f64 for free, because an enum IS a struct-table row; the
+NEW clause is the reverse — a target that IS an enum row accepts nothing but its own type,
+so a bare integer (the literal `0` included, since it carries no different node shape from
+any other `i64` value), a different enum, and `null` all refuse into an enum slot. Both
+explicit conversions (`(i64) c`, `(Color) n`) go through `tk_cast`/`MTASK_CAST` untouched, a
+plain machine cast neither function is ever asked about.
+
+**The operators** (teko_ops.tk) gain one EARLY branch in `tk_ops_binary`/`tk_ops_unary`,
+ahead of the existing class-operator resolution: when either operand's row is `TK_KENUM`
+(checked before the generic `tk_op_declared`/"declares no operator" path, which would
+otherwise misfire — an enum declares no `operator` method at all, so the unmodified path
+would refuse every legal comparison too), the six comparisons and `& | ^` on the SAME enum,
+plus unary `~`, are left to the core untouched (the width/kind registration already makes
+the core's own instruction correct); everything else is refused `teko: no operator \`X\`
+takes these operands`, the exact class-operator message, reused rather than duplicated. An
+operand the oracle could not type at all (an array element, `teko_array.tk`'s own `N_INDEX`
+gap) is left alone rather than refused, the same "refuse only what is SURE wrong" rule
+`tk_check_scalar_compat` already states for `ety < 0`.
+
+**`switch` needed one line, not zero.** The spec's own claim — "zero lines in
+teko_switch.tk, a qualified constant already resolves as a case label" — holds for the
+CASE LABELS (`Color.Red` folds to an `N_INT` regardless of its retagged type, and
+`tk_switch_label_val` only reads `nd_val`) but NOT for the switch's own hidden local: `i64
+$t = x;` was hardcoded to `i64` regardless of the subject's real type, harmless while the
+only switchable type was a plain integer, and wrong the moment `$t`'s declared type
+disagrees with an enum-typed case label under `teko_ops.tk`'s new guard above (`$t == Color.
+Red` reads as "an i64 compared against a Color", the SAME shape the guard correctly refuses
+when a program writes it by hand). The fix is `tk_switch_stmt`'s own one line: `$t`'s
+declared type is the parse-time oracle's best guess at the subject's (`tk_pty_of`,
+teko_struct.tk), falling back to `i64` exactly where the old hardcoded value was — which is
+every existing fixture's own switch, none of which switches on a DECLARED LOCAL of a
+non-`i64` type (`--dump-ast` of the 46 fixtures already in the tree proves this: byte-
+identical). The parser's own oracle does not see a PARAMETER's type (`tk_slv`/`tk_local`
+track a declared local's `N_VAR` only, teko_struct.tk's own header says so for the
+identical reason K4's `use (a, &b)` cannot see one either), so `switch` directly on an enum
+PARAMETER is not yet taught — assign it to a local first. Recorded in
+[not-yet.md](docs/reference/not-yet.md), not worked around.
+
+**A fixed array of an enum needed one exemption, in `teko_array.tk`.** The existing refusal
+("an array of objects is not taught yet") reads `tk_struct_by_ty(ety) >= 0`, true for ANY
+struct-table row, enum included, though the reason the module states for the refusal — "the
+element would be an object slot with no local name for `teko_rc.tk`'s pass to walk" — does
+not hold for an enum, which owns no object and is never counted (`tk_is_counted` answers
+"no" for a `TK_KENUM` row by construction, the same clause this crumb's own header leans
+on). `tk_arr_on_stmt`/`tk_garr_collect` gain one `&& !tk_is_enum(esi)` each; a struct or a
+class array element is still refused exactly as before. This module is not in the spec's
+own § 9 table for N2a; the fixture's own "enum in array" requirement is what surfaced the
+gap, and the fix is narrow enough (a value type with no counting obligation, moved by width
+alone, the same as any core integer array already is) to belong with this crumb rather than
+wait for a later one.
+
+**Two pre-existing parser ambiguities, neither new to `enum` and neither this crumb's to
+fix (D2):** `(i64) p.w` (a cast binds tighter than `.`, already in not-yet.md before this
+crumb) and, newly documented here, a unary prefix (`!`, `-`, `~`) directly in front of a
+parenthesized expression that itself opens with a qualified constant (`!(Color.Red <
+Color.Green)`, reproduced identically with a plain class const, `!(Shape.MAX < 10)`): the
+core's cast-detection right after a unary prefix does not backtrack past a type word
+followed by `.`, and answers `expected ) in cast`. The fixture and the doc samples work
+around both by binding the qualified constant to a local first.
+
+`tests/surface_enum.tk` (`expect-exit: 42`): implicit and explicit member values, the
+default underlying type and two explicit ones (`: u8`, and a SIGNED `: i16` round-tripping a
+negative value through a class field's own indirect load, N0/D38's `tk_ld`), the six
+comparisons, `| & ^` plus unary `~` (a double negation), both explicit casts, an enum
+global/field/array element/parameter/return, a duplicate value used as an alias, and a
+`switch` with a fallthrough pair of case labels and a `default`. `docs/reference/enums.md`
+is folded into [types.md](docs/reference/types.md) (a `## enum` section, a compiled sample
+of its own) rather than a page of its own, since the type is now part of "what runs today"
+and not a spec; [diagnostics.md](docs/reference/diagnostics.md) carries the five new
+`teko:` strings plus the two existing ones this crumb reuses verbatim (`no operator`, `a
+value of type`); [not-yet.md](docs/reference/not-yet.md) carries N2b/N2c, `[Flags]`, the
+bare member name in a `case`, and the two parser limitations above.
+
+Proof: `mc build . --config mc.macos.toml` clean; 47/47 fixtures at their `expect-exit` (the
+46 existing plus `surface_enum`); `--dump-ast` of the 46 existing fixtures byte-identical to
+`214704d6`, compared against a from-scratch build of that commit; probes outside `tests/`
+confirming `i64 n = c;`, `Color c = 0;`, `f64 x = c;`, a cross-enum comparison, `c + Color.
+Green`, an unknown member, an empty enum, a duplicate member and a bad underlying type each
+refuse with the exact message this entry and diagnostics.md carry; `FIXPOINT OK` (`teko2.o
+== teko3.o` on the first turn, `--dump-asm` diff empty, 47/47 under the self-hosted
+`teko1`); `sh scripts/check-docs.sh` green (402 links, 349 diagnostics, 88 samples); `mc
+limits . --config mc.macos.toml` verdict `ok`, `syntax` `14/28` to `15/30` (one word, the
+static ceiling growing with the source), `types`/`passes`/`intrin`/`alias` unmoved
+(`9`/`15`/`8`/`16`, measured against a from-scratch build of `214704d6`) — exactly as the
+spec's own § 10 table predicted, `types` included: nothing is registered by teko itself, so
+a program that declares no enum pays nothing (`tests/surface_enum.tk`'s own five type
+declarations move that program's `types` row from `9` to `14`, one per declaration, the
+same cost a `class` already has). `mc pkg hash .`:
+`b349f700c1918334ebecebc2fdfd98604b2cb170c1c390afc949c655c330d015`.

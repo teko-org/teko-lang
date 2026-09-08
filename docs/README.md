@@ -48,7 +48,7 @@ types](specs/datetime-extras.md).
 
 ## The internals — how the port itself is built
 
-[`internals/`](internals/README.md): the [31 `.tk` modules](internals/modules.md), the
+[`internals/`](internals/README.md): the [32 `.tk` modules](internals/modules.md), the
 [pass model](internals/passes.md), the [node table](internals/nodes-and-xt.md),
 [reference counting](internals/runtime.md), [dependency
 injection](internals/di.md), the [bootstrap ladder](internals/bootstrap.md),

@@ -1,6 +1,6 @@
 # The module map
 
-Thirty-one files: [`teko.tk`](../../teko.tk) and the thirty `teko_*.tk` modules it
+Thirty-two files: [`teko.tk`](../../teko.tk) and the thirty-one `teko_*.tk` modules it
 `#include`s. The order of those includes is not cosmetic — a module may forward-declare a
 **function** a later module defines, but a **global** has to already exist where it is
 read, so a file that touches another's tables is included after it. `teko_type.tk` opens
@@ -31,6 +31,7 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_this.tk` | the receiver a method does not declare, `this`, `base.m()` | `syntax_expr("this")` | which type's body is open, and whether it is static |
 | `teko_access.tk` | `public` `private` `protected` `internal` `static` `abstract` `partial`, and `Type.member` | `syntax` for the four leading words, and `syntax_expr`/`syntax_stmt` per type name | the project root `internal` is measured from, deferred static accesses |
 | `teko_typeof.tk` | nothing of the surface: it is the static-type oracle | one `pass()` | the names of one function, and the accesses waiting for the pass |
+| `teko_enum.tk` | `enum Name [: underlying] { Member [= const], ... }` | `syntax("enum")`, one `type_new` per declared enum, sized/kinded by the underlying type | nothing of its own: members live in `teko_const.tk`'s qualified-constant table |
 | `teko_deleg.tk` | `delegate`, contextual and explicit values, lambdas, `use (...)` | `syntax("delegate")`, `on_stmt` for the capture taint | `(delegate, function)` thunk pairs, capture lists, by-reference lambdas |
 | `teko_heaparr.tk` | `T[]` on the heap, `new T[n]`, its guarded index | `syntax_type` — the one in this compiler | one type row per element type, global `T[]` declarations |
 | `teko_ternary.tk` | `c ? a : b` | `syntax_infix("?")` | the placeholder calls the pass rewrites |

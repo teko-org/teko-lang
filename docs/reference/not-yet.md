@@ -66,7 +66,7 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | written | message |
 |---|---|
 | `T[][]`, or any multidimensional array | `teko: an array of arrays is not taught yet` |
-| a **fixed** array of a class or struct type | `teko: an array of objects is not taught yet; use a field array or wait for T[]` |
+| a **fixed** array of a class or struct type (an `enum` element is taught, N2a: it owns no object slot for `teko_rc.tk` to walk) | `teko: an array of objects is not taught yet; use a field array or wait for T[]` |
 | reading a `ref T[]` / `out T[]` inside the callee | `expression with no codegen`, from the core — the parameter carries the caller's slot, and the array is not reachable through it |
 | `.Length` on a **global fixed** array | `teko: unknown member: Length` — a local fixed array and any `T[]` answer |
 | an index whose base is not an array the parse can name | ``teko: `[` needs an array`` |
@@ -116,6 +116,20 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 | a `when` on the textually last `_` arm | ``teko: the last `_` arm of a switch expression cannot carry a `when``` |
 | a switch expression with no `_` arm | ``teko: a switch expression needs a `_` arm`` |
 | control falling out of a non-empty `case` | `teko: control cannot fall out of a case; end it with break` |
+
+## Enums
+
+`docs/specs/enum.md`'s N2a is the type, the members, the operators and `switch`; two later
+crumbs of the same spec are not built yet:
+
+| written | what happens |
+|---|---|
+| `.ToString()`, `.Parse()`, `.TryParse()`, `.IsDefined()`, `.GetNames()`, `.GetValues()` (N2b) | not taught: an enum value converts to `str` no way at all yet |
+| `DateTimeKind` as an `enum` (N2c) | not applicable: `DateTime`/`TimeSpan` are not built either (`docs/specs/datetime.md`) |
+| `[Flags]` | not taught: teko has no attribute grammar; the bitwise operators already work on every enum, `[Flags]` only changes `ToString` |
+| the bare member name inside a `switch` on that enum (`case Red:` instead of `case Color.Red:`) | an ordinary identifier, `mc: unknown name` — C# allows it, teko requires the qualified form everywhere |
+| `switch` on an enum **parameter**, directly (`switch (c)` with `Color c` the enclosing function's own parameter) | the switch's own hidden local is declared from the parser's best guess at the subject's type (`tk_pty_of`, teko_struct.tk), which sees a DECLARED LOCAL but not a parameter (a parameter carries no type the parser can read at that point, the same limitation this page's own "Numeric conversions" section already names for a virtual/interface call argument); the mismatch surfaces as `teko: a value of type Color does not convert to i64` at the switch's own hidden assignment. Assign the parameter to a local first, `Color d = c; switch (d) { ... }` |
+| a unary `!`/`-`/`~` directly in front of a parenthesized expression that itself starts with a qualified constant (`!(Color.Red < Color.Green)`, `!(Shape.MAX < 10)`) | `mc: expected ) in cast` — the core's own cast detection, right after a unary prefix, does not backtrack past a type word followed by `.`; not this crumb's to fix (D2), and not new to `enum` (a plain class const in parens reproduces it too). Bind the qualified constant to a local first, or drop the outer parentheses when the operator allows it |
 
 ## Dependency injection
 
