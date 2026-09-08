@@ -30,7 +30,7 @@ Before halting on a design question, be sure it is not already decided:
 
 - **One agent at a time**, on its own branch and its own worktree — never the main
   checkout. Branch prefixes: `ngen/**`, `feat/**`, `fix/**`, `docs/**`, `verify/**`, `chore/**`,
-  `ci/**` (the ones the `All Green` ruleset lets an agent push to).
+  `ci/**` — the `All Green` ruleset excludes them, so an agent can push to them directly.
   Commit and push per commit; never run `git config user.*`.
 - **Scout → implementer → independent verifier → PR.** The scout checks the task against
   the current tree (are the citations right? is it already landed? are the dependencies

@@ -44,7 +44,7 @@ and never a `cmp`.
 allocation** ([types.md](../reference/types.md) § `struct`): a `decimal` field would be a
 reference to sixteen bytes on the arena, copied by aliasing rather than by value, and every
 `decimal` in a loop would be a block to reclaim. C# gives it value semantics and no heap,
-`type_new` is the mechanism that gives exactly that, and the decision § 14 proposes is the ruling that
+`type_new` is the mechanism that gives exactly that, and the decision § 14 proposes — a proposal until it enters the log — would be the ruling that
 lets teko use it.
 
 ### How sixteen bytes travel
