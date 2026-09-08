@@ -126,8 +126,8 @@ If `mc` itself has a bug or limitation affecting teko's port:
 - **`fixpoint` job**: teko0→teko1→teko2→teko3, object comparison and ASM diff, all 45 fixtures via teko1.
 - **`docs` job**: `sh scripts/check-docs.sh` against `docs/**`.
 - **`site.yml`**: builds `mcsite` from the pinned mc tag and renders `docs/` into the
-  website; `--check` on every pull request touching `docs/**` or `site/**`, deploy to
-  GitHub Pages only on a push to `main`.
+  website; `--check` on every pull request touching `docs/**` or `site/**`, a publish to
+  the `site` branch (which the server behind teko-lang.org pulls) only on a push to `main`.
 - **Squash merge only.** The ruleset `main` requires fast-forward or squash; merge commits are blocked.
 - **No legacy workflows.** The retired standalone compiler's own CI configuration
   (`pr.yml`, release cycles) is history, not run.

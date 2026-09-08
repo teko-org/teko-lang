@@ -639,3 +639,24 @@ built once by each release, is byte-identical between `0.15.18` and `0.15.22` on
 parses into. Only then was `MC_VERSION` written and the literal `0.15.18` mentions
 (`CONTRIBUTING.md`, `docs/guide/00-getting-started.md`, `.github/workflows/site.yml`)
 raised to `0.15.22`.
+
+### D36 · The site is served from the VPS, not from GitHub Pages (2026-09-08)
+D28 put teko-lang.org on GitHub Pages because that is where `minicompiler/mc`'s own
+`site.yml` deploys. The domain itself, though, is not served that way on mc's side: the
+`A` record of `minicompiler.dev` points at the VPS, proxied by Cloudflare, and Traefik on
+that server routes it — and GitHub never issued the certificate for teko-lang.org, twelve
+hours of `authorization_created` with `pages/health` reporting every check green. The owner
+asked why Pages at all when the server is there; there was no reason left.
+
+So the site is served the way the registry is. `site.yml` still builds `mcsite` from the
+pinned mc tag and renders `docs/`, and on a push to `main` it commits the rendered tree as
+an orphan commit on the **`site` branch**, force-pushed with the workflow's own token. On
+the VPS, `/srv/teko-site/pull.sh` (cron, every five minutes) checks that branch out into the
+directory an `nginx` container serves, and `/etc/dokploy/traefik/dynamic/teko-site.yml` —
+hand-written like `mc-panel.yml` — routes `teko-lang.org` and `www.teko-lang.org` to it,
+behind the `mc-cf-only` allow-list so the origin answers Cloudflare alone. **No deploy
+credential exists anywhere**: the repository is public and the server only reads it. In
+Cloudflare the apex `A` record moves from GitHub's four addresses to the VPS, proxied, and
+`www` becomes a `CNAME` to the apex; the three redirect domains do not change. The `CNAME`
+file the Pages artifact carried is gone with the artifact.
+
