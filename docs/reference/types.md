@@ -109,9 +109,9 @@ i64 main() {
 ```
 
 `i8`/`i16` convert to a wider integer or to `f64`/`f32` the same way `i64` already does
-(the section above; what does NOT convert is an `f32` into an `f64` slot or back, the
-width gap [not-yet.md](not-yet.md#numeric-conversions) lists — read an `f32` back through
-an `f32`); nothing converts back without a cast, and a float, `null`, or a
+(the section above; what does NOT convert is an `f32` into an `f64` slot or an `f64` into
+an `f32` one — the width gap [not-yet.md](not-yet.md#numeric-conversions) lists, where the
+bytes are reinterpreted and the value is wrong — so keep an `f32` in `f32` slots); nothing converts back without a cast, and a float, `null`, or a
 class/struct/interface/delegate/`T[]` value does not convert INTO an `i8`/`i16` slot
 either, with the same wording every other mismatched value already gets.
 
