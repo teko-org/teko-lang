@@ -59,6 +59,20 @@ and the vtable itself starts with the class's own release function at +0 and its
 table (or 0) at +8, which is how the runtime frees an object whose class it knows nothing
 about. A `T[]` and a delegate value are objects of the same shape.
 
+**A nullable over a VALUE is one too** — the box `i64?`, `f64?`, an `enum?`, `TimeSpan?`
+and every other value nullable point at ([nullable.md](nullable.md)):
+
+| word | holds |
+|---|---|
+| +0 | the vtable pointer, whose +0 is the one release every box shares |
+| +8 | the reference count |
+| +16 | the payload width, in bytes |
+| +24 | the payload itself |
+
+A box holds no reference of its own — a counted `T` is already a pointer, and its nullable
+IS that pointer — so the release is `rt_free(p, 24 + width)` and nothing else, and it is
+the same function for every payload type there is.
+
 `rt_alloc` hands out **zeroed** bytes, so a field nobody assigned reads as `0` and a
 reference field reads as null.
 
@@ -78,7 +92,10 @@ reference field reads as null.
 "Counted" means a class, an interface, a delegate or a `T[]` -- and a `T?` over any of
 them, which is counted exactly as what it encloses is: `Cell?` IS the `Cell` pointer, and
 the null handle `0` is a release the runtime already treats as a no-op
-([nullable.md](nullable.md)). A value produced and handed
+([nullable.md](nullable.md)). A `T?` over a VALUE is counted too, as the box above: it is
+released at the `}` that closes its block, with the object that holds it as a field,
+element by element inside an `i64?[]`, with the closure that captured it, and at the store
+that overwrites it — every one of those the rule that was already there. A value produced and handed
 straight to a call — `f(new Cell(1))` — has no owner, so it is **parked** and released when
 the statement that built it ends, which is C#'s and C++'s rule for a temporary. At most 64
 such temporaries may be alive in one statement.
@@ -174,6 +191,11 @@ with classes sees a floor above zero rather than a wrong answer.
 
 They are ordinary functions of the runtime ([runtime.md](runtime.md)), and the fixtures use
 them as the oracle of every reclaim claim on this page.
+
+`i64? n = 5;` moves `rt_live()` by **one**: the box is an allocation, and this page counts
+it rather than hiding it. A 32-byte box comes straight back to the 32-byte free list, so a
+loop that churns `i64?` reuses one block and `rt_peak()` does not move at all —
+`tests/surface_nullable_value.tk` asserts both.
 
 ---
 

@@ -711,6 +711,78 @@ void tk_enum_unary_check(i64 n) {
     tk_enum_op_refuse(tok, nd_line(n), nd_file(n));
 }
 
+// ---- docs/specs/nullable.md § 5, § 19.4: a nullable operand, claimed and
+// refused rather than lowered ----
+//
+// `T?` is a POINTER-WIDTH HANDLE (docs/specs/nullable.md § 2), for a
+// reference exactly `T`'s own pointer and for a value the counted box. Left
+// unclaimed, a nullable operand of `==`/`!=` falls to the SAME early exit a
+// bare reference gets against a core type ("`v + zero` is the core's own
+// arithmetic over it") -- and for a nullable that exit is never right: the
+// handle is not the value, so `i64? a = 5; a == 5` would compare a BOX
+// ADDRESS against the integer five, always false, and `f64? x == 5.0` and
+// `Cell? c == someCell` are the same mistake one arm over. The rule this
+// claim enforces (§ 5's own table): a nullable operand takes `==`/`!=`
+// against `null` and nothing else -- comparing the handle against the literal
+// `0` IS the right answer there, so that one case is left to the core
+// untouched, the same way `c == null` on a non-nullable reference already is
+// (teko_null.tk, rule 1's own comparison exemption). Every other operator,
+// and `==`/`!=` against anything but `null` (another nullable included, until
+// Q4a's lifted rule), is refused by name.
+void tk_nl_op_refuse(i64 si, i64 tok, i64 line, uptr fl) {
+    uptr sp = tk_op_spell(tok);
+    if (sp == 0) err_at(fl, line, "teko: this operator cannot be overloaded");
+    err_at(fl, line, tk_op_none_msg(sr_name_at(si), sp));
+}
+
+// 1 when `n` is `HasValue`'s own `left != 0` (teko_null.tk's
+// `tk_nl_hv_mark` marks the RECEIVER, `a` here, not the binary itself --
+// that header explains why). The shape is checked as well as the mark, so a
+// SOURCE-written `a != 0` over the very same receiver -- were the mark ever
+// to collide with one, which nothing in this project builds today -- still
+// refuses: only the exact lowering `HasValue` emits is exempt.
+i64 tk_nl_is_hv(i64 tok, i64 a, i64 b) {
+    if (tok != K_NE) return 0;
+    if (!tk_nl_hv_is(a)) return 0;
+    return nd_kind(b) == N_INT && nd_val(b) == 0;
+}
+
+// `sa`/`sb` are `tk_op_row`'s own answer; at least one of them is already
+// known to be a nullable row when this runs. `a`/`b` are the operand NODES
+// themselves -- what `tk_is_null_lit` reads, the exact shape rule 1's own
+// comparison exemption already recognizes (`null`, an ordinary `N_INT` of 0
+// typed `TY_UPTR`), never the static type a nullable operand carries.
+void tk_nl_binary_check(i64 n, i64 sa, i64 sb, i64 a, i64 b) {
+    i64 tok = nd_op(n);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 si = sa;
+    if (!tk_is_nl(si)) si = sb;
+    if (tk_nl_is_hv(tok, a, b)) return;               // HasValue's own lowering
+    if (tok != K_EQ && tok != K_NE) { tk_nl_op_refuse(si, tok, line, fl); return; }
+    if (tk_is_null_lit(a) || tk_is_null_lit(b)) return;   // the handle vs 0: the core's own
+    tk_nl_op_refuse(si, tok, line, fl);
+}
+
+void tk_nl_unary_check(i64 n, i64 sa) {
+    tk_nl_op_refuse(sa, nd_op(n), nd_line(n), nd_file(n));
+}
+
+// docs/specs/nullable.md § 19.4: a nullable used BARE as a condition -- `if`
+// and the ternary alike, the ternary already an `N_IF` by the time this pass
+// runs (teko_ternary.tk's own header) -- is refused, `bool?` first of all:
+// the handle answers `HasValue`, and for a boxed VALUE `false` is still a
+// live box, so `if (b)` on a `bool? b = false;` would run the branch its own
+// value refuses. `while`/`do`/`for` need no clause of their own: their guard
+// is `if (!(cond))` (teko_loop.tk's `tk_loop_guard`), and `!` on a nullable
+// operand is refused by `tk_nl_unary_check` above the moment the walk reaches
+// that inner node -- one rule catches both shapes.
+void tk_nl_cond_check(i64 cond) {
+    i64 si = tk_op_row(tk_ty_of(cond));
+    if (!tk_is_nl(si)) return;
+    err_at(nd_file(cond), nd_line(cond), tk_join3("teko: ", sr_name_at(si), " is not a condition"));
+}
+
 // One node of the walk. A binary whose two operands are both of core types is
 // left exactly as it is -- the core owns it -- and that is the whole of the
 // no-op guarantee for a program that declares no operator. So is one where no
@@ -727,6 +799,7 @@ void tk_ops_binary(i64 n) {
     i64 tb = tk_ty_of(b);
     i64 sa = tk_op_row(ta);
     i64 sb = tk_op_row(tb);
+    if (tk_is_nl(sa) || tk_is_nl(sb)) { tk_nl_binary_check(n, sa, sb, a, b); return; }
     if (tk_is_enum(sa) || tk_is_enum(sb)) { tk_enum_binary_check(n, sa, sb, ta, tb); return; }
     // docs/specs/datetime.md § 4: a PRIMITIVE operand claims the node before
     // anything else looks at it. Unlike an enum, whose two legal groups the
@@ -762,6 +835,7 @@ void tk_ops_unary(i64 n) {
     i64 ta = tk_ty_of(a);
     i64 sa = tk_op_row(ta);
     i64 tok = nd_op(n);
+    if (tk_is_nl(sa)) { tk_nl_unary_check(n, sa); return; }
     if (tk_is_enum(sa)) { tk_enum_unary_check(n); return; }
     if (tk_prim_is(ta)) { tk_prim_unary(n, ta); return; }   // `-t` (datetime.md § 4)
     if (sa < 0) {
@@ -796,6 +870,11 @@ void tk_ops_visit(i64 n) {
         tk_ops_unary(n);
         return;
     }
+    // docs/specs/nullable.md § 19.4: `if`'s own condition, and the ternary's
+    // (already this same node by the time this pass runs). The walk still
+    // descends into `nd_a(n)` on its own after this visitor returns, so a
+    // nested operator or a nested `if` inside the condition is claimed too.
+    if (k == N_IF) { tk_nl_cond_check(nd_a(n)); return; }
     // docs/specs/datetime.md § 3: a cast over a primitive is the compiler's to
     // write and not the source's, and this walk is where the difference is
     // read (teko_prim.tk's own `tk_prim_cast_check`). It rides here for the

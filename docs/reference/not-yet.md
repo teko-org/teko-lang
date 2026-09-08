@@ -79,26 +79,33 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 
 ## The nullable `T?`
 
-`T?` is taught over a REFERENCE — a class, an interface, a delegate, a `T[]` and a
-`struct` ([nullable.md](nullable.md)). What is not taught around it:
+`T?` is taught over ANY type — a class, an interface, a delegate, a `T[]`, a `struct`, and
+every value type through the counted box ([nullable.md](nullable.md)). What is not taught
+around it:
 
 | written | message |
 |---|---|
-| `i64?`, `f64?`, `bool?`, `char?`, an `enum?`, `TimeSpan?`, `DateTime?` | `teko: a nullable of a value type is not taught yet` — the counted box is a later crumb |
 | `T??` | `teko: a nullable of a nullable is not taught` |
 | `uptr?`, `ptr?`, `str?` | `teko: a raw pointer has no nullable` |
 | `void?` | `teko: void? is not a type` |
 | `Nullable<T>` spelled out | `teko: not a generic type` — the spelling is `T?` and there is no `Nullable` type word |
 | `Box<Cell?>`, a nullable as a generic argument | `teko: a nullable is not a generic argument yet` — a type argument travels as a spelling, and `Cell?` is not one the lexer can form |
 | `a ?? b`, `a?.m` | not taught: the two operators are a later crumb, and `??` will tie with the ternary at precedence 1, so `a \|\| b ?? c` will read as `(a \|\| b) ?? c` where C# reads `a \|\| (b ?? c)` |
-| `a == b` on two nullables | ``teko: Cell? declares no operator `==` `` — comparing two handles is not comparing two values |
-| `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators) | ``teko: Cell? declares no operator `+` `` |
+| `a == b` on two nullables, `a == 5`/`a == c` (a nullable against a plain value of what it encloses) | ``teko: Cell? declares no operator `==` `` — the handle is not the value, so only `null` is the other side a nullable may compare against |
+| `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators), reference or value, either operand a plain value of the enclosed type or another nullable | ``teko: Cell? declares no operator `+` `` — every operator but `==`/`!=` against `null`; `a.Value + b.Value` is the form |
 | `T?` to `U?` where `T` converts to `U` | `teko: a value of type Circle? does not convert to Shape?` — no covariance between nullable rows; write `x.Value` |
 | `x.GetValueOrDefault()` on a reference nullable | `teko: a reference nullable has no default` — `default(T)` for a reference is `null`, which is the one value a `T` slot may not take |
+| `x.GetValueOrDefault(fallback)`, C#'s one-argument overload | `teko: unknown member of i64?: GetValueOrDefault` — an arity this type does not have. `??` (Q2) is the form that says which default it means |
+| `f(5)` where the only candidate that could take it is `f(i64?)` and another overload exists | `teko: no overload of f matches these arguments` — the overload rounds match by exact type, an integer literal and `null`; the implicit `T` → `T?` is not one of them. A name declared ONCE takes the wrap and needs no round at all |
+| `k > 0 ? 5 : null` in an `i64?` slot | `teko: the two arms of ?: have different types` — the ternary types its arms against each other, and `null` is a `uptr`. Write two arms of the same type, or two statements |
+| `n = 5;` on a PARAMETER declared `i64?` | `teko: a parameter of class type is borrowed; it is not reassigned` — a box is counted, so the rule every counted parameter already lives by (K2) reaches it. Declare a local |
+| `g.Value` on a GLOBAL nullable | `teko: unknown member: Value` — the oracle types no global but a `T[]` (G1), so a `.` on one falls to the by-name search. Pre-existing since Q1a, shared with every global of a taught row; bind it to a local first |
 | `x.Value = e` | `teko: .Value is not a slot` |
 | `c.v` on a `Cell?` (flow narrowing, C# 8's `if (c != null) { c.v }`) | `teko: a Cell? is read through .Value` — the analysis behind narrowing is a dominator pass this design does not buy |
 | `f(3, 4)` on an `Op?` local | `call to unknown function f`, from the core — a nullable delegate is a value to compare and to pass, not one to call, and `.Value(...)` is not taught either |
 | `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no reference subject at all |
+| `if (a)`, `a ? x : y` on a bare `T?` | `teko: i64? is not a condition` (named by the row; `bool?` prints as `u8?`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` is the form |
+| `while (a)`, `for (…; a; …)`, `do … while (a);` on a bare `T?` | ``teko: i64? declares no operator `!` `` — a loop's guard is `!(cond)`, and the unary refusal is reached first |
 | `x.ToString()` on a nullable | deferred with all text |
 | a `switch` whose subject is a `Cell` or a `Cell?` | **accepted and compared as a pointer**, which no `case` label can match. Pre-existing for every reference, not a nullable's own |
 

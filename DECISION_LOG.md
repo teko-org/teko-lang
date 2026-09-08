@@ -1336,3 +1336,129 @@ the proof the new clauses fire only where a `?` is written; `FIXPOINT OK`;
 `syntax_type` 1/8 → 2/8, which is what a second registration is; twenty-nine refusal probes
 outside `tests/` (`build/probe_*`, not committed) enumerated in the pull request, each with
 its message and its exit; `mc pkg hash .` in the pull request.
+
+
+### D44 · `T?` over a value — the counted box (2026-09-08)
+[`docs/specs/nullable.md`](docs/specs/nullable.md) § 2's box arm and § 15's Q1b, landed on
+top of D43. `T?` is now taught over **every** type teko has: the reference arm is D43's
+handle itself, and a VALUE — `i64`, `u64`, `i32`, `i8`, `i16`, `u8`, `u16`, `u32`, `bool`,
+`char`, `f64`, `f32`, an `enum` at any underlying width, `TimeSpan` and `DateTime` — is a
+handle to an **immutable counted box**. The refusal `teko: a nullable of a value type is
+not taught yet` is gone with the crumb that owed it.
+
+**1. One invariant, two storages, and no new rule of lifetime.** The handle stays a
+pointer, `null` stays `0` and `HasValue` stays `handle != 0`; what a value handle points at
+is an object with the very shape a `T[]` of heap already has ([`teko_heaparr.tk`](teko_heaparr.tk)):
+vtable at `+0`, count at `+8`, the payload WIDTH at `+16` and the payload itself at `+24`.
+`tk_is_counted` ([`teko_struct.tk`](teko_struct.tk)) answers 1 for the box arm — one clause,
+beside the one D43 wrote — and that single answer is the whole reclaim: a `T?` field, a
+`T?` element of an `i64?[]`, a `T?` argument (borrowed and parked), a `T?` return (owned),
+a `T?` temporary and a `T?` captured by a closure are the counted positions
+[`teko_rc.tk`](teko_rc.tk) and [`teko_deleg.tk`](teko_deleg.tk) already knew. **One release
+serves every box there is** — a box holds no reference, because a counted `T` is already a
+pointer and never reaches this arm — so it is `rt_free(p, 24 + ld64(p + 16))` and nothing
+else.
+
+**2. Value semantics come from immutability, not from a copy rule.** Every store into a
+`T?` slot builds a FRESH box (`tk_nl_wrap`, [`teko_null.tk`](teko_null.tk)), so `b = a;
+b = 7;` leaves `a` at its own value, and no site can reach a payload's address:
+`.Value` is not a slot. The implicit `T` → `T?` is written at the nine slots D33 enumerated,
+each one line beside the `tk_num_widen` call already there — an initializer, an assignment
+and a `return` ([`teko_rc.tk`](teko_rc.tk)); an argument of a free/method call (same file),
+of a virtual call ([`teko_expr.tk`](teko_expr.tk)) and of an interface call
+([`teko_iface.tk`](teko_iface.tk)); an element of a `params T[]`
+([`teko_params.tk`](teko_params.tk)); a field store ([`teko_typeof.tk`](teko_typeof.tk));
+and an element of a `T[]` ([`teko_heaparr.tk`](teko_heaparr.tk)) — and the widening runs
+FIRST, so `f64? x = 5;` boxes one point zero.
+
+**3. The honest cost is measured, not argued.** `i64? x = 5;` ALLOCATES and `rt_live()`
+counts it, where C#'s `int?` costs nothing. `tests/surface_nullable_value.tk` asserts the
+number at every shape and asserts that `rt_peak()` does not move across ten thousand
+iterations of a loop that churns a box: a 32-byte box comes straight back to the 32-byte
+free list, which is Q0's probe 8 holding in a program.
+
+**Three departures from the spec, each measured rather than argued.**
+
+- **The box's runtime is GENERATED, not written into `lib/rt.tk`**, where § 2 put it. It is
+  the same departure D43 made for `tk_nl_ck` and for the same reason: everything in
+  `lib/rt.tk` is parsed into every program that includes it, so a function added there moves
+  the `--dump-ast` of every fixture, and this crumb's own gate is that a fixture spelling no
+  value `?` does not move at all. `tk_nl_vt`, `tk_nl_release`, `tk_nl_new` and `tk_nl_dflt`
+  go through `tk_top_emit`, once per unit that needs each.
+- **The payload WRITER is one function per payload type**, where § 2 promised no per-type
+  code at all. It is three lines — `T? tk_nl_box_T(T v) { uptr p = tk_nl_new(W); stW(p + 24,
+  v); return p; }` — and it is per type for the exact reason `tkarr_put_T` is per element
+  type: `v` has to be DECLARED at that type, because a float travels in the machine's other
+  register file and an `i64` parameter never receives it, and because an `enum` or a
+  primitive with members reaching a numeric slot is refused by D34/D40's own clause. The
+  RELEASE is still one function for every box, which is what § 2's property was about.
+- **`GetValueOrDefault()` is a typed load through one address, not a ternary.** § 6 wrote it
+  as `x == 0 ? <zero of T> : x.Value`; what runs is `tk_ld(T, tk_nl_dflt(x))`, where
+  `tk_nl_dflt` answers the box's own payload address or the address of eight zero bytes.
+  `default(T)` is all-zero bits for every value teko has — `0`, `0.0`, `false`, `'\0'`, the
+  zero member of an `enum`, a `TimeSpan` of no ticks — so it evaluates the nullable exactly
+  once, needs no branch in the tree and needs no per-type code either.
+
+**What the value arm refuses, and where.** The scalar half of the compatibility check
+(`tk_check_scalar_compat`, [`teko_typeof.tk`](teko_typeof.tk)) hands a boxed slot to
+`tk_nl_check_value`, which judges the value against what the nullable ENCLOSES and reports
+under the NULLABLE's own name — the slot the source actually wrote: `i64? n = 2.5;` is
+`teko: a value of type f64 does not convert to i64?`, `Color? c = 5;` is
+`teko: a value of type i64 does not convert to Color?`, and a class in an `i64?` slot is
+refused by the same wording. `tk_row_fits` gains the guard that no row fits a box arm, and
+`i64 j = n;` stays D43's own `teko: a value of type i64? does not convert to i64`. The
+overload rounds need no line: an integer literal lands on `i64` and picks `pick(i64)` over
+`pick(i64?)` (C#'s own preference), a value of the nullable row picks `pick(i64?)`, and
+`null` picks it too by D43's clause.
+
+**`mc limits` is unmoved, and the row ceiling was measured rather than raised.** `types` 11,
+`alias` 19, `syntax` 15, `passes` 15/30, `intrin` 8/16, `syntax_type` 2/8 — the compiler
+registers no new primitive, no new pass and no new intrinsic, and `mc limits . --config`
+answers `ok`. In a COMPILED program a `T?` still costs one row per distinct `T`:
+`tests/surface_nullable_value.tk`, the heaviest fixture this repository has for the
+construct, uses **24 of `TK_MAXSTRUCT`'s 32** (measured by adding dummy classes until
+`teko: too many type declarations` fires: 8 more are accepted, 9 are not), so the ceiling
+stands where D43 left it.
+
+**Proof:** the taught compiler builds on mc 0.15.23; 55/55 fixtures at their `expect-exit`
+(53 before, plus `surface_nullable_value.tk` at 42 and `surface_nullable_value_panic.tk` at
+70); `--dump-ast` of all **53 pre-existing fixtures byte-identical** to `dc6d0ce9` — this
+crumb touches no accepted program that does not spell a value `?`; `FIXPOINT OK`;
+`sh scripts/check-docs.sh` green; `mc limits` unmoved as above; refusal probes outside
+`tests/` (`build/probe_nl_*`, not committed) enumerated in the pull request, each with its
+message; `mc pkg hash .` in the pull request.
+
+**The fix a verifier's review found: `i64? a = 5; a == 5` compiled and ran always false.**
+`tk_ops_binary` ([`teko_ops.tk`](teko_ops.tk)) claims a binary only when at least one side
+is a ROW of the type table (`tk_op_row(ta) >= 0`); when the operator is not declared by
+either side, it falls through to the core's own raw arithmetic whenever the OTHER side is
+of a core type — the clause that is right for a bare reference (`v + zero` really is one
+pointer word plus zero) and wrong for a nullable, where the handle is never the value.
+`i64? a`'s own type IS a row (`tk_nl_row`'s own `TK_KNULL` one), so `a == 5` reached that
+same fallback: `5` is a core `i64`, its own row lookup answers `-1`, and the site fell
+through unclaimed — the handle compared against five, byte for byte, always false. `Cell?
+== Cell` and `i64? == i64?` never hit the fallback (both operands are rows), which is why
+those two were already correctly refused and the gap went unnoticed until `T?` met a plain
+core-typed operand. **The rule this fix enforces:** a nullable operand — reference or value,
+found by `tk_is_nl` on either side's row — claims the binary UNCONDITIONALLY, ahead of that
+fallback, and takes `==`/`!=` against `null` (`tk_is_null_lit`, either side) and nothing
+else; every other operator, and `==`/`!=` against anything but `null`, is refused by the
+existing `tk_op_none_msg` wording. The same claim reaches unary `- ! ~ +`, and a new one at
+`N_IF` (the ternary's own node by the time this pass runs) refuses a nullable used bare as a
+condition — `teko: i64? is not a condition`, named by the row (a `bool?` prints as `u8?`,
+`bool` being an alias of `u8`); a `while`/`for`/`do` guard is `!(cond)` and meets the unary
+refusal first, ``declares no operator `!` `` — since a boxed value's handle answers
+`HasValue`, not the value inside it, and `false` is still a live box. `HasValue`'s own
+lowering (`left != 0`) would have been caught by the new claim as well — `left` IS a
+nullable operand — so it is MARKED (`tk_nl_hv_mark`, on the RECEIVER node rather than the
+binary: `tk_nl_pend`'s own return value is copied into a deferred placeholder by
+`node_assign`, which keeps a child's id and drops the parent's, so marking the child is what
+survives that copy) instead of built any differently, which is what keeps `--dump-ast`
+byte-identical on the fixtures that already spell `.HasValue`. **Proof of the fix:** 55/55
+fixtures unchanged at their `expect-exit`; `--dump-ast` of the 53 pre-existing fixtures still
+byte-identical to `dc6d0ce9`; `FIXPOINT OK`; `sh scripts/check-docs.sh` green; a probe matrix
+outside `tests/` covering every operator (`+ - * / % < <= > >= & | ^ << >>` and unary
+`- ! ~ +`) over `i64?`/`f64?`/`Cell?`, `T? == null`/`!= null` on both sides, two nullables
+compared, `HasValue` as a bare condition (both a local and a PARAMETER, the two lowering
+paths), and `bool?`/`Cell?` bare in `if`/the ternary/`while` — each refusing or compiling as
+the rule states.

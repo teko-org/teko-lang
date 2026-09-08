@@ -471,8 +471,24 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: .Value is not a slot"` — `x.Value = e`. A nullable is written whole.
 - `"teko: a reference nullable has no default"` — `GetValueOrDefault()` on a `T?` over a
   reference. Its C# answer is `null`, which is the one value a `T` slot may not take.
-- `"teko: a nullable of a value type is not taught yet"` — `i64?`, `f64?`, `bool?`,
-  `char?`, an `enum?`, `TimeSpan?`, `DateTime?`. The counted box is a later crumb.
+- `"teko: too many nullable value types in one unit"` — more than 32 distinct payload
+  types boxed in one source. Each one costs a writer of three lines; the ceiling is the
+  table that remembers which have been emitted.
+- `"teko: "` — completed by *`i64?` declares no operator `+`* (the row's own name, then the
+  operator's spelling between backticks): a nullable operand takes `==`/`!=` against `null`
+  and nothing else — every other binary, and `==`/`!=` against anything but `null` (another
+  nullable included, before Q4a's lifted rule), is refused by name. The handle is not the
+  value: `a == 5` would compare the box's own address against five, always false, which is
+  the mistake this claim exists to catch (`tk_op_none_msg`, [teko_ops.tk](../../teko_ops.tk),
+  the same wording an ordinary type that declares no operator already gets).
+- `"teko: "` — completed by *`i64?` is not a condition* (the row's own name; a `bool?`
+  prints as `u8?`): a nullable used bare as `if`'s condition or the ternary's. A
+  `while`/`for`/`do` guard is `!(cond)`, so there the `!` on a nullable meets the unary
+  form of the operator refusal above first, ``declares no operator `!` ``.
+  `a.HasValue`, `a == null` or `a.Value` is the form.
+- `"teko: too many HasValue reads in one unit"` — more than 64 `.HasValue` reads in one
+  source. `HasValue`'s own lowering (`left != 0`) is marked so the operator claim above does
+  not refuse its own code; the mark table is this ceiling.
 - `"teko: a nullable of a nullable is not taught"` — `T??`, and `T[]??`.
 - `"teko: a raw pointer has no nullable"` — `uptr?`, `ptr?`, `str?`. `0` is an ordinary
   value of a raw pointer, and `null` already lands in one.
@@ -481,7 +497,10 @@ Every one of these is [nullable.md](nullable.md)'s.
   travels as a spelling and `Cell?` is not one the lexer can form.
 - `"teko: a value of type Cell? does not convert to Cell"` — the ordinary conversion
   wording: `T?` does not convert to `T`, and one nullable row does not convert to another.
-  Write `.Value`.
+  Write `.Value`. A nullable over a VALUE is judged by the same wording under its own
+  name: `teko: a value of type f64 does not convert to i64?`, and
+  `teko: a value of type i64 does not convert to Color?`, since an `enum` and a primitive
+  with members take their own type and nothing else — inside a box as outside one.
 - `"teko: a nullable with no value"` — a run-time **panic**, exit 70: `.Value` on a handle
   of 0 ([memory.md](memory.md)).
 

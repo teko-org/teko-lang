@@ -1,14 +1,14 @@
 # `T?` — the nullable, over any type
 
-**Half built.** Q0 and Q1a landed (D43): the row, the `?` suffix at every declaration
-position it reaches, `HasValue`/`Value`, the reclaim, and the rule that `null` needs a slot
-declared `T?` — over a REFERENCE. What runs is
-[the reference page](../reference/nullable.md), and the ten probes behind it are
-[nullable-probes.md](../internals/nullable-probes.md); D43 records the four places this page
-was measured wrong and what replaced them. The rest — the counted box for a value type
-(Q1b), `??` and `?.` (Q2), definite assignment (Q3) and the lifted `==` (Q4a) — is still a
-plan, and every fenced sample stays `// no-run` because the page describes the whole design
-rather than the part that runs.
+**Mostly built.** Q0, Q1a (D43) and Q1b (D44) landed: the row, the `?` suffix at every
+declaration position it reaches, `HasValue`/`Value`/`GetValueOrDefault()`, the reclaim, the
+rule that `null` needs a slot declared `T?`, and the counted box that carries a VALUE
+nullable. What runs is [the reference page](../reference/nullable.md), and the ten probes
+behind it are [nullable-probes.md](../internals/nullable-probes.md); D43 and D44 record the
+places this page was measured wrong and what replaced them. The rest — `??` and `?.` (Q2),
+definite assignment (Q3) and the lifted `==` (Q4a) — is still a plan, and every fenced
+sample stays `// no-run` because the page describes the whole design rather than the part
+that runs.
 
 `T?` is teko's one nullable mechanism. It is sugar for `Nullable<T>` over **any** type —
 a class, an interface, a delegate, a `struct`, a `T[]`, `string` when it lands, and every
@@ -84,8 +84,13 @@ Four properties come out of that choice, and they are why it beats the alternati
 - **One release function for every value nullable, not one per type.** A box holds no
   reference — a counted `T` never reaches the box arm, because a counted `T` is already a
   pointer and takes the row above — so the release is `rt_free(p, 24 + ld64(p + 16))` and
-  nothing else. `lib/rt.tk` grows three small functions and one vtable, and the compiler
-  generates **no** per-type code, which is less than `T[]` needs.
+  nothing else. **As built (D44), those three functions and the vtable are GENERATED**, not
+  written into `lib/rt.tk` — everything there is parsed into every program that includes it,
+  and a function added there moves the `--dump-ast` of every fixture — and the WRITER that
+  stores the payload is one three-line function per payload TYPE, for the same reason
+  `tkarr_put_T` is one per element type: a float travels in the other register file, and an
+  `enum` or a primitive reaching an `i64` slot is refused by D34/D40's own clause. The
+  release stays one function for every box there is.
 - **Every position works with no new rule.** A `T?` field is an ordinary counted field, a
   `T?` element of a `T?[]` is an ordinary counted element, a `T?` argument is borrowed, a
   `T?` return hands the caller a reference it already owns, a `T?` temporary is parked, a
@@ -617,9 +622,10 @@ only where a `?` is written; `FIXPOINT OK`; `mc limits` verdict `ok` with `types
 [`CLAUDE.md`](../../CLAUDE.md) and [docs/README.md](../README.md), and a section in
 [guide/10-values-and-types.md](../guide/10-values-and-types.md).
 
-### Q1b — `T?` over a value (M)
+### Q1b — `T?` over a value (M) — LANDED, D44
 
-The box: `tk_nl_new`/`tknl_release`/the vtable in `lib/rt.tk`; `tk_nl_wrap` writing the box
+The box: `tk_nl_new`/`tk_nl_release`/the vtable, GENERATED rather than written into
+`lib/rt.tk` (D44, the same departure D43 made for `tk_nl_ck`); `tk_nl_wrap` writing the box
 at the nine slots; the typed payload load at `.Value`; `GetValueOrDefault()`;
 `i64?`/`f64?`/`bool?`/`char?`/`i8?`/`enum?`/`TimeSpan?`/`DateTime?`; `T?[]` and `T[]?`.
 Depends on Q1a.

@@ -214,6 +214,13 @@ number either, so it does not land in a numeric slot at all —
 `teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
 carries.
 
+**Every type on this page has a `T?`**, the scalars included: `i64?`, `f64?`, `bool?`,
+`char?`, `i8?`, an `enum?`, `TimeSpan?` and `DateTime?` are the same one mechanism, over a
+counted box holding the value's own bytes. `i64? n = 5;` therefore ALLOCATES, `n.Value` is
+the checked read and `i64 j = n;` is refused —
+`teko: a value of type i64? does not convert to i64`. The whole rule, the cost and what it
+does not do are [nullable.md](nullable.md).
+
 ```teko
 // no-run
 i64 solo(i64 a) { return a; }
@@ -660,7 +667,8 @@ There is no **local** `const`: declare it at the top or as a member.
 | a struct has no reference count | its allocation lives for the run |
 | `str` has no length field | `tk_str_len` walks to the NUL |
 | `ptr` and `uptr` are the same type | an overload cannot tell them apart |
-| types declared in one source | 32 |
+| types declared in one source | 32 — a `T[]` and a `T?` take one row each, made the first time each is spelled |
+| distinct value types boxed by `T?` in one source | 32 |
 | fields, summed across all types | 256 |
 
 What a v0.4.0 program cannot write at all, and the message it gets, is

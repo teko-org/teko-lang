@@ -31,7 +31,7 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_this.tk` | the receiver a method does not declare, `this`, `base.m()` | `syntax_expr("this")` | which type's body is open, and whether it is static |
 | `teko_access.tk` | `public` `private` `protected` `internal` `static` `abstract` `partial`, and `Type.member` | `syntax` for the four leading words, and `syntax_expr`/`syntax_stmt` per type name | the project root `internal` is measured from, deferred static accesses |
 | `teko_typeof.tk` | nothing of the surface: it is the static-type oracle | one `pass()` | the names of one function, and the accesses waiting for the pass |
-| `teko_null.tk` | `T?` over a reference: the `?` type suffix, `HasValue`/`Value`, and the refusal of `null` outside a `T?` slot | `syntax_type` — the second one in this compiler, behind `teko_heaparr.tk`'s | the `?` lexeme, the `null` nodes the compiler wrote itself, and whether `tk_nl_ck` was emitted |
+| `teko_null.tk` | `T?` over ANY type: the `?` type suffix, `HasValue`/`Value`/`GetValueOrDefault()`, the refusal of `null` outside a `T?` slot, the counted box a value nullable points at and the implicit `T` → `T?` that writes it | `syntax_type` — the second one in this compiler, behind `teko_heaparr.tk`'s | the `?` lexeme, the `null` nodes the compiler wrote itself, the payload types whose box writer was emitted, and whether `tk_nl_ck`/`tk_nl_new`/`tk_nl_dflt` were |
 | `teko_enum.tk` | `enum Name [: underlying] { Member [= const], ... }` | `syntax("enum")`, one `type_new` per declared enum, sized/kinded by the underlying type | nothing of its own: members live in `teko_const.tk`'s qualified-constant table |
 | `teko_deleg.tk` | `delegate`, contextual and explicit values, lambdas, `use (...)` | `syntax("delegate")`, `on_stmt` for the capture taint | `(delegate, function)` thunk pairs, capture lists, by-reference lambdas |
 | `teko_heaparr.tk` | `T[]` on the heap, `new T[n]`, its guarded index | `syntax_type` — the first of the two in this compiler | one type row per element type, global `T[]` declarations |
@@ -68,8 +68,11 @@ Three shapes recur:
   parsed into a call to a name nothing declares; a `pass()` rewrites it. If the pass were
   ever not registered, the core's resolver would refuse the call outright rather than
   compile something wrong.
-- **generated declarations.** A vtable, a release function, a thunk, a `T[]` row's own three and
-  a whole generic instance are declarations teko emits itself. Every one that can fire in
+- **generated declarations.** A vtable, a release function, a thunk, a `T[]` row's own three,
+  a nullable box's own four and a whole generic instance are declarations teko emits itself.
+  Nothing that a program may not need is written into `lib/rt.tk` instead: everything there is
+  parsed into every program that includes it, so a function added there would move the
+  `--dump-ast` of every fixture. Every one that can fire in
   the middle of a declaration of the program's own goes through `tk_top_emit`
   ([nodes-and-xt.md](nodes-and-xt.md)).
 
