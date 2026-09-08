@@ -929,9 +929,10 @@ row of the type table is a VALUE of that type, judged by the type alone, in ever
 `tk_pm_elem_fits` ([`teko_params.tk`](teko_params.tk)) applies the same rule to an element
 of a `params` list, so `params Color[]` takes members and `params i64[]` refuses one. And
 `null`, which those two functions let land on any row of the type table (D32), lands on no
-enum: an enum is a value whatever row it occupies, so `f(null)` against `f(Color)` and
-`total(null)` against `params Color[]` are refused at the call site
-(`teko: a value of type uptr does not convert to Color`), not accepted and caught later. A
+enum: an enum is a value whatever row it occupies, so `f(null)` against `f(Color)` finds no
+candidate (`teko: no overload of f matches these arguments`) and `total(null)` against
+`params Color[]` is refused where it stands (`teko: a value of type uptr does not convert
+to Color`), neither accepted and caught later. A
 `switch` on an enum PARAMETER stays refused (``teko: no operator `==` takes these
 operands``): a parameter has no type at parse time, and giving it one is a crumb of its own
 (not-yet.md).
