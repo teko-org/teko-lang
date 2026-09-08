@@ -6,7 +6,7 @@ calendar), D41.** What the two types actually do today is
 [timespan.md](../reference/timespan.md) and [datetime.md](../reference/datetime.md), and
 the mechanism is [the internals note](../internals/primitives.md). What is left of this
 page as design and nothing more is the TEXT half (§ 7: `ToString`, `Parse`, `TryParse`)
-and `Now`/`UtcNow`/`Today` (§ 8, blocked on `mc`). The samples below still carry `// no-run`
+and `Now`/`UtcNow`/`Today` (§ 8, C6). The samples below still carry `// no-run`
 because each of them names one of those.
 
 The rest of the page is unchanged, and deliberately: it is the design C1 and C2 were built
@@ -274,22 +274,15 @@ makes between `putf64` and `fmt_f64`. A `str` is not reference counted
 ([memory.md](../reference/memory.md)), so a `ToString()` inside a loop grows the arena;
 that is stated in the reference the crumb owes, not hidden.
 
-## 8. What stays out, and the one thing that is blocked
+## 8. What stays out, and `Now`
 
-**`DateTime.Now`, `DateTime.UtcNow` and `DateTime.Today` are blocked on `mc`.** They need a
-wall clock, and a wall clock is one symbol whose name differs per host: `clock_gettime` on
-Linux and macOS, `GetSystemTimeAsFileTime` on Windows. teko cannot pick between them —
-`mc` has no conditional compilation, the five legs compile one source, and the Windows leg
-resolves `<sys>`'s libc-shaped names through `mcrt.obj`, which is `mc`'s file and not this
-repository's. Writing a second include per host, or an `[include].paths` root chosen by the
-build config, would push an operating-system choice into every consumer's `teko.toml` for
-one function.
-
-So the ask goes to `mc`'s notices file, in `mc`'s own shape: **`<sys>` grows a wall clock**,
-one function with one name across the three hosts (`i64 sys_time_ns()`, or the POSIX pair
-`clock_gettime` shimmed on Windows as the other five already are). It unblocks on whichever
-`mc` release carries it; until then `DateTime.Now` is refused by name and the rest of this
-page lands without it. Everything else here — every component, every operator, every
+**`DateTime.Now`, `DateTime.UtcNow` and `DateTime.Today` are C6, teko's own.** They need a
+wall clock, one symbol whose name differs per host: `clock_gettime` on Linux and macOS,
+`GetSystemTimePreciseAsFileTime` on Windows. The owner's ruling (2026-09-08): teko declares
+the `extern` itself, and the taught compiler picks the one for the target host at compile
+time — `mc` gives `extern`, the target's name, and the sysroot teko already writes; nothing
+is asked of it. Until C6 lands `DateTime.Now` is refused by name and the rest of this page
+lands without it. Everything else here — every component, every operator, every
 format — needs no clock and no `mc` change at all.
 
 Also deliberately outside:

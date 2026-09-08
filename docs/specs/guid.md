@@ -12,7 +12,7 @@ It is **the smallest page in this plan** because it invents nothing: the sixteen
 the machine module that moves it and the member-lowering table are all built by
 `docs/specs/decimal.md` and `docs/specs/datetime.md`, and this page spends them. What it
 adds is 16 bytes of layout, a hex parser, a hex formatter and a byte comparison — and one
-blocked function.
+function that reads the host's entropy (N9, § 5).
 
 ---
 
@@ -127,7 +127,7 @@ stops at the first difference.
 | `Guid.Empty` | `.ToString()` — the "D" form |
 | `Guid.Parse(str)` | `.ToString(str fmt)` — `"D"` or `"N"` |
 | `Guid.TryParse(str, out Guid)` | `.CompareTo(Guid)`, `.Equals(Guid)` |
-| `Guid.NewGuid()` — **blocked**, § 5 | `.IsEmpty` — an `i64` 0/1 |
+| `Guid.NewGuid()` — N9, § 5 | `.IsEmpty` — an `i64` 0/1 |
 
 **Text.** `ToString()` writes 36 characters, lowercase, `8-4-4-4-12`, which is C#'s `"D"`
 and C#'s own casing. `ToString("N")` writes the same 32 hex digits with no dashes. `"B"`
@@ -144,7 +144,7 @@ more formats for the same sixteen bytes and nothing asks for them.
 one comparison the caller would otherwise write against a static that costs a load. It is
 the one addition on this page, and it is additive: `g == Guid.Empty` works too.
 
-## 5. `Guid.NewGuid` is blocked on `mc`
+## 5. `Guid.NewGuid` is teko's own entropy `extern`
 
 A version-4 `Guid` is sixteen bytes of **cryptographically random** data with the version
 nibble set to `4` and the variant bits to `10`. The nibbles are arithmetic; the randomness

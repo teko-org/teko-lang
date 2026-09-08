@@ -171,7 +171,7 @@ not:
 
 | written | what happens |
 |---|---|
-| `DateTime.Now`, `UtcNow`, `Today` (C6) | `teko: DateTime.Now is not taught yet` and its two siblings — a wall clock is one symbol per operating system (`clock_gettime`, `GetSystemTimeAsFileTime`) and `mc`'s `<sys>` is where it has to land; the ask is filed (`docs/specs/datetime.md` § 8/§ 14) |
+| `DateTime.Now`, `UtcNow`, `Today` (C6) | `teko: DateTime.Now is not taught yet` and its two siblings — a wall clock is one symbol per operating system (`clock_gettime`, `GetSystemTimePreciseAsFileTime`), and teko declares it itself as an `extern` chosen by the target host (C6, the owner's ruling of 2026-09-08) |
 | `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — the same text crumb `TimeSpan` waits for |
 | `DateTime.SpecifyKind(d, k)`, `d.Subtract(x)` | `teko: unknown static member of DateTime: SpecifyKind` / `teko: unknown member of DateTime: Subtract` — both need a member row whose parameters differ from each other (a `DateTime` beside a `DateTimeKind`, and two overloads of one arity), and a row takes one parameter TYPE and a count. `SpecifyKind` is `new DateTime(d.Ticks, k)` and `Subtract` is `-` |
 | `ToLocalTime`, `ToUniversalTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly` | not taught: a time-zone database is not a language feature, and the two date-only types wait on [datetime-extras.md](../specs/datetime-extras.md) |

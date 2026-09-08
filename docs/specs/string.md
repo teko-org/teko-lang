@@ -270,7 +270,7 @@ temporary. There is no new operator machinery on this page at all.
 needs a root type, which needs `object`, which needs boxing — § 11. `"n=" +
 tk_num(n)` is the road today and `$"n={n}"` is the road when § 9 unblocks.
 
-## 9. `$"..."` is blocked on `mc`'s lexer
+## 9. `$"..."` needs `mc` 0.15.25, where a module claims `$`
 
 C#'s interpolation is `$"a{x}b"`, and teko cannot lex it today. `$` opens a **hole** token
 in `mc`'s lexer — `$1`, `$name`, `$$name`, the machinery `#rule` substitution uses — and
@@ -315,7 +315,7 @@ No boxing, no run-time tag, no `object`. The alignment and format specifiers C# 
 
 | left out | why |
 |---|---|
-| `$"…"` | § 9, blocked on `mc`'s lexer |
+| `$"…"` | § 9, on a pin at `mc` ≥ 0.15.25 |
 | `"n=" + 5` | § 8: it needs a universal `ToString`, which needs `object` |
 | `string.Format`, `{0}` placeholders | `params string[]` makes it writable as a library function once `string` exists; it is not a language construct |
 | Unicode-aware `ToUpper`/`ToLower`, culture, collation, normalisation | a table-driven library, not a primitive. The two methods here are ASCII-only and say so in their own documentation |
@@ -437,7 +437,7 @@ everything N7 gated on. **Owes:** runtime.md, the index guard in
 [arrays.md](../reference/arrays.md), and the `this[i]` row in
 [not-yet.md](../reference/not-yet.md).
 
-### N10 — interpolation (M, blocked)
+### N10 — interpolation (M, after the pin reaches 0.15.25)
 
 § 9's lowering, one `syntax_expr("$", …)`, one fixture per hole type.
 **Blocked** until `mc`'s lexer hands back a `$` before a `"`.

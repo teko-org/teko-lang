@@ -46,22 +46,21 @@ example that is only illustrative.
 
 ## What depends on `mc`
 
-None of these is teko's to write, and each changes what teko can promise.
+Nothing that blocks a 1.0. The list this section used to carry has closed or moved:
 
-| needed from `mc` | what it unblocks here |
+| item | where it stands |
 |---|---|
-| the registry's **R2** — building the taught compiler from `[package].modules` and the package's `[deps]` before validating | a teko library can declare `check` units written in **teko**; until then every one of them has to be core syntax |
-| the registry's **R3** — classifying on `[package].language = "teko"`, or on a `[deps] teko` when the key is absent | the key is written into `mc.toml` today and ignored; R3 is what makes it mean something |
-| **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool. Until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
-| **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | teko declares `[deps] stdlib` instead of relying on what the release binary bundles |
-| **the hook API frozen at 1.0.0, with a deprecation policy** — a package taught in a `1.x` teko validates on any `1.y` `mc`. Until it lands, the registry's validator compiles `check` with the same `mc` release it itself pins, and a hook API break between the validator's release and a package's own tag forces a re-tag, not a silent re-validation (D35) | the pin can move without a survey of every module. This is the one that decides whether a 1.0 is maintainable at all |
-| **`[package].mc`, the minimum `mc` release a package reads as its own floor** | today a package names no minimum, so a tag validated once can start failing under a newer validator's `mc` for a reason the package's own `mc.toml` says nothing about (the fork this pin closes, D35). A floor `mc` itself checks before it builds is what lets a package say "I need at least this hook surface" instead of the registry silently rebuilding on whatever release happens to run |
+| the registry's **R2** (the taught compiler built from `[package].modules` and `[deps]` before validating) and **R3** (`language = "teko"`, derived from `[deps] teko`) | **delivered and proved**: `teko_std` 0.7.2 is on the index, its `check` unit compiled by a compiler the validator built from `<teko/teko.tk>` and `<teko/user.mc>` (D43's manifest shape) |
+| a wall clock, an entropy source, `<i128>` on x86-64 | **teko's own** (the owner's ruling of 2026-09-08): an `extern` per target host, a `bcrypt.def` in teko's own Windows sysroot, a machine module for a primitive — the tooling `mc` already gives. Nothing is asked of `mc` for them |
+| **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool; until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
+| **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | one include line here (`[deps] stdlib`, `<stdlib/float.mc>`) when it ships |
+| the hook API | **stable**: `mc` no longer changes it and works on real core defects only (the owner, 2026-09-08). teko treats the API pinned since 0.15.18 as the surface it builds on, proves every pin raise by the whole recipe (D29, D35, D37), and reports a core defect with a pure-mc reproducer — never a feature request |
+| a minimum `mc` a package declares (`[package].mc`) | the owner's topic with the `mc` project directly; not a teko ask |
 
-The last one is worth stating plainly. Everything teko is, is hooks: fifteen passes, fourteen
-`syntax` registrations, a `source_claim`, an `on_source`, a `syntax_param`, a `syntax_type`.
-A patch release of `mc` that changes what one of them returns changes this compiler. Today
-that is handled by pinning and by proving before raising the pin; a 1.0 needs the guarantee
-on the other side.
+Everything teko is, is hooks: fifteen passes, fourteen `syntax` registrations, a
+`source_claim`, an `on_source`, a `syntax_param`, a `syntax_type`. That is why a pin is
+raised only after the whole recipe is green on the new release, and why the 1.0.0 of teko
+ships together with the 1.0.0 of `mc` — the owner's rule, not a dependency on a change.
 
 ## Raising the pin, and a canary
 
