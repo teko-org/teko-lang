@@ -898,6 +898,35 @@ uptr tk_cap_writer(i64 ty) {
     return "tk_cap_put";
 }
 
+// `tk_prim_is`/`tk_prim_raw` (teko_prim.tk, included after this file) --
+// forward-declared the same way `tk_lambda_build` above is, for the capture
+// value below.
+i64 tk_prim_is(i64 ty);
+i64 tk_prim_raw(i64 e);
+
+// the value a BY-VALUE capture hands to `tk_cap_writer`'s own `i64` slot:
+// `tk_cap_put`'s `v` parameter (`lib/rt.tk`) is declared `i64`, the register
+// file plain data crosses in, and `tk_check_scalar_compat` (teko_typeof.tk,
+// D34/D40) refuses ANY primitive-with-members or `enum` value reaching a
+// numeric slot other than its own -- correct for a value the SOURCE wrote,
+// wrong here, because the eight bytes crossing into the closure are exactly
+// what a `TimeSpan`/`DateTime`/`enum` local already carries in its own slot
+// (D38's `tk_ld` reads the very same bytes back out on the other end,
+// `tk_lambda_prologue` below). This is the compiler's own raw view of the
+// value, the same category `tk_prim_raw` already names for a row's argument
+// (teko_prim.tk): a primitive-with-members goes through it so the cast is
+// remembered as the compiler's, and an `enum` (no hand-written-cast refusal
+// exists for one, docs/specs/enum.md § 5) takes the plain machine cast.
+// `tk_is_int_ty` (teko_typeof.tk, included ahead of this file) already
+// covers every ordinary integer -- `i8`/`i16`/`u8`/`u16`/`u32`/`i32`/`i64` --
+// so only a `TK_SINT` id OUTSIDE that list needs the raw view at all.
+i64 tk_cap_val(i64 ty, uptr name) {
+    i64 v = tk_id(name);
+    if (tk_prim_is(ty)) return tk_prim_raw(v);
+    if (type_kind(ty) == TK_SINT && !tk_is_int_ty(ty)) return tk_cast(TY_I64, v);
+    return v;
+}
+
 // the object the allocator is handed: a fresh block with one `tk_cap_put`
 // link per capture (lib/rt.tk), each writing the value or the ADDRESS taken
 // AT THAT INSTANT -- the "frozen copy" D221 decision 20 asks a by-value
@@ -913,7 +942,8 @@ i64 tk_lambda_capture_chain(i64 objsize) {
         if (lc_byref_at(i)) {
             blk = tk_call3("tk_cap_put", blk, off, tk_addr(lc_name_at(i)));
         } else {
-            blk = tk_call3(tk_cap_writer(lc_ty_at(i)), blk, off, tk_id(lc_name_at(i)));
+            i64 v = tk_cap_val(lc_ty_at(i), lc_name_at(i));
+            blk = tk_call3(tk_cap_writer(lc_ty_at(i)), blk, off, v);
         }
         i = i + 1;
     }

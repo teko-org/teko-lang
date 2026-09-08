@@ -14,6 +14,8 @@
 //   a + b   a - b   -a         the operators, each a call with an overflow
 //   a * 3   a / 2              check, none of them the core's raw arithmetic
 //   a < b   a == b   ...       the six comparisons
+//   () use (t) => ...          a lambda's by-value capture of an 8-byte
+//                              primitive (the fix, teko_deleg.tk's `tk_cap_val`)
 //
 // Every tick count below is exact: `FromDays(1).Ticks` is 864000000000 and
 // nothing else, which is what makes the fixture an oracle rather than a
@@ -29,6 +31,8 @@ class Box {
 }
 
 TimeSpan g_span;                                   // a global of primitive type
+
+delegate TimeSpan TSOp();
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same table
@@ -171,6 +175,21 @@ i64 main() {
     if (longer(hour, half) != hour) return 66;
     TimeSpan pick = grown > hour ? grown : hour;
     if (pick.Minutes != 30) return 67;
+
+    // ---- a lambda's by-value capture of a `TimeSpan` (fix: the raw eight
+    // bytes crossing into the closure went through `tk_cap_put`'s `i64`
+    // slot untyped, and `tk_check_scalar_compat` refused the primitive on
+    // sight -- `tk_cap_val`, teko_deleg.tk, now wraps it in the compiler's
+    // own raw view, `tk_prim_raw`, the same one a row's own argument gets)
+    TimeSpan cap_src = TimeSpan.FromHours(2.0);
+    TSOp cap_f = () use (cap_src) => cap_src + TimeSpan.FromHours(1.0);
+    TimeSpan cap_r = cap_f();
+    if (cap_r.Hours != 3) return 68;
+    // the closure's copy is frozen at construction: mutating the declarer's
+    // own local afterward does not move the captured value
+    cap_src = TimeSpan.FromHours(10.0);
+    cap_r = cap_f();
+    if (cap_r.Hours != 3) return 69;
 
     return 42;
 }
