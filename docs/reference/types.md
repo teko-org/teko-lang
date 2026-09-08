@@ -298,8 +298,13 @@ A value of struct type is a **pointer to the allocation**, eight bytes wide, pro
 `new`; `new Name` and `new Name()` both hand out zeroed bytes, so a field nobody assigned
 reads as `0` and a reference field reads as null. **A struct has no default value of its
 own**: `Name p;` with no `new` is not initialized — it is not null, it is whatever the slot
-held — and reading or writing a field through it is the developer's error, not a refusal or
-a panic the compiler makes for you. Build it (`Name p = new Name;`) before you touch it.
+held. Reading or writing a field through such a local is **refused where it is read**
+(`teko: p is used before it is assigned`, D46): `p.x = 4` reads `p` to reach the field, and
+a local declared without an initializer and with no assignment anywhere earlier in the body
+does not have one to read. Build it (`Name p = new Name;`), or assign it before you touch
+it — including inside a branch, which the rule counts on purpose
+([nullable.md](nullable.md) § Definite assignment). The refusal is what D42 deferred to the
+nullable design; it did not exist before, and the line reached the run instead.
 
 ```
 struct Name { [modifier] type field; ... methods ... }
