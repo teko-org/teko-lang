@@ -751,7 +751,7 @@ existed for `i32` and stayed invisible until `i8`/`i16` — and this crumb's fix
 does exercise every one of those seven shapes — made it observable. The fix is `tk_ld`
 (teko_struct.tk), `tk_arr_load`'s own two-line check factored out once: wrap the raw
 zero-extended load in `tk_cast` (the one surface form that sign-extends by kind,
-`MTASK_CAST`) when the type is `TK_SINT` and narrower than the word. The nine raw
+`MTASK_CAST`) when the type is `TK_SINT` and narrower than the word. The ten raw
 `tk_call(tk_ldn(ty), addr)` sites this port had — teko_struct.tk's own array-field index,
 teko_access.tk's `ref`/`out` and its static-field chain, teko_expr.tk's field load and its
 delegate-field call, teko_deleg.tk's closure prologue, teko_prop.tk's auto-accessor body,
@@ -759,7 +759,7 @@ teko_heaparr.tk's delegate-element call, teko_this.tk's own field read, and
 teko_typeof.tk's pending-field resolution — now go through it; `teko_array.tk`'s own
 `tk_arr_load` (already correct) and `teko_loop.tk`'s single `TY_UPTR` site (never narrow)
 are untouched. Zero new intrinsics, zero changes to `mc` (D2/D21): the fix is the same cast
-`(i8) x` already lowers to, written by the compiler where nine sites did not write it.
+`(i8) x` already lowers to, written by the compiler where ten sites did not write it.
 
 **No accepted program's `--dump-ast` moves.** The check only fires for `type_kind(ty) ==
 TK_SINT && type_width(ty) < 8`, and no existing fixture reads a struct/class field, a
@@ -768,7 +768,7 @@ field of `i32` type with a value the sign bit of which matters for the assertion
 `i32` use in the existing 45 is either a local, a parameter, a `return`, a widening source,
 or a field/argument the fixture reads back through a comparison the bug's own zero-extension
 does not change the OUTCOME of (`primitives_float.tk`'s `b.w` is an `f64` field, not an
-`i32` one — the value flows through it, the field itself is never narrow-signed). The nine
+`i32` one — the value flows through it, the field itself is never narrow-signed). The ten
 sites now route through `tk_ld` produce the identical two-node shape `tk_arr_load` already
 had for `i32`; for every OTHER type (`TK_INT`, `TK_FLOAT`, a row of the type table) the
 function returns the raw call unchanged, byte-for-byte the same node the old code built.
