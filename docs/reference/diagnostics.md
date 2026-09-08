@@ -474,6 +474,20 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: too many nullable value types in one unit"` — more than 32 distinct payload
   types boxed in one source. Each one costs a writer of three lines; the ceiling is the
   table that remembers which have been emitted.
+- `"teko: "` — completed by *`i64?` declares no operator `+`* (the row's own name, then the
+  operator's spelling between backticks): a nullable operand takes `==`/`!=` against `null`
+  and nothing else — every other binary, and `==`/`!=` against anything but `null` (another
+  nullable included, before Q4a's lifted rule), is refused by name. The handle is not the
+  value: `a == 5` would compare the box's own address against five, always false, which is
+  the mistake this claim exists to catch (`tk_op_none_msg`, [teko_ops.tk](../../teko_ops.tk),
+  the same wording an ordinary type that declares no operator already gets).
+- `"teko: "` — completed by *`bool?` is not a condition* (the row's own name): a nullable
+  used bare as `if`'s condition, the ternary's, or `while`/`for`/`do`'s (their own guard is
+  `!(cond)`, and `!` on a nullable is the unary form of the operator refusal above).
+  `a.HasValue`, `a == null` or `a.Value` is the form.
+- `"teko: too many HasValue reads in one unit"` — more than 64 `.HasValue` reads in one
+  source. `HasValue`'s own lowering (`left != 0`) is marked so the operator claim above does
+  not refuse its own code; the mark table is this ceiling.
 - `"teko: a nullable of a nullable is not taught"` — `T??`, and `T[]??`.
 - `"teko: a raw pointer has no nullable"` — `uptr?`, `ptr?`, `str?`. `0` is an ordinary
   value of a raw pointer, and `null` already lands in one.

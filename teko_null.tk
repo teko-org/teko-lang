@@ -152,6 +152,45 @@ i64 tk_nl_own_null_is(i64 n) {
     return 0;
 }
 
+// ---- `HasValue`'s own binary, MARKED rather than told apart by shape ----
+// The operator claim `tk_ops_pass` runs over every `N_BINARY` of the unit
+// (docs/specs/nullable.md § 19.4, teko_ops.tk's own `tk_nl_binary_check`)
+// would otherwise refuse `HasValue`'s own `left != 0` -- `left` IS a
+// nullable operand, which is exactly the shape the claim exists to catch.
+// The node is registered here instead of built any differently: `tk_int(0)`
+// is what `HasValue` has always lowered to, and changing it (to
+// `tk_nullnode()`, say) would move `--dump-ast` on every fixture that
+// already spells `.HasValue`, which this crumb's own gate forbids. A
+// separate table from `nl_own` above: that one marks NULL NODES, this one
+// marks the RECEIVER -- `left`/`recv`, `tk_bin`'s own first operand -- and
+// NOT the binary `tk_bin` returns: `tk_nl_pend` (the PASS-TIME half, below)
+// hands its own return value to a caller that splices it into a DEFERRED
+// placeholder through `node_assign` (teko_typeof.tk's `tk_pend_do`, the same
+// discipline `tk_ops_replace`'s own header describes), which copies the
+// binary's FIELDS into the placeholder's own node id -- the receiver child
+// travels across that copy unchanged, the binary's own id does not.
+#define TK_MAXNLHV 64
+
+i64 nl_hv[TK_MAXNLHV];
+i64 tk_nnlhv = 0;
+
+void tk_nl_hv_mark(i64 n) {
+    if (tk_nnlhv == TK_MAXNLHV)
+        err_at(tk_file, tk_line, "teko: too many HasValue reads in one unit");
+    st64(nl_hv + tk_nnlhv * 8, n);
+    tk_nnlhv = tk_nnlhv + 1;
+}
+
+i64 tk_nl_hv_is(i64 n) {
+    i64 i = tk_nnlhv - 1;
+    loop {
+        if (i < 0) break;
+        if (ld64(nl_hv + i * 8) == n) return 1;
+        i = i - 1;
+    }
+    return 0;
+}
+
 // `uptr tk_nl_ck(uptr p) { if (p == 0) panic("a nullable with no value"); return p; }`
 // -- the checked read behind `.Value`, emitted at the first `.Value` of the
 // unit and never twice. `panic` is `lib/rt.tk`'s own: the same `teko:` line on
@@ -397,6 +436,14 @@ i64 tk_nl_member_of(i64 left, i64 si, uptr m, i64 line, uptr fl) {
         if (p_id() == K_LPAR) err_at2(fl, line, "teko: the member is a field, not a method", m);
         tk_line = line;
         tk_file = fl;
+        // docs/specs/nullable.md § 19.4: `tk_ops_pass`'s own claim over a
+        // nullable operand (teko_ops.tk's `tk_nl_binary_check`) would refuse
+        // its own lowering here -- `left` IS a nullable operand -- so the
+        // RECEIVER is MARKED (`tk_nl_hv_mark`, above) rather than the node
+        // built any differently: the RHS stays the plain `tk_int(0)` it
+        // always was, which is what keeps `--dump-ast` byte-identical on
+        // every fixture that already spells `.HasValue`.
+        tk_nl_hv_mark(left);
         return tk_bin(K_NE, left, tk_int(0));
     }
     if (str_eq(m, "Value")) {
@@ -438,6 +485,12 @@ i64 tk_nl_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown) {
         st64(pty, TY_I64);
         st64(ppure, 1);
         st64(pown, TK_BORROWED);
+        // docs/specs/nullable.md § 19.4: the RECEIVER is marked, not the
+        // binary -- this return value is about to be spliced into a
+        // DEFERRED placeholder through `node_assign` (teko_typeof.tk's
+        // `tk_pend_do`), which copies these fields into a node of a
+        // DIFFERENT id and would carry no mark of its own across that copy.
+        tk_nl_hv_mark(recv);
         return tk_bin(K_NE, recv, tk_int(0));
     }
     if (str_eq(m, "Value")) {

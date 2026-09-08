@@ -91,8 +91,8 @@ around it:
 | `Nullable<T>` spelled out | `teko: not a generic type` — the spelling is `T?` and there is no `Nullable` type word |
 | `Box<Cell?>`, a nullable as a generic argument | `teko: a nullable is not a generic argument yet` — a type argument travels as a spelling, and `Cell?` is not one the lexer can form |
 | `a ?? b`, `a?.m` | not taught: the two operators are a later crumb, and `??` will tie with the ternary at precedence 1, so `a \|\| b ?? c` will read as `(a \|\| b) ?? c` where C# reads `a \|\| (b ?? c)` |
-| `a == b` on two nullables | ``teko: Cell? declares no operator `==` `` — comparing two handles is not comparing two values |
-| `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators) | ``teko: Cell? declares no operator `+` `` |
+| `a == b` on two nullables, `a == 5`/`a == c` (a nullable against a plain value of what it encloses) | ``teko: Cell? declares no operator `==` `` — the handle is not the value, so only `null` is the other side a nullable may compare against |
+| `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators), reference or value, either operand a plain value of the enclosed type or another nullable | ``teko: Cell? declares no operator `+` `` — every operator but `==`/`!=` against `null`; `a.Value + b.Value` is the form |
 | `T?` to `U?` where `T` converts to `U` | `teko: a value of type Circle? does not convert to Shape?` — no covariance between nullable rows; write `x.Value` |
 | `x.GetValueOrDefault()` on a reference nullable | `teko: a reference nullable has no default` — `default(T)` for a reference is `null`, which is the one value a `T` slot may not take |
 | `x.GetValueOrDefault(fallback)`, C#'s one-argument overload | `teko: unknown member of i64?: GetValueOrDefault` — an arity this type does not have. `??` (Q2) is the form that says which default it means |
@@ -104,6 +104,7 @@ around it:
 | `c.v` on a `Cell?` (flow narrowing, C# 8's `if (c != null) { c.v }`) | `teko: a Cell? is read through .Value` — the analysis behind narrowing is a dominator pass this design does not buy |
 | `f(3, 4)` on an `Op?` local | `call to unknown function f`, from the core — a nullable delegate is a value to compare and to pass, not one to call, and `.Value(...)` is not taught either |
 | `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no reference subject at all |
+| `if (a)`, `a ? x : y`, `while (a)`, `for (…; a; …)`, `do … while (a);` on a bare `T?` | `teko: bool? is not a condition` (named by the row) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` is the form |
 | `x.ToString()` on a nullable | deferred with all text |
 | a `switch` whose subject is a `Cell` or a `Cell?` | **accepted and compared as a pointer**, which no `case` label can match. Pre-existing for every reference, not a nullable's own |
 

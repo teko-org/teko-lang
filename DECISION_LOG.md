@@ -1427,3 +1427,36 @@ crumb touches no accepted program that does not spell a value `?`; `FIXPOINT OK`
 `sh scripts/check-docs.sh` green; `mc limits` unmoved as above; refusal probes outside
 `tests/` (`build/probe_nl_*`, not committed) enumerated in the pull request, each with its
 message; `mc pkg hash .` in the pull request.
+
+**The fix a verifier's review found: `i64? a = 5; a == 5` compiled and ran always false.**
+`tk_ops_binary` ([`teko_ops.tk`](teko_ops.tk)) claims a binary only when at least one side
+is a ROW of the type table (`tk_op_row(ta) >= 0`); when the operator is not declared by
+either side, it falls through to the core's own raw arithmetic whenever the OTHER side is
+of a core type — the clause that is right for a bare reference (`v + zero` really is one
+pointer word plus zero) and wrong for a nullable, where the handle is never the value.
+`i64? a`'s own type IS a row (`tk_nl_row`'s own `TK_KNULL` one), so `a == 5` reached that
+same fallback: `5` is a core `i64`, its own row lookup answers `-1`, and the site fell
+through unclaimed — the handle compared against five, byte for byte, always false. `Cell?
+== Cell` and `i64? == i64?` never hit the fallback (both operands are rows), which is why
+those two were already correctly refused and the gap went unnoticed until `T?` met a plain
+core-typed operand. **The rule this fix enforces:** a nullable operand — reference or value,
+found by `tk_is_nl` on either side's row — claims the binary UNCONDITIONALLY, ahead of that
+fallback, and takes `==`/`!=` against `null` (`tk_is_null_lit`, either side) and nothing
+else; every other operator, and `==`/`!=` against anything but `null`, is refused by the
+existing `tk_op_none_msg` wording. The same claim reaches unary `- ! ~ +`, and a new one at
+`N_IF` (the ternary's own node by the time this pass runs) refuses a nullable used bare as a
+condition — `teko: bool? is not a condition` — since a boxed value's handle answers
+`HasValue`, not the value inside it, and `false` is still a live box. `HasValue`'s own
+lowering (`left != 0`) would have been caught by the new claim as well — `left` IS a
+nullable operand — so it is MARKED (`tk_nl_hv_mark`, on the RECEIVER node rather than the
+binary: `tk_nl_pend`'s own return value is copied into a deferred placeholder by
+`node_assign`, which keeps a child's id and drops the parent's, so marking the child is what
+survives that copy) instead of built any differently, which is what keeps `--dump-ast`
+byte-identical on the fixtures that already spell `.HasValue`. **Proof of the fix:** 55/55
+fixtures unchanged at their `expect-exit`; `--dump-ast` of the 53 pre-existing fixtures still
+byte-identical to `dc6d0ce9`; `FIXPOINT OK`; `sh scripts/check-docs.sh` green; a probe matrix
+outside `tests/` covering every operator (`+ - * / % < <= > >= & | ^ << >>` and unary
+`- ! ~ +`) over `i64?`/`f64?`/`Cell?`, `T? == null`/`!= null` on both sides, two nullables
+compared, `HasValue` as a bare condition (both a local and a PARAMETER, the two lowering
+paths), and `bool?`/`Cell?` bare in `if`/the ternary/`while` — each refusing or compiling as
+the rule states.

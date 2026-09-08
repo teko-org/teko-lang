@@ -314,13 +314,30 @@ unambiguous:
 
 ## Operators
 
+**A nullable operand takes `==`/`!=` against `null`, on either side, and nothing else.**
+The handle IS the value for a reference and IS the box's own address for a value, so any
+other binary would compare the wrong thing in silence — `i64? a = 5; a == 5` would compare
+the BOX ADDRESS against the integer five, always false, exactly the mistake the claim below
+exists to catch (`tk_ops_binary`/`tk_ops_unary`, [teko_ops.tk](../../teko_ops.tk)).
+
 | form | verdict |
 |---|---|
-| `x == null`, `x != null`, `null == x` | taught: a comparison of the handle against 0 |
+| `x == null`, `null == x`, `x != null`, `null != x` | taught: a comparison of the handle against 0, for any `T?`, reference or value |
 | `a == b` on two nullables | refused: ``teko: Cell? declares no operator `==` ``, and ``teko: i64? declares no operator `==` `` for a value. Comparing two handles is not comparing two values: two boxes holding 5 would answer "different" |
-| `a + b`, `a < b`, `a & b` … | refused, the same way two bare references are. C#'s lifted arithmetic stays out; `a.Value + b.Value` is the form |
+| `a == 5`, `a == k` (`k` a plain `i64`), `a == c` (`c` a plain `Cell`) | refused: ``teko: i64? declares no operator `==` ``. Only `null` is the other side a nullable may compare against; a plain value of the enclosed type is not |
+| `a + b`, `a - b`, `a * b`, `a / b`, `a % b` | refused: ``teko: i64? declares no operator `+` `` (and so on, by operator) |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | refused, the same wording — C#'s lifted ordering stays out |
+| `a & b`, `a \| b`, `a ^ b`, `a << b`, `a >> b` | refused, the same wording |
+| `-a`, `!a`, `~a`, `+a` | refused, the same wording, unary: ``teko: i64? declares no operator `-` `` |
+| `if (a)`, `a ? x : y`, `while (a)`, `for (…; a; …)`, `do … while (a);` | refused: ``teko: bool? is not a condition`` (and by the row's own name for any other `T?`) — the handle answers `HasValue`, and for a boxed value `false` is still a live box, so a bare condition would run the branch its own value refuses. `a.HasValue`, `a == null` or `a.Value` (a `bool`) is the form |
 | `a ?? b`, `a?.m` | not taught yet ([not-yet.md](not-yet.md)) |
-| `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no reference subject |
+| `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no nullable subject |
+
+`a.Value + b.Value` (and `a.Value` alone, in any position) is unaffected: `.Value` answers
+the ENCLOSED type, not the nullable row, so ordinary arithmetic and ordinary conditions over
+it are exactly what they are over a `T`. So is `a.HasValue`, `a.GetValueOrDefault()` and
+`?.`/`.Value` chained (`a.Value.get()`), none of which is a binary or a unary over `a`
+itself.
 
 ---
 
