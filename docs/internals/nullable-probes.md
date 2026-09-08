@@ -234,7 +234,17 @@ never passes 64 bytes: one block is reused for the whole loop. Exit 42.
 ## Probe 9 — can teko_typeof.tk's walk see an assignment before the read it has to judge?
 
 **Yes, from the walk's own construction**, and this is the one probe answered from the
-source rather than from a program — Q3 is the crumb that owes the measurement.
+source rather than from a program — Q3 is the crumb that owed the measurement.
+
+**Measured (D46): yes, and the walk it rides is one of its OWN, in the same file and inside
+the same registered `pass()`.** The construction below is right about what the tree carries;
+what it is wrong about is that a single pre-order visitor can read it. Setting the bit when
+an assignment is VISITED would vouch for that assignment's own right-hand side (`a = a + 1`
+on an unassigned `a`), and a visitor that sees only one node at a time cannot tell an
+`N_ASSIGN`'s target — which is not a read — from an `N_IDENT` that is. So `tk_da_walk`
+recurses itself, with three clauses (a declaration, an assignment, an address) over the same
+mark-per-`N_BLOCK` shape, and `passes` still does not move, which is what the probe was
+asked.
 `tk_ty_walk_list` (teko_typeof.tk) calls the visitor on every node of every function body
 **in the order the source wrote it**, under the scope that holds at that node: a block
 pushes a mark and pops it, and a local joins the scope only after the statement that
