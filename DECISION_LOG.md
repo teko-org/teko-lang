@@ -917,4 +917,17 @@ spec's own § 10 table predicted, `types` included: nothing is registered by tek
 a program that declares no enum pays nothing (`tests/surface_enum.tk`'s own five type
 declarations move that program's `types` row from `9` to `14`, one per declaration, the
 same cost a `class` already has). `mc pkg hash .`:
-`b349f700c1918334ebecebc2fdfd98604b2cb170c1c390afc949c655c330d015`.
+`81c97fa09efe9ca4f128cc95bdeb6108e60508f163ecd229f06587cae55eb78e`.
+
+**A member is a typed value in overload resolution.** `Color.Red` is an `N_INT` retagged
+with the enum's type, and `tk_ov_args_fit` ([`teko_over.tk`](teko_over.tk)) read every
+non-float `N_INT` as the untyped integer literal — so `f(Color.Red)` against `f(Color)` and
+`f(i64)` landed on `f(i64)` and was then refused, and against `f(Color)` and `f(Other)`,
+or `f(Color)` and `f(Color, i64)`, matched nothing. The rule, the third exclusion beside the
+float literal (its kind) and `null` (`tk_is_null_lit`, D32): an `N_INT` whose `nd_type` is a
+row of the type table is a VALUE of that type, judged by the type alone, in every round.
+`tk_pm_elem_fits` ([`teko_params.tk`](teko_params.tk)) applies the same rule to an element
+of a `params` list, so `params Color[]` takes members and `params i64[]` refuses one. A
+`switch` on an enum PARAMETER stays refused (``teko: no operator `==` takes these
+operands``): a parameter has no type at parse time, and giving it one is a crumb of its own
+(not-yet.md).
