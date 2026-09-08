@@ -16,9 +16,14 @@
 // know it by its own id, not by its `TK_SINT` kind alone -- a class, an
 // interface and `ref`/`out`/`params` are ALSO `TK_INT`/never `TK_SINT`, so
 // kind alone cannot tell an integer from a reference. The boundary value
-// `2147483647` (`i32`'s own max) is the probe; a NEGATIVE `i32` widened to a
-// float is left out on purpose -- docs/reference/not-yet.md § *Numeric
-// conversions* carries why.
+// `2147483647` (`i32`'s own max) is the probe; a NEGATIVE `i32` follows right
+// after, at three of the same slots (an initializer, a field store, a free
+// call's argument) plus a narrowing `(i64)` back. `mc`'s aarch64 `fa_cast`
+// (`lib/machine_arm64_float.mc`) used to pick `ucvtf`/`fcvtzu` for any source
+// that was not the exact id `TY_I64`, so a negative `i32` widened to a huge
+// positive `f64` instead of a negative one -- fixed in mc 0.15.23 (D37); this
+// used to be a gap recorded under *Numeric conversions* in
+// docs/reference/not-yet.md.
 //
 // expect-exit: 42
 
@@ -100,6 +105,18 @@ i64 widen() {
     i32 im = 3;
     if (im + 1.5 != 4.5) return 20;              // a binary mixing `f64` and `i32`, left
     if (1.5 + im != 4.5) return 21;              // ...and right
+
+    i32 d = -5;                                  // a NEGATIVE `i32` this time (D37)
+    f64 fd = d;                                  // a variable initializer, `i32`-sourced
+    if (fd != -5.0) return 22;
+
+    b.w = d;                                     // a field store, `i32`-sourced
+    if (b.w != -5.0) return 23;
+
+    if (twice(d) != -10.0) return 24;            // a free call's argument, `i32`-sourced
+
+    i64 back = (i64) fd;                         // narrowing back (`fcvtzs`), from a negative value
+    if (back != -5) return 25;
     return 0;
 }
 
