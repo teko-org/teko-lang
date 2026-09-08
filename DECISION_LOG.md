@@ -713,3 +713,88 @@ two `0.15.22` mentions left alone are historical (D35's own entry above, and
 `windows-sysroot/action.yml`'s comment on which release added which kernel32 export, both
 about the PAST release and not the current pin).
 
+
+### D38 · `i8`/`i16`, and every indirect load teko builds for itself (2026-09-08)
+`docs/specs/small-ints.md`'s N0, the first crumb of the numeric-types sequence
+([`docs/specs/README.md`](docs/specs/README.md)). Two lines in `teko_type.tk` —
+`type_new("i8", 1, 1, TK_SINT)` and `type_new("i16", 2, 2, TK_SINT)`, kept in their own
+globals (`tk_ty_i8`/`tk_ty_i16`) the way every registration in this port is — and
+`tk_is_int_ty` (teko_typeof.tk) rewritten from `t == TY_MAX` (a number written down, and
+`i32`'s own id read by coincidence) to the positive list the spec's § 2 states: the core's
+five raw ids, `i32` by its own exported name (`ty_i32`, `src/hooks.mc`), and this crumb's
+two. The rule that goes with it, in the predicate's own comment: **a `type_new` id joins
+`tk_is_int_ty` only when the module that registered it says so, by name, there** —
+`type_kind(t) == TK_SINT` is not a shortcut for the same answer, because `TimeSpan`,
+`DateTime` and every future `enum` will register that kind too, and none of them is a
+number.
+
+**The spec's own claim — "two lines, and one predicate, nothing else" — held for every
+DECLARED local, parameter, global and array element (the core's own `walk_narrow`,
+`type_signed` and `fold_taught` do all of that by kind, M45), and did not hold for what
+teko generates for ITSELF.** Every indirect load this project builds — a struct/class
+field, a `ref`/`out` pointee, a static field, a property's auto-generated getter, a
+delegate's by-value capture, an inline array field, a pending (parse-deferred) field
+access — reads through `tk_ldn`'s raw `ld8`/`ld16` (teko_struct.tk), the core's own FIXED
+intrinsics, always zero-extending. Correct for the three unsigned narrow types this
+project already had (`u8`/`u16`/`u32`); silently wrong for a signed one: `box.v = -9;` read
+back `247`. Caught by this crumb's own fixture, not by inspection — `docs/specs/small-ints.md`
+never named the gap because its own worked example never round-tripped a value through a
+STRUCT FIELD, only through locals, a parameter, a return and a local array (all core
+grammar, all already correct).
+
+`teko_array.tk`'s own `tk_arr_load` already carried the fix, for `i32`, its only signed
+narrow element before this crumb (a comment there says so: "the raw load is always
+zero-extending ... so a signed narrower-than-word element ... is cast to its own type
+afterward"). `i32` never reached a struct field, a `ref`/`out` pointee or any of the other
+six shapes above with a NEGATIVE value in any existing fixture, so the same gap already
+existed for `i32` and stayed invisible until `i8`/`i16` — and this crumb's fixture, which
+does exercise every one of those seven shapes — made it observable. The fix is `tk_ld`
+(teko_struct.tk), `tk_arr_load`'s own two-line check factored out once: wrap the raw
+zero-extended load in `tk_cast` (the one surface form that sign-extends by kind,
+`MTASK_CAST`) when the type is `TK_SINT` and narrower than the word. The nine raw
+`tk_call(tk_ldn(ty), addr)` sites this port had — teko_struct.tk's own array-field index,
+teko_access.tk's `ref`/`out` and its static-field chain, teko_expr.tk's field load and its
+delegate-field call, teko_deleg.tk's closure prologue, teko_prop.tk's auto-accessor body,
+teko_heaparr.tk's delegate-element call, teko_this.tk's own field read, and
+teko_typeof.tk's pending-field resolution — now go through it; `teko_array.tk`'s own
+`tk_arr_load` (already correct) and `teko_loop.tk`'s single `TY_UPTR` site (never narrow)
+are untouched. Zero new intrinsics, zero changes to `mc` (D2/D21): the fix is the same cast
+`(i8) x` already lowers to, written by the compiler where nine sites did not write it.
+
+**No accepted program's `--dump-ast` moves.** The check only fires for `type_kind(ty) ==
+TK_SINT && type_width(ty) < 8`, and no existing fixture reads a struct/class field, a
+`ref`/`out` pointee, a static field, a property, a delegate capture or an inline array
+field of `i32` type with a value the sign bit of which matters for the assertion — every
+`i32` use in the existing 45 is either a local, a parameter, a `return`, a widening source,
+or a field/argument the fixture reads back through a comparison the bug's own zero-extension
+does not change the OUTCOME of (`primitives_float.tk`'s `b.w` is an `f64` field, not an
+`i32` one — the value flows through it, the field itself is never narrow-signed). The nine
+sites now route through `tk_ld` produce the identical two-node shape `tk_arr_load` already
+had for `i32`; for every OTHER type (`TK_INT`, `TK_FLOAT`, a row of the type table) the
+function returns the raw call unchanged, byte-for-byte the same node the old code built.
+
+`tests/primitives_small_ints.tk` (`expect-exit: 42`) is the fixture: negative `i8`/`i16`
+locals with a signed `>>`, `/`, `%` and comparison; a local array (the core-grammar
+baseline); every one of the seven indirect-load shapes above, each with a value whose sign
+bit the assertion depends on; the nine-slot `f64` conversion (an initializer, an
+assignment, a free call's argument, an explicit narrowing cast back); and the wrap
+arithmetic `docs/specs/small-ints.md` § 4 states — `(i8) 100 + (i8) 100` is `200` in
+flight and `-56` at the next store, `(i16) 32767 + (i16) 1` wraps to `-32768` the same
+way, because teko does not teach C#'s integer promotion (a decision `u8`/`u16`/`u32`
+already made, D3 forbidding a change to `mc`'s own `+`).
+
+`sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong` stay ordinary identifiers
+([not-yet.md](docs/reference/not-yet.md)): the spec's own § 1 leaves the seven-word C#
+alias family an open fork this crumb does not take.
+
+Proof: `mc build . --config mc.macos.toml` clean; 46/46 fixtures at their `expect-exit`
+(the 45 existing plus `primitives_small_ints`); `--dump-ast` of the 45 existing fixtures
+byte-identical to `29a7825f`; `FIXPOINT OK` (`teko2.o == teko3.o` on the first turn,
+`--dump-asm` diff empty, 46/46 under the self-hosted `teko1`); `sh scripts/check-docs.sh`
+green (399 links, 345 diagnostics, 85 samples — no new diagnostic string, so
+`docs/reference/diagnostics.md` needed no change); `mc limits . --config mc.macos.toml`
+verdict `ok` on both `build/teko.mc` and `tests/hello.tk`, `types` `7/14` to `9/14` and
+`alias` `14/28` to `16/28` — the spec's own § 10 table predicted `alias` would stay put;
+measured, a `type_new` registration moves it the same as `types`, by the count of new
+words, not just the estimator's `types` row — `passes` `15/30` and `intrin` `8/16`
+unmoved, exactly as the spec's table also said. `mc pkg hash .` reported in the PR.

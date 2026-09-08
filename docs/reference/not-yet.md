@@ -25,6 +25,7 @@ Nothing here is a promise about a later version; what is designed and not built 
 | a standalone `when` | `teko: when not taught yet` |
 | `type X = ...` | not taught: there is no type alias in the surface |
 | a variant / discriminated union | not taught |
+| `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong` | not taught: ordinary identifiers, because teko registers none of the seven C# alias words — `i8`/`i16` are `type_new` primitives of their own, spelled `mc`'s way, not C#'s ([types.md](types.md#i8-and-i16)) |
 
 Interfaces have no covariance and no contravariance, and a `struct` has no reference count
 of its own ([memory.md](memory.md)).
