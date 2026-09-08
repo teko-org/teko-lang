@@ -120,7 +120,7 @@ lowering table instead of `Name_new()`.
 #include "time.tk"
 
 i64 main() {
-    DateTime leap = new DateTime(638443008000000000);   // 2024-02-29, Unspecified
+    DateTime leap = new DateTime(638447616000000000);   // 2024-02-29, Unspecified
     DateTime next = leap.AddDays(1);
     if (next.Month != 3) return 1;
     if (next.Day != 1) return 2;
@@ -152,7 +152,7 @@ i64 main() {
     DateTime sum = a + b;         // teko: no operator `+` takes these operands
     i64 raw = a;                  // teko: a value of type DateTime does not convert to i64
     DateTime c = 5;               // teko: a value of type i64 does not convert to DateTime
-    i64 cast = (i64) a;           // teko: a date does not cast; `.Ticks` reads it
+    i64 cast = (i64) a;           // teko: a DateTime does not cast; `.Ticks` reads it
     TimeSpan t = b - 1;           // teko: a value of type i64 does not convert to DateTime
     i64 y = a.Yearr;              // teko: unknown member of DateTime
     i64 n = DateTime.Now();       // teko: DateTime.Now is not taught yet
@@ -166,7 +166,7 @@ i64 main() {
 | a `DateTime` in an `i64` slot | `teko: a value of type DateTime does not convert to i64` |
 | a `DateTime` in an `f64` slot | `teko: a value of type DateTime does not convert to f64` |
 | an integer in a `DateTime`/`TimeSpan` slot | `teko: a value of type i64 does not convert to DateTime` |
-| `(i64) dt`, `(DateTime) n` written by hand | ``teko: a date does not cast; `.Ticks` reads it and `new DateTime(t)` builds it`` |
+| `(i64) dt`, `(DateTime) n` written by hand | ``teko: a DateTime does not cast; `.Ticks` reads it and `new DateTime(...)` builds it`` |
 | an unknown member | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` |
 | `DateTime.Now`, `UtcNow`, `Today` | `teko: DateTime.Now is not taught yet` (§ 8) |
 | `extern` with a `DateTime` parameter | none: a `DateTime` is eight bytes and passes as one, so an `extern` takes it |

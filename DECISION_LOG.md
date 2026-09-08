@@ -1142,9 +1142,10 @@ Proof: `mc build . --config mc.macos.toml` clean on mc **0.15.23** (`MC_VERSION`
 functions, zero deleted and zero changed lines, which is the file growing and not the
 accepted code moving; `FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm`
 diff empty over 205653 lines, 51/51 under the self-hosted `teko1`);
-`sh scripts/check-docs.sh` green but for one PRE-EXISTING failure, `docs/reference/types.md`
-line 88 (`f64 f = a;` with a negative `i8` answers wrong on macOS/aarch64), which reproduces
-on `c13d7d84` and belongs to the small-ints crumb, not to this one; `mc limits . --config
+`sh scripts/check-docs.sh` green (466 links, 356 diagnostics, 95 samples) — a first run
+reported `docs/reference/types.md` line 88 failing, which was the unpinned `mc` on the PATH
+(0.15.18, the `fa_cast` D37 fixed) building the sample; with the pinned 0.15.23 the sample
+passes on `c13d7d84` and on this branch alike; `mc limits . --config
 mc.macos.toml` verdict `ok`, `types` `10` → `11` and `alias` `17` → `19` (the `type_new`
 plus `DateTimeKind`'s `type_alias`), `syntax` `15`, `passes` `15/30` and `intrin` `8/16`
 **unmoved**. Thirty-two refusal probes outside `tests/` (`build/refuse/*`, not committed)
