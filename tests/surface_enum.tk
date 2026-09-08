@@ -2,9 +2,12 @@
 // explicit values, the default underlying `i32`, an explicit `: u8` and an
 // explicit signed `: i16`), the six comparisons, the bitwise trio plus unary
 // `~`, both explicit conversions, an enum global/field/array element/
-// parameter/return, a duplicate value used as an alias, and a `switch` with
-// a fallthrough pair of case labels and a `default` (docs/specs/enum.md
-// N2a).
+// parameter/return, a duplicate value used as an alias, a `switch` with a
+// fallthrough pair of case labels and a `default`, and overload resolution
+// on an enum member (docs/specs/enum.md N2a; the overload half is the fix
+// for `teko-org/teko-lang#685`'s review, `tk_ov_args_fit`/`tk_pm_elem_fits`
+// treating every `N_INT` as the untyped integer literal without asking
+// whether its own `nd_type` names a row of the type table first).
 //
 // expect-exit: 42
 
@@ -14,6 +17,7 @@ enum Color { Red, Green, Blue }                  // default underlying: i32
 enum Level : u8 { Low = 10, Mid, High }          // 10, 11, 12
 enum Signed : i16 { Neg = 0 - 100, Zero = 0, Pos = 100 }
 enum Perm { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
+enum Other { X }                                 // a second, unrelated enum
 
 Color g_color = Color.Blue;                      // a global of enum type
 
@@ -41,6 +45,31 @@ i64 describe(Color c) {
             break;
     }
     return r;
+}
+
+// overload resolution: an enum member is an `N_INT` (`teko_enum.tk`'s own
+// declaration retags the folded node's type to the enum's row, D39), and it
+// is judged as a TYPED value -- never the untyped integer literal every
+// other `N_INT` is, past the check whether `nd_type` names a row of the type
+// table (`tk_struct_by_ty(nd_type(a)) >= 0`).
+i64 pick_ci(Color c) { return 100; }             // f(Color) / f(i64): `Color.Red`
+i64 pick_ci(i64 n)   { return 200; }             // picks Color, `1` still picks i64
+
+i64 pick_co(Color c) { return 300; }             // f(Color) / f(Other): arity ties,
+i64 pick_co(Other o)  { return 400; }            // the TYPE is what has to decide
+
+i64 pick_ar(Color c)          { return 500; }    // f(Color) / f(Color, i64): arity
+i64 pick_ar(Color c, i64 n)   { return 600; }    // alone decides, the type never in doubt
+
+i64 sum_colors(params Color[] cs) {              // `tk_pm_elem_fits`'s own rule
+    i64 s = 0;
+    i64 i = 0;
+    while (i < cs.Length) {
+        Color v = cs[i];                         // a cast binds tighter than `[`, the
+        s = s + (i64) v;                         // same pre-existing ambiguity as `.` (D2)
+        i = i + 1;
+    }
+    return s;
 }
 
 i64 main() {
@@ -108,6 +137,16 @@ i64 main() {
     if (describe(Color.Red) != 1) return 24;
     if (describe(Color.Green) != 1) return 25;
     if (describe(Color.Blue) != 2) return 26;
+
+    // overload resolution on an enum member -- the review's own defect 1
+    if (pick_ci(Color.Red) != 100) return 27;      // Color.Red picks f(Color), not f(i64)
+    if (pick_ci(1) != 200) return 28;               // a plain literal still picks f(i64)
+    if (pick_co(Color.Red) != 300) return 29;       // f(Color) over f(Other), same arity
+    if (pick_ar(Color.Red) != 500) return 30;       // arity alone decides between the two
+    if (pick_ar(Color.Red, 7) != 600) return 31;
+
+    // `params Color[]` with enum members (`tk_pm_elem_fits`)
+    if (sum_colors(Color.Red, Color.Green, Color.Blue) != 3) return 32;
 
     return 42;
 }
