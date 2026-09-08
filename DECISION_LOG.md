@@ -660,3 +660,56 @@ Cloudflare the apex `A` record moves from GitHub's four addresses to the VPS, pr
 `www` becomes a `CNAME` to the apex; the three redirect domains do not change. The `CNAME`
 file the Pages artifact carried is gone with the artifact.
 
+### D37 · The pin rises to 0.15.23 (2026-09-08)
+`MC_VERSION` moves from `0.15.22` to `0.15.23` (`minicompiler/mc` PRs #58-#59). The reason
+is a defect this repository itself reported: on `aarch64`, `lib/machine_arm64_float.mc`'s
+`fa_cast` decided signedness with `t == TY_I64`, true only of the full-width signed
+integer, so every narrower signed source (`i32`, and any `i16`/`i8` a module registers,
+`mc`'s `TK_SINT` kinds) took the UNSIGNED conversion instructions — `ucvtf` widening,
+`fcvtzu` narrowing. `i32 d = -5; f64 x = (f64) d;` read the sign-extended `-5` register as
+a huge positive integer instead of a negative one, correct on `x86_64` (whose `fx_cast`
+already treated everything but `TY_U64`/`TY_UPTR` as signed) and correct on `aarch64` too
+for a non-negative `i32`, which is why the earlier D33 fixture (`primitives_float.tk`)
+never caught it — it probes `2147483647`, the positive boundary, never a negative one. PR
+#59 tests `type_signed()` (`t == TY_I64 || type_kind(t) == TK_SINT`, already exported from
+`src/ast.mc`) at both cast directions instead: `SCVTF`/`FCVTZS` for a signed source or
+target, `UCVTF`/`FCVTZU` otherwise. PR #58, in the same range, touches `Makefile` and
+`site/` only (a glibc `mcsite` render and `make bundle`'s in-place rewrite) — nothing under
+`src/`, `stage0/`, `lib/` or `tools/` outside `machine_arm64_float.mc` itself.
+
+**Zero code changes here beyond the fixture.** `docs/reference/hooks.md` does not appear in
+the `v0.15.22...v0.15.23` diff at all (`gh api repos/minicompiler/mc/compare/...`), and
+neither does `scripts/sysroot-windows.sh` — the kernel32 export list
+`.github/actions/windows-sysroot/action.yml` carries stays the same nineteen names; no sync
+was needed. This repository calls no `<float>` hook directly (D33's own
+finding stands: the bug lives entirely inside `mc`'s bundled float machine, reached only
+through the surface `(f64)`/`(i64)` casts teko already taught), so no hook signature or
+behaviour this repository depends on moved.
+
+`tests/primitives_float.tk` gains the negative-`i32` half D33 left out on purpose
+(`docs/reference/not-yet.md` § *Numeric conversions*, now removed — the gap it named is
+closed): a negative `i32` widened to `f64` at the same three slots the positive boundary
+already covers — a variable initializer, a field store, a free call's argument — plus a
+narrowing `(i64)` cast back, which exercises `fcvtzs` the same way. `expect-exit: 42`
+unchanged; the fixture now returns 22-25 for the four new checks instead of falling
+through past 21.
+
+Proof: a standalone probe (`i32 d = -5; f64 fd = d; if (fd < 0.0) return 42; return 1;`)
+built by the taught compiler exits `1` under mc 0.15.22 (the bug, reproduced) and `42`
+under mc 0.15.23 (fixed) — same probe source, same teko frontend, only the `mc` release
+under it changed. 45/45 fixtures at their `expect-exit` (`primitives_float` included, now
+at its widened `expect-exit: 42` through the new checks), `FIXPOINT OK` (`teko2.o ==
+teko3.o` on the first turn, `--dump-asm` diff empty), `sh scripts/check-docs.sh` green (397
+links, 345 diagnostics, 83 samples), `mc limits . --config mc.macos.toml` verdict `ok` on
+every table for both `build/teko.mc` and `tests/hello.tk`, unchanged against the 0.15.22
+baseline. `mc pkg hash .` unchanged (`3e6feff8e981912423654dbc12ca6d4948efa89d21ea02128b7636f0683791b1` —
+the hash reads no path this pin's changes touch). `--dump-ast` of all 45 fixtures, taken on
+the tree BEFORE the fixture edit (so the comparison is the pin alone), is byte-identical
+between `0.15.22` and `0.15.23` on every one — confirming the codegen fix changes no AST
+this repository's grammar produces, only the instructions the backend emits underneath it.
+Only then was `MC_VERSION` written and the literal `0.15.22` mentions (`CONTRIBUTING.md`,
+`docs/guide/00-getting-started.md`, `.github/workflows/site.yml`) raised to `0.15.23`; the
+two `0.15.22` mentions left alone are historical (D35's own entry above, and
+`windows-sysroot/action.yml`'s comment on which release added which kernel32 export, both
+about the PAST release and not the current pin).
+
