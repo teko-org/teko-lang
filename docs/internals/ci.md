@@ -75,12 +75,13 @@ sysroot action, so they cannot assemble different sysroots.
 `site.yml` has two jobs. `build` obtains the pinned `mc` through `setup-mc`, checks
 `minicompiler/mc` out at **the tag that action resolved** into `_mc/`, builds `mcsite` there
 (`mc build site --config site/mc.linux.toml`, mc's own ELF writer, no linker), and runs
-`_mc/build/mcsite site --check` from the repository root. On a push to `main` the same
-job commits what it rendered as an orphan commit on the `site` branch and force-pushes it
-with the workflow's own token (`contents: write`); the VPS that serves teko-lang.org pulls
-that branch every five minutes and hands it to nginx behind Traefik, the same server and
-the same rite as mc's own domain (D36). No deploy credential exists: the repository is
-public and the server only reads it.
+`_mc/build/mcsite site --check` from the repository root, with `contents: read` — a pull
+request's check never holds a write token. On a push to `main` it hands the rendered
+`public/` to `publish`, the one job granted `contents: write`, which commits that tree as an
+orphan commit on the `site` branch and force-pushes it with the workflow's own token; the
+VPS that serves teko-lang.org pulls that branch every five minutes and hands it to nginx
+behind Traefik, the same server and the same rite as mc's own domain (D36). No deploy
+credential exists: the repository is public and the server only reads it.
 
 Nothing of the generator is vendored here, so it cannot drift from the compiler the fixtures
 were proved on: raising `MC_VERSION` moves both at once. Everything `mcsite` reads at run

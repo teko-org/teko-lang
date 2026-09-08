@@ -2,7 +2,7 @@ name: site
 
 # Builds teko-lang.org out of `docs/` and publishes the rendered pages to the
 # `site` branch, which the VPS that serves the domain pulls every five minutes
-# (DECISION_LOG.md D37): no deploy credential leaves this repository, because
+# (DECISION_LOG.md D36): no deploy credential leaves this repository, because
 # the repository is public and the server only ever reads it.
 #
 # THE GENERATOR IS NOT VENDORED. `mcsite` is `minicompiler/mc`'s own site
@@ -38,12 +38,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # the build job force-pushes the `site` branch
+  contents: read
 
 # One publish at a time, and never cancel one halfway: two force-pushes of the
-# `site` branch racing each other would leave the server with whichever won.
+# `site` branch racing each other would leave the server with whichever won. A
+# pull request's check is its own group, so it never queues behind a publish.
 concurrency:
-  group: site
+  group: site-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
   cancel-in-progress: false
 
 jobs:
@@ -121,8 +122,34 @@ jobs:
           cp -R site/public public
           find public -maxdepth 2 | sort | head -40
 
-      - name: publish public/ to the site branch
+      - name: hand public/ to the publish job
         if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-public
+          path: public
+          retention-days: 1
+          if-no-files-found: error
+
+  # The only job that can write to the repository: it force-pushes the rendered
+  # tree as an orphan commit on the `site` branch, and nothing else. `build`
+  # keeps `contents: read`, so a pull request's check never holds a write token.
+  publish:
+    name: publish
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: take public/ from the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: site-public
+          path: public
+
+      - name: publish public/ to the site branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
