@@ -77,6 +77,31 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 A run-time index into a **fixed** array is not guarded; every index into a `T[]` is
 ([arrays.md](arrays.md)).
 
+## The nullable `T?`
+
+`T?` is taught over a REFERENCE — a class, an interface, a delegate, a `T[]` and a
+`struct` ([nullable.md](nullable.md)). What is not taught around it:
+
+| written | message |
+|---|---|
+| `i64?`, `f64?`, `bool?`, `char?`, an `enum?`, `TimeSpan?`, `DateTime?` | `teko: a nullable of a value type is not taught yet` — the counted box is a later crumb |
+| `T??` | `teko: a nullable of a nullable is not taught` |
+| `uptr?`, `ptr?`, `str?` | `teko: a raw pointer has no nullable` |
+| `void?` | `teko: void? is not a type` |
+| `Nullable<T>` spelled out | `teko: not a generic type` — the spelling is `T?` and there is no `Nullable` type word |
+| `Box<Cell?>`, a nullable as a generic argument | `teko: a nullable is not a generic argument yet` — a type argument travels as a spelling, and `Cell?` is not one the lexer can form |
+| `a ?? b`, `a?.m` | not taught: the two operators are a later crumb, and `??` will tie with the ternary at precedence 1, so `a \|\| b ?? c` will read as `(a \|\| b) ?? c` where C# reads `a \|\| (b ?? c)` |
+| `a == b` on two nullables | ``teko: Cell? declares no operator `==` `` — comparing two handles is not comparing two values |
+| `a + b`, `a < b`, `a & b` on nullables (C#'s lifted operators) | ``teko: Cell? declares no operator `+` `` |
+| `T?` to `U?` where `T` converts to `U` | `teko: a value of type Circle? does not convert to Shape?` — no covariance between nullable rows; write `x.Value` |
+| `x.GetValueOrDefault()` on a reference nullable | `teko: a reference nullable has no default` — `default(T)` for a reference is `null`, which is the one value a `T` slot may not take |
+| `x.Value = e` | `teko: .Value is not a slot` |
+| `c.v` on a `Cell?` (flow narrowing, C# 8's `if (c != null) { c.v }`) | `teko: a Cell? is read through .Value` — the analysis behind narrowing is a dominator pass this design does not buy |
+| `f(3, 4)` on an `Op?` local | `call to unknown function f`, from the core — a nullable delegate is a value to compare and to pass, not one to call, and `.Value(...)` is not taught either |
+| `x is null`, `case null:` | there is no `is` in teko, and a `switch` takes no reference subject at all |
+| `x.ToString()` on a nullable | deferred with all text |
+| a `switch` whose subject is a `Cell` or a `Cell?` | **accepted and compared as a pointer**, which no `case` label can match. Pre-existing for every reference, not a nullable's own |
+
 ## Namespaces and order of declaration
 
 | written | message |
@@ -87,6 +112,7 @@ A run-time index into a **fixed** array is not guarded; every index into a `T[]`
 | a `global`, an `extern` or `main` inside a namespace block | `teko: a global is declared outside every namespace`, and its two siblings |
 | a **qualified** base or interface declared **below** its use | `teko: unknown base class or interface` |
 | a base class in **another** namespace, declared below | the same |
+| a `T[]` or a `T?` on a SHORT type name inside a `namespace`, at a parameter or a return | `name expected`, from the core — the short-name reader answers the type without going through `p_type()`, so no type suffix is ever read at that position. Write the declaration outside the namespace |
 | a type used above an `#include "x.tk"` that declares it | `expected ; after expression`, from the core — the forward scan does not read across a raw `#include`, so the name is not a type there; use `import` |
 
 ## Parameters and calls

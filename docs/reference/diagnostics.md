@@ -456,6 +456,35 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
   know to be one. Bind it to a local of the right type first.
 
+## The nullable `T?`
+
+Every one of these is [nullable.md](nullable.md)'s.
+
+- `"teko: null needs a slot declared "` — completed by the slot's own type and a `?`
+  (`teko: null needs a slot declared Cell?`). `null` lands only in a slot written `T?`;
+  declare it that way, or build a value. A COMPARISON against `null` is untouched.
+- `"teko: a Cell? is read through .Value"` — the `a ` and the ` is read through .Value`
+  around the type's own name: a member of the enclosed type, read straight off the
+  nullable. `Nullable<T>` has the members `Nullable<T>` has, so write `c.Value.v`.
+- `"teko: unknown member of Cell?: zz"` — the same wording every other receiver gets, for a
+  name that is a member of nothing.
+- `"teko: .Value is not a slot"` — `x.Value = e`. A nullable is written whole.
+- `"teko: a reference nullable has no default"` — `GetValueOrDefault()` on a `T?` over a
+  reference. Its C# answer is `null`, which is the one value a `T` slot may not take.
+- `"teko: a nullable of a value type is not taught yet"` — `i64?`, `f64?`, `bool?`,
+  `char?`, an `enum?`, `TimeSpan?`, `DateTime?`. The counted box is a later crumb.
+- `"teko: a nullable of a nullable is not taught"` — `T??`, and `T[]??`.
+- `"teko: a raw pointer has no nullable"` — `uptr?`, `ptr?`, `str?`. `0` is an ordinary
+  value of a raw pointer, and `null` already lands in one.
+- `"teko: void? is not a type"` — `void?`.
+- `"teko: a nullable is not a generic argument yet"` — `Box<Cell?>`. A type argument
+  travels as a spelling and `Cell?` is not one the lexer can form.
+- `"teko: a value of type Cell? does not convert to Cell"` — the ordinary conversion
+  wording: `T?` does not convert to `T`, and one nullable row does not convert to another.
+  Write `.Value`.
+- `"teko: a nullable with no value"` — a run-time **panic**, exit 70: `.Value` on a handle
+  of 0 ([memory.md](memory.md)).
+
 ## Namespaces, `using` and `import`
 
 - `"teko: a nested namespace is not taught"` — one level; write `namespace A.B` instead of
@@ -648,6 +677,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `new` on a type declared below"`` | 32 |
 | `"teko: too many static accesses on a type declared below"` | 32 |
 | `"teko: too many consts"` | 128 member constants |
+| `"teko: too many compiler-written nulls in one unit"` | 64 ternaries over a reference type in one unit |
 | `"teko: too many top-level consts"` | 128 |
 | `"teko: too many local arrays"` | 1024 declarations in scope |
 | `"teko: too many global arrays"` | 512 in one source |

@@ -1226,3 +1226,113 @@ three it extends differing by insertion (and the gensym renumbering an insertion
 `mc limits` unmoved (`types` 11, `alias` 19, `syntax` 15, `passes` 15/30, `intrin` 8/16);
 `mc pkg hash .` in the pull request.
 
+
+### D43 · `T?` over a reference, and `null` only in a slot declared `T?` (2026-09-08)
+[`docs/specs/nullable.md`](docs/specs/nullable.md) § 19's four proposals, as far as Q0 and
+Q1a carry them. Three of the four land here; the fourth (definite assignment) is Q3's and
+is untouched.
+
+**1. `T?` is one row of the type table over the type it encloses, and the value is the
+handle itself.** `TK_KNULL` is a sixth row kind beside `TK_KSTRUCT`/`TK_KCLASS`/
+`TK_KIFACE`/`TK_KDELEG`/`TK_KARRAY`/`TK_KENUM` ([`teko_struct.tk`](teko_struct.tk)), made
+lazily by `tk_nl_row` the first time a source spells the suffix — the exact shape
+`tk_ha_row` has for `T[]`, down to the registered name being a lexeme the lexer can never
+form. For a REFERENCE `T` — a class, an interface, a delegate, a `T[]` of heap, a `struct` —
+the handle IS `T`'s own pointer and `null` is `0`, so `Cell?` and `Cell` have the same
+representation and the reclaim serves both with no line of its own: `tk_is_counted` answers
+for a nullable row whatever it answers for the row it encloses, and `rc_dec(0)`/`rt_own(0)`
+were already no-ops over the null handle. `tk_row_fits` gains the implicit `T` → `T?` (and
+`D` → `B?`, `C` → `I?`, wherever `D` → `B` already fits) and refuses both `T?` → `T` and one
+nullable row into another; `tk_ty_mangle_name` maps the row to `opt_T`, the rule `arr_T`
+already lived by. The VALUE arm — the counted box for `i64?`, `f64?`, an `enum?`,
+`TimeSpan?` — is Q1b's and is refused by name here:
+`teko: a nullable of a value type is not taught yet`.
+
+**2. `null` lands only in a slot declared `T?`, and a comparison against `null` stays legal
+anywhere a reference-shaped value does.** The first half supersedes D32's "a reference lands
+on any row" for the STORE direction, in the two places that judged it: `tk_ov_args_fit`
+([`teko_over.tk`](teko_over.tk)) now lets `null` land on a raw `uptr` or on a nullable
+parameter and on nothing else, so `held(null)` against `held(Cell)` and `held(Cell?)` picks
+the nullable one instead of being ambiguous; `tk_pm_elem_fits`
+([`teko_params.tk`](teko_params.tk)) does the same for an element of a `params T[]`. The
+refusal itself is one clause of `tk_check_scalar_compat`
+([`teko_typeof.tk`](teko_typeof.tk)) — `teko: null needs a slot declared Cell?` — which
+every store slot of the language already reaches, measured slot by slot in
+[`docs/internals/nullable-probes.md`](docs/internals/nullable-probes.md) probe 1b. The one
+store that does not reach it is an ELEMENT of a `T[]`: `tk_ha_store`
+([`teko_heaparr.tk`](teko_heaparr.tk)) judges its value through `tk_check_field_store`
+([`teko_struct.tk`](teko_struct.tk)), which returned at once for a `null`, so the rule is
+applied in that function's own `null` arm as well. The second half needs no code and is what
+keeps § 9's three roads honest: a zeroed field, an element of `new T[n]` and a `struct`
+declared without `new` all still deliver a `null` to a non-nullable slot, so refusing
+`c == null` would delete the defensive code that catches them and make the run-time guards
+unreachable from the surface.
+
+**3. `Nullable<T>` is the compiler's construct, not an instance of the generic mechanism.**
+It reads at the type position through a second `syntax_type` handler
+([`teko_null.tk`](teko_null.tk)) registered behind the array's, and the two cooperate rather
+than race: `take_type` offers a position to the chain ONCE, so `Cell?[]` is read here and
+handed to `tk_ha_type`, and `Cell[]?` is read there and handed to `tk_nl_row`. Both were
+measured as failures before they were written (probes 1 and 2). `HasValue` is `x != 0`;
+`x.Value` is `tk_nl_ck(x)`, the guard, then the same pointer;
+`GetValueOrDefault()` is refused on a reference nullable because C#'s answer for it is
+`null`, which is the one value a `T` slot may not take.
+
+**Four departures from the spec, each measured rather than argued.**
+
+- **`tk_nl_ck` is GENERATED, not written into `lib/rt.tk`.** Everything in `lib/rt.tk` is
+  parsed into every program that includes it, so a function added there moves the
+  `--dump-ast` of every fixture — and this crumb's own gate is that a fixture spelling no
+  `?` does not move at all. It is emitted once per unit that spells `.Value`, through
+  `tk_top_emit`, the discipline `tkarr_release_T` already uses.
+- **The refusal for a member of the enclosed type reads `teko: a Cell? is read through
+  .Value`, not the spec's `… .Value or ?.`.** `?.` is Q2's and does not exist yet; a refusal
+  naming a form the language does not have is a refusal that lies. Q2 widens the wording
+  when it lands the operator.
+- **`ref T?` and `out T?` are TAUGHT**, where § 11 listed them as not-yet: they were
+  measured working at both positions, with an object and with `null`, and with the reclaim
+  ending at its floor, so refusing them would be refusing something that works.
+  `tests/surface_nullable_ref.tk` carries the oracle.
+- **A `null` the COMPILER wrote is not judged by rule 1.** `tk_tern_lower`
+  ([`teko_ternary.tk`](teko_ternary.tk)) declares its temporary of reference type with a
+  `null` placeholder both branches overwrite before anything reads it. It is registered as
+  the compiler's own (`tk_nl_own_null`, [`teko_null.tk`](teko_null.tk)) and skipped by the
+  check — the exact standing D41 gives `tk_prim_raw`'s cast against `tk_prim_cast_check`,
+  and what keeps `tests/surface_ternary.tk` and `tests/surface_switch.tk` byte-identical.
+
+**Two positions `T?` does not reach, both found by Q0 and neither worked around.** A
+nullable as a GENERIC ARGUMENT is refused where it stands
+(`teko: a nullable is not a generic argument yet`, one line in `tk_gen_read_targ`): a type
+argument travels as the SPELLING of the type, substituted into the template and mangled
+into the instance's declaration name, and `Cell?` is not a spelling the lexer can form. A
+SHORT type name inside a `namespace`, at a parameter or a return, never reaches the
+`syntax_type` chain at all — `tk_ns_param_ty` answers the type without calling `p_type()` —
+and that is **pre-existing and shared with `T[]`**: measured on the stock `0a37e491`,
+`i64 use(Cell[] cs)` and `Cell[] make()` inside a namespace already answered `name expected`
+there, with no `?` anywhere. Both are rows of
+[`docs/reference/not-yet.md`](docs/reference/not-yet.md), not patches here, and neither is a
+defect on `mc`'s side: the position is teko's own reader.
+
+**The migration is a breaking change, and it is nine fixtures.** `Cell c = null;` compiled
+before this entry and does not after. Two shapes, exactly as § 10 planned them: declare the
+slot `T?` where the name is only ever compared against `null` (`order_types.tk`,
+`surface_delegate.tk`'s `ncheck`, `surface_overload_free.tk`'s `held`), and close a block
+around the value's life where the name is read afterwards (`surface_delegate.tk`'s `rcheck`,
+`surface_lambda.tk`, `surface_params.tk`, `surface_refout.tk` three times,
+`surface_array_heap.tk`, `surface_foreach.tk`) — the reclaim already releases at the `}` and
+on the way out of a `return`, so `x = null;` followed by an `rt_live()` assertion becomes a
+`}` followed by the same assertion. `surface_panic_null.tk` is the tenth shape and the
+interesting one: its `Op f = null; return f(1, 2);` becomes a null arriving through a ZEROED
+FIELD, which keeps the exit-70 oracle and documents § 9's first road at the same time. Six
+fences of the guide and the reference migrate the same two ways.
+
+**Proof:** the taught compiler builds on mc 0.15.23; 53/53 fixtures at their `expect-exit`
+(51 before, plus `surface_nullable_ref.tk` at 42 and `surface_nullable_panic.tk` at 70);
+`--dump-ast` of the 42 fixtures this crumb does not touch **byte-identical** to `0a37e491`,
+and the nine migrated ones differing only by the type word or the block insertion — that is
+the proof the new clauses fire only where a `?` is written; `FIXPOINT OK`;
+`sh scripts/check-docs.sh` green; `mc limits` with `types` 11, `alias` 19, `syntax` 15,
+`passes` 15/30 and `intrin` 8/16 all **unmoved**, and the single row that moves being
+`syntax_type` 1/8 → 2/8, which is what a second registration is; twenty-nine refusal probes
+outside `tests/` (`build/probe_*`, not committed) enumerated in the pull request, each with
+its message and its exit; `mc pkg hash .` in the pull request.

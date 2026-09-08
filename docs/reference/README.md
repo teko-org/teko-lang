@@ -19,6 +19,7 @@ CI legs run on every push.
 | [generics.md](generics.md) | `class Box<T, const N: i64>`, instantiation and mangling, inline array fields, partial generics |
 | [delegates.md](delegates.md) | `delegate`, contextual and explicit values, the null panic, lambdas, `use (...)` by value and by reference |
 | [arrays.md](arrays.md) | fixed arrays local, global and inline; the heap `T[]`, its run-time index guard and its counted elements |
+| [nullable.md](nullable.md) | `T?` over a reference: the rule that `null` needs a `T?` slot, `HasValue`/`Value`, the conversions, the overloads and the reclaim |
 | [namespaces.md](namespaces.md) | `namespace`, `using`, `import`, how a bare name resolves, `internal` |
 | [control-flow.md](control-flow.md) | `if`, `loop`/`break N`/`continue N`, `while`, `do`, `for`, `foreach`, both `switch` spellings, the ternary |
 | [parameters.md](parameters.md) | default arguments, overloads, `ref`/`out`, `params` |
