@@ -1,9 +1,14 @@
 # `T?` — the nullable, over any type
 
-**Designed, not built.** Nothing on this page runs today; every fenced sample is marked
-`// no-run` for that reason. The reference describes what runs
-([types.md](../reference/types.md), [memory.md](../reference/memory.md)); this page is the
-plan for the delta.
+**Half built.** Q0 and Q1a landed (D43): the row, the `?` suffix at every declaration
+position it reaches, `HasValue`/`Value`, the reclaim, and the rule that `null` needs a slot
+declared `T?` — over a REFERENCE. What runs is
+[the reference page](../reference/nullable.md), and the ten probes behind it are
+[nullable-probes.md](../internals/nullable-probes.md); D43 records the four places this page
+was measured wrong and what replaced them. The rest — the counted box for a value type
+(Q1b), `??` and `?.` (Q2), definite assignment (Q3) and the lifted `==` (Q4a) — is still a
+plan, and every fenced sample stays `// no-run` because the page describes the whole design
+rather than the part that runs.
 
 `T?` is teko's one nullable mechanism. It is sugar for `Nullable<T>` over **any** type —
 a class, an interface, a delegate, a `struct`, a `T[]`, `string` when it lands, and every

@@ -71,10 +71,16 @@ void set_ha_put_at(i64 i, i64 v) { st64(ha_put + i * 8, v); }
 // delegate FIELD's own call does (`tk_field_deleg_call`).
 i64 tk_args(uptr pn);
 
-uptr tk_ha_relname(i64 ety)   { return tk_join("tkarr_release_", type_name(ety)); }
-uptr tk_ha_vtname(i64 ety)    { return tk_join("tkarr_vt_", type_name(ety)); }
-uptr tk_ha_allocname(i64 ety) { return tk_join("tkarr_new_", type_name(ety)); }
-uptr tk_ha_putname(i64 ety)   { return tk_join("tkarr_put_", type_name(ety)); }
+// A generated SYMBOL is mangled, never spelled: `tk_ty_mangle_name`
+// (teko_struct.tk) is the identity every one of the four uses, because an
+// element type may itself be a row whose registered NAME carries `?` (`Cell?`,
+// Q1a) or `[`/`]` -- neither of which a linker symbol may hold. For every
+// element type that is a plain word it is `type_name` itself, so the symbols
+// this module already emitted do not move.
+uptr tk_ha_relname(i64 ety)   { return tk_join("tkarr_release_", tk_ty_mangle_name(ety)); }
+uptr tk_ha_vtname(i64 ety)    { return tk_join("tkarr_vt_", tk_ty_mangle_name(ety)); }
+uptr tk_ha_allocname(i64 ety) { return tk_join("tkarr_new_", tk_ty_mangle_name(ety)); }
+uptr tk_ha_putname(i64 ety)   { return tk_join("tkarr_put_", tk_ty_mangle_name(ety)); }
 
 // `ld64(t + 16)`, freshly built every time: a node lives in only one sibling
 // list, so a caller that needs it twice (the release fn's own size, and,
@@ -338,7 +344,16 @@ i64 tk_ha_type(i64 ty) {
     i64 line = p_line();
     uptr fl = p_file();
     if (p_id() == K_LBRACK) err_at(fl, line, "teko: an array of arrays is not taught yet");
-    return tk_ha_row(ty);
+    i64 row = tk_ha_row(ty);
+    // Q1a: `Cell[]?`, a NULLABLE array. `take_type` dispatches the chain once
+    // per type position, so the `?` that follows `[]` has to be read here --
+    // this is the array half of the two-line cooperation teko_null.tk's own
+    // `tk_nl_type` makes from the other side (`Cell?[]`).
+    if (p_id() != tk_nl_quest) return row;
+    p_next();
+    if (p_id() == tk_nl_quest) err_at(fl, line, "teko: a nullable of a nullable is not taught");
+    if (p_id() == K_LBRACK) err_at(fl, line, "teko: an array of arrays is not taught yet");
+    return tk_nl_row(row);
 }
 
 void tk_ha_init() {

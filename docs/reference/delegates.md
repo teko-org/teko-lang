@@ -22,7 +22,7 @@ machine's twelve on the code pointer and the object itself.
 |---|---|
 | `Op f = add;` | contextual: the function's name is wrapped in a thunk |
 | `Op g = new Op(mul);` | the explicit form of the same |
-| `Op h = null;` | the null delegate |
+| `Op? h = null;` | the null delegate: `null` needs a slot declared `T?` |
 | `Op p = flag != 0 ? add : mul;` | a ternary of two function names, coerced arm by arm |
 | `f = g;` | another value of the same delegate type |
 
@@ -83,7 +83,7 @@ i64 main() {
     h.cb = f;
     if (h.cb(2, 3) != 5) return 6;               // called where it is read
 
-    Op maybe = null;
+    Op? maybe = null;
     if (maybe != null) return 7;
 
     return f(20, 20) + g(1, 2);                  // 40 + 2
@@ -96,9 +96,13 @@ i64 main() {
 
 delegate i64 Op(i64 a, i64 b);
 
+class NH {
+    public Op cb;                                // never assigned: rt_alloc zeroes it
+}
+
 i64 main() {
-    Op f = null;
-    return f(1, 2);                              // teko: call through a null delegate
+    NH h = new NH;
+    return h.cb(1, 2);                           // teko: call through a null delegate
 }
 ```
 
@@ -214,15 +218,17 @@ class Box {
 }
 
 i64 main() {
-    Box b = new Box(42);
-    BoxOp f = new BoxOp(() use (b) => b.v);
-    i64 got = f();
-
-    b = null;
-    if (released != 0) return 1;                 // the closure keeps it alive
-    if (rt_live() != 2) return 2;                // the Box and the closure
-
-    f = null;
+    i64 got = 0;
+    {
+        BoxOp f;
+        {
+            Box b = new Box(42);
+            f = new BoxOp(() use (b) => b.v);
+            got = f();
+        }                                        // the Box's own slot closes here
+        if (released != 0) return 1;             // the closure keeps it alive
+        if (rt_live() != 2) return 2;            // the Box and the closure
+    }                                            // ...and the closure's closes here
     if (released != 1) return 3;
     if (rt_live() != 0) return 4;
     return got;

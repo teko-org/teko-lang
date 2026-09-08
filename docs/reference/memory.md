@@ -75,7 +75,10 @@ reference field reads as null.
 | a **global**, a **static field**, a **Singleton** | never released: it is a root |
 | a **parameter** of class type | **borrows** — it carries no count of its own, and reassigning it is refused |
 
-"Counted" means a class, an interface, a delegate or a `T[]`. A value produced and handed
+"Counted" means a class, an interface, a delegate or a `T[]` -- and a `T?` over any of
+them, which is counted exactly as what it encloses is: `Cell?` IS the `Cell` pointer, and
+the null handle `0` is a release the runtime already treats as a no-op
+([nullable.md](nullable.md)). A value produced and handed
 straight to a call — `f(new Cell(1))` — has no owner, so it is **parked** and released when
 the statement that built it ends, which is C#'s and C++'s rule for a temporary. At most 64
 such temporaries may be alive in one statement.
@@ -154,6 +157,7 @@ with classes sees a floor above zero rather than a wrong answer.
 | | why |
 |---|---|
 | a `struct` allocation | a struct has no vtable, so there is no release function to reach and no count to keep |
+| a `struct?` | the same: a nullable answers for the row it encloses, and a struct is not counted |
 | a `static` field of class type | it holds its reference correctly, and lives for the whole run |
 | a global, and a global `T[]` | a root by construction |
 | a Singleton service | a root by design ([di.md](di.md)) |
@@ -185,6 +189,7 @@ no handler. `panic("...")` is a surface function a program may call itself.
 | `index below zero into an array` | a negative index into a `T[]` |
 | `index past the end of an array` | an index at or past `Length` |
 | `a negative array length` | `new T[n]` with `n < 0` |
+| `a nullable with no value` | `.Value` on a `T?` whose handle is 0 ([nullable.md](nullable.md)) |
 | `interface dispatch on a class with no interface table` | an interface call on an object whose class declares none |
 | `interface not implemented by this class` | the table has no row for that interface |
 | `arena exhausted` | the 4 MiB block cannot serve the allocation |

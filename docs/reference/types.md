@@ -207,7 +207,10 @@ i64 main() {
 }
 ```
 
-`null` is a reference and a number is not, so it does not land in a numeric slot either —
+`null` lands **only in a slot declared `T?`** ([nullable.md](nullable.md)):
+`Cell c = null;` is `teko: null needs a slot declared Cell?`, and `Cell? c = null;` is the
+spelling. A comparison against `null` stays legal on any reference-shaped slot. It is not a
+number either, so it does not land in a numeric slot at all —
 `teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
 carries.
 

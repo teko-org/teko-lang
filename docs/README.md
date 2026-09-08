@@ -25,6 +25,7 @@ yet](guide/99-what-is-not-there-yet.md).
 [`reference/`](reference/README.md): [types](reference/types.md),
 [classes and interfaces](reference/classes.md), [generics](reference/generics.md),
 [delegates](reference/delegates.md), [arrays](reference/arrays.md),
+[the nullable `T?`](reference/nullable.md),
 [namespaces](reference/namespaces.md), [control flow](reference/control-flow.md),
 [parameters](reference/parameters.md), [dependency injection](reference/di.md),
 [memory](reference/memory.md), [the runtime](reference/runtime.md),
@@ -48,7 +49,7 @@ types](specs/datetime-extras.md).
 
 ## The internals — how the port itself is built
 
-[`internals/`](internals/README.md): the [34 `.tk` modules](internals/modules.md), the
+[`internals/`](internals/README.md): the [35 `.tk` modules](internals/modules.md), the
 [pass model](internals/passes.md), the [node table](internals/nodes-and-xt.md),
 [reference counting](internals/runtime.md), [dependency
 injection](internals/di.md), the [bootstrap ladder](internals/bootstrap.md),

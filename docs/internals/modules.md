@@ -1,6 +1,6 @@
 # The module map
 
-Thirty-four files: [`teko.tk`](../../teko.tk) and the thirty-three `teko_*.tk` modules it
+Thirty-five files: [`teko.tk`](../../teko.tk) and the thirty-four `teko_*.tk` modules it
 `#include`s. The order of those includes is not cosmetic — a module may forward-declare a
 **function** a later module defines, but a **global** has to already exist where it is
 read, so a file that touches another's tables is included after it. `teko_type.tk` opens
@@ -31,9 +31,10 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_this.tk` | the receiver a method does not declare, `this`, `base.m()` | `syntax_expr("this")` | which type's body is open, and whether it is static |
 | `teko_access.tk` | `public` `private` `protected` `internal` `static` `abstract` `partial`, and `Type.member` | `syntax` for the four leading words, and `syntax_expr`/`syntax_stmt` per type name | the project root `internal` is measured from, deferred static accesses |
 | `teko_typeof.tk` | nothing of the surface: it is the static-type oracle | one `pass()` | the names of one function, and the accesses waiting for the pass |
+| `teko_null.tk` | `T?` over a reference: the `?` type suffix, `HasValue`/`Value`, and the refusal of `null` outside a `T?` slot | `syntax_type` — the second one in this compiler, behind `teko_heaparr.tk`'s | the `?` lexeme, the `null` nodes the compiler wrote itself, and whether `tk_nl_ck` was emitted |
 | `teko_enum.tk` | `enum Name [: underlying] { Member [= const], ... }` | `syntax("enum")`, one `type_new` per declared enum, sized/kinded by the underlying type | nothing of its own: members live in `teko_const.tk`'s qualified-constant table |
 | `teko_deleg.tk` | `delegate`, contextual and explicit values, lambdas, `use (...)` | `syntax("delegate")`, `on_stmt` for the capture taint | `(delegate, function)` thunk pairs, capture lists, by-reference lambdas |
-| `teko_heaparr.tk` | `T[]` on the heap, `new T[n]`, its guarded index | `syntax_type` — the one in this compiler | one type row per element type, global `T[]` declarations |
+| `teko_heaparr.tk` | `T[]` on the heap, `new T[n]`, its guarded index | `syntax_type` — the first of the two in this compiler | one type row per element type, global `T[]` declarations |
 | `teko_ternary.tk` | `c ? a : b` | `syntax_infix("?")` | the placeholder calls the pass rewrites |
 | `teko_stmt.tk` | every `{` block, and the honest stops for `var`, `match`, `when`, a local `const` | `syntax_stmt("{")` and one per stopped word | — |
 | `teko_expr.tk` | `new`, `.` as field/method/property access | `syntax_expr("new")`, `syntax_infix(".")` | forward-deferred `new` sites |

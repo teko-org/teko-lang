@@ -1,0 +1,349 @@
+// surface_nullable_ref.tk -- `T?` over a REFERENCE (Q1a,
+// docs/specs/nullable.md): teko's one nullable mechanism, spelled as a type
+// suffix and represented by the pointer itself, with `null` the handle 0.
+//
+// What each helper proves, in order:
+//
+//   1. `declcheck`  -- `Cell? c;` is `Cell? c = null;`; a store of a real
+//                      object into the same slot; `== null` and `!= null`;
+//                      `HasValue`; `Value`, and a member through it;
+//   2. `implcheck`  -- `T` -> `T?` is implicit and IDENTICAL (the same
+//                      pointer, no box), including `D` -> `B?` for a derived
+//                      class and `C` -> `I?` for an interface;
+//   3. `fieldcheck` -- a `Cell? next` field: a linked list that ends in null,
+//                      walked through `.Value`;
+//   4. `arrcheck`   -- `Cell?[]`, an array whose ELEMENT is a nullable, and
+//                      `Cell[]?`, a nullable array;
+//   5. `sigcheck`   -- `T?` as a parameter and as a return type, on a free
+//                      function, on a method and through an interface;
+//   6. `overcheck`  -- `held(Cell)` beside `held(Cell?)`: `null` picks the
+//                      nullable one, an object picks the bare one;
+//   7. `pmcheck`    -- `params Cell?[]`, with a null element and a real one;
+//   8. `dgcheck`    -- `Op? f = null;` and a `struct?`;
+//   9. `refcheck`   -- `ref Cell?` and `out Cell?`: the callee writes the
+//                      caller's own slot, with an object and with null;
+//  10. `rccheck`    -- the reclaim: a `Cell?` is counted exactly as a `Cell`
+//                      is, `rt_live()` comes back to its floor, and a null
+//                      handle releases nothing.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 cell_dtors = 0;
+
+class Cell {
+    public i64 v;
+
+    public Cell(i64 x) {
+        v = x;
+    }
+
+    ~Cell() {
+        cell_dtors = cell_dtors + 1;
+    }
+
+    public i64 get() {
+        return v;
+    }
+}
+
+class Shape {
+    public virtual i64 area() { return 0; }
+}
+
+class Circle : Shape {
+    public i64 r;
+    public Circle(i64 x) { r = x; }
+    public override i64 area() { return r * r; }
+}
+
+interface IArea {
+    i64 area();
+}
+
+class Square : IArea {
+    public i64 s;
+    public Square(i64 x) { s = x; }
+    public i64 area() { return s * s; }
+}
+
+struct Vec {
+    public i64 x;
+}
+
+public delegate i64 Op(i64 a, i64 b);
+
+i64 add(i64 a, i64 b) { return a + b; }
+
+// ---- 1. the declaration, the two tests, HasValue and Value ----
+
+i64 declcheck() {
+    Cell? c;                                      // no initializer: the slot is null
+    if (c != null) return 1;
+    if (c.HasValue) return 2;
+
+    c = new Cell(7);                              // ...and a real object goes in the same slot
+    if (c == null) return 3;
+    if (!c.HasValue) return 4;
+    if (c.Value.get() != 7) return 5;             // a member, through the checked read
+
+    Cell hard = c.Value;                          // the checked read into a NON-nullable slot
+    if (hard.v != 7) return 6;
+
+    Cell? empty = null;                           // ...and the explicit spelling
+    if (empty != null) return 7;
+    return 0;
+}
+
+// ---- 2. `T` -> `T?`, identical at every slot ----
+
+Cell? pass_through(Cell? c) {
+    return c;
+}
+
+i64 implcheck() {
+    Cell obj = new Cell(3);
+    Cell? c = obj;                                // implicit, and the very same pointer
+    if (c.Value.v != 3) return 1;
+    if (pass_through(obj).HasValue == 0) return 2;   // implicit at an argument too
+
+    Shape? s = new Circle(4);                     // a derived class into a base nullable
+    Shape sh = s.Value;                           // a VIRTUAL call needs a name on the left
+    if (sh.area() != 16) return 3;
+
+    IArea? a = new Square(5);                     // a class into an interface nullable
+    IArea ai = a.Value;
+    if (ai.area() != 25) return 4;
+    return 0;
+}
+
+// ---- 3. a `T?` field: a list that ends in null ----
+
+class Node {
+    public i64 v;
+    public Node? next;
+
+    public Node(i64 x) {
+        v = x;
+    }
+}
+
+i64 fieldcheck() {
+    Node a = new Node(1);
+    Node b = new Node(2);
+    a.next = b;                                   // implicit `Node` -> `Node?`
+    if (a.next == null) return 1;
+    if (b.next != null) return 2;                 // never assigned: the zeroed field
+    if (a.next.Value.v != 2) return 3;
+
+    i64 total = 0;
+    Node? walk = a;
+    loop {
+        if (!walk.HasValue) break;
+        total = total + walk.Value.v;
+        walk = walk.Value.next;
+    }
+    if (total != 3) return 4;
+    return 0;
+}
+
+// ---- 4. `Cell?[]` and `Cell[]?` ----
+
+i64 arrcheck() {
+    Cell?[] cs = new Cell?[3];
+    if (cs.Length != 3) return 1;
+    if (cs[0] != null) return 2;                  // `new T[n]` zeroes the elements
+    cs[0] = new Cell(1);
+    cs[2] = null;                                 // ...and null goes back in
+    if (cs[0] == null) return 3;
+    if (cs[0].Value.get() != 1) return 4;
+
+    Cell[]? xs = null;                            // a NULLABLE array
+    if (xs != null) return 5;
+    xs = new Cell[2];
+    if (xs == null) return 6;
+    if (xs.Value.Length != 2) return 7;
+    return 0;
+}
+
+// ---- 5. `T?` at a parameter, a return and an interface row ----
+
+i64 depth(Cell? c) {
+    if (c == null) return 0;
+    return c.Value.get();
+}
+
+Cell? make(i64 k) {
+    if (k == 0) return null;
+    return new Cell(k);
+}
+
+interface IPick {
+    Cell? pick(Cell? c);
+}
+
+class Picker : IPick {
+    public Cell? pick(Cell? c) {
+        return c;
+    }
+}
+
+i64 sigcheck() {
+    if (depth(null) != 0) return 1;
+    if (depth(new Cell(9)) != 9) return 2;        // implicit at the argument
+    if (make(0) != null) return 3;
+    if (make(4).Value.get() != 4) return 4;
+
+    IPick p = new Picker();
+    if (p.pick(null) != null) return 5;
+    if (p.pick(new Cell(6)).Value.get() != 6) return 6;
+    return 0;
+}
+
+// ---- 6. the overload: `null` is the nullable signature's ----
+
+i64 held(Cell c) {
+    return 100 + c.get();
+}
+
+i64 held(Cell? c) {
+    if (c == null) return 1000;
+    return 2000;
+}
+
+i64 overcheck() {
+    if (held(null) != 1000) return 1;             // only `held(Cell?)` takes it
+    if (held(new Cell(5)) != 105) return 2;       // ...and an object takes the bare one
+    return 0;
+}
+
+// ---- 7. `params Cell?[]` ----
+
+i64 count_present(params Cell?[] cs) {
+    i64 n = 0;
+    i64 i = 0;
+    loop {
+        if (i >= cs.Length) break;
+        if (cs[i] != null) n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+i64 pmcheck() {
+    if (count_present(null, null) != 0) return 1;
+    if (count_present(new Cell(1), null, new Cell(2)) != 2) return 2;
+    return 0;
+}
+
+// ---- 8. a nullable delegate and a nullable struct ----
+
+i64 dgcheck() {
+    Op? f = null;
+    if (f != null) return 1;
+    Op g = add;
+    if (g(2, 3) != 5) return 2;                   // the bare delegate still calls
+
+    Vec? v = null;
+    if (v != null) return 3;
+    Vec w = new Vec();
+    v = w;                                        // implicit, and NOT counted
+    if (v == null) return 4;
+    if (v.Value.x != 0) return 5;
+    return 0;
+}
+
+// ---- 9. `ref T?` and `out T?`: the slot itself, written by the callee ----
+
+void fill(ref Cell? c) {
+    c = new Cell(5);
+}
+
+void clear(ref Cell? c) {
+    c = null;                                     // null goes back into a nullable slot
+}
+
+void give(out Cell? c) {
+    c = new Cell(6);
+}
+
+i64 refcheck() {
+    Cell? c = null;
+    fill(ref c);
+    if (c == null) return 1;
+    if (c.Value.v != 5) return 2;
+    clear(ref c);
+    if (c != null) return 3;
+
+    Cell? d;
+    give(out d);
+    if (d.Value.v != 6) return 4;
+    return 0;
+}
+
+// ---- 10. the reclaim: a `Cell?` counts exactly as a `Cell` does ----
+
+i64 rccheck() {
+    i64 floor = rt_live();
+    i64 seen = cell_dtors;
+
+    {
+        Cell? c = null;                           // a null handle owns nothing
+        if (rt_live() != floor) return 1;
+        c = new Cell(1);
+        if (rt_live() != floor + 1) return 2;
+    }                                             // the block closes: released once
+    if (cell_dtors != seen + 1) return 3;
+    if (rt_live() != floor) return 4;
+
+    {
+        Cell?[] cs = new Cell?[2];                // the array + one live element
+        cs[0] = new Cell(2);
+        if (rt_live() != floor + 2) return 5;
+    }
+    if (cell_dtors != seen + 2) return 6;
+    if (rt_live() != floor) return 7;
+
+    {
+        Node n = new Node(1);
+        n.next = new Node(2);                     // a counted `T?` FIELD
+        if (rt_live() != floor + 2) return 8;
+    }
+    if (rt_live() != floor) return 9;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = declcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = implcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = fieldcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = arrcheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = sigcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = overcheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = pmcheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = dgcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = refcheck();
+    if (bad != 0) return 90 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 100 + bad;
+
+    return 42;
+}

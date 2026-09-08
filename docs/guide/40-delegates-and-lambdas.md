@@ -13,7 +13,7 @@ function body, and takes at most ten parameters.
 |---|---|
 | `Op f = twice;` | contextual: the function's name is wrapped in a thunk |
 | `Op g = new Op(twice);` | the explicit form of the same |
-| `Op h = null;` | the null delegate |
+| `Op? h = null;` | the null delegate: `null` needs a slot declared `T?` |
 | `Op p = flag != 0 ? add : mul;` | a ternary of two function names, coerced arm by arm |
 
 `f(3)` is an indirect call through the value's own code pointer. A delegate is a type in
@@ -91,9 +91,11 @@ i64 main() {
     if (byref(6) != 10) return 5;                // the declarer's own slot
     if (acc != 10) return 6;
 
-    Box b = new Box(20);
-    Op reads = new Op((i64 x) use (b) => b.v + x);
-    b = null;
+    Op reads;
+    {
+        Box b = new Box(20);
+        reads = new Op((i64 x) use (b) => b.v + x);
+    }                                            // the Box's own slot closes here
     if (reads(2) != 22) return 7;                // the closure kept the Box alive
 
     if (apply(named, 10) != 20) return 8;
@@ -109,9 +111,13 @@ Calling a null delegate stops the program instead of faulting:
 
 delegate i64 Op(i64 a);
 
+class H {
+    public Op cb;                                // never assigned: rt_alloc zeroes it
+}
+
 i64 main() {
-    Op f = null;
-    return f(1);                                 // teko: call through a null delegate
+    H h = new H;
+    return h.cb(1);                              // teko: call through a null delegate
 }
 ```
 

@@ -68,6 +68,45 @@ TimeSpan gap  = next - leap;                   // one day, 864000000000 ticks
 to `mc`. [`timespan.md`](../reference/timespan.md) and
 [`datetime.md`](../reference/datetime.md) are the two reference pages.
 
+## `null`, and the slot that may hold it
+
+`null` lands **only in a slot declared `T?`**. That is one rule for every reference — a
+class, an interface, a delegate, a `T[]`, a `struct` — and it is checked where the value is
+written, not where it is read.
+
+```teko
+// no-run
+class Cell {
+    public i64 v;
+}
+
+i64 main() {
+    Cell? maybe = null;                      // the only slot null lands in
+    Cell  hard  = null;                      // teko: null needs a slot declared Cell?
+    return 0;
+}
+```
+
+A `T?` is the same eight bytes a `T` is — the pointer itself, with `0` for "nothing" — so it
+costs nothing at run time and is reclaimed exactly as a `T` is. `T` goes into a `T?`
+implicitly; the way back is written down:
+
+| written | means |
+|---|---|
+| `Cell? c;` | declared empty; the same slot `Cell? c = null;` gives |
+| `c = new Cell(1);` | a real object in the same slot |
+| `c == null` / `c != null` | the test, legal on any reference-shaped slot |
+| `c.HasValue` | the same test as a value |
+| `c.Value` | the checked read: the object, or a panic if there is none |
+| `c.Value.get()` | ...and a member through it |
+| `Cell? p = obj;` | implicit; identical bytes |
+| `Cell h = c;` | refused — write `c.Value` |
+
+Testing against `null` stays legal on a slot that is **not** nullable, and it has to: a
+field nobody assigned and an element of `new T[n]` both read as zero, so the defensive code
+that catches them must keep compiling. The whole account, with the conversions, the
+overload rule and what is not taught yet, is [nullable.md](../reference/nullable.md).
+
 ## The two array shapes
 
 They are different types, and the difference is where the length lives.
@@ -122,6 +161,7 @@ i64 main() {
 }
 ```
 
-The exhaustive account is [types.md](../reference/types.md) and
-[arrays.md](../reference/arrays.md); what `#include "rt.tk"` brings in is
+The exhaustive account is [types.md](../reference/types.md),
+[arrays.md](../reference/arrays.md) and
+[nullable.md](../reference/nullable.md); what `#include "rt.tk"` brings in is
 [runtime.md](../reference/runtime.md).

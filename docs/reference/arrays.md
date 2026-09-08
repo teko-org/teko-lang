@@ -113,7 +113,7 @@ counted like a class reference.
 | `new T[n]` | `n` elements, zeroed; a negative `n` panics |
 | `xs[i]` / `xs[i] = e` / `+=` / `-=` / `++` / `--` | element access, **guarded at run time** |
 | `xs.Length` | the length it carries |
-| `xs = null` | releases the array, and every element still in it |
+| the block that declared `xs` closes | releases the array, and every element still in it |
 
 Every index is checked: out of range is a panic with exit 70
 (`teko: index past the end of an array`), never a read past the allocation.
@@ -229,17 +229,17 @@ i64 sum_areas(Circle[] cs) {
 }
 
 i64 main() {
-    Circle[] cs = new Circle[3];
-    cs[0] = new Circle(1);
-    cs[1] = new Circle(2);
-    cs[2] = new Circle(3);
-    if (rt_live() != 4) return 1;                // the array object and the three circles
-    if (sum_areas(cs) != 14) return 2;
+    {
+        Circle[] cs = new Circle[3];
+        cs[0] = new Circle(1);
+        cs[1] = new Circle(2);
+        cs[2] = new Circle(3);
+        if (rt_live() != 4) return 1;            // the array object and the three circles
+        if (sum_areas(cs) != 14) return 2;
 
-    cs[0] = new Circle(10);                      // the slot released Circle(1)
-    if (dtors != 1) return 3;
-
-    cs = null;                                   // the array, and the three live elements
+        cs[0] = new Circle(10);                  // the slot released Circle(1)
+        if (dtors != 1) return 3;
+    }                                            // the array, and the three live elements
     if (dtors != 4) return 4;
     if (rt_live() != 0) return 5;
     return 42;

@@ -10,7 +10,7 @@ nothing here describes a construct the taught compiler cannot compile.
 | page | covers |
 |---|---|
 | [00-getting-started.md](00-getting-started.md) | what teko is, the pinned `mc`, the taught compiler, a first program, the fixtures, the fixed point |
-| [10-values-and-types.md](10-values-and-types.md) | scalars, the seven aliases, floats, `str`, `ptr`, fixed arrays and `T[]` |
+| [10-values-and-types.md](10-values-and-types.md) | scalars, the seven aliases, floats, `str`, `ptr`, `null` and the `T?` slot, fixed arrays and `T[]` |
 | [20-classes.md](20-classes.md) | classes and structs, members, inheritance, `virtual`/`abstract`, interfaces, traits, properties, operators |
 | [30-generics.md](30-generics.md) | type and `const` parameters, instantiation, inline array fields |
 | [40-delegates-and-lambdas.md](40-delegates-and-lambdas.md) | delegate types, lambdas, explicit captures, the null panic |

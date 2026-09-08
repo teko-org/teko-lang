@@ -9,7 +9,8 @@ need it.
 
 | page | covers |
 |---|---|
-| [modules.md](modules.md) | the 33 module files, one entry each: what it teaches, what it registers, what it keeps |
+| [modules.md](modules.md) | the 35 module files, one entry each: what it teaches, what it registers, what it keeps |
+| [nullable-probes.md](nullable-probes.md) | the ten Q0 probes behind `T?`, measured: which declaration positions the `?` reaches, which slots the `null` literal reaches, and the five findings that shaped Q1a |
 | [primitives.md](primitives.md) | a primitive with members: the lowering table, the two identity casts, the four sites that read it, and the P0 probes that measured the mechanism |
 | [passes.md](passes.md) | the fifteen `pass()` registrations, in order, and why the order is what it is |
 | [nodes-and-xt.md](nodes-and-xt.md) | the node table keyed by position, in-place rewriting, and the rule about which node carries the type |
