@@ -1661,12 +1661,25 @@ call that first asks for text may stand in any body, the two globals go through
 `tk_top_emit` (D27, category (c) — `teko_heaparr.tk`'s own per-element-type row is made
 lazily the same way, for the same reason).
 
-**An enum a program never asks text of pays nothing**: `--dump-ast` of the 57 fixtures that
-existed before this crumb — `tests/surface_enum.tk` among them — is byte-identical to
-`33c7485c`, compiled from scratch by both releases. The spec's own preference (§ "if the
-table is generated only when `ToString`/`Parse` is used, nothing changes: prefer this") is
-what the design follows; eagerly emitting the two globals for every declared enum was
-considered and rejected on exactly this measurement.
+**An enum a program never asks text of pays nothing.** None of the 57 fixtures that existed
+before this crumb spells `ToString`/`Parse`/`TryParse`/`IsDefined` on an enum, so **no
+`Name__names`/`Name__vals` global appears in any of their `--dump-ast`** — the lazy-globals
+design's own proof. `--dump-ast` of the 3 fixtures that do not `#include "../lib/rt.tk"`
+(`hello`, `primitives_ptr`, `primitives_scalar`) is byte-identical to `33c7485c`. The other 54
+DO include `lib/rt.tk`, and their dump moves — not from anything this crumb's own design
+changed, but because `lib/rt.tk` is `#include`d text: the six new functions this crumb
+appends (`tk_enum_find`, `tk_enum_name`, `tk_enum_isdefined`, `tk_enum_parse`, the four
+`tk_enum_tryparseN` as one row, `tk_str_eq`, `tk_i64_to_dec`) land in EVERY fixture that pulls
+`lib/rt.tk` in, called or not. Measured precisely: identical except for the appended new
+`rt.tk` functions, which no pre-existing fixture calls — zero lines removed from `lib/rt.tk`
+itself (`diff` against `33c7485c`'s own copy: 0 `<` lines, a pure append after its existing
+end), and zero pre-existing function BODY moves anywhere in the 54 dumps. The spec's own
+preference (§ "if the table is generated only when `ToString`/`Parse` is used, nothing
+changes: prefer this") is what the design follows for the two GLOBALS; the new FUNCTIONS
+`lib/rt.tk` itself carries are a one-time, one-crumb cost every `#include "rt.tk"` fixture
+pays regardless, the same as every earlier `lib/rt.tk` addition in this log (D40's
+`TimeSpan`/`DateTime` helpers, D39's own). Eagerly emitting the two per-enum globals for
+every declared enum was considered and rejected on the globals' own measurement above.
 
 **Two dispatch sites, mirroring `teko_prim.tk`'s own split for the identical reason.**
 `Color.Red.ToString()` never resolves at PARSE time: `tk_struct_of_expr` (teko_struct.tk)
@@ -1732,30 +1745,55 @@ global inside a generated body is not measured, so it is left rather than shippe
 `[Flags]`-style `ToString` decomposition (no attribute grammar). All three are recorded in
 [not-yet.md](docs/reference/not-yet.md) § Enums, not silently dropped.
 
-`tests/surface_enum_text.tk` (`expect-exit: 42`): `ToString` on a member, on an aliased
+`tests/surface_enum_text.tk` (`expect-exit: 50`): `ToString` on a member, on an aliased
 value (the first name) and on two out-of-set values (positive and negative, over the
 default `i32` underlying); `Parse` round-tripping every member of two enums, aliased value
 included; `TryParse` on a good and a bad name, over BOTH an `i32`-underlying and a
 `u8`-underlying enum, the `out` slot left untouched on failure; `IsDefined` on a defined
-value, an undefined one, and a value shared by an alias. `tests/surface_enum_parse_panic.tk`
-(`expect-exit: 70`): `Color.Parse("Nope")`.
+value, an undefined one, and a value shared by an alias — plus, over a NARROW signed (`:
+i16`) and a default `i32` enum each carrying a NEGATIVE member (`Neg = 0 - 100`/`Neg = 0 -
+5`), `ToString`, `Parse`, `TryParse` (including the sign-extended value written through
+`out`) and `IsDefined`, the review fix below's own regression cover.
+`tests/surface_enum_parse_panic.tk` (`expect-exit: 70`): `Color.Parse("Nope")`.
+
+**Review fix (`teko-org/teko-lang#696`): a negative member's own value collided with `-1`,
+the "not found" sentinel.** `tk_enum_value(names, vals, n, s)` returned the MEMBER'S VALUE on
+a match, `-1` on none — so `Signed.Parse("Neg")` on `enum Signed : i16 { Neg = 0 - 100, ...
+}` (already in `tests/surface_enum.tk`) panicked (exit 70) instead of answering `Signed.Neg`,
+and `Signed.TryParse("Neg", out s)` answered 0 without writing, because `Neg`'s own value
+(`-100`) reads exactly like "not found" to a `v < 0` test. Fixed at the root: `tk_enum_value`
+is now `tk_enum_find(names, n, s)`, answering the member's INDEX (or `-1`) rather than its
+value; `tk_enum_parse` and the four `tk_enum_tryparseN` read `vals[idx]` only once the index
+itself has cleared the `< 0` check, so no member's own value is ever read as a sentinel.
+`docs/reference/runtime.md`'s own `enum` text table corrected to match (it named
+`tk_enum_value`, "or `-1`" — the phrasing that hid the bug in the first read). Proof: the
+reproducer named in the review (`enum Small { A = 0 - 5, B = 0, C = 5 } ... Small.Parse("A")
+!= Small.A`) went from exit 70 to the expected answer; `tests/surface_enum_text.tk` gained
+the `Signed`/`SignedWide` negative-member coverage above (12 more `return N` checks, N
+picking up from 30 through 45, the fixture's own `expect-exit` moved from 42 to 50 to keep
+every code distinct from the success one).
 
 Proof: `mc build . --config mc.macos.toml` clean; **59/59** fixtures at their `expect-exit`
 (the 57 existing — Q3's `tests/surface_definite.tk` among them — plus the two this crumb
-adds); `--dump-ast` of the 57 existing fixtures byte-identical to `33c7485c`, compared
-against a from-scratch build of that commit (`0` diffs); `FIXPOINT OK` (`teko1.o ==
-teko2.o` on the first turn, `--dump-asm` diff empty over 213151 lines, 59/59 fixtures under
-the self-hosted `teko1`); `sh scripts/check-docs.sh` green (560 links, 378 diagnostics, 110
-samples — 73 run, 37 no-run, the two this crumb adds among them); `mc limits . --config
-mc.macos.toml` verdict `ok`, `syntax` `15/30`, `passes` `15/30`, `intrin` `8/16`, `alias`
-`19/38`, `types` `11/22` — every row identical, element for element, to the same command
-run against `33c7485c` from scratch: N2b adds no syntax word, no pass and no intrinsic,
-exactly the spec's own § 10 prediction ("nothing" for every row `TimeSpan`'s own C1 did not
-already move). Five probes outside `tests/` (`build/probe/*.tk`, not committed) proving the
-five refusals this entry names, each with its exact message: a `TryParse` `out` argument of
-the wrong type (`teko: a value of type i64 does not convert to Color`), a wrong argument
-count (`teko: wrong number of arguments for Parse`), a missing include
-(`teko: Color needs #include "rt.tk" before it is used`), `ToString` without `()`
-(`teko: the member is a method; call it with (): ToString`), and `TryParse`'s second
-argument not `out` (`` teko: TryParse's second argument is `out <name>` ``). `mc pkg hash .`:
-`a78a8563bb0c40b25050398ec3cf2b5685e0cc4f85bd1bbcfa77949f50773883`.
+adds); `--dump-ast` of the 3 of the 57 existing fixtures that do not `#include
+"../lib/rt.tk"` (`hello`, `primitives_ptr`, `primitives_scalar`) byte-identical to
+`33c7485c`, compiled from scratch by both releases; the other 54 move — the appended new
+`lib/rt.tk` functions landing in their own `#include`, not called by any of them, no
+`Name__names`/`Name__vals` global among the moved lines, zero pre-existing function body
+touched (`diff` of `lib/rt.tk` against `33c7485c`'s own copy: `0` `<` lines, a pure append);
+`FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm` diff empty over 213151
+lines, 59/59 fixtures under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (560
+links, 378 diagnostics, 110 samples — 73 run, 37 no-run, the two this crumb adds among
+them); `mc limits . --config mc.macos.toml` verdict `ok`, `syntax` `15/30`, `passes`
+`15/30`, `intrin` `8/16`, `alias` `19/38`, `types` `11/22` — every row identical, element
+for element, to the same command run against `33c7485c` from scratch: N2b adds no syntax
+word, no pass and no intrinsic, exactly the spec's own § 10 prediction ("nothing" for every
+row `TimeSpan`'s own C1 did not already move). Five probes outside `tests/`
+(`build/probe/*.tk`, not committed) proving the five refusals this entry names, each with
+its exact message: a `TryParse` `out` argument of the wrong type (`teko: a value of type
+i64 does not convert to Color`), a wrong argument count (`teko: wrong number of arguments
+for Parse`), a missing include (`teko: Color needs #include "rt.tk" before it is used`),
+`ToString` without `()` (`teko: the member is a method; call it with (): ToString`), and
+`TryParse`'s second argument not `out` (`` teko: TryParse's second argument is `out <name>`
+``). `mc pkg hash .` after the review fix above:
+`cac36b8d7e82c4672e9ef7e233c75503a6b8b79942f7cbc8d074fb4d46d93ee2`.

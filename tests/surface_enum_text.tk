@@ -6,14 +6,20 @@
 // untouched on failure; `Color.IsDefined(v)`. Two enums with different
 // underlying widths (the default `i32` and an explicit `: u8`), so the
 // four width-specific `TryParse` writers (lib/rt.tk) are both exercised.
+// Two more enums carry a NEGATIVE member (`: i16` and the default `i32`),
+// proving `tk_enum_find` (lib/rt.tk) -- not the member's own value -- is
+// what "not found" tests against: a negative value used to collide with the
+// `-1` sentinel `tk_enum_value` answered before the fix (`teko-org/teko-lang#696`).
 //
-// expect-exit: 42
+// expect-exit: 50
 
 #include "../lib/rt.tk"
 
 enum Color { Red, Green, Blue }                                   // default underlying: i32
 enum Perm  { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
 enum Level : u8 { Low = 10, Mid, High }                            // an explicit narrow width
+enum Signed : i16 { Neg = 0 - 100, Zero = 0, Pos = 100 }           // negative, narrow width
+enum SignedWide { Neg = 0 - 5, Zero = 0, Pos = 5 }                 // negative, default i32
 
 i64 main() {
     // ToString on a member
@@ -66,5 +72,29 @@ i64 main() {
     if (Color.IsDefined(0 - 1)) return 28;
     if (!Perm.IsDefined(3)) return 29;                    // the shared value both share
 
-    return 42;
+    // a NEGATIVE member, narrow (i16) underlying: ToString, Parse, TryParse,
+    // IsDefined -- `tk_enum_find` (lib/rt.tk) must not mistake `Neg`'s own
+    // value for the "not found" sentinel
+    if (!tk_str_eq(Signed.Neg.ToString(), "Neg")) return 30;
+    if (Signed.Parse("Neg") != Signed.Neg) return 31;
+    if ((i64) Signed.Parse("Neg") != 0 - 100) return 32;
+    Signed s1 = Signed.Zero;
+    if (Signed.TryParse("Neg", out s1) != 1) return 33;
+    if (s1 != Signed.Neg) return 34;                      // written value round-trips
+    if ((i64) s1 != 0 - 100) return 35;                   // sign-extended, not zero-extended
+    Signed s2 = Signed.Pos;
+    if (Signed.TryParse("Nope", out s2) != 0) return 36;
+    if (s2 != Signed.Pos) return 37;                      // untouched on failure
+    if (!Signed.IsDefined(0 - 100)) return 38;
+
+    // a NEGATIVE member, default (i32) underlying
+    if (!tk_str_eq(SignedWide.Neg.ToString(), "Neg")) return 39;
+    if (SignedWide.Parse("Neg") != SignedWide.Neg) return 40;
+    SignedWide w1 = SignedWide.Zero;
+    if (SignedWide.TryParse("Neg", out w1) != 1) return 41;
+    if (w1 != SignedWide.Neg) return 43;
+    if ((i64) w1 != 0 - 5) return 44;
+    if (!SignedWide.IsDefined(0 - 5)) return 45;
+
+    return 50;
 }
