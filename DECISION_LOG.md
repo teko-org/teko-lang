@@ -1547,3 +1547,92 @@ with incompatible operands and with a foreign nullable row, `?.` on a non-nullab
 `void` method, as a slot and with an index, `??=`, `a?[i]`, `a || b ?? c` and a plain `.` on
 either result — each refusing with the message documented in
 [`docs/reference/diagnostics.md`](docs/reference/diagnostics.md).
+
+
+### D46 · Definite assignment — a local read before it is assigned is refused (2026-09-08)
+[`docs/specs/nullable.md`](docs/specs/nullable.md) § 8 and § 15's Q3, the fourth of § 19's
+proposals and the half D42 deferred. **A local declared without `?` and without an
+initializer, read with no assignment to it anywhere earlier in source order, is refused
+where it is read**: `teko: <name> is used before it is assigned`.
+
+**1. It over-approximates "assigned", on purpose, and that is the whole design.** A name
+counts as assigned from the moment an assignment to it appears earlier in the body, in
+whatever block that assignment sits and whether or not that block runs — an `if` arm, an
+`else`, a `loop` body, a `switch` case, a nested block. So the rule can never refuse a
+correct program, which is the property that lets it land at all: D42's own example of
+legitimate code is *declare first, build in a branch*, and a strong analysis would need a
+dominator tree nobody has asked for. What it catches is exactly the class D42 named — a
+`struct`, a class or a scalar local declared and then read with **nothing** ever written to
+it, which until now reached the run as whatever the stack held. `struct P p; p.x = 4;` is
+refused at the store, because that store READS `p` to reach the field.
+
+**2. Four "counts as an assignment" cases, three of them free.** By the time the analysis
+runs, an initializer, a later `x = e`, a `foreach` variable and a `for` initialiser are all
+either an `N_VAR` carrying a value or an `N_ASSIGN`, and `f(out x)` / `f(ref x)` /
+`use (&x)` are all the `N_ADDR` `tk_ref_addr` builds. The fourth — a by-value `use (x)` —
+is an ordinary `N_IDENT` and needed a row: `tk_cap_val` ([teko_deleg.tk](teko_deleg.tk))
+records the node it reads the local through, and the walk counts that one node as an
+assignment instead of a read. § 8's table asks for it in as many words ("refusing a capture
+is not this crumb's business"), and the alternative — matching the generated
+`tk_cap_put(...)` call by NAME — is the kind of shape-matching that breaks the day the
+writer changes.
+
+**3. Three declarations are born assigned.** One with an initializer; a local array
+(`i64 a[4]` — `nd_val` is the length and the name IS the storage, the same clause
+`tk_ty_scope_var` already reads); and a `T?`, because `T? x;` is `T? x = null;` and the `?`
+is the licence to hold nothing (§ 19.2, D43). A parameter, a field, a global and an element
+of `new T[n]` are not judged at all: § 8's own "out of scope, and stated so".
+
+**4. `a = a + 1;` on an unassigned `a` is refused**, C#'s own answer. The bit is set AFTER
+the value is walked, not before, so an assignment does not vouch for its own right-hand
+side. That is not an over-approximation lost: a read of a slot nothing ever wrote is never
+correct.
+
+**5. Zero new pass, and it rides teko_typeof.tk's walk of its own.** § 12 promised the
+oracle's own visitor and Q0's probe 9 said the walk could see an assignment before the read
+it judges. What landed is a walk **beside** it, in the same file and inside the same
+registered `pass()`: a pre-order visitor cannot mark an assignment after its value, and it
+cannot tell an `N_ASSIGN`'s target — which is not a read — from an `N_IDENT` that is. So
+`tk_da_walk` is its own recursion, run from `tk_typeof_pass` after the deferred `.` has been
+rewritten. Two consequences, both wanted: the tree is at its closest to the source (`p.x = 4`
+is already the `st64(p + off, 4)` whose `p` is the read to judge), and none of the reads
+`tk_rc_pass` INJECTS later — the `rc_dec(x)` of a block's releases — exists to be mistaken
+for one the source wrote. `tk_typeof_pass`'s early return is now a guard around the pend
+walk alone; the check runs over every unit, because a local read before it is assigned is
+wrong in a program with no deferred `.` exactly as in one with a hundred.
+
+**6. Two ceilings, both new.** `TK_MAXDA` 256 locals per function: on overflow the rule
+**steps aside for that function** rather than judge a name against a table that could not
+hold its declaration — a silent accept is safe where a silent refuse is not.
+`TK_MAXCAPRD` 256 by-value captures over the unit, which is a diagnostic
+(`teko: too many captures by value in one unit`) because a missing row there would produce
+a false refusal.
+
+**7. D42's second defect is closed at compile time.** Its ruling — "this is the developer's
+error, documented, not the language's" — was explicitly conditional on the nullable design
+arriving ("where the compiler learns that a name declared without `?` must be built before
+it is read"). It has. [`docs/reference/types.md`](docs/reference/types.md) § `struct` now
+says the read is refused, and `null` reaching a non-nullable local is one road narrower in
+[`docs/reference/nullable.md`](docs/reference/nullable.md): what remains open is the branch
+the rule deliberately does not judge, a row of
+[`docs/reference/not-yet.md`](docs/reference/not-yet.md) with the other seven.
+
+**8. Two findings this crumb did not act on.** A refusal raised on a node the
+`<teko-loop-prelude>` `#rule` built (`x++`, `x--`, `x += k` as a STATEMENT) is reported at
+the rule's own file and line rather than the source's — pre-existing for every diagnostic
+on such a node (``teko: no operator `+` takes these operands`` on `t++` prints the same
+file), and none of Q3's business. And `mc limits`' registration rows are untouched:
+`passes` 15/30, `syntax` 15, `infix` 24, `syntax_type` 2/8, `intrin` 8/16, `alias` 19,
+`types` 11 — only `nodes`, `funcs`, `globals`, `strings` and `symbols` move, which is the
+code itself.
+
+**Proof:** 57/57 fixtures at their `expect-exit`, `tests/surface_definite.tk` (the new one)
+at 42 over nine helpers, every one of them a shape the analysis must ACCEPT — the false
+refusal is the failure mode that fixture exists to catch; `--dump-ast` of the 56
+pre-existing fixtures byte-identical to `7e7d4bca`, the crumb refusing and rewriting
+nothing; `FIXPOINT OK`; `sh scripts/check-docs.sh` green, its 108 samples included; and a
+probe set outside `tests/` — ten refusals (a `struct` written through, a scalar, a class
+method call, an assignment that comes later, `a = a + 1`, a loop body, an inner
+declaration that does not assign the outer name, a `T[]` indexed, `x++`, a method body) and
+five acceptances (a `T?` with no initializer, one branch only, `out`/`ref`/`use`, the
+`for`/`foreach` forms, and the four positions out of scope).

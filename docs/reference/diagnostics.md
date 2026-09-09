@@ -524,6 +524,14 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: tk_qdot is the compiler's own name"` — a call spelled `tk_qdot(...)` in the source: that name is the placeholder `?.` lowers through, and a program never calls it.
 - `"teko: too many ?. accesses in one unit"` — more than 64 `?.` in one source. Each one
   remembers the member name and the form its rewrite needs; the table is this ceiling.
+- `"teko: "` — completed by *`name` is used before it is assigned*: a **local** declared
+  without `?` and without an initializer, read with no assignment to it anywhere earlier in
+  the body. Reported at the read. Build it (`P p = new P();`), assign it before the read,
+  or declare it `T?` if it is allowed to hold nothing. `f(out x)`, `f(ref x)`, a `foreach`
+  variable, a `for` initialiser and a `use (...)` capture all count as assignments, and so
+  does an assignment inside an `if`, a `loop` or a nested block, whether or not it runs —
+  the rule over-approximates so it can never refuse a correct program
+  ([nullable.md](nullable.md) § Definite assignment).
 
 ## Namespaces, `using` and `import`
 
@@ -741,6 +749,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |
 | `"teko: too many captures in one lambda"` | 32, summed across the lambdas being read |
+| `"teko: too many captures by value in one unit"` | 256, summed over every lambda: definite assignment reads each one's own node |
 | `"teko: too many capturing lambdas"` | 64 capturing by reference |
 | `"teko: too many tainted lambda locals"` | 64 |
 | `"teko: too many unresolved names in one lambda"` | 64 |

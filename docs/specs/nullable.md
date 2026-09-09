@@ -1,14 +1,14 @@
 # `T?` — the nullable, over any type
 
-**Mostly built.** Q0, Q1a (D43), Q1b (D44) and Q2 (D45) landed: the row, the `?` suffix at
-every declaration position it reaches, `HasValue`/`Value`/`GetValueOrDefault()`, the
-reclaim, the rule that `null` needs a slot declared `T?`, the counted box that carries a
-VALUE nullable, and the two operators `??` and `?.`. What runs is
+**Mostly built.** Q0, Q1a (D43), Q1b (D44), Q2 (D45) and Q3 (D46) landed: the row, the `?`
+suffix at every declaration position it reaches, `HasValue`/`Value`/`GetValueOrDefault()`,
+the reclaim, the rule that `null` needs a slot declared `T?`, the counted box that carries a
+VALUE nullable, the two operators `??` and `?.`, and definite assignment. What runs is
 [the reference page](../reference/nullable.md), and the ten probes behind it are
-[nullable-probes.md](../internals/nullable-probes.md); D43, D44 and D45 record the places
-this page was measured wrong and what replaced them. The rest — definite assignment (Q3)
-and the lifted `==` (Q4a) — is still a plan, and every fenced sample stays `// no-run`
-because the page describes the whole design rather than the part that runs.
+[nullable-probes.md](../internals/nullable-probes.md); D43, D44, D45 and D46 record the
+places this page was measured wrong and what replaced them. The rest — the lifted `==`
+(Q4a) — is still a plan, and every fenced sample stays `// no-run` because the page
+describes the whole design rather than the part that runs.
 
 `T?` is teko's one nullable mechanism. It is sugar for `Nullable<T>` over **any** type —
 a class, an interface, a delegate, a `struct`, a `T[]`, `string` when it lands, and every
@@ -31,7 +31,7 @@ follows C# where C# has a form.
 |---|---|---|
 | 1 | **No type is nullable by default.** `null` lands only in a slot declared `T?` | the owner, 2026-09-08 |
 | 2 | **`T?` is `Nullable<T>` for any `T`**, reference or value: one mechanism, one spelling | the owner, same day |
-| 3 | **A `struct` declared without `new` stays the developer's error** — no guard, no refusal of the declaration itself | D42 |
+| 3 | **A `struct` declared without `new` stays the developer's error** — no guard, no refusal of the declaration itself. Superseded in part by D46: the DECLARATION is still never refused, and the READ now is, when nothing assigns the name anywhere before it | D42, D46 |
 | 4 | **Definite assignment belongs to this design**: with `T?` in the language, the compiler can say that a name written without `?` has to be built before it is read | D42, in as many words |
 | 5 | **`Nullable<T>` does not use the generic mechanism.** It is a construct of the compiler over the type it encloses, the way `T[]` and `params T[]` already are | the owner, same day |
 
@@ -437,6 +437,14 @@ nobody assigned reads as 0 by design), a global (BSS), an element of `new T[n]`,
 parameter. The analysis is about **locals**, which is where the compiler has the whole
 lifetime in front of it.
 
+**As built (D46), three more things this section did not say.** A local ARRAY (`i64 a[4]`)
+is born assigned, the name being the storage itself. `a = a + 1;` on an unassigned `a` is
+refused, C#'s own answer: the bit is set after the value is walked, so an assignment does
+not vouch for its own right-hand side. And the by-value `use (x)` row above needed a
+mechanism the other three did not — it is an ordinary `N_IDENT` by the time the walk sees
+it, so `tk_cap_val` ([teko_deleg.tk](../../teko_deleg.tk)) records the node and the walk
+counts that one node as an assignment.
+
 ---
 
 ## 9. What rule 1 does **not** prove
@@ -542,6 +550,15 @@ node in source order under the scope that holds at that node — and adds a bit 
 registers a pass of its own only if the probe in Q0 shows the walk cannot see an assignment
 before the read.
 
+**As built (D46): a walk BESIDE that one, in the same file and inside the same registered
+`pass()`.** A pre-order visitor cannot set the bit after the value it is assigned, and it
+cannot tell an `N_ASSIGN`'s target — which is not a read — from an `N_IDENT` that is; so
+`tk_da_walk` is a recursion of its own, run from `tk_typeof_pass` after the deferred `.` has
+been rewritten. `passes` still does not move, which is what the promise was about, and the
+early return of `tk_typeof_pass` is now a guard around the pend walk alone: the check runs
+over every unit. The one other file the crumb touches is
+[teko_deleg.tk](../../teko_deleg.tk), for the by-value capture row of § 8.
+
 ---
 
 ## 13. What it costs in `mc limits`
@@ -571,7 +588,7 @@ Measured against D42's own baseline (`types` 11, `alias` 19, `syntax` 15, `passe
 | `tests/surface_nullable_panic.tk` | `.Value` on an empty nullable | `70` |
 | `tests/surface_nullable_ops.tk` | `??` on a reference and on a value nullable, evaluating the left side once (a counter proves it); `?.` on a field, on a property and on a method; `a?.b?.c` chained; `??` inside a `return`, an argument and a loop condition | `42` |
 | `tests/surface_nullable_rc.tk` | a `Cell?` field released with its object and when overwritten; a `Cell?[]` released element by element; an `i64?[]`; a `T?` parked as an argument temporary; `rt_live()` at zero at the end | `42` |
-| `tests/surface_definite_assign.tk` | every shape the analysis **accepts**: a local assigned in one branch and read after, a `struct` built in a branch, an `out` argument, a `foreach` variable, a captured local | `42` |
+| `tests/surface_definite.tk` | every shape the analysis **accepts**: a local assigned in one branch and read after, a `struct` built in a branch, an `out` argument, a `foreach` variable, a captured local. Named `surface_definite_assign.tk` here before it was built | `42` |
 | the nine migrated fixtures | their own oracles, unchanged | unchanged |
 
 Refusals are proved the way this repository already proves them: probes outside `tests/`
@@ -667,12 +684,17 @@ the one refusal. Depends on nothing in Q1/Q2 — it can land before them — but
 **after**, because D42 hands it to this design and this design is what makes the refusal
 answerable ("declare it `T?`").
 
-**Gate:** `surface_definite_assign.tk` at `42`; all fifty-one at their `expect-exit` with
+**Gate:** `surface_definite.tk` at `42`; all fifty-one at their `expect-exit` with
 `--dump-ast` byte-identical (the crumb refuses and rewrites nothing); the probe set proving
 each refusal and, more importantly, the **absence** of a false refusal on the shapes § 8
 lists as accepted. **Owes:** the section in [types.md](../reference/types.md), the message in
 [diagnostics.md](../reference/diagnostics.md), and the D42 cross-reference in
 [not-yet.md](../reference/not-yet.md).
+
+**Gate as met (D46):** 57/57, `tests/surface_definite.tk` at `42` over nine helpers of
+accepted shapes, `--dump-ast` byte-identical on the fifty-six, fifteen probes (ten refusals,
+five acceptances), `mc limits` with `passes` still 15/30 and every other registration row
+unmoved.
 
 ### Q4a — lifted `==` and `!=` (S, optional)
 
@@ -736,7 +758,7 @@ unblock on whichever `mc` release answers.
 | **`??` cannot sit where C# puts it**, because `mc`'s table starts at 1. | § 5: tie it at 1, document the one shape that differs, do not renumber the base grammar (D3) |
 | **Two suffixes now compete at one type position** (`[]` and `?`). | `take_type` dispatches the chain once per position, so the cooperation is two lines in each of two handlers, and `T[][]`'s existing refusal is the precedent for how the second suffix is judged |
 | **`TK_MAXSTRUCT` is 32 and a nullable row consumes one.** | The ceiling already exists with a message (`teko: too many type declarations`), and a raise is BSS. Measure in Q1a; raise only against a fixture that proves it |
-| **The definite-assignment analysis is weaker than C#'s.** | Deliberately: it never refuses what it is not sure about, so it can never break a correct program. The gap is a not-yet row, and the strong version is a dominator pass nobody has asked for |
+| **The definite-assignment analysis is weaker than C#'s.** | Deliberately: it never refuses what it is not sure about, so it can never break a correct program. The gap is a not-yet row, and the strong version is a dominator pass nobody has asked for. **As built (D46)**, that row is written out shape by shape in [not-yet.md](../reference/not-yet.md), and the fixture asserts the accepted half rather than the refused one |
 | **`GetValueOrDefault()` diverges from C# on a reference nullable.** | Ruling 1 beats C# fidelity here: `default(T)` for a reference is `null`, and handing a `null` to a `T` slot is what the whole page exists to stop. The refusal names `??`, which is the form that says which default it means |
 
 ---

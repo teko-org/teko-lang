@@ -113,6 +113,24 @@ around it:
 | `x.ToString()` on a nullable | deferred with all text |
 | a `switch` whose subject is a `Cell` or a `Cell?` | **accepted and compared as a pointer**, which no `case` label can match. Pre-existing for every reference, not a nullable's own |
 
+### What definite assignment lets through
+
+The rule ([nullable.md](nullable.md) § Definite assignment) refuses a local read with **no**
+assignment anywhere earlier in the body, and nothing more. It over-approximates on purpose,
+so it can never refuse a correct program; the price is the list below, every row of which
+**compiles** and reaches the run with whatever the slot held. C# refuses most of them, with
+a dominator pass nobody has asked for here.
+
+| written | what happens |
+|---|---|
+| `Vec v; if (c) { v = new Vec(); } v.x = 4;` | **accepted.** One arm assigns, and the rule does not ask which arm runs. This is the shape D42 called legitimate, and buying the refusal would cost the shape |
+| `Vec v; loop { v = new Vec(); break; } v.x = 4;` | **accepted**, for the same reason: an assignment inside a loop body counts without the loop being unrolled |
+| `i64 a; { a = 1; } i64 b = a;` | **accepted**, and correct — the block runs. A nested block is not distinguished from the body |
+| `Op f = (i64 x) use (a) => x + a;` on an `i64 a;` never assigned | **accepted.** A capture counts as an assignment: what a closure does with the name is the lambda's business, not this rule's |
+| a field, a global, a parameter, an element of `new T[n]` | **not judged at all.** Three of the four are zeroed by construction, and a parameter arrives with a value |
+| more than 256 locals in one function | **the rule steps aside for that function**, rather than judge a name against a table that could not hold its declaration |
+| the position of a refusal on `x++` / `x--` / `x += k` as a STATEMENT | reported at `<teko-loop-prelude>`, the `#rule` that lowers those three, instead of at the source line. Pre-existing for **every** diagnostic raised on a node that rule builds (``teko: no operator `+` takes these operands`` on `t++` prints the same file), not this rule's own |
+
 ## Namespaces and order of declaration
 
 | written | message |

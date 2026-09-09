@@ -44,9 +44,13 @@
 // The walk carries a SECOND rewrite, teko_this.tk's: an unqualified name inside
 // a method is a member of `this` unless a local or a parameter answers first,
 // and the scope this file already maintains is what answers that. A program
-// with no deferred `.` and no method at all never enters the pass --
-// `tk_typeof_pass` returns the root untouched -- so a tree that is not this
-// pass's business is not this pass's to move.
+// with no deferred `.` and no method at all never enters that walk -- so a tree
+// that is not this pass's business is not this pass's to move.
+//
+// The pass carries one CHECK as well, and it rewrites nothing: Q3's definite
+// assignment (D46, `docs/specs/nullable.md` § 8), at the bottom of this file. It
+// runs over every unit, because a local read before it is assigned is wrong in a
+// program with no deferred `.` exactly as it is in one with a hundred.
 
 #define TK_MAXSCOPE 256               // names of one function: parameters and locals
 #define TK_MAXPEND  128               // member accesses waiting for the pass
@@ -178,6 +182,11 @@ void tk_ty_scope_params(i64 p) {
 
 // ---- the static type of a node, under the scope currently entered ----
 i64 tk_ty_of(i64 n);
+
+// teko_deleg.tk is included after this file as well: the N_IDENT a by-value
+// `use (...)` reads its local through, which Q3's own walk at the bottom counts
+// as an assignment rather than as a read (D46, its own comment there).
+i64 tk_capread_is(i64 n);
 
 // teko_null.tk is included after this file: the three members a NULLABLE
 // receiver answers, at the deferred position this file owns (Q1a), and the
@@ -878,9 +887,167 @@ void tk_pend_check() {
     }
 }
 
+// ---- Q3 (D46): definite assignment ----
+//
+// One bit per LOCAL, over the tree this pass has just finished resolving:
+// `docs/specs/nullable.md` § 8's rule at its minimum useful strength -- a local
+// declared WITHOUT `?` and WITHOUT an initializer, read before any assignment to
+// it appears anywhere earlier in source order, is refused where it is read.
+//
+// It is deliberately an OVER-APPROXIMATION of "assigned", so it can never
+// refuse a correct program: an `x = e` inside an `if`, a `loop` or a nested
+// block counts from the moment the walk passes it, with no dominator tree and
+// no question about whether that branch runs. What it catches is the whole
+// class D42 named -- a `struct`, a class or a scalar local declared and then
+// read with nothing ever written to it, which until now reached the run as
+// whatever the stack held.
+//
+// Why HERE and not a pass of its own: this file already owns the walk that
+// visits every node of every body in source order, and the tree is at its
+// closest to what the source wrote at exactly this point -- the deferred `.`
+// above has just become the load/store/call it stood for (so `p.x = 4` is the
+// `st64(p + off, 4)` whose `p` is the read this rule judges), and nothing
+// below has run yet, so none of the reads `tk_rc_pass` INJECTS -- the
+// `rc_dec(x)` of a block's own releases -- exists to be mistaken for one the
+// source wrote. Zero pass registrations; `mc limits`' `passes` row does not
+// move (Q0's probe 9, docs/internals/nullable-probes.md).
+//
+// The four shapes § 8 lists as assignments reduce to two node kinds by the time
+// the walk sees them, which is why three of the four need no clause at all:
+//
+//   an initializer, and any later `x = e`   N_VAR with `nd_a`, and N_ASSIGN
+//   `f(out x)` / `f(ref x)` / `use (&x)`    N_ADDR (`tk_ref_addr`, teko_ref.tk)
+//   a `foreach` variable, a `for` initial   N_VAR with `nd_a`: both constructs
+//                                           lower to a declaration that has one
+//   `use (x)`, by value                     an ordinary N_IDENT, told apart by
+//                                           the node teko_deleg.tk recorded for
+//                                           it (`tk_capread_is`)
+//
+// The assignment is recorded AFTER the value is walked, so `i64 a; a = a + 1;`
+// is refused on its own right-hand side, C#'s own answer for it.
+
+#define TK_MAXDA 256                  // locals of one function the rule judges
+
+uptr da_name[TK_MAXDA];               // the local, innermost last
+i64  da_set[TK_MAXDA];                // 1 once an assignment to it has been walked
+i64  tk_nda = 0;
+i64  tk_da_off = 0;                   // 1 when the table overflowed: the rule steps aside
+
+uptr da_name_at(i64 i) { return ld64(da_name + i * 8); }
+i64  da_set_at(i64 i)  { return ld64(da_set + i * 8); }
+
+void set_da_name_at(i64 i, uptr v) { st64(da_name + i * 8, v); }
+void set_da_set_at(i64 i, i64 v)   { st64(da_set + i * 8, v); }
+
+// A local the rule has anything to judge. Three declarations are born assigned:
+// one with an initializer, a local ARRAY (`i64 a[4]` -- `nd_val` is the length,
+// and the name IS the storage, exactly as `tk_ty_scope_var` reads it), and a
+// `T?` (`T? x;` is `T? x = null;`, nullable.md § 19.2 -- the `?` is the licence
+// to hold nothing). Everything else starts at 0 and has to earn its bit.
+i64 tk_da_starts_set(i64 n) {
+    if (nd_val(n) != 0) return 1;
+    if (nd_a(n) != 0) return 1;
+    return tk_is_nl(tk_struct_by_ty(nd_type(n)));
+}
+
+// A name is pushed for EVERY declaration, assigned or not: an inner `i64 a = 1;`
+// has to shadow an outer `i64 a;` while its own block is open, or a read of the
+// inner one would be judged against the outer one's bit.
+void tk_da_add(uptr name, i64 set) {
+    if (tk_nda == TK_MAXDA) { tk_da_off = 1; return; }
+    set_da_name_at(tk_nda, name);
+    set_da_set_at(tk_nda, set);
+    tk_nda = tk_nda + 1;
+}
+
+i64 tk_da_find(uptr name) {
+    i64 i = tk_nda - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(da_name_at(i), name)) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// the newest entry of that name -- a global, a parameter and a name from an
+// enclosing function are all "not found", and none of them is this rule's
+// to judge: an assignment to one of those marks nothing.
+void tk_da_assign(uptr name) {
+    i64 i = tk_da_find(name);
+    if (i >= 0) set_da_set_at(i, 1);
+}
+
+void tk_da_read(i64 n) {
+    if (tk_da_off) return;
+    i64 i = tk_da_find(nd_name(n));
+    if (i < 0) return;
+    if (da_set_at(i)) return;
+    err_at(nd_file(n), nd_line(n),
+           tk_join3("teko: ", nd_name(n), " is used before it is assigned"));
+}
+
+// The same shape `tk_ty_walk_list` has -- a mark per N_BLOCK, cut back on the
+// way out -- with the three node kinds this rule reads differently: a
+// declaration (the name joins the scope AFTER its own initializer), an
+// assignment (the target is not a read of itself, and the value is walked
+// first), and an address (the callee's own store, so the name counts assigned
+// and is not read here). Every other kind is its children in order, which is
+// what makes an `if` arm, a loop body and a ternary arm -- an N_CALL argument
+// list by then (`tk_ternary`'s placeholder) -- all reachable with no clause.
+void tk_da_walk(i64 n) {
+    loop {
+        if (n == 0) break;
+        i64 k = nd_kind(n);
+        if (k == N_BLOCK) {
+            i64 mark = tk_nda;
+            tk_da_walk(nd_a(n));
+            tk_nda = mark;
+        } else if (k == N_VAR) {
+            tk_da_walk(nd_a(n));
+            tk_da_add(nd_name(n), tk_da_starts_set(n));
+        } else if (k == N_ASSIGN) {
+            tk_da_walk(nd_a(n));
+            tk_da_assign(nd_name(n));
+        } else if (k == N_ADDR) {
+            tk_da_assign(nd_name(n));
+        } else if (k == N_IDENT) {
+            if (tk_capread_is(n)) tk_da_assign(nd_name(n));
+            else tk_da_read(n);
+        } else {
+            tk_da_walk(nd_a(n));
+            tk_da_walk(nd_b(n));
+            tk_da_walk(nd_c(n));
+            tk_da_walk(nd_d(n));
+        }
+        n = nd_next(n);
+    }
+}
+
+// A parameter is not judged (it arrives with a value) and neither is a field, a
+// global or an element of `new T[n]` -- § 8's own "out of scope, and stated
+// so". So the table starts EMPTY at every function: a name nothing declared in
+// this body is simply not found, and not found is not refused.
+void tk_da_check(i64 root) {
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_FUNC) {
+            tk_nda = 0;
+            tk_da_off = 0;
+            tk_da_walk(nd_b(f));
+        }
+        f = nd_next(f);
+    }
+    tk_nda = 0;
+    tk_da_off = 0;
+}
+
 i64 tk_typeof_pass(i64 root) {
-    if (tk_npend == 0 && tk_nmethod == 0) return root;
-    tk_ty_pass_walk(root, &tk_pend_visit);
-    tk_pend_check();
+    if (tk_npend != 0 || tk_nmethod != 0) {
+        tk_ty_pass_walk(root, &tk_pend_visit);
+        tk_pend_check();
+    }
+    tk_da_check(root);                           // Q3: after the `.` above is resolved
     return root;
 }

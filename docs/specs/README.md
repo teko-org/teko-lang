@@ -17,7 +17,7 @@ looking up a construct must never find a plan described as if it worked.
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
 | [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and `NewGuid` over teko's own entropy `extern` |
 | [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation over the `$` token `mc` 0.15.25 lets a module claim |
-| [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **the handle and the box are built** ([nullable.md](../reference/nullable.md), D43/D44); what is left of the page is the two operators and definite assignment |
+| [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **all of it is built** ([nullable.md](../reference/nullable.md), D43/D44/D45/D46); what is left of the page is the lifted `==` (Q4a) |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
@@ -38,8 +38,8 @@ fixes the order.
 | 5a | ~~**Q0** the nullable probes~~ **landed**, D43 | `docs/internals/nullable-probes.md` | S | — |
 | 5b | ~~**Q1a** `T?` over a reference, and `null` only in a `T?` slot~~ **landed**, D43 | `docs/reference/nullable.md` | M | Q0 |
 | 5c | ~~**Q1b** `T?` over a value (the counted box)~~ **landed**, D44 | `docs/reference/nullable.md` | M | Q1a |
-| 5d | **Q2** `??` and `?.` | nullable.md | M | Q1b |
-| 5e | **Q3** definite assignment | nullable.md | M | Q0 |
+| 5d | ~~**Q2** `??` and `?.`~~ **landed**, D45 | `docs/reference/nullable.md` | M | Q1b |
+| 5e | ~~**Q3** definite assignment~~ **landed**, D46 | `docs/reference/nullable.md` | M | Q0 |
 | 6 | **N2b** `enum`: `ToString`, `Parse`, the statics | enum.md | S | N2a, C1 |
 | 7 | ~~**C2** `DateTime`~~ **landed**, D41 | `docs/specs/datetime.md` | L | C1 |
 | 8 | **N2c** `DateTimeKind` becomes an `enum` | enum.md | S | N2a, C2 |

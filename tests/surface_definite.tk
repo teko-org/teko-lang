@@ -1,0 +1,349 @@
+// surface_definite.tk -- definite assignment (Q3, D46,
+// docs/specs/nullable.md § 8): a local declared without `?` and without an
+// initializer, read before any assignment to it appears, is refused where it
+// is read.
+//
+// The refusals live outside this file, in probes -- a program that does not
+// compile has no exit code to assert. What this fixture proves is the OTHER
+// half, and the one that matters more: every shape the analysis has to
+// ACCEPT still compiles and still answers what it always did. The rule
+// over-approximates on purpose (an assignment anywhere earlier in source
+// order counts, whatever branch it sits in), so a false refusal here is the
+// failure mode this file exists to catch.
+//
+// What each helper proves, in order:
+//
+//   1. `initcheck`   -- the ordinary shapes: an initializer, an assignment
+//                       before the read, a declaration read only after it is
+//                       built, and a local whose value is never read at all;
+//   2. `branchcheck` -- the over-approximation: an assignment inside an `if`
+//                       arm, inside an `else`, inside a `loop`, inside a
+//                       nested block and inside a `switch` case, each read
+//                       afterwards -- C# would refuse three of the five;
+//   3. `structcheck` -- D42's own shape, now legal only when it is built: a
+//                       `struct` declared first and `new`ed in a branch, and
+//                       a class local the same way;
+//   4. `refoutcheck` -- `f(out x)` and `f(ref x)` are the callee's own store,
+//                       so they assign; and a `ref`/`out` parameter is not a
+//                       local this rule judges at all;
+//   5. `formcheck`   -- the constructs that declare WITH a value: a `for`
+//                       initialiser, a `foreach` variable over a local array
+//                       and over a heap one, and a `switch` on a local;
+//   6. `nullcheck`   -- a `T?` local with no initializer is `null` and IS
+//                       assigned (§ 19.2), for a reference row and a value
+//                       row, before and after a store;
+//   7. `scopecheck`  -- the scope discipline: a name declared in an inner
+//                       block, an outer name assigned from inside one, and
+//                       the same name declared again in a sibling block;
+//   8. `capcheck`    -- a lambda's `use (x)` by value and `use (&x)` by
+//                       reference, both counted as assignments, and a local
+//                       assigned only by the lambda behind a `&`;
+//   9. `outofscope`  -- a parameter, a field, a global and an element of
+//                       `new T[n]`, none of which this rule judges.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+// ---- 1. the ordinary shapes ----
+
+i64 initcheck() {
+    i64 a = 1;                                    // an initializer
+    i64 b;
+    b = 2;                                        // assigned, then read
+    if (a + b != 3) return 1;
+
+    i64 c;
+    c = a;
+    i64 d = c;                                    // read only after the store
+    if (d != 1) return 2;
+
+    i64 unread;                                   // never read: never judged
+    unread = 9;
+
+    i64 e;
+    e = 0;
+    e = e + 5;                                    // its own right side, after a store
+    if (e != 5) return 3;
+    return 0;
+}
+
+// ---- 2. the over-approximation ----
+
+i64 branchcheck() {
+    i64 cond = 1;
+
+    i64 a;
+    if (cond > 0) { a = 10; }                     // one arm only: C# refuses, teko does not
+    if (a != 10) return 1;
+
+    i64 b;
+    if (cond < 0) { b = 1; } else { b = 20; }     // both arms
+    if (b != 20) return 2;
+
+    i64 c;
+    i64 i = 0;
+    loop {
+        if (i > 0) break;
+        c = 30;                                   // inside a loop the analysis does not unroll
+        i = i + 1;
+    }
+    if (c != 30) return 3;
+
+    i64 d;
+    { d = 40; }                                   // a nested block
+    if (d != 40) return 4;
+
+    i64 e;
+    switch (cond) {
+        case 1: e = 50; break;
+        default: e = 0; break;
+    }
+    if (e != 50) return 5;
+    return 0;
+}
+
+// ---- 3. D42's own shape ----
+
+struct Vec {
+    public i64 x;
+    public i64 y;
+}
+
+class Cell {
+    public i64 v;
+
+    public Cell(i64 v) { this.v = v; }
+    public i64 get() { return v; }
+}
+
+i64 structcheck() {
+    i64 cond = 1;
+
+    Vec v;
+    if (cond > 0) { v = new Vec(); }              // built in a branch, read after
+    v.x = 4;
+    v.y = 5;
+    if (v.x + v.y != 9) return 1;
+
+    Vec w = new Vec();                            // built at the declaration
+    w.x = 1;
+    if (w.x != 1) return 2;
+
+    Cell c;
+    if (cond > 0) { c = new Cell(7); }
+    if (c.get() != 7) return 3;
+
+    Cell e;
+    e = new Cell(8);
+    if (e.v != 8) return 4;
+    return 0;
+}
+
+// ---- 4. `ref` and `out` ----
+
+void mk(out i64 z) { z = 7; }
+void bump(ref i64 z) { z = z + 1; }
+void mkcell(out Cell c) { c = new Cell(3); }
+
+i64 through(ref i64 p) {                          // a `ref` parameter is not a local
+    p = p + 1;
+    return p;
+}
+
+i64 refoutcheck() {
+    i64 a;
+    mk(out a);                                    // the callee's own store
+    if (a != 7) return 1;
+
+    bump(ref a);
+    if (a != 8) return 2;
+
+    i64 b;
+    mk(out b);
+    if (through(ref b) != 8) return 3;
+
+    Cell c;
+    mkcell(out c);
+    if (c.v != 3) return 4;
+
+    Vec v;
+    v = new Vec();
+    v.x = 2;
+    bump(ref v.x);                                // a FIELD behind `ref`, not a local
+    if (v.x != 3) return 5;
+    return 0;
+}
+
+// ---- 5. the constructs that declare with a value ----
+
+i64 formcheck() {
+    i64 s = 0;
+    for (i64 i = 0; i < 4; i++) { s = s + i; }    // the initialiser declares and assigns
+    if (s != 6) return 1;
+
+    i64 xs[3];
+    xs[0] = 1;
+    xs[1] = 2;
+    xs[2] = 3;
+    i64 t = 0;
+    foreach (i64 v in xs) { t = t + v; }          // the construct writes the variable
+    if (t != 6) return 2;
+
+    i64[] hs = new i64[3];
+    hs[0] = 4;
+    hs[1] = 5;
+    hs[2] = 6;
+    i64 u = 0;
+    foreach (i64 v in hs) { u = u + v; }
+    if (u != 15) return 3;
+
+    i64 arr[2];                                   // a local array: the name IS the storage
+    arr[0] = 8;
+    arr[1] = 9;
+    if (arr[0] + arr[1] != 17) return 4;
+
+    i64 k;
+    k = 2;
+    i64 r = 0;
+    switch (k) {
+        case 2: r = 20; break;
+        default: r = 0; break;
+    }
+    if (r != 20) return 5;
+    return 0;
+}
+
+// ---- 6. a `T?` with no initializer is null, and null is a value ----
+
+i64 nullcheck() {
+    Cell? c;                                      // `Cell? c;` is `Cell? c = null;`
+    if (c != null) return 1;
+    c = new Cell(5);
+    if (c.Value.v != 5) return 2;
+
+    i64? n;
+    if (n.HasValue) return 3;
+    if (n.GetValueOrDefault() != 0) return 4;
+    n = 6;
+    if (n.Value != 6) return 5;
+
+    Vec? v;
+    if (v != null) return 6;
+    return 0;
+}
+
+// ---- 7. the scope discipline ----
+
+i64 scopecheck() {
+    i64 outer;
+    { outer = 1; }                                // an inner block assigns the outer name
+    if (outer != 1) return 1;
+
+    {
+        i64 inner = 2;                            // declared and read inside one block
+        if (inner != 2) return 2;
+    }
+    {
+        i64 inner;                                // the same name, a sibling block
+        inner = 3;
+        if (inner != 3) return 3;
+    }
+
+    i64 shadowed = 4;
+    {
+        i64 shadowed = 5;                         // shadows while the block is open
+        if (shadowed != 5) return 4;
+    }
+    if (shadowed != 4) return 5;
+    return 0;
+}
+
+// ---- 8. a lambda's captures ----
+
+delegate i64 Op(i64 x);
+delegate void Sink();
+
+i64 capcheck() {
+    i64 a;
+    a = 3;
+    Op f = (i64 x) use (a) => x + a;              // by value, after a store
+    if (f(1) != 4) return 1;
+
+    i64 b;
+    Op g = (i64 x) use (b) => x + b;              // by value, with no store at all:
+    if (g(0) != g(0)) return 2;                   // § 8 counts a capture, and does not judge it
+
+    i64 c = 0;
+    Sink s = () use (&c) => { c = 9; };           // by reference: an N_ADDR, an assignment
+    s();
+    if (c != 9) return 3;
+
+    i64 d;
+    Sink t = () use (&d) => { d = 11; };          // the store the lambda itself makes
+    t();
+    if (d != 11) return 4;
+    return 0;
+}
+
+// ---- 9. what the rule does not judge ----
+
+i64 g_total;                                      // a global: BSS, zero, not a local
+
+class Holder {
+    public i64 v;
+    public Cell? c;
+
+    public Holder() { }
+    public i64 read() { return v; }               // a FIELD, never judged
+}
+
+i64 takes(i64 p, Cell q) {                        // parameters arrive with a value
+    return p + q.v;
+}
+
+i64 outofscope() {
+    if (g_total != 0) return 1;
+    g_total = 1;
+
+    Holder h = new Holder();
+    if (h.read() != 0) return 2;                  // `rt_alloc` zeroes a field by design
+    if (h.c != null) return 3;
+
+    if (takes(1, new Cell(2)) != 3) return 4;
+
+    Cell[] cs = new Cell[2];                      // an element of `new T[n]`: zeroed
+    if (cs[0] != null) return 5;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = initcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = branchcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = structcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = refoutcheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = formcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = nullcheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = scopecheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = capcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = outofscope();
+    if (bad != 0) return 90 + bad;
+
+    return 42;
+}

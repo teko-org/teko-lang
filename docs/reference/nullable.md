@@ -46,7 +46,7 @@ non-nullable slot by three roads, all of them still open on purpose:
 |---|---|
 | a field of counted type nobody assigned | `rt_alloc` hands out zeroed bytes ([memory.md](memory.md)) |
 | an element of `new T[n]` | the same zeroing |
-| a `struct` local declared without `new` | the developer's error, by ruling (DECISION_LOG D42) |
+| a local declared without `new` and assigned only in a branch that does not run | definite assignment (below) refuses the read when there is no assignment **anywhere**; it does not judge which branch runs |
 
 So `if (c == null)` on a `Cell` parameter compiles exactly as it always did, and the
 run-time guards — `teko: call through a null delegate`, `teko: index into a null array` —
@@ -471,6 +471,78 @@ field, and element by element inside a `T?[]`.
 A box captured by a closure earns the closure's own reference, and an `i64?` handed to a
 call is parked and swept when the statement ends — both of them the counted rules that
 were already there.
+
+---
+
+## Definite assignment
+
+The other half of the rule. A slot written **without** `?` promises to hold a value, and
+the compiler holds the source to that promise where it can see it: **a local declared
+without `?` and without an initializer, read before any assignment to it appears, is
+refused where it is read.**
+
+```teko
+// no-run
+struct Vec {
+    public i64 x;
+}
+
+i64 main() {
+    i64 a;
+    i64 b = a;                         // teko: a is used before it is assigned
+
+    Vec v;
+    v.x = 4;                           // teko: v is used before it is assigned
+    return 0;
+}
+```
+
+`v.x = 4` is refused because it **reads** `v` — the address the field is written through —
+and a `struct` value is a pointer that only `new` produces ([types.md](types.md) §
+`struct`). Until this rule landed, that line reached the run holding whatever the stack
+held.
+
+**It refuses only what it is sure about.** A name counts as assigned from the moment an
+assignment to it appears earlier in source order, whatever block that assignment sits in
+and whether or not that block runs:
+
+| counts as an assignment | |
+|---|---|
+| an initializer, and any later `x = e` | including one inside an `if` arm, a `loop`, a `switch` case or a nested block |
+| `f(out x)`, `f(ref x)` | the callee's own store |
+| a `foreach` variable, a `for` initialiser | the construct declares it with a value |
+| `use (x)` and `use (&x)` in a lambda | the capture is the lambda's business, not this rule's |
+
+So the shape D42 named as legitimate — declare first, build in a branch — compiles:
+
+```teko
+// no-run
+struct Vec {
+    public i64 x;
+}
+
+i64 main() {
+    i64 c = 1;
+
+    Vec w;
+    if (c > 0) { w = new Vec(); }
+    w.x = 4;                           // accepted: the rule is not sure, so it does not refuse
+    return 0;
+}
+```
+
+That over-approximation is deliberate: a false refusal would break correct code, and this
+rule has no dominator tree. What it leaves through is a row of [not-yet.md](not-yet.md).
+
+**A `T? x;` is assigned.** `Cell? c;` is `Cell? c = null;` — the `?` is the licence to hold
+nothing, and C# refuses that declaration where teko does not.
+
+**Only locals.** A parameter arrives with a value; a field and an element of `new T[n]` are
+zeroed by `rt_alloc`; a global is BSS. None of the four is judged, and the three roads
+above stay open for exactly that reason.
+
+The three declarations that are born assigned, and so are never judged: one with an
+initializer, a local array (`i64 a[4]` — the name **is** the storage), and a `T?`.
 
 ---
 
