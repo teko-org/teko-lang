@@ -288,8 +288,8 @@ never populate. The two globals a text-using enum needs (`Color__names`, `Color_
 are built lazily, the first time one of these four names is spelled on that enum — an enum
 a program never asks text of pays nothing.
 
-- `"teko: wrong number of arguments for "` — completed by the name (`Parse`, `IsDefined` or
-  `ToString`): each takes exactly one argument, `ToString` takes none.
+- `"teko: wrong number of arguments for "` — completed by the name: `Parse` and
+  `IsDefined` take exactly one argument, `ToString` takes none.
 - `"teko: TryParse's second argument is `out <name>`"` — `Color.TryParse(s, out c)`'s second
   argument has to be `out` over a variable; a bare value, `ref`, or nothing at that position
   is refused this way.
