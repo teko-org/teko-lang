@@ -85,24 +85,82 @@ i64  pt_ty_at(i64 i)   { return ld64(pt_ty + i * 8); }
 uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
 uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
 
+// ---- a column that names a type the row cannot see yet ----
+// Every column below carries a type ID, written at `teko_init()` time -- and
+// one type a row names is declared by the very include its lowering symbols
+// live in: `DateTimeKind` is an `enum` inside `lib/time.tk`
+// (docs/specs/enum.md § 8, N2c), so its id does not exist until a program
+// writes `#include "time.tk"`, long after `tk_time_init()` wrote the rows.
+// Such a column carries the NAME instead, encoded as an id BELOW -1
+// (`-2 - slot`, so -1 keeps its own meaning of "no type here"), and the id is
+// read AT THE SITE, where the enum's own row of teko_struct.tk's type table
+// exists. The three accessors below are the only readers, so no caller of
+// this file ever sees the encoding.
+#define TK_MAXPRIML 4                 // types a row names before they exist
+
+uptr pl_name[TK_MAXPRIML];
+i64  tk_npriml = 0;
+
+uptr pl_name_at(i64 i) { return ld64(pl_name + i * 8); }
+
+i64 tk_prim_late(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_npriml) break;
+        if (str_eq(pl_name_at(i), name)) return 0 - 2 - i;
+        i = i + 1;
+    }
+    if (tk_npriml == TK_MAXPRIML)
+        err_at(tk_file, tk_line, "teko: too many late type names over a primitive");
+    st64(pl_name + tk_npriml * 8, name);
+    tk_npriml = tk_npriml + 1;
+    return 0 - 2 - (tk_npriml - 1);
+}
+
+// the id a column carries: its own, or the one the named type has NOW. A name
+// still undeclared answers -1, which every reader here already takes as
+// "nothing known, refuse nothing" -- and a site that needed the type is the
+// very site `tk_prim_need_include` refuses for the missing include.
+i64 tk_prim_ty(i64 col) {
+    if (col >= 0 - 1) return col;
+    i64 si = tk_struct_find_exact(pl_name_at(0 - 2 - col));
+    if (si < 0) return 0 - 1;
+    return sr_ty_at(si);
+}
+
 // ---- the member rows ----
-// A row's parameter list is a COUNT and ONE type: every row this mechanism
-// carries takes its arguments in a single type (`new DateTime(y, m, d)` is
-// three integers, `TimeSpan.FromHours(x)` one float), which is what keeps the
-// list one column instead of a pool. A member whose parameters differ from
-// each other -- C#'s `DateTime.SpecifyKind(DateTime, DateTimeKind)`, its two
-// `Subtract` overloads -- is not taught (docs/reference/not-yet.md); the day
-// one is, this column becomes a list and nothing else moves.
+// A row's parameter list is a COUNT and a HEAD into the position pool below:
+// one column per POSITION, since `new DateTime(ticks, kind)` takes an `i64`
+// and a `DateTimeKind` and no single type spells the pair (D41 named this the
+// day it would come, and N2c is that day). Every other row this mechanism
+// carries still takes its arguments in one type -- `new DateTime(y, m, d)` is
+// three integers, `TimeSpan.FromHours(x)` one float -- and `tk_prim_membern`
+// writes those positions for it.
 //
 // Rows of ONE name and DIFFERENT counts are the overload set of that name:
 // `new DateTime(ticks)`, `new DateTime(y, m, d)` and `new DateTime(y, m, d, h,
 // mi, s)` are three rows, and the site picks by the number of arguments
 // written (`tk_prim_pick`).
+#define TK_MAXPRIMP 128               // parameter positions, over every row
+
+i64  ppos_ty[TK_MAXPRIMP];
+i64  tk_nprimp = 0;
+
+i64  ppos_ty_at(i64 i) { return tk_prim_ty(ld64(ppos_ty + i * 8)); }
+
+i64 tk_prim_pos(i64 ty) {
+    if (tk_nprimp == TK_MAXPRIMP)
+        err_at(tk_file, tk_line, "teko: too many primitive parameter positions");
+    st64(ppos_ty + tk_nprimp * 8, ty);
+    tk_nprimp = tk_nprimp + 1;
+    return tk_nprimp - 1;
+}
+
 i64  pmr_ty[TK_MAXPRIMM];
 uptr pmr_name[TK_MAXPRIMM];
 i64  pmr_kind[TK_MAXPRIMM];
 i64  pmr_np[TK_MAXPRIMM];              // how many arguments the row takes
-i64  pmr_p0[TK_MAXPRIMM];              // the type of EVERY argument, or -1 for none
+i64  pmr_pp[TK_MAXPRIMM];              // its FIRST position in the pool, or -1 for none
 uptr pmr_sym[TK_MAXPRIMM];             // the lib function the row lowers to
 i64  pmr_ret[TK_MAXPRIMM];
 i64  tk_nprimm = 0;
@@ -111,9 +169,9 @@ i64  pmr_ty_at(i64 i)   { return ld64(pmr_ty + i * 8); }
 uptr pmr_name_at(i64 i) { return ld64(pmr_name + i * 8); }
 i64  pmr_kind_at(i64 i) { return ld64(pmr_kind + i * 8); }
 i64  pmr_np_at(i64 i)   { return ld64(pmr_np + i * 8); }
-i64  pmr_p0_at(i64 i)   { return ld64(pmr_p0 + i * 8); }
+i64  pmr_pp_at(i64 i)   { return ld64(pmr_pp + i * 8); }
 uptr pmr_sym_at(i64 i)  { return ld64(pmr_sym + i * 8); }
-i64  pmr_ret_at(i64 i)  { return ld64(pmr_ret + i * 8); }
+i64  pmr_ret_at(i64 i)  { return tk_prim_ty(ld64(pmr_ret + i * 8)); }
 
 // ---- the operator rows ----
 i64  po_tok[TK_MAXPRIMO];
@@ -145,17 +203,38 @@ void tk_prim_type(i64 ty, uptr name, uptr inc) {
     tk_nprimt = tk_nprimt + 1;
 }
 
-// `np` arguments, each of type `p0` (-1 and 0 for a row that takes none).
-void tk_prim_membern(i64 ty, uptr name, i64 kind, i64 np, i64 p0, uptr sym, i64 ret) {
+// `np` arguments whose positions are already in the pool, starting at `pp`.
+void tk_prim_memberp(i64 ty, uptr name, i64 kind, i64 np, i64 pp, uptr sym, i64 ret) {
     if (tk_nprimm == TK_MAXPRIMM) err_at(tk_file, tk_line, "teko: too many primitive members");
     st64(pmr_ty + tk_nprimm * 8, ty);
     st64(pmr_name + tk_nprimm * 8, name);
     st64(pmr_kind + tk_nprimm * 8, kind);
     st64(pmr_np + tk_nprimm * 8, np);
-    st64(pmr_p0 + tk_nprimm * 8, p0);
+    st64(pmr_pp + tk_nprimm * 8, pp);
     st64(pmr_sym + tk_nprimm * 8, sym);
     st64(pmr_ret + tk_nprimm * 8, ret);
     tk_nprimm = tk_nprimm + 1;
+}
+
+// `np` arguments, each of type `p0` (-1 and 0 for a row that takes none).
+void tk_prim_membern(i64 ty, uptr name, i64 kind, i64 np, i64 p0, uptr sym, i64 ret) {
+    i64 pp = 0 - 1;
+    i64 i = 0;
+    loop {
+        if (i >= np) break;
+        i64 s = tk_prim_pos(p0);
+        if (i == 0) pp = s;
+        i = i + 1;
+    }
+    tk_prim_memberp(ty, name, kind, np, pp, sym, ret);
+}
+
+// two arguments that DIFFER in type: `new DateTime(ticks, kind)`, the one C#
+// shape the single column could not spell.
+void tk_prim_member2(i64 ty, uptr name, i64 kind, i64 t0, i64 t1, uptr sym, i64 ret) {
+    i64 pp = tk_prim_pos(t0);
+    tk_prim_pos(t1);
+    tk_prim_memberp(ty, name, kind, 2, pp, sym, ret);
 }
 
 // the shape most rows have: no argument (`p0` -1) or exactly one.
@@ -337,8 +416,17 @@ i64 tk_prim_raw(i64 e) {
 // declared return type is what every oracle already reads. The other direction
 // -- a cast TO a primitive -- is remembered by `tk_cast` itself (teko_array.tk),
 // so every module that writes one is covered by construction.
+//
+// An ENUM result takes the same cast, and for the same reason: `d.Kind` lowers
+// to `tk_dt_kind((i64) d)`, whose declared return type is the enum's UNDERLYING
+// integer, and without the cast every oracle would read the site as that
+// integer -- `i64 n = d.Kind;` would convert where docs/specs/enum.md § 5
+// refuses it. The plain machine cast is what teko_null.tk's own payload read
+// already writes for an enum (`tk_nl_payload`), and it is not an instruction:
+// the value is the underlying integer at run time, no box and no tag.
 i64 tk_prim_ret(i64 ret, i64 call) {
     if (tk_prim_is(ret)) return tk_cast(ret, call);
+    if (tk_is_enum(tk_struct_by_ty(ret))) return tk_cast(ret, call);
     return call;
 }
 
@@ -409,8 +497,16 @@ i64 tk_prim_ty_of(i64 n, i64 atpass) {
 // the value as the lowered call takes it: the raw eight bytes for a primitive
 // column, and C# 10.2.3's own widening (`tk_num_widen`, teko_typeof.tk) for an
 // integer landing on a float one -- `TimeSpan.FromHours(2)` is `FromHours(2.0)`.
+//
+// An ENUM column is unwrapped the same way a captured enum is (teko_deleg.tk's
+// own `tk_cap_val`): the lowering symbol takes an `i64` --
+// `tk_dt_from_ticks_kind(i64, i64)`, lib/time.tk, which never names the enum --
+// so the value crosses as its underlying integer, and it is the CHECK above
+// (`tk_check_scalar_compat`, docs/specs/enum.md § 5) that already refused
+// everything but the enum itself in this position.
 i64 tk_prim_conv(i64 pty, i64 e, i64 ety) {
     if (tk_prim_is(pty)) return tk_prim_raw(e);
+    if (tk_is_enum(tk_struct_by_ty(pty))) return tk_cast(TY_I64, e);
     return tk_num_widen(pty, ety, e);
 }
 
@@ -429,7 +525,7 @@ i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
 // wrapped node keeps no `nd_next` of its own (`tk_num_widen`'s own rule), and
 // the list is rebuilt in order out of what the conversion hands back.
 i64 tk_prim_args(i64 ri, i64 args, i64 atpass, i64 line, uptr fl) {
-    i64 pty = pmr_p0_at(ri);
+    i64 pp = pmr_pp_at(ri);
     i64 np = pmr_np_at(ri);
     i64 head = 0;
     i64 a = args;
@@ -438,7 +534,7 @@ i64 tk_prim_args(i64 ri, i64 args, i64 atpass, i64 line, uptr fl) {
         if (i >= np) break;
         i64 nx = nd_next(a);
         set_nd_next(a, 0);
-        head = list_append(head, tk_prim_arg(pty, a, atpass, line, fl));
+        head = list_append(head, tk_prim_arg(ppos_ty_at(pp + i), a, atpass, line, fl));
         a = nx;
         i = i + 1;
     }

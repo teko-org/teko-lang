@@ -200,8 +200,8 @@ not the identity cast `TimeSpan.Ticks` is:
 | signature | is |
 |---|---|
 | `i64 tk_dt_ticks(i64)` `i64 tk_dt_kind_of(i64)` | the two halves of the eight bytes |
-| `i32 tk_dt_kind(i64)` | `.Kind`, as a `DateTimeKind` |
-| `i32 tk_dtk_unspecified()` `tk_dtk_utc()` `tk_dtk_local()` | the three `DateTimeKind` values |
+| `i32 tk_dt_kind(i64)` | `.Kind`, answered as the underlying `i32` and cast to `DateTimeKind` at the site |
+| `enum DateTimeKind : i32` | the three values, an ordinary `enum` declaration in the same file and not a function (N2c) |
 | `i64 tk_dt_pack(i64 ticks, i64 kind)` | the two halves back into one value, range-checked |
 | `i64 tk_dt_days_before(i64 month, i64 leap)` | the cumulative month table, as a function |
 | `i64 tk_dt_is_leap(i64 y)` `i64 tk_dt_days_in_month(i64 y, i64 m)` | the two calendar statics |

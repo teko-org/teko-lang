@@ -36,7 +36,7 @@ count from `0001-01-01 00:00:00` with a `Kind` in the two bits above it.
 |---|---|---|---|---|
 | `TimeSpan` | 8 | 8 | `TK_SINT` | ticks, signed, `-2^63 .. 2^63 - 1` |
 | `DateTime` | 8 | 8 | `TK_SINT` | bits 0..61 ticks, bits 62..63 `Kind` |
-| `DateTimeKind` | 4 | 4 | `type_alias` over `i32` | `0` Unspecified, `1` Utc, `2` Local |
+| `DateTimeKind` | 4 | 4 | an `enum : i32` in `lib/time.tk` (N2c) | `0` Unspecified, `1` Utc, `2` Local |
 
 `TK_SINT` is the fifth kind ([`mc` hooks.md](https://github.com/minicompiler/mc/blob/main/docs/reference/hooks.md)
 § `type_new`): eight bytes wide is the word, so nothing narrows and nothing extends — the
@@ -290,7 +290,7 @@ Also deliberately outside:
 | left out | why |
 |---|---|
 | `ToLocalTime`, `ToUniversalTime`, `DateTimeOffset` | a time-zone database is not a language feature |
-| `enum DateTimeKind` | teko has no `enum`; the alias plus three constants is the same surface, and `enum` is a crumb of its own |
+| ~~`enum DateTimeKind`~~ | **landed** (N2c, D48): teko had no `enum` when this page was written, so C2 shipped a `type_alias` over `i32` plus three constants — the same surface, and `enum` a crumb of its own. It is now an ordinary `enum` declared in `lib/time.tk`, and the two registrations are gone |
 | culture, `ParseExact`, custom format strings | the market's answer is a formatting library, not a primitive |
 | `TimeSpan * f64`, `DateTime` in a `switch` pattern | neither is refused on principle; neither is in this design |
 | `DateOnly`, `TimeOnly` | C# has them; nothing asks for them yet |
@@ -300,7 +300,7 @@ Also deliberately outside:
 | module | what it grows |
 |---|---|
 | **`teko_prim.tk`** (new) | the primitive registry: the id table, the member table, the operator table, `tk_prim_is`, `tk_prim_member`, `tk_prim_op`. Registrations only — no pass, no `syntax*` of its own |
-| **`teko_time.tk`** (new) | three registrations (`type_new` ×2, `type_alias` ×1), `syntax_expr` for `DateTime`, `TimeSpan` and `DateTimeKind` so a type word opens an expression, and every row of § 4 and § 6 |
+| **`teko_time.tk`** (new) | two registrations (`type_new` ×2), `syntax_expr` for `DateTime` and `TimeSpan` so a type word opens an expression, and every row of § 4 and § 6. C2 also registered a `type_alias` for `DateTimeKind`; N2c replaced it with an `enum` in `lib/time.tk` and deleted both registrations |
 | `teko_expr.tk` | `.` on a receiver whose type is a primitive, and `new Name(args)` on a primitive name — two lookups into `teko_prim.tk`, at the two places the row question is already asked |
 | `teko_typeof.tk` | the deferred `.` when the receiver is a parameter; `tk_ty_of` answers a primitive member's declared result; `tk_check_scalar_compat` gains the one clause of § 5 |
 | `teko_access.tk` | `Type.member` where the type is a primitive: the same deferred static access, resolved against the member table |
@@ -326,7 +326,7 @@ Measured on `6b868f0c` with `mc limits . --config teko.toml`, the gate's own con
 | row | today | after | why |
 |---|---|---|---|
 | `types` | 7 | **10** | `decimal`, `DateTime`, `TimeSpan` — this page owns two of the three |
-| `alias` | 14 | **15** | `DateTimeKind` |
+| `alias` | 14 | **15** | `DateTimeKind` (N2c gave the alias back: the measured floor is 18 today, and the `enum`'s own `type_new` puts one alias back per program that includes `lib/time.tk`) |
 | `syntax` | 14 | **17** | one `syntax_expr` per type word that opens an expression |
 | `passes` | 15 | **15** | by design: the mechanism adds no pass |
 | `intrin` | 8 | **8** | by design: teko still registers none |
@@ -347,6 +347,13 @@ The P0 crumb measures it on the heaviest fixture before C1 is written.
 | `tests/primitives_datetime_overflow.tk` | `DateTime.MaxValue.AddTicks(1)` | `70` |
 | `tests/primitives_datetime_text.tk` | `"o"` and `"s"` both ways, `TryParse` on a good and a bad string, `Parse` of what `ToString` wrote | `42` |
 | `tests/primitives_datetime_parse_bad.tk` | `DateTime.Parse("not a date")` | `70` |
+
+**The names above are this page's design, not what landed.** C1 and C2 shipped four
+fixtures under the `surface_*` family the repository uses — `tests/surface_timespan.tk`
+(42), `tests/surface_timespan_overflow.tk` (70), `tests/surface_datetime.tk` (42, 106
+assertions) and `tests/surface_datetime_panic.tk` (70) — and N2c added
+`tests/surface_datetime_kind.tk` (42) beside them (D41 § 6, D48). Read every
+`tests/primitives_*` name on this page as the `surface_*` one that carries it.
 
 Every one of them is a whole program with `#include "../lib/time.tk"`, returns `42` on
 success and a small distinct number per failed assertion, which is the convention
@@ -400,7 +407,7 @@ written cast refusal are NOT in it ([not-yet.md](../reference/not-yet.md)).
 teko_expr.tk/teko_typeof.tk/teko_access.tk; the operator rows in teko_ops.tk; the
 conversion clause; `lib/time.tk`'s `TimeSpan` half.
 
-**Gate:** `tests/primitives_timespan.tk` (42) and `tests/primitives_timespan_overflow.tk`
+**Gate:** `tests/surface_timespan.tk` (42) and `tests/surface_timespan_overflow.tk`
 (70) added and green, the other 45 unchanged and `--dump-ast` byte-identical on all of
 them, `FIXPOINT OK`, `mc limits` verdict `ok` with `passes` and `intrin` **not moved**,
 `sh scripts/check-docs.sh` green. **Owes:** a `TimeSpan` section in
@@ -412,7 +419,7 @@ them, `FIXPOINT OK`, `mc limits` verdict `ok` with `passes` and `intrin` **not m
 
 ### C2 — `DateTime` (L)
 
-The second `type_new`, the `DateTimeKind` alias, the calendar, the components, the `Add*`
+The second `type_new`, the `DateTimeKind` alias (an `enum` since N2c), the calendar, the components, the `Add*`
 family, the operators mixing the two types, `"o"`/`"s"` in both directions, and the
 `Now`/`UtcNow`/`Today` refusal.
 

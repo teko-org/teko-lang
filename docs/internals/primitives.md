@@ -32,12 +32,20 @@ A **member row** is
 | `TK_PMCTOR` | `new Type(args)` | `new DateTime(2024, 2, 29)` |
 | `TK_PMSOON` | `Type.Name`, refused by name | `DateTime.Now` |
 
-**The parameter list is a count and ONE type**, because every row this mechanism carries
-takes its arguments in a single type: three integers for `new DateTime(y, m, d)`, one float
-for `TimeSpan.FromHours(x)`. A member whose parameters differ from each other —
-`DateTime.SpecifyKind(DateTime, DateTimeKind)`, the two `Subtract` overloads — is not
-taught ([not-yet.md](../reference/not-yet.md)); the day one is, that column becomes a list
-and nothing else moves.
+**The parameter list is a count and a HEAD into a pool of positions**, one column per
+argument. It was a count and ONE type until N2c, because every row took its arguments in a
+single type — three integers for `new DateTime(y, m, d)`, one float for
+`TimeSpan.FromHours(x)` — and `new DateTime(ticks, kind)` is the first that does not: an
+`i64` beside a `DateTimeKind`. `tk_prim_membern` still writes `np` positions of one type
+for every other row, so nothing else moved, exactly as this page said it would not.
+
+**A column may name a type that does not exist yet.** `DateTimeKind` is an `enum` declared
+inside `lib/time.tk`, so its id is created when a program writes `#include "time.tk"`, long
+after `tk_time_init()` wrote the rows. Such a column carries the NAME instead, encoded as
+an id below -1, and `tk_prim_ty` reads the real id at the SITE, where the enum's own row of
+the type table exists (`tk_prim_late`). A name still undeclared answers -1, which every
+reader here already takes as "nothing known, refuse nothing" — and that site is the very
+one `tk_prim_need_include` refuses for the missing include.
 
 **Rows of one name and different counts are the overload set of that name.** `new
 DateTime(...)` is five rows (1, 2, 3, 6 and 7 arguments) and the site picks by how many it
@@ -147,11 +155,11 @@ it is `teko: too many casts over a primitive in one unit`.
 
 ## What the second primitive actually cost
 
-`DateTime` added one `type_new`, one `syntax_expr`/`syntax_stmt` pair, one `type_alias`
-(`DateTimeKind`, over `i32`, with a three-value handler of its own), its 36 rows, and the
-calendar in `lib/time.tk` — about 300 lines of ordinary teko. In `mc limits` that is
-`types 10 → 11` and `alias 17 → 19`, with `syntax`, `passes 15/30` and `intrin 8/16`
-unmoved, verdict `ok`.
+`DateTime` added one `type_new`, one `syntax_expr`/`syntax_stmt` pair, its 36 rows, and the
+calendar in `lib/time.tk` — about 300 lines of ordinary teko. C2 also registered
+`DateTimeKind` as a `type_alias` over `i32` with a three-value handler of its own; N2c
+deleted both and wrote an ordinary `enum` in `lib/time.tk` instead, which is why the
+compiler's own `alias` row is 18 today and not 19.
 
 In `teko_prim.tk` it cost the three additions this page names (multi-argument rows,
 `TK_PMSOON`, the own-cast list) and no pass. The next primitive —

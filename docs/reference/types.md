@@ -624,7 +624,8 @@ i64 main() {
 }
 ```
 
-`DateTimeKind` is an alias of `i32` with three values. A date that does not exist panics
+`DateTimeKind` is an [`enum`](#enum) with three values, declared in `lib/time.tk`, so
+`d.Kind` answers it and no bare integer lands in it. A date that does not exist panics
 where it is built (`new DateTime(2023, 2, 29)` is `teko: a date does not exist`, exit 70),
 and `DateTime.Now` is refused by name until `mc`'s `<sys>` carries a wall clock.
 [datetime.md](datetime.md) is the whole type.

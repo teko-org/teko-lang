@@ -365,8 +365,39 @@ messages reuse the wordings a declared type already gets; only a handful are its
   `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
   to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
   the site says so, instead of reading as a member nobody declared.
-- `"teko: unknown static member of DateTimeKind"` — completed by the member: the three
-  values are `Unspecified`, `Utc` and `Local`.
+### `DateTimeKind`, since it became an `enum`
+
+`DateTimeKind` is an ordinary `enum` declared in `lib/time.tk` (N2c), not a compiler
+registration, so it refuses what [every enum refuses](#enums) and under the same wordings.
+Three of them are what the crumb bought, and each used to compile:
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 main() {
+    DateTime d = new DateTime(1, DateTimeKind.Utc);
+    i64 n = d.Kind;              // teko: a value of type DateTimeKind does not convert to i64
+    DateTimeKind k = 7;          // teko: a value of type i64 does not convert to DateTimeKind
+    DateTime e = new DateTime(1, 7);   // teko: a value of type i64 does not convert to DateTimeKind
+    return 0;
+}
+```
+
+`(DateTimeKind) 7` is still accepted — an explicit cast into an enum is C#'s own, and the
+value is caught at run time by the range check of `tk_dt_from_ticks_kind` (`teko: a date
+kind is out of range`, exit 70) if it reaches a constructor.
+
+**A program that forgot `#include "time.tk"` is no longer told which file it forgot.** The
+name belongs to the library file now, so `DateTimeKind.Utc` without the include reaches
+`teko: unknown member: Utc` and `DateTimeKind k;` reaches the core's own `expected ; after
+expression`, where the old registration answered `teko: DateTimeKind needs #include
+"time.tk" before it is used`. `DateTime` and `TimeSpan` keep that refusal, because they are
+compiler registrations; the trade is [D48](../../DECISION_LOG.md)'s.
+
+The message `"teko: unknown static member of DateTimeKind"` is gone with the handler that
+raised it: a member the enum does not declare now reads as
+`teko: DateTimeKind has no member Nope`, the wording every enum shares.
 
 The three panics `lib/time.tk` raises for a `TimeSpan` at RUN time (`a time span
 overflowed`, `a time span divided by zero`, `a time span is out of range`) and the eleven it
@@ -801,6 +832,8 @@ truncation; the fix is to split the unit.
 | `"teko: too many primitive types"` | 8 primitives with a member table |
 | `"teko: too many primitive members"` | 96 rows, over every primitive |
 | `"teko: too many primitive operators"` | 32 rows, over every primitive |
+| `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row |
+| `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
 | `"teko: too many casts over a primitive in one unit"` | 4096 casts the compiler wrote itself, in one compilation unit |
 | `"teko: too many services"` | 32 marked classes |
 | ``"teko: too many `inject` sites"`` | 32 |

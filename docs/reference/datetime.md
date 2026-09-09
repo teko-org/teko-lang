@@ -105,9 +105,24 @@ Three values under one word:
 | `DateTimeKind.Utc` | `1` |
 | `DateTimeKind.Local` | `2` |
 
-`DateTimeKind` is an **alias of `i32`**, so a kind is an ordinary small integer and
-`DateTimeKind k = d.Kind;` is a declaration like any other. Making it a real `enum` is
-[a crumb of its own](../specs/datetime.md) and would only tighten what converts.
+`DateTimeKind` is an **`enum`** — the ordinary one, declared in `lib/time.tk` as
+
+```teko
+// no-run
+public enum DateTimeKind : i32 { Unspecified = 0, Utc = 1, Local = 2 }
+```
+
+so it has everything [an enum has](types.md#enum): `.ToString()`, `Parse`, `TryParse`,
+`IsDefined`, `case DateTimeKind.Utc:` as a `switch` label, and the two explicit casts.
+`DateTimeKind k = d.Kind;` is a declaration like any other, and **nothing else converts
+into one**: `i64 n = d.Kind;` and `DateTimeKind k = 7;` are refused where the older alias
+of `i32` took any integer, and so is `new DateTime(t, 7)`. Write `(DateTimeKind) 7` when
+you mean it — an explicit cast into an enum is C#'s own, and the constructor's own range
+check still panics on it.
+
+Because the type is declared by the library file and not by the compiler, it needs
+`#include "time.tk"` like everything else `lib/time.tk` carries; without it the name is an
+ordinary unknown identifier.
 
 The arithmetic **keeps** the `Kind` of the value it started from; the comparisons
 **ignore** it. Two dates of different `Kind` and equal ticks are equal, which is C#'s own

@@ -1,0 +1,138 @@
+// surface_datetime_kind.tk -- `DateTimeKind` as a real `enum`
+// (docs/specs/enum.md § 8, N2c, D48). The surface of `tests/surface_datetime.tk`
+// does not move -- `d.Kind != DateTimeKind.Utc` is spelled the same either way,
+// and that fixture is byte-identical to what C2 landed -- so what this one
+// proves is everything the ALIAS could not do:
+//
+//   DateTimeKind k = d.Kind;           the property answers the enum, not an i32
+//   switch (k) { case DateTimeKind.Utc: ... }   a qualified member as a label
+//   (DateTimeKind) 1 == DateTimeKind.Utc        C#'s explicit cast in
+//   new DateTime(t, k)                 the enum in a constructor argument,
+//                                      from a variable and from a member
+//   d.Kind.ToString()                  "Utc", through the deferred `.`
+//   DateTimeKind.Parse("Local")        the statics every enum has (N2b)
+//   DateTimeKind.TryParse / IsDefined
+//   c ? DateTimeKind.Utc : ...         a ternary over two enum arms
+//   () use (k) => k                    a lambda's by-value capture
+//
+// The three refusals the tightening buys -- `i64 n = d.Kind;`,
+// `DateTimeKind k = 7;` and `new DateTime(t, 7)` -- have no harness (D33) and
+// are written down in docs/reference/diagnostics.md.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+delegate DateTimeKind KindOp();
+
+// the receiver the PARSER cannot type: a parameter, deferred to the oracle's
+// own pass and lowered there against the very same row
+DateTimeKind kind_of(DateTime d) { return d.Kind; }
+
+// an enum parameter and an enum return, over the library's own type
+DateTimeKind flip(DateTimeKind k) {
+    if (k == DateTimeKind.Utc) return DateTimeKind.Local;
+    return DateTimeKind.Utc;
+}
+
+// a `switch` over the three members, read from a local copy of the parameter
+i64 rank(DateTimeKind k) {
+    DateTimeKind c = k;
+    i64 r = 0;
+    switch (c) {
+        case DateTimeKind.Unspecified:
+            r = 10;
+            break;
+        case DateTimeKind.Utc:
+            r = 20;
+            break;
+        case DateTimeKind.Local:
+            r = 30;
+            break;
+        default:
+            r = 40;
+            break;
+    }
+    return r;
+}
+
+i64 main() {
+    i64 t = 638447616000000000;
+    DateTime utc = new DateTime(t, DateTimeKind.Utc);
+    DateTime local = new DateTime(t, DateTimeKind.Local);
+    DateTime plain = new DateTime(t);
+
+    // ---- the property answers the enum ----
+    DateTimeKind k = utc.Kind;
+    if (k != DateTimeKind.Utc) return 1;
+    if (local.Kind != DateTimeKind.Local) return 2;
+    if (plain.Kind != DateTimeKind.Unspecified) return 3;
+    if (k == DateTimeKind.Local) return 4;
+
+    // ...and so does a parameter's, resolved by the pass
+    if (kind_of(utc) != DateTimeKind.Utc) return 5;
+    if (kind_of(plain) != DateTimeKind.Unspecified) return 6;
+
+    // ---- C#'s explicit cast, both ways ----
+    if ((DateTimeKind) 1 != DateTimeKind.Utc) return 7;
+    if ((DateTimeKind) 0 != DateTimeKind.Unspecified) return 8;
+    if ((i64) DateTimeKind.Local != 2) return 9;
+    if ((i64) (utc.Kind) != 1) return 10;    // the cast binds before `.`, so the parentheses are the surface
+
+    // ---- the enum in a constructor argument, from a variable ----
+    DateTime again = new DateTime(t, k);
+    if (again.Kind != DateTimeKind.Utc) return 11;
+    if (again.Ticks != t) return 12;
+    DateTimeKind lk = local.Kind;
+    DateTime relocal = new DateTime(t, lk);
+    if (relocal.Kind != DateTimeKind.Local) return 13;
+    // ...and from another date's own property, in one expression
+    DateTime copy = new DateTime(t, utc.Kind);
+    if (copy.Kind != DateTimeKind.Utc) return 14;
+
+    // the arithmetic keeps the Kind and the comparison ignores it, exactly as
+    // C2 left them -- now typed by the enum
+    if (utc.AddDays(1).Kind != DateTimeKind.Utc) return 15;
+    if (local.Date.Kind != DateTimeKind.Local) return 16;
+    if (!(utc == local)) return 17;
+
+    // ---- an enum parameter, an enum return, a switch ----
+    if (flip(DateTimeKind.Utc) != DateTimeKind.Local) return 18;
+    if (flip(DateTimeKind.Local) != DateTimeKind.Utc) return 19;
+    if (flip(utc.Kind) != DateTimeKind.Local) return 20;
+    if (rank(DateTimeKind.Unspecified) != 10) return 21;
+    if (rank(utc.Kind) != 20) return 22;
+    if (rank(local.Kind) != 30) return 23;
+    if (rank((DateTimeKind) 7) != 40) return 24;
+
+    // ---- the text side every enum has (N2b) ----
+    if (!tk_str_eq(utc.Kind.ToString(), "Utc")) return 25;
+    if (!tk_str_eq(local.Kind.ToString(), "Local")) return 26;
+    if (!tk_str_eq(plain.Kind.ToString(), "Unspecified")) return 27;
+    if (!tk_str_eq(k.ToString(), "Utc")) return 28;
+    if (!tk_str_eq(DateTimeKind.Local.ToString(), "Local")) return 29;
+    if (!tk_str_eq(((DateTimeKind) 7).ToString(), "7")) return 30;
+
+    if (DateTimeKind.Parse("Local") != DateTimeKind.Local) return 31;
+    if (DateTimeKind.Parse("Unspecified") != DateTimeKind.Unspecified) return 32;
+    DateTimeKind out_k = DateTimeKind.Unspecified;
+    if (!DateTimeKind.TryParse("Utc", out out_k)) return 33;
+    if (out_k != DateTimeKind.Utc) return 34;
+    if (DateTimeKind.TryParse("Nope", out out_k)) return 35;
+    if (out_k != DateTimeKind.Utc) return 36;              // untouched on failure
+    if (!DateTimeKind.IsDefined(2)) return 37;
+    if (DateTimeKind.IsDefined(7)) return 38;
+
+    // ---- a ternary over two enum arms, and a by-value capture ----
+    i64 flag = 1;
+    DateTimeKind picked = flag == 1 ? DateTimeKind.Utc : DateTimeKind.Local;
+    if (picked != DateTimeKind.Utc) return 39;
+    DateTimeKind picked2 = utc.Kind == DateTimeKind.Utc ? local.Kind : plain.Kind;
+    if (picked2 != DateTimeKind.Local) return 40;
+
+    DateTimeKind cap = local.Kind;
+    KindOp cap_f = () use (cap) => cap;
+    if (cap_f() != DateTimeKind.Local) return 41;
+
+    return 42;
+}

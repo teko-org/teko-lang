@@ -39,7 +39,7 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_stmt.tk` | every `{` block, and the honest stops for `var`, `match`, `when`, a local `const` | `syntax_stmt("{")` and one per stopped word | — |
 | `teko_expr.tk` | `new`, `.` as field/method/property access | `syntax_expr("new")`, `syntax_infix(".")` | forward-deferred `new` sites |
 | `teko_prim.tk` | nothing of the surface on its own: the lowering table a PRIMITIVE gets members from, and the `syntax_expr`/`syntax_stmt` handlers a primitive's type word is registered with | nothing: the owner module registers | one row per member and per operator of every primitive |
-| `teko_time.tk` | `TimeSpan`, `DateTime` and `DateTimeKind` — the type words, their members and their operators | two `type_new`, one `type_alias`, two `syntax_expr`/`syntax_stmt` pairs and one `syntax_expr` of its own, then the rows of `teko_prim.tk`'s two tables | the two type ids |
+| `teko_time.tk` | `TimeSpan` and `DateTime` — the type words, their members and their operators (`DateTimeKind` is an `enum` of `lib/time.tk` since N2c, registered by nothing here) | two `type_new` and two `syntax_expr`/`syntax_stmt` pairs, then the rows of `teko_prim.tk`'s two tables | the two type ids |
 | `teko_params.tk` | `params T[]`, the array built at the call site | `syntax_infix("[")` | the parameters the modifier marked, and the declarations carrying one, each shared or not |
 | `teko_default.tk` | `i64 add(i64 a, i64 b = 10)` | `syntax_param` — the one in this compiler | one row per free declaration with a parameter list |
 | `teko_over.tk` | overload of a top-level function by signature | nothing: one `pass()` | every declaration of the unit, and the names declared more than once |
