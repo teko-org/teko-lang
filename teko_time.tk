@@ -148,7 +148,12 @@ void tk_dt_statics() {
 void tk_dt_ctors() {
     i64 dt = tk_ty_datetime;
     tk_prim_membern(dt, "new", TK_PMCTOR, 1, TY_I64, "tk_dt_from_ticks", dt);
-    tk_prim_membern(dt, "new", TK_PMCTOR, 2, TY_I64, "tk_dt_from_ticks_kind", dt);
+    // the one row whose two arguments differ in TYPE: a tick count and a
+    // `DateTimeKind`, the `enum` `lib/time.tk` declares (N2c). The type does
+    // not exist here -- the include that declares it has not been read yet --
+    // so the column names it and the site reads the id (`tk_prim_late`).
+    tk_prim_member2(dt, "new", TK_PMCTOR, TY_I64, tk_prim_late("DateTimeKind"),
+                    "tk_dt_from_ticks_kind", dt);
     tk_prim_membern(dt, "new", TK_PMCTOR, 3, TY_I64, "tk_dt_ymd", dt);
     tk_prim_membern(dt, "new", TK_PMCTOR, 6, TY_I64, "tk_dt_ymdhms", dt);
     tk_prim_membern(dt, "new", TK_PMCTOR, 7, TY_I64, "tk_dt_ymdhmsms", dt);
@@ -160,9 +165,11 @@ void tk_dt_members() {
     // `.Ticks` is a CALL here, unlike `TimeSpan.Ticks`: the raw eight bytes
     // carry the `Kind` above the ticks, so reading them as a number is the one
     // thing that would be silently wrong. `.Kind` answers a `DateTimeKind`,
-    // which is `i32` under an alias (§ 1).
+    // the `enum` of `lib/time.tk` (§ 1 as N2c rewrote it): the lowering symbol
+    // still answers the underlying `i32` and `tk_prim_ret` casts the call to
+    // the enum, so `i64 n = d.Kind;` is refused where the old alias converted.
     tk_prim_member(dt, "Ticks", TK_PMPROP, 0 - 1, "tk_dt_ticks", TY_I64);
-    tk_prim_member(dt, "Kind",  TK_PMPROP, 0 - 1, "tk_dt_kind",  ty_i32);
+    tk_prim_member(dt, "Kind",  TK_PMPROP, 0 - 1, "tk_dt_kind",  tk_prim_late("DateTimeKind"));
     // the civil calendar: proleptic Gregorian, computed as C# computes it
     tk_prim_member(dt, "Year",        TK_PMPROP, 0 - 1, "tk_dt_year",   TY_I64);
     tk_prim_member(dt, "Month",       TK_PMPROP, 0 - 1, "tk_dt_month",  TY_I64);
@@ -214,37 +221,20 @@ void tk_dt_operators() {
     tk_prim_op(K_GE, 2, dt, dt, "tk_dt_ge", TY_I64, 0);
 }
 
-// ---- `DateTimeKind`: an alias over `i32`, and three constants ----
-// § 1's own shape, and § 8's reason: teko had no `enum` when the page was
-// written, and an alias plus three constants is the same surface. Now that
-// `enum` is taught (docs/specs/enum.md N2a) turning it into one is a crumb of
-// its own (N2c) -- a TIGHTENING, since an alias converts from any integer and
-// an enum from nothing but itself.
+// ---- `DateTimeKind` is not registered here at all ----
+// § 1 registered it as `type_alias("DateTimeKind", ty_i32)` plus a
+// three-constant expression handler, because teko had no `enum` when the page
+// was written. N2c (docs/specs/enum.md § 8) makes it what C# declares: an
+// ORDINARY `enum` written in `lib/time.tk` beside the functions it belongs to,
+// declared by the program's own `#include` like every other name that file
+// carries. Nothing is registered for it in `tk_time_init()` -- the `enum`
+// keyword's own handler (teko_enum.tk) does the `type_new` and the
+// `syntax_expr`/`syntax_stmt` when the include is read -- and the rows above
+// name it through `tk_prim_late`, which reads its id at the site.
 //
-// The word is a TYPE (`type_alias`) and an EXPRESSION (`syntax_expr`) at once,
-// which mc's own hooks.md § "a word may be a type and something else" makes a
-// contract: the two tables are read at disjoint grammar positions. A
-// declaration -- `DateTimeKind k = dt.Kind;` -- is the core's own `parse_var`
-// through `type_of_token`, so no `syntax_stmt` is registered for it.
-i64 tk_dtk_expr() {
-    i64 line = p_line();
-    uptr fl = p_file();
-    p_next();                                    // the type word
-    if (!p_accept(tk_dot_tok))
-        err_at2(fl, line, "teko: a type name reaches its static members", "DateTimeKind");
-    uptr m = p_ident();
-    if (p_id() == K_LPAR)
-        err_at2(fl, line, "teko: the member is a property; it is not called", m);
-    uptr sym = 0;
-    if (str_eq(m, "Unspecified")) sym = "tk_dtk_unspecified";
-    if (str_eq(m, "Utc"))         sym = "tk_dtk_utc";
-    if (str_eq(m, "Local"))       sym = "tk_dtk_local";
-    if (sym == 0) err_at2(fl, line, "teko: unknown static member of DateTimeKind", m);
-    tk_prim_need_include_of("DateTimeKind", tk_time_include(), sym, line, fl);
-    tk_line = line;
-    tk_file = fl;
-    return tk_call(sym, 0);
-}
+// It is a TIGHTENING: an alias converts from any integer, an enum from nothing
+// but itself, so `DateTimeKind k = 7;` and `i64 n = d.Kind;` are refused where
+// they used to compile.
 
 // Called from teko.tk's `teko_init()` AFTER `tk_float_init()`: the `From*` and
 // `Add*` rows name `ty_f64`, the id `<float>`'s own registration returns, so
@@ -266,7 +256,4 @@ void tk_time_init() {
     tk_dt_ctors();
     tk_dt_members();
     tk_dt_operators();
-
-    type_alias("DateTimeKind", ty_i32);
-    syntax_expr("DateTimeKind", &tk_dtk_expr);
 }
