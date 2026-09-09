@@ -24,7 +24,7 @@ sed -e 's/^os   = .*/os   = "linux"/' -e 's/^arch = .*/arch = "x86_64"/' \
 # Build the taught compiler
 mc build . --config mc.host.toml
 
-# Run the fixtures (45 programs, each with // expect-exit: N oracle)
+# Run the fixtures (every program under tests/, each with its // expect-exit: N oracle)
 for src in tests/*.tk; do
   n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
   sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
