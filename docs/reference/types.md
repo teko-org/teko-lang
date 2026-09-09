@@ -499,6 +499,67 @@ An `enum` is a type declared at the top level, exactly as a `struct`/`class` is 
 no `enum` inside a class or struct body, and `enum Empty { }` is refused: it declares at
 least one member. [diagnostics.md](diagnostics.md) has every one of these messages in full.
 
+### `ToString`, `Parse`, `TryParse`, `IsDefined`
+
+Four members, dispatched by name and built lazily — the two globals a text-using enum needs
+(`Color__names`, `Color__vals`) are written the first time one of these four is spelled on
+it, never at the `enum` itself, so an enum a program never asks text of costs nothing. They
+lower to [`lib/rt.tk`](runtime.md), behind the same include every fixture already carries:
+
+```
+#include "rt.tk"
+```
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+enum Color { Red, Green, Blue }
+enum Perm  { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
+
+i64 main() {
+    if (!tk_str_eq(Color.Red.ToString(), "Red")) return 1;
+    if (!tk_str_eq(Perm.Alias.ToString(), "All")) return 2;        // the FIRST name of an
+                                                                     // aliased value, C#'s rule
+    Color c = (Color) 9;                                            // outside the declared set
+    if (!tk_str_eq(c.ToString(), "9")) return 3;                    // the decimal digits
+
+    if (Color.Parse("Green") != Color.Green) return 4;
+    if (Color.Parse("Blue") != Color.Blue) return 5;
+
+    Color out1;
+    if (Color.TryParse("Red", out out1) != 1) return 6;
+    if (out1 != Color.Red) return 7;
+    Color out2 = Color.Green;
+    if (Color.TryParse("Nope", out out2) != 0) return 8;
+    if (out2 != Color.Green) return 9;                              // untouched on failure
+
+    if (!Color.IsDefined(1)) return 10;
+    if (Color.IsDefined(9)) return 11;
+
+    return 42;
+}
+```
+
+`Color.Parse(s)` panics (exit 70) on a name no member spells — C#'s own `FormatException`
+road, teko's own answer since this language has no exceptions:
+
+```teko
+// expect-exit: 70
+#include "rt.tk"
+
+enum Color { Red, Green, Blue }
+
+i64 main() {
+    Color c = Color.Parse("Nope");
+    return (i64) c;
+}
+```
+
+`CompareTo`/`Equals`, `GetNames`/`GetValues` and `[Flags]`-style formatting are not taught
+yet ([not-yet.md](not-yet.md)). [diagnostics.md](diagnostics.md#enums) has every message in
+full.
+
 ---
 
 ## `TimeSpan`

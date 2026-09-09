@@ -173,12 +173,16 @@ a dominator pass nobody has asked for here.
 
 ## Enums
 
-`docs/specs/enum.md`'s N2a is the type, the members, the operators and `switch`; two later
-crumbs of the same spec are not built yet:
+`docs/specs/enum.md`'s N2a is the type, the members, the operators and `switch`; N2b is
+`ToString`, `Parse`, `TryParse` and `IsDefined` — all four taught
+([types.md](types.md#tostring-parse-tryparse-isdefined)). What is left of § 6 and one later
+crumb of the same spec are not built yet:
 
 | written | what happens |
 |---|---|
-| `.ToString()`, `.Parse()`, `.TryParse()`, `.IsDefined()`, `.GetNames()`, `.GetValues()` (N2b) | not taught: an enum value converts to `str` no way at all yet |
+| `.CompareTo(other)`, `.Equals(other)` | `teko: unknown member of Color` — C#'s ordering/equality members; the ordinal comparison itself is already free through `<`/`<=`/`>`/`>=`/`==`/`!=` (N2a), so these two would be a thin wrapper over the same operators and are left for the crumb that adds `IComparable`/`IEquatable` conformance generally, rather than one-off for `enum` |
+| `Color.GetNames()` → `str[]`, `Color.GetValues()` → `Color[]` | `teko: unknown static member of Color` — both need a HEAP array (`T[]`) built and filled at compile time from the two globals `tk_enum_ensure` already writes (`Color__names`, `Color__vals`); the array machinery itself is proven for `str[]`/`Color[]` (`docs/specs/enum.md` § 6), but filling one from a fixed-size global inside the generated body is not measured yet, so it stays out rather than land unproven |
+| `[Flags]`-style `ToString` (`Perm.Read \| Perm.Write` printing `"Read, Write"`) | not taught: teko has no attribute grammar, so there is no `[Flags]` to key the decomposition on; `.ToString()` always answers a single name or the digits (C#'s own behaviour for a value with no `[Flags]`) |
 | `DateTimeKind` as an `enum` (N2c) | it is a `type_alias` over `i32` today ([datetime.md](datetime.md)); the crumb that makes it an `enum` is below, with the rest of `docs/specs/datetime.md` |
 | `[Flags]` | not taught: teko has no attribute grammar; the bitwise operators already work on every enum, `[Flags]` only changes `ToString` |
 | the bare member name inside a `switch` on that enum (`case Red:` instead of `case Color.Red:`) | an ordinary identifier, `mc: unknown name` — C# allows it, teko requires the qualified form everywhere |
@@ -194,12 +198,12 @@ not:
 | written | what happens |
 |---|---|
 | `DateTime.Now`, `UtcNow`, `Today` (C6) | `teko: DateTime.Now is not taught yet` and its two siblings — a wall clock is one symbol per operating system (`clock_gettime`, `GetSystemTimePreciseAsFileTime`), and teko declares it itself as an `extern` chosen by the target host (C6, the owner's ruling of 2026-09-08) |
-| `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — the same text crumb `TimeSpan` waits for |
+| `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — a crumb of its own; the `enum` page's own N2b landed a PARALLEL mechanism keyed on a struct-table row, not `teko_prim.tk`'s lowering table `TimeSpan`/`DateTime` use, so it does not carry over automatically |
 | `DateTime.SpecifyKind(d, k)`, `d.Subtract(x)` | `teko: unknown static member of DateTime: SpecifyKind` / `teko: unknown member of DateTime: Subtract` — both need a member row whose parameters differ from each other (a `DateTime` beside a `DateTimeKind`, and two overloads of one arity), and a row takes one parameter TYPE and a count. `SpecifyKind` is `new DateTime(d.Ticks, k)` and `Subtract` is `-` |
 | `ToLocalTime`, `ToUniversalTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly` | not taught: a time-zone database is not a language feature, and the two date-only types wait on [datetime-extras.md](../specs/datetime-extras.md) |
 | `DateTimeKind` as an `enum` (N2c) | it is a `type_alias` over `i32`, so any integer lands in a `DateTimeKind` slot and `d.Kind` lands in an `i64` one. Turning it into a real `enum` only tightens that, and is a crumb of its own |
 | `switch` on a `DateTime` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a date takes no integer operand |
-| `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — text is a crumb of its own, shared with the `enum` page's N2b, and no primitive has a `str` member yet |
+| `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — a crumb of its own; no `teko_prim.tk` primitive has a `str` member yet, and the `enum` page's own N2b (built) does not carry over, since it is a parallel mechanism keyed on a struct-table row rather than a reuse of this table |
 | `t * 1.5`, `t / 1.5` (C#'s `operator *(TimeSpan, double)`) | ``teko: no operator `*` takes these operands`` — the spec's § 4 leaves the float multiply out |
 | `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
 | `+t` (C#'s unary plus) | ``teko: no operator `+` takes these operands`` — the unary minus is taught, its C# twin is not |

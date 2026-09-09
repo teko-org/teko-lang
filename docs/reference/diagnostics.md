@@ -279,6 +279,40 @@ entry says what completes it.
   operator, and a mismatched or bare-integer operand on any of those six, is refused this
   way too.
 
+### `ToString`, `Parse`, `TryParse`, `IsDefined` (N2b)
+
+Four names, dispatched by the enum's own row rather than by
+[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime): registering
+an enum there would make `tk_ty_binary` ask a table its own bitwise/comparison operators
+never populate. The two globals a text-using enum needs (`Color__names`, `Color__vals`)
+are built lazily, the first time one of these four names is spelled on that enum — an enum
+a program never asks text of pays nothing.
+
+- `"teko: wrong number of arguments for "` — completed by the name (`Parse`, `IsDefined` or
+  `ToString`): each takes exactly one argument, `ToString` takes none.
+- `"teko: TryParse's second argument is `out <name>`"` — `Color.TryParse(s, out c)`'s second
+  argument has to be `out` over a variable; a bare value, `ref`, or nothing at that position
+  is refused this way.
+- `"teko: a value of type "` — `TryParse`'s `out` argument has to be a variable already
+  declared the SAME enum type: `i64 x; Color.TryParse(s, out x);` is refused the same way an
+  ordinary mismatched value is (D34's own wording, reused).
+- `"teko: "` — completed by *`Name` needs #include "rt.tk" before it is used*: `ToString`,
+  `Parse`, `TryParse` and `IsDefined` all lower to `lib/rt.tk` (§ 9 of
+  [docs/specs/enum.md](../specs/enum.md), the same rule `TimeSpan` follows), and the message
+  names the file a program forgot instead of reaching `mc`'s own "call to unknown function".
+- `"teko: the member is a method; call it with ()"` — `c.ToString` without `()` (reused
+  verbatim from the primitives table's own wording).
+- `"teko: too many enums asked for text in one unit"` — more than 128 distinct enums asked
+  `ToString`/`Parse`/`TryParse`/`IsDefined` of in one compilation unit; `[limits] tolerance`
+  is the escape hatch, the same one every other fixed table in this port gives.
+
+`Color.Parse(s)` **panics** (exit 70, `rt_panic`) on a name no member spells, with
+`the string is not a `, followed by the enum's own name — C#'s own `FormatException` road,
+teko's own answer to it (no exceptions in this language). `TryParse` answers 0/1 instead and
+never panics. Both are runtime messages, from `lib/rt.tk`, not a compile-time `teko: …`
+refusal, so they carry no entry of their own in this list (D19 scans `teko*.tk`, the
+compiler's own sources, not the runtime library it teaches programs to link).
+
 ## Primitives with members (`TimeSpan`, `DateTime`)
 
 A primitive is a type of eight bytes with no row in the type table — no field, no vtable,
