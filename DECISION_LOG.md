@@ -1650,7 +1650,7 @@ enum and four ordinary calls into `lib/rt.tk`, none of it touching `teko_prim.tk
 
 **The two globals are built LAZILY**, the first time `ToString`/`Parse`/`TryParse`/
 `IsDefined` is actually spelled on that enum — never at the `enum` declaration itself.
-`tk_enum_ensure(si)` is the memoized builder: it walks `teko_const.tk`'s own qualified-
+`tk_enum_ensure(si, line, fl)` is the memoized builder: it walks `teko_const.tk`'s own qualified-
 constant table for the rows this enum wrote (`mc_cls_at(i) == si`), in the SAME order they
 were declared, and emits `str Name__names[n] = { ... }` / `i64 Name__vals[n] = { ... }` as
 plain `N_GLOBAL` nodes with a compile-time-constant initializer list — no `N_BLOB`, no
@@ -1784,6 +1784,14 @@ dividend. `tests/surface_enum_text.tk` gained `enum Wide : i64` and the three ch
 ends of the range (`i64` minimum, `i64` maximum, zero — `return 46..48`); the minimum's check
 answered 46 against the old formatter, 50 against the new one.
 
+**Copilot's second pass (`teko-org/teko-lang#696`), two smaller ones.** `tk_enum_ensure`
+refused "too many enums asked for text in one unit" at whatever `tk_line`/`tk_file` last
+held, since its three callers set them only after the call; it now takes the use site
+(`line`, `fl`) and refuses there — a no-op on accepted code, the 59 `--dump-ast` dumps
+byte-identical before and after. `docs/reference/not-yet.md` named `GetNames`/`GetValues`'s
+refusal as `teko: unknown static member of Color`; the enum path refuses earlier, as
+`teko: Color has no member GetNames` — the row now says so.
+
 Proof: `mc build . --config mc.macos.toml` clean; **59/59** fixtures at their `expect-exit`
 (the 57 existing — Q3's `tests/surface_definite.tk` among them — plus the two this crumb
 adds); `--dump-ast` of the 3 of the 57 existing fixtures that do not `#include
@@ -1806,5 +1814,5 @@ i64 does not convert to Color`), a wrong argument count (`teko: wrong number of 
 for Parse`), a missing include (`teko: Color needs #include "rt.tk" before it is used`),
 `ToString` without `()` (`teko: the member is a method; call it with (): ToString`), and
 `TryParse`'s second argument not `out` (`` teko: TryParse's second argument is `out <name>`
-``). `mc pkg hash .` after the review fix and the Copilot fix above:
-`00efec613b05cd87e6fde4061aaade6ed739e2685ec37281d1bf52ee51cd50e7`.
+``). `mc pkg hash .` after the review fix and the two Copilot passes above:
+`cc2d24556b11ae8a523b7ad91d4690a988149f8315ac08fb03d99e3321e30238`.
