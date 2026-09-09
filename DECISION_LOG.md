@@ -1773,6 +1773,17 @@ the `Signed`/`SignedWide` negative-member coverage above (12 more `return N` che
 picking up from 30 through 45, the fixture's own `expect-exit` moved from 42 to 50 to keep
 every code distinct from the success one).
 
+**Copilot finding (`teko-org/teko-lang#696`): `tk_i64_to_dec` negated `v` and so overflowed
+on `i64`'s minimum.** The formatter's own comment claimed no enum value reaches it; wrong —
+an enum over `i64` reaches it through an explicit cast, which C# does not range-check either
+(docs/specs/enum.md § 5), so `((Wide) (0 - 9223372036854775807 - 1)).ToString()` formatted
+garbage. Fixed at the root, the textbook way: the digits are peeled on the NON-POSITIVE side
+(a positive `v` is negated first, a negative one is kept), `'0' - v % 10` per digit since
+mc's `%` truncates toward zero and so keeps a non-positive remainder for a non-positive
+dividend. `tests/surface_enum_text.tk` gained `enum Wide : i64` and the three checks at the
+ends of the range (`i64` minimum, `i64` maximum, zero — `return 46..48`); the minimum's check
+answered 46 against the old formatter, 50 against the new one.
+
 Proof: `mc build . --config mc.macos.toml` clean; **59/59** fixtures at their `expect-exit`
 (the 57 existing — Q3's `tests/surface_definite.tk` among them — plus the two this crumb
 adds); `--dump-ast` of the 3 of the 57 existing fixtures that do not `#include
@@ -1795,5 +1806,5 @@ i64 does not convert to Color`), a wrong argument count (`teko: wrong number of 
 for Parse`), a missing include (`teko: Color needs #include "rt.tk" before it is used`),
 `ToString` without `()` (`teko: the member is a method; call it with (): ToString`), and
 `TryParse`'s second argument not `out` (`` teko: TryParse's second argument is `out <name>`
-``). `mc pkg hash .` after the review fix above:
-`cac36b8d7e82c4672e9ef7e233c75503a6b8b79942f7cbc8d074fb4d46d93ee2`.
+``). `mc pkg hash .` after the review fix and the Copilot fix above:
+`00efec613b05cd87e6fde4061aaade6ed739e2685ec37281d1bf52ee51cd50e7`.
