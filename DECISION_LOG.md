@@ -1782,7 +1782,7 @@ adds); `--dump-ast` of the 3 of the 57 existing fixtures that do not `#include
 `Name__names`/`Name__vals` global among the moved lines, zero pre-existing function body
 touched (`diff` of `lib/rt.tk` against `33c7485c`'s own copy: `0` `<` lines, a pure append);
 `FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm` diff empty over 213151
-lines, 59/59 fixtures under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (560
+lines, 59/59 fixtures under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (562
 links, 378 diagnostics, 110 samples — 73 run, 37 no-run, the two this crumb adds among
 them); `mc limits . --config mc.macos.toml` verdict `ok`, `syntax` `15/30`, `passes`
 `15/30`, `intrin` `8/16`, `alias` `19/38`, `types` `11/22` — every row identical, element
