@@ -1630,7 +1630,7 @@ code itself.
 at 42 over nine helpers, every one of them a shape the analysis must ACCEPT — the false
 refusal is the failure mode that fixture exists to catch; `--dump-ast` of the 56
 pre-existing fixtures byte-identical to `7e7d4bca`, the crumb refusing and rewriting
-nothing; `FIXPOINT OK`; `sh scripts/check-docs.sh` green, its 106 samples included; and a
+nothing; `FIXPOINT OK`; `sh scripts/check-docs.sh` green, its 108 samples included; and a
 probe set outside `tests/` — ten refusals (a `struct` written through, a scalar, a class
 method call, an assignment that comes later, `a = a + 1`, a loop body, an inner
 declaration that does not assign the outer name, a `T[]` indexed, `x++`, a method body) and
