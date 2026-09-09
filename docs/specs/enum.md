@@ -276,30 +276,46 @@ a formatting rule would be a language feature bought for a string.
 | `enum` members with an underlying `f64` | C# has none either |
 | `Enum.GetName<T>`, `Enum.Parse<T>` | the generic-static form needs generics over a primitive; the per-enum statics of § 6 are the same surface without it |
 
-## 8. What `DateTimeKind` becomes
+## 8. What `DateTimeKind` becomes — **landed** (N2c, D48)
 
-`docs/specs/datetime.md` § 1 registers `DateTimeKind` as `type_alias` over `i32` with three
-constants beside it, and its § 8 says plainly that `enum` is a crumb of its own. When this
-page lands **first** — and § 11 puts it first, because it is cheaper — that page writes
+`docs/specs/datetime.md` § 1 registered `DateTimeKind` as `type_alias` over `i32` with
+three constants beside it, and its § 8 said plainly that `enum` is a crumb of its own. C2
+landed first, so this is what N2c did instead:
 
 ```teko
 // no-run
 public enum DateTimeKind : i32 { Unspecified = 0, Utc = 1, Local = 2 }
 ```
 
-in `lib/time.tk` instead, and **not one line of its surface changes**:
-`leap.Kind != DateTimeKind.Unspecified` is spelled identically either way, and its fixture
-`tests/primitives_datetime.tk` is unchanged. What changes is under it, and all of it is an
-improvement:
+written in `lib/time.tk` — an ordinary declaration in an ordinary library file, the first
+`enum` any teko program declares from inside an `#include`d one — with the `type_alias`,
+the `syntax_expr` and the three `tk_dtk_*` functions of C2 all deleted. **Not one line of
+the surface changed**: `leap.Kind != DateTimeKind.Unspecified` is spelled identically
+either way, and `tests/surface_datetime.tk` is byte-identical to what C2 landed. What
+changed is under it, and all of it is an improvement:
 
 - `dt.Kind` is typed `DateTimeKind` rather than `i32`, so `i64 k = dt.Kind;` is refused
-  where it used to convert;
-- `DateTime.SpecifyKind(d, 7)` is refused, where an `i32` alias would take any integer;
-- the `alias` row of `mc limits` does not move (14 stays 14) and the `types` row takes one
-  more, which is the trade this page makes everywhere.
+  where it used to convert, and so are `DateTimeKind k = 7;` and `new DateTime(t, 7)`;
+- the enum's own text side (§ 6) comes along for free: `d.Kind.ToString()` is `"Utc"`,
+  `DateTimeKind.Parse`/`TryParse`/`IsDefined` all work, and `case DateTimeKind.Utc:` is a
+  `switch` label;
+- the compiler's own `alias` row of `mc limits` drops from 19 to **18** (the `type_alias`
+  is gone), and a program that includes `lib/time.tk` takes one more `types` and one more
+  `syntax`, which is the trade this page makes everywhere.
 
-If `datetime.md`'s C2 lands **before** this page, nothing breaks and the change is a
-three-line follow-up inside `lib/time.tk`, carried by N2a's own gate.
+**Three lines it was not.** The type a member row NAMES is written at `teko_init()` time
+and the `enum` exists only after the `#include` is read, so `teko_prim.tk` grew a
+late-by-name column (`tk_prim_late`/`tk_prim_ty`); a row's parameter list became one column
+per POSITION, because `new DateTime(ticks, kind)` is an `i64` beside a `DateTimeKind`; and
+`tk_prim_ret`/`tk_prim_conv` grew an enum arm each, to cast the lowering call up to the
+enum and the argument back down to its underlying integer. The whole of it is in
+[primitives.md](../internals/primitives.md).
+
+**What it cost the surface.** `DateTimeKind` is a library name now, so a program that
+forgot `#include "time.tk"` is no longer told which file it forgot: the friendly refusal
+C2 had cannot survive, because any registration keyed on the word makes it a taught TOKEN
+(`word_add`) and `enum DateTimeKind` would then fail at `tk_newname` with `teko: name of
+enum expected`. Recorded in [diagnostics.md](../reference/diagnostics.md) and D48.
 
 ## 9. The hooks, by module
 
@@ -329,6 +345,7 @@ Baseline as `docs/specs/decimal.md` § 10 measured it: `types 7/14`, `alias 14/2
 | `types` | 7 | **+1 per `enum` a program declares** | the compiler's own floor does not move: no enum is registered by teko itself |
 | `syntax` | 14 | **15** | one, for the `enum` word |
 | `alias` | 14 | 14 | none |
+| `alias` (N2c) | 19 | **18** | `DateTimeKind`'s `type_alias` deleted with the registration |
 | `passes` | 15 | 15 | the operator rule rides `tk_ops_pass`, the member lookup rides the parse |
 | `intrin` | 8 | 8 | teko still registers none |
 
@@ -345,6 +362,8 @@ An `enum` costs a program exactly what a `class` costs it — one `type_new` and
 | `tests/surface_enum_ns.tk` | an `enum` inside `namespace geo`, reached as `geo.Color.Red` and, under a `using`, as `Color.Red` | `42` |
 | `tests/surface_enum_text.tk` | `ToString` on a member, on an aliased value and on a value cast in from outside the set (default and narrow underlying, including a negative member); `Parse`/`TryParse` round-trip over the same, including a negative member's sign-extended `out` write; `IsDefined` | `50` |
 | `tests/surface_enum_parse_panic.tk` | `Color.Parse("Nope")` | `70` |
+
+| `tests/surface_datetime_kind.tk` | N2c: `DateTimeKind k = d.Kind;`; the three members as `switch` labels; both explicit casts; `new DateTime(t, k)` from a variable and from another date's own `.Kind`; `.ToString()` on a member, a property and a value outside the set; `Parse`/`TryParse`/`IsDefined`; a ternary over two enum arms; a by-value capture | `42` |
 
 The refusals of § 3 have no harness (D33's own note) and are documented with a `// no-run`
 fence in [diagnostics.md](../reference/diagnostics.md) and this page.
@@ -380,14 +399,15 @@ reuse of `docs/specs/datetime.md`'s primitive-member lowering table (§ 6's own 
 [runtime.md](../reference/runtime.md) and the `enum` section of
 types.md.
 
-### N2c — `DateTimeKind` becomes an `enum` (S)
+### N2c — `DateTimeKind` becomes an `enum` (S) — **landed**, D48
 
-§ 8, three lines inside `lib/time.tk`. **Depends on N2a and on
-`docs/specs/datetime.md`'s C2**, and is unnecessary if C2 lands after N2a — in which case
-C2 simply writes the `enum` in the first place.
+§ 8. **Depended on N2a and on `docs/specs/datetime.md`'s C2**, and C2 landed first, so the
+`enum` replaced the alias rather than being written in its place. Three lines inside
+`lib/time.tk` it was not: see § 8 for the three additions `teko_prim.tk` took.
 
-**Gate:** `tests/primitives_datetime.tk` unchanged and still at `42`; `mc limits` `alias`
-back to 14. **Owes:** one row of `docs/specs/datetime.md` § 1, when that page is merged.
+**Gate met:** `tests/surface_datetime.tk` byte-identical and still at `42`;
+`tests/surface_datetime_kind.tk` added at `42`; 60/60 fixtures; `mc limits` `alias`
+19 → **18** on the compiler's own floor, `types`/`passes`/`intrin` unmoved.
 
 ## 13. Risks and law tensions
 

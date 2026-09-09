@@ -1816,3 +1816,130 @@ for Parse`), a missing include (`teko: Color needs #include "rt.tk" before it is
 `TryParse`'s second argument not `out` (`` teko: TryParse's second argument is `out <name>`
 ``). `mc pkg hash .` after the review fix and the two Copilot passes above:
 `cc2d24556b11ae8a523b7ad91d4690a988149f8315ac08fb03d99e3321e30238`.
+
+### D48 · `DateTimeKind` is an `enum`, and a primitive row's parameters are per position (2026-09-08)
+`docs/specs/enum.md` § 8, N2c — the last crumb of the `enum` sequence, over D39's `TK_KENUM`
+type, D47's text side and D41's primitive-member table. **The whole surface of
+`tests/surface_datetime.tk` is byte-identical to what C2 landed**, which is the point of
+the crumb: `leap.Kind != DateTimeKind.Unspecified` is spelled the same either way, and
+everything that moved is under it.
+
+**`DateTimeKind` is now an ordinary declaration in an ordinary library file:**
+
+```teko
+// no-run
+public enum DateTimeKind : i32 { Unspecified = 0, Utc = 1, Local = 2 }
+```
+
+in `lib/time.tk`, beside the functions that use it. D41's `type_alias("DateTimeKind",
+ty_i32)`, its `syntax_expr` and the three `tk_dtk_unspecified/utc/local()` functions are
+DELETED — an alias and an enum of one name cannot coexist, `tk_newname` (teko_struct.tk)
+refuses the second with `teko: the name is already a type`. This is the first `enum` teko
+declares from inside an `#include`d file; it works because the include is textual and read
+before any use, and because `tk_fwd_scan`'s pre-scan does not need to know the word.
+
+**It is a pure tightening, and the tightening is the deliverable.** An alias over `i32`
+converted from any integer; an enum converts from nothing but itself (D39 § 5). Measured on
+this branch:
+
+- `i64 n = d.Kind;` → `teko: a value of type DateTimeKind does not convert to i64`
+- `DateTimeKind k = 7;` → `teko: a value of type i64 does not convert to DateTimeKind`
+- `new DateTime(t, 7)` → `teko: a value of type i64 does not convert to DateTimeKind`
+- `d.Kind + DateTimeKind.Utc` → ``teko: no operator `+` takes these operands``
+
+All four compiled before. `(DateTimeKind) 7` is still accepted — an explicit cast into an
+enum is C#'s own — and the run-time guard in `tk_dt_from_ticks_kind` (`k < 0 || k > 2`,
+`teko: a date kind is out of range`, exit 70) STAYS, because that cast is exactly how a
+program still reaches it. And the enum's whole text side comes along for free, with no row
+of its own: `d.Kind.ToString()`, `DateTimeKind.Parse`/`TryParse`/`IsDefined`,
+`case DateTimeKind.Utc:`, a ternary over two enum arms and a by-value capture all work
+through the mechanisms D39/D47 already built.
+
+**Three lines in `lib/time.tk` it was NOT** — the spec's § 8 estimate was wrong, because a
+row of D41's table names its types at `teko_init()` time and this type exists only after
+the `#include`. `teko_prim.tk` took three additions, all of them the ones D41 itself named
+as coming:
+
+1. **A column may name a type that does not exist yet.** `tk_prim_late(name)` returns an id
+   BELOW -1 (`-2 - slot`, so -1 keeps its meaning of "no type here") and `tk_prim_ty(col)`
+   resolves it at the SITE through `tk_struct_find_exact`/`sr_ty_at`. The three accessors
+   (`ppos_ty_at`, `pmr_ret_at`) are the only readers, so no caller sees the encoding, and a
+   name still undeclared answers -1 — which every reader already takes as "refuse nothing",
+   and which is the very site `tk_prim_need_include` refuses for the missing include.
+2. **A row's parameter list is a COUNT and a HEAD into a pool of positions**, one column per
+   argument, where it was a count and ONE type. `new DateTime(ticks, kind)` is an `i64`
+   beside a `DateTimeKind` and is the first row that needed it — the case D41 wrote down as
+   "the day one is, this column becomes a list and nothing else moves", and nothing else
+   moved: `tk_prim_membern` writes `np` positions of one type for every other row, and
+   `tk_prim_member2` is the two-position registration. Ceiling `TK_MAXPRIMP` 128 (41 used),
+   `TK_MAXPRIML` 4 (1 used), both with a capacity message.
+3. **`tk_prim_ret` and `tk_prim_conv` grew one enum arm each.** The lowering symbol still
+   answers the UNDERLYING integer (`i32 tk_dt_kind(i64)`, unchanged) and still takes one
+   (`tk_dt_from_ticks_kind(i64, i64)`, unchanged, and `lib/time.tk` never names the enum),
+   so the compiler writes `(DateTimeKind) tk_dt_kind((i64) d)` on the way out and `(i64) k`
+   on the way in. Neither is an instruction and neither is a licence the surface has: the
+   precedents are `tk_nl_payload` (teko_null.tk, an enum out of a nullable box) and
+   `tk_cap_val` (teko_deleg.tk, an enum captured by value into a lambda).
+
+Nothing else was needed. The comparison, the overload pick, the ternary, the capture, the
+`switch` label and the deferred `.ToString()` are all keyed on the type table's own row and
+worked with no line added — proved by the fixture, not assumed.
+
+**The one thing the crumb LOST: the friendly include refusal.** `DateTimeKind.Utc` without
+`#include "time.tk"` used to say `teko: DateTimeKind needs #include "time.tk" before it is
+used`; it now says `teko: unknown member: Utc`, and `DateTimeKind k;` reaches the core's own
+`expected ; after expression`. Keeping the hint was tried and is IMPOSSIBLE without touching
+a shared parse function: any registration keyed on the word (`syntax_expr` is the only door,
+and mc's `syntax_expr_find` scans backwards so the enum's own later registration would
+correctly shadow it) calls `word_add`, which makes `DateTimeKind` a TOKEN rather than a
+`T_IDENT` — and `enum DateTimeKind` in `lib/time.tk` then dies at `tk_newname` with
+`lib/time.tk:204: teko: name of enum expected: DateTimeKind`, measured on a throwaway build.
+Buying the message back would mean a clause in `tk_newname` (every class, struct, interface,
+trait and enum declaration passes through it) plus reserving the word program-wide for
+programs that never include the file. `DateTime` and `TimeSpan` keep their own include
+refusal, because they are compiler registrations; a library type is told apart by the
+library, which is exactly what `DateTimeKind` now is. Written down in
+[diagnostics.md](docs/reference/diagnostics.md).
+
+**Fixtures: 60.** `tests/surface_datetime.tk` is UNCHANGED (byte-identical, still 42) —
+that is the proof the surface did not move — and `tests/surface_datetime_kind.tk` (42) is
+new: `DateTimeKind k = d.Kind;`, the three members as `switch` labels through a parameter
+and a local, both explicit casts, `new DateTime(t, k)` from a variable and from another
+date's own `.Kind`, `.ToString()` on a member/a property/a value outside the set,
+`Parse`/`TryParse` with `out`/`IsDefined`, a ternary over two enum arms, and a by-value
+capture. The four refusals above have no harness (D33) and are in `diagnostics.md` behind a
+`// no-run` fence.
+
+**`--dump-ast`, and the two diffs that are NOT the accepted code moving.** 53 of the 59
+existing fixtures are byte-identical to `37417b63`. The six that are not are exactly the
+six that `#include "../lib/time.tk"`, and their diffs are two facts and nothing else:
+
+- **three functions deleted** (`tk_dtk_unspecified/utc/local`, 15 lines of dump), in all
+  six — the library file lost them;
+- **one interface id shifted by one**, in `surface_nullable_ops.tk` (5 → 6) and
+  `surface_nullable_value.tk` (19 → 20). An interface's id in its own itab is its ROW INDEX
+  in teko_struct.tk's type table (`tk_itab_emit`, teko_iface.tk), the enum takes a row where
+  the `type_alias` took none, and every type declared after it in the same unit moves up by
+  one. The itab entry and the lookup are the same number, so it stays consistent — proved by
+  those two fixtures passing.
+
+`surface_datetime.tk`'s own dump changes as § 8 predicted and in no other way:
+`DateTimeKind.Utc` is now `INT val=1 type=DateTimeKind` (a folded constant) where it was
+`CALL name=tk_dtk_utc`, `.Kind` gains a `CAST type=DateTimeKind` over the call, and the
+constructor's kind argument gains the `CAST type=i64` back down.
+
+**Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config
+mc.macos.toml` clean; **60/60** fixtures at their `expect-exit`; `--dump-ast` as above;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (60/60 under the
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (562 links, samples and diagnostics
+included). `mc limits` verdict `ok` throughout — on the compiler's own floor (the
+`tests/hello.tk` leg) `alias` **19 → 18** (the deleted `type_alias`) with `syntax` 15,
+`types` 11, `passes` 15/30 and `intrin` 8/16 all unmoved; on a program that includes
+`lib/time.tk` (the `tests/surface_datetime.tk` leg) `types` **13 → 14** and `syntax`
+**15 → 16** (the enum's own `type_new` and its `syntax_expr`/`syntax_stmt` pair, the exact
+cost § 10 publishes for any `enum` a program declares) with `alias` 21 → 21, since the
+`type_new` puts back the alias the deleted registration freed. The spec's § 10 prediction
+of "`alias` 14 stays 14" is right for the program and one too high for the compiler;
+`syntax` is the arena's own `T_SYNTAX` high-water mark over the four registries that share
+it, which is why removing one `syntax_expr` from the floor did not move it. `mc pkg hash .`:
+`9aeb988f053a379e7385f526dbf962a9116b08f9e7c7d2ccf500c9873a226fc7`.

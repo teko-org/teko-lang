@@ -40,9 +40,9 @@ fixes the order.
 | 5c | ~~**Q1b** `T?` over a value (the counted box)~~ **landed**, D44 | `docs/reference/nullable.md` | M | Q1a |
 | 5d | ~~**Q2** `??` and `?.`~~ **landed**, D45 | `docs/reference/nullable.md` | M | Q1b |
 | 5e | ~~**Q3** definite assignment~~ **landed**, D46 | `docs/reference/nullable.md` | M | Q0 |
-| 6 | **N2b** `enum`: `ToString`, `Parse`, the statics | enum.md | S | N2a, C1 |
+| 6 | ~~**N2b** `enum`: `ToString`, `Parse`, the statics~~ **landed**, D47 | enum.md | S | N2a, C1 |
 | 7 | ~~**C2** `DateTime`~~ **landed**, D41 | `docs/specs/datetime.md` | L | C1 |
-| 8 | **N2c** `DateTimeKind` becomes an `enum` | enum.md | S | N2a, C2 |
+| 8 | ~~**N2c** `DateTimeKind` becomes an `enum`~~ **landed**, D48 | enum.md | S | N2a, C2 |
 | 9 | **N4** `DateOnly` and `TimeOnly` | datetime-extras.md | M | C2 |
 | 10 | **C3** the sixteen-byte value and `teko_wide.tk` | `docs/specs/decimal.md` | M | C1 |
 | 11 | **N3** `Guid` | guid.md | M | C3, C1 |
