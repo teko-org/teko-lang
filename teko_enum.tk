@@ -25,6 +25,253 @@
 // own rule) and given the `tk_check_scalar_compat`/`teko_ops.tk` clauses
 // that make it convert from nothing but itself and compute only the two
 // operator groups C# gives every enum: docs/specs/enum.md § 4-5.
+//
+// ---- N2b: `ToString`, `Parse`, `TryParse`, `IsDefined` (docs/specs/enum.md
+// § 6, D47) ----
+//
+// An enum already has a row of teko_struct.tk's type table (`TK_KENUM`), so
+// it is never a candidate for `teko_prim.tk`'s own lowering table -- that
+// mechanism is keyed on a `type_new` id with NO row (`TimeSpan`, `DateTime`),
+// and `tk_ty_binary` (teko_typeof.tk) asks `tk_prim_op_ret` the moment either
+// operand answers `tk_prim_is`, a question an enum's own bitwise/comparison
+// operators (D39's own early claim in `teko_ops.tk`, not a row of that
+// table) never populate an answer for. Registering an enum there would silently
+// break every existing `Color.Red | Color.Green` typed through it. So this is
+// a PARALLEL, self-contained mechanism, not a reuse of `teko_prim.tk`'s
+// tables: two globals per enum and four ordinary calls into `lib/rt.tk`,
+// dispatched by the enum's own `si` (its struct-table row) rather than by a
+// `type_new` id `tk_prim_is` would ever see.
+//
+// THE TWO GLOBALS ARE BUILT LAZILY, the first time `ToString`/`Parse`/
+// `TryParse`/`IsDefined` is actually spelled on that enum -- never at the
+// `enum` declaration itself. An enum that is never asked for text pays
+// nothing: `--dump-ast` of every enum fixture that does not call one of these
+// four names is untouched by this crumb. `tk_enum_ensure` is the memoized
+// builder, the same shape `teko_heaparr.tk`'s own per-element-type row is
+// made lazily on first use, through `tk_top_emit` because the call that
+// triggers it may stand in any body (D27, category (c)).
+i64 tk_args(uptr pn);
+
+#define TK_MAXENUMT 128            // enums a program asks TEXT of, in one unit
+
+i64  en_si[TK_MAXENUMT];           // the enum's own struct-row index
+uptr en_names[TK_MAXENUMT];        // "Name__names", the global's own symbol
+uptr en_vals[TK_MAXENUMT];         // "Name__vals"
+i64  en_n[TK_MAXENUMT];            // how many members
+i64  tk_nenumt = 0;
+
+i64  en_si_at(i64 i)    { return ld64(en_si + i * 8); }
+uptr en_names_at(i64 i) { return ld64(en_names + i * 8); }
+uptr en_vals_at(i64 i)  { return ld64(en_vals + i * 8); }
+i64  en_n_at(i64 i)     { return ld64(en_n + i * 8); }
+
+i64 tk_enum_slot(i64 si) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nenumt) break;
+        if (en_si_at(i) == si) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the two globals a text-using enum needs (§ 6), built once and memoized:
+// every member this enum's own declaration wrote into `teko_const.tk`'s
+// qualified table (`mc_cls_at(i) == si`), collected in the SAME order they
+// were declared in -- which is what makes `ToString` answer the FIRST name
+// of an aliased value, C#'s own rule, for free. `line`/`fl` are the use
+// site, so the one refusal here points at the call that asked for text.
+i64 tk_enum_ensure(i64 si, i64 line, uptr fl) {
+    i64 ei = tk_enum_slot(si);
+    if (ei >= 0) return ei;
+    uptr ename = sr_name_at(si);
+    uptr names_sym = tk_join(ename, "__names");
+    uptr vals_sym  = tk_join(ename, "__vals");
+    i64 nhead = 0;
+    i64 vhead = 0;
+    i64 cnt = 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nmconst) break;
+        if (mc_cls_at(i) == si) {
+            nhead = list_append(nhead, tk_str(mc_name_at(i)));
+            vhead = list_append(vhead, tk_int(mc_val_at(i)));
+            cnt = cnt + 1;
+        }
+        i = i + 1;
+    }
+    i64 gnames = tk_nd(N_GLOBAL);
+    set_nd_name(gnames, names_sym);
+    set_nd_type(gnames, TY_UPTR);
+    set_nd_a(gnames, nhead);
+    set_nd_val(gnames, cnt);
+    tk_top_emit(gnames);
+    i64 gvals = tk_nd(N_GLOBAL);
+    set_nd_name(gvals, vals_sym);
+    set_nd_type(gvals, TY_I64);
+    set_nd_a(gvals, vhead);
+    set_nd_val(gvals, cnt);
+    tk_top_emit(gvals);
+    if (tk_nenumt == TK_MAXENUMT) err_at(fl, line, "teko: too many enums asked for text in one unit");
+    st64(en_si + tk_nenumt * 8, si);
+    st64(en_names + tk_nenumt * 8, names_sym);
+    st64(en_vals + tk_nenumt * 8, vals_sym);
+    st64(en_n + tk_nenumt * 8, cnt);
+    tk_nenumt = tk_nenumt + 1;
+    return tk_nenumt - 1;
+}
+
+// § 9's own rule, restated without depending on `teko_prim.tk` (whose
+// `tk_prim_need_include` asks a `type_new` id with no struct row, which an
+// enum never has): the four lowering symbols live in `lib/rt.tk`, so a
+// program that spells `ToString`/`Parse`/... without it is told which file
+// it forgot instead of reaching the core's own `call to unknown function`.
+void tk_enum_need_include(uptr ename, uptr sym, i64 line, uptr fl) {
+    if (decl_find(sym) >= 0) return;
+    err_at(fl, line, tk_join3(tk_join3("teko: ", ename, " needs #include "),
+                              "\"rt.tk\"", " before it is used"));
+}
+
+// `Color.Parse(s)` -- panics (exit 70) on a name that is not a member, C#'s
+// own `FormatException` road. `Color.TryParse(s, out c)` answers 0/1 instead
+// and writes `c` only on success. `Color.IsDefined(v)` asks the raw ordinal.
+// `m` is already read (the `.` consumed): a name this dispatcher does not
+// recognize answers 0, which the caller (`tk_static_member`, teko_access.tk)
+// reads as "not one of the taught statics" and falls through to its own
+// "has no member" refusal -- so the two globals are never built for an enum
+// whose program never spells one of these four names.
+i64 tk_enum_static(i64 si, uptr m, i64 line, uptr fl) {
+    i64 isparse = str_eq(m, "Parse");
+    i64 istry   = str_eq(m, "TryParse");
+    i64 isdef   = str_eq(m, "IsDefined");
+    if (!isparse && !istry && !isdef) return 0;
+    i64 ei = tk_enum_ensure(si, line, fl);
+    uptr ename = sr_name_at(si);
+    uptr names = en_names_at(ei);
+    uptr vals  = en_vals_at(ei);
+    i64  cnt   = en_n_at(ei);
+    i64  ety   = sr_ty_at(si);
+    if (isparse) {
+        tk_enum_need_include(ename, "tk_enum_parse", line, fl);
+        i64 na = 0;
+        i64 args = tk_args(&na);
+        if (na != 1) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+        tk_line = line;
+        tk_file = fl;
+        uptr msg = tk_join3("the string is not a ", ename, "");
+        i64 a = tk_id(names);
+        a = list_append(a, tk_id(vals));
+        a = list_append(a, tk_int(cnt));
+        a = list_append(a, args);
+        a = list_append(a, tk_str(msg));
+        return tk_cast(ety, tk_call("tk_enum_parse", a));
+    }
+    if (istry) {
+        // FOUR width-specific writers (lib/rt.tk): a single `st64` through
+        // `out c` would overrun a narrower enum's own slot -- `Level : u8` is
+        // one byte wide, not eight -- so the symbol is picked by the enum's
+        // own `type_width`, the same question `tk_stn` (teko_struct.tk)
+        // answers for an ordinary indirect store.
+        uptr sym = "tk_enum_tryparse64";
+        i64 w = type_width(ety);
+        if (w == 1) sym = "tk_enum_tryparse8";
+        else if (w == 2) sym = "tk_enum_tryparse16";
+        else if (w == 4) sym = "tk_enum_tryparse32";
+        tk_enum_need_include(ename, sym, line, fl);
+        p_expect(K_LPAR, "expected ( after TryParse");
+        i64 se = parse_expr(0);
+        p_expect(K_COMMA, "expected , after the string");
+        // `out c` is read directly through `tk_ref_addr`, NOT through
+        // `parse_expr`'s own registered `out` handler (`tk_out_arg`,
+        // teko_ref.tk): that handler TAGS the node `tk_rfarg_kind`/
+        // `tk_ref_check_call` then require to match the CALLEE's own
+        // declared parameter kind, and the callee here (`tk_enum_tryparseN`,
+        // lib/rt.tk) takes a plain `uptr` -- an untagged address answers
+        // `TK_RP_NONE` by construction, matching it, and `tk_ref_addr` alone
+        // gives back the plain address AND the pointee's type in one call.
+        if (type_of_token(p_id()) != tk_ty_out)
+            err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+        p_next();
+        i64 pty = 0 - 1;
+        i64 oe = tk_ref_addr(line, fl, &pty);
+        p_expect(K_RPAR, "expected ) after TryParse");
+        if (pty >= 0 && pty != ety)
+            tk_reject_compat(tk_pointee_name(pty), ename, line, fl);
+        tk_line = line;
+        tk_file = fl;
+        i64 a = tk_id(names);
+        a = list_append(a, tk_id(vals));
+        a = list_append(a, tk_int(cnt));
+        a = list_append(a, se);
+        a = list_append(a, oe);
+        return tk_call(sym, a);
+    }
+    // isdef
+    tk_enum_need_include(ename, "tk_enum_isdefined", line, fl);
+    i64 na = 0;
+    i64 args = tk_args(&na);
+    if (na != 1) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+    tk_line = line;
+    tk_file = fl;
+    i64 a = tk_id(vals);
+    a = list_append(a, tk_int(cnt));
+    a = list_append(a, args);
+    return tk_call("tk_enum_isdefined", a);
+}
+
+// `c.ToString()` -- the member's own name, or the decimal digits when the
+// value matches none (a value cast in from outside the set, C#'s own
+// behaviour). `left` is the receiver, already parsed; `m` is already read.
+// A name other than `ToString` answers 0, the same "not ours" convention
+// `tk_enum_static` uses, read by `tk_member_of` (teko_expr.tk).
+i64 tk_enum_instance(i64 left, i64 si, uptr m, i64 line, uptr fl) {
+    if (!str_eq(m, "ToString")) return 0;
+    i64 ei = tk_enum_ensure(si, line, fl);
+    uptr ename = sr_name_at(si);
+    tk_enum_need_include(ename, "tk_enum_name", line, fl);
+    if (p_id() != K_LPAR) err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+    i64 na = 0;
+    tk_args(&na);
+    if (na != 0) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+    tk_line = line;
+    tk_file = fl;
+    i64 a = tk_id(en_names_at(ei));
+    a = list_append(a, tk_id(en_vals_at(ei)));
+    a = list_append(a, tk_int(en_n_at(ei)));
+    a = list_append(a, tk_cast(TY_I64, left));
+    return tk_call("tk_enum_name", a);
+}
+
+// the DEFERRED twin of `tk_enum_instance`, for a receiver only the pass's own
+// oracle can type -- a qualified enum constant chained straight into
+// `.ToString()` (`Color.Red.ToString()`) never resolves at parse time,
+// because `tk_struct_of_expr` (teko_struct.tk) does not recognize a retyped
+// `N_INT` the way it recognizes a local or a call. `pi` is the deferred
+// access `teko_typeof.tk` already parsed (the form, the arguments, the
+// receiver); `pty`/`ppure`/`pown` are the same out-parameters
+// `tk_prim_pend` (teko_prim.tk) fills for the identical reason.
+i64 tk_enum_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown) {
+    uptr m = pd_name_at(pi);
+    if (!str_eq(m, "ToString")) return 0;
+    i64 line = pd_line_at(pi);
+    uptr fl = pd_file_at(pi);
+    if (pd_form_at(pi) != TK_PCALL)
+        err_at2(fl, line, "teko: the member is a method; call it with ()", m);
+    if (pd_na_at(pi) != 0) err_at(fl, line, tk_join("teko: wrong number of arguments for ", m));
+    i64 ei = tk_enum_ensure(si, line, fl);
+    uptr ename = sr_name_at(si);
+    tk_enum_need_include(ename, "tk_enum_name", line, fl);
+    tk_line = line;
+    tk_file = fl;
+    i64 a = tk_id(en_names_at(ei));
+    a = list_append(a, tk_id(en_vals_at(ei)));
+    a = list_append(a, tk_int(en_n_at(ei)));
+    a = list_append(a, tk_cast(TY_I64, pd_recv_at(pi)));
+    st64(pty, TY_UPTR);
+    st64(ppure, 0);
+    st64(pown, TK_OWNED);
+    return tk_call("tk_enum_name", a);
+}
 
 // the eight underlying types C# allows, read through the core's own
 // `p_type()` -- so `: u8`/`: i16`/... resolve through the SAME registered

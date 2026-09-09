@@ -1548,7 +1548,6 @@ with incompatible operands and with a foreign nullable row, `?.` on a non-nullab
 either result — each refusing with the message documented in
 [`docs/reference/diagnostics.md`](docs/reference/diagnostics.md).
 
-
 ### D46 · Definite assignment — a local read before it is assigned is refused (2026-09-08)
 [`docs/specs/nullable.md`](docs/specs/nullable.md) § 8 and § 15's Q3, the fourth of § 19's
 proposals and the half D42 deferred. **A local declared without `?` and without an
@@ -1636,3 +1635,184 @@ method call, an assignment that comes later, `a = a + 1`, a loop body, an inner
 declaration that does not assign the outer name, a `T[]` indexed, `x++`, a method body) and
 five acceptances (a `T?` with no initializer, one branch only, `out`/`ref`/`use`, the
 `for`/`foreach` forms, and the four positions out of scope).
+
+### D47 · `enum`: `ToString`, `Parse`, `TryParse`, `IsDefined` — a parallel mechanism, not `teko_prim.tk`'s (2026-09-08)
+`docs/specs/enum.md` § 6, N2b — the second crumb of the `enum` sequence, over D39's own
+`TK_KENUM` type and D40's primitive-member table. Four names, dispatched by the enum's own
+struct-table row (`si`) rather than by `teko_prim.tk`'s `type_new`-keyed lowering table:
+`TimeSpan`/`DateTime` have NO row there, an enum always does (D39), and registering one in
+`tk_prim_type` would make `tk_ty_binary` (teko_typeof.tk) ask `tk_prim_op_ret` for every
+enum binary — a table an enum's own bitwise/comparison operators (D39's early claim in
+`teko_ops.tk`) never populate a row of, silently breaking `Color.Red | Color.Green`'s own
+typing. So N2b is a self-contained, PARALLEL mechanism in `teko_enum.tk`: two globals per
+enum and four ordinary calls into `lib/rt.tk`, none of it touching `teko_prim.tk`'s tables,
+`tk_prim_is`, or a single line `TimeSpan`/`DateTime` read.
+
+**The two globals are built LAZILY**, the first time `ToString`/`Parse`/`TryParse`/
+`IsDefined` is actually spelled on that enum — never at the `enum` declaration itself.
+`tk_enum_ensure(si, line, fl)` is the memoized builder: it walks `teko_const.tk`'s own qualified-
+constant table for the rows this enum wrote (`mc_cls_at(i) == si`), in the SAME order they
+were declared, and emits `str Name__names[n] = { ... }` / `i64 Name__vals[n] = { ... }` as
+plain `N_GLOBAL` nodes with a compile-time-constant initializer list — no `N_BLOB`, no
+relocation, no generated function body per enum, exactly the mechanism the spec's § 6
+states. Declaration order is what makes an ALIASED value's `ToString` answer the FIRST name
+declared with it, C#'s own rule, for free — a forward scan over the SAME array. Because the
+call that first asks for text may stand in any body, the two globals go through
+`tk_top_emit` (D27, category (c) — `teko_heaparr.tk`'s own per-element-type row is made
+lazily the same way, for the same reason).
+
+**An enum a program never asks text of pays nothing.** None of the 57 fixtures that existed
+before this crumb spells `ToString`/`Parse`/`TryParse`/`IsDefined` on an enum, so **no
+`Name__names`/`Name__vals` global appears in any of their `--dump-ast`** — the lazy-globals
+design's own proof. `--dump-ast` of the 3 fixtures that do not `#include "../lib/rt.tk"`
+(`hello`, `primitives_ptr`, `primitives_scalar`) is byte-identical to `33c7485c`. The other 54
+DO include `lib/rt.tk`, and their dump moves — not from anything this crumb's own design
+changed, but because `lib/rt.tk` is `#include`d text: the six new functions this crumb
+appends (`tk_enum_find`, `tk_enum_name`, `tk_enum_isdefined`, `tk_enum_parse`, the four
+`tk_enum_tryparseN` as one row, `tk_str_eq`, `tk_i64_to_dec`) land in EVERY fixture that pulls
+`lib/rt.tk` in, called or not. Measured precisely: identical except for the appended new
+`rt.tk` functions, which no pre-existing fixture calls — zero lines removed from `lib/rt.tk`
+itself (`diff` against `33c7485c`'s own copy: 0 `<` lines, a pure append after its existing
+end), and zero pre-existing function BODY moves anywhere in the 54 dumps. The spec's own
+preference (§ "if the table is generated only when `ToString`/`Parse` is used, nothing
+changes: prefer this") is what the design follows for the two GLOBALS; the new FUNCTIONS
+`lib/rt.tk` itself carries are a one-time, one-crumb cost every `#include "rt.tk"` fixture
+pays regardless, the same as every earlier `lib/rt.tk` addition in this log (D40's
+`TimeSpan`/`DateTime` helpers, D39's own). Eagerly emitting the two per-enum globals for
+every declared enum was considered and rejected on the globals' own measurement above.
+
+**Two dispatch sites, mirroring `teko_prim.tk`'s own split for the identical reason.**
+`Color.Red.ToString()` never resolves at PARSE time: `tk_struct_of_expr` (teko_struct.tk)
+recognizes a local (`N_IDENT`) and a call (`N_CALL`) as a typed receiver, not a retyped
+`N_INT` (a qualified enum constant, D39's own retagging), so it defers — exactly the "a
+receiver the parser cannot type" road `teko_typeof.tk`'s pass already owns. A LOCAL
+receiver (`c.ToString()`) resolves at parse time, through `tk_member_of` (teko_expr.tk); a
+deferred one resolves through `tk_pend_emit`'s own PASS-time twin (teko_typeof.tk). Both
+gained one guard, `if (tk_is_enum(si)) { r = tk_enum_instance/tk_enum_pend(...); if (r != 0)
+return r; }`, ahead of the existing "unknown member of" refusal, mirroring the `tk_prim_is`
+guard `tk_dot`/`tk_pend_do` already carry for a primitive receiver. A name other than
+`ToString` answers 0, read as "not ours" — which is also what keeps the lazy build lazy: an
+unrecognized member name never reaches `tk_enum_ensure`.
+
+**The statics** (`Color.Parse`, `TryParse`, `IsDefined`) hook `tk_static_member`
+(teko_access.tk) the same way, ahead of its own unconditional "has no member" for an enum:
+`tk_enum_static(si, m, line, fl)` answers 0 for any other name, read the same way.
+
+**`TryParse`'s `out` argument is read directly through `tk_ref_addr` (teko_ref.tk), not
+through `parse_expr`'s own registered `out` handler.** The obvious shape — parse the second
+argument as an ordinary expression and let `out c` tag itself — breaks on
+`tk_ref_check_call` (teko_ref.tk), the pass that walks every `N_CALL` and refuses an
+argument whose `ref`/`out` tag does not match the CALLEE's own declared parameter kind: the
+callee here is a plain `lib/rt.tk` function taking `uptr`, not a `ref`/`out` parameter, so a
+TAGGED address argument is refused where an UNTAGGED one is not. `tk_ref_addr` builds the
+same address (a bare local's `&`, a field's `left + offset`, an array element's own
+addressing) without calling `tk_rfarg_tag`, so the node answers `TK_RP_NONE` by construction
+— matching the callee exactly — and hands back the pointee's type in the same call, which is
+what the `out` argument's own type check (`tk_reject_compat`, reused verbatim) needs.
+Measured with a probe (`build/probe/p1_out_mismatch.tk`, not committed): the naive shape
+refused every `TryParse` call outright before this fix, `teko: argument 5 is not passed by
+reference`; this design compiles and runs it.
+
+**`TryParse` writes through FOUR width-specific functions**, not one. A single `st64`
+through the `out` slot would overrun a narrower enum's own storage — `Level : u8` is one
+byte wide, not eight — so `lib/rt.tk` carries `tk_enum_tryparse8/16/32/64`, picked at the
+call site by the enum's own `type_width`, the same question `tk_stn` (teko_struct.tk)
+answers for an ordinary indirect store. `tests/surface_enum_text.tk` exercises both the
+default `i32` width and an explicit `: u8` one.
+
+**`ToString`'s digits fallback, and the two runtime helpers `lib/rt.tk` did not have.**
+`str` is `uptr` with a NUL terminator and no `string` object yet (N7), so a name/value
+lookup needs a byte-wise `tk_str_eq` and a decimal formatter `tk_i64_to_dec` this file did
+not carry — added here, mirroring `mc`'s own `examples/api/lib/rt.mc:itoa` (not vendored,
+the same small idiom, and the same documented limit: `i64`'s minimum is not representable
+via negation and is not handled — no enum value reaches it, since C# does not range-check an
+explicit cast either, D39 § 5). `tk_enum_name`/`tk_enum_value` are the spec's own pinned
+pair (§ 6); `tk_enum_isdefined`, `tk_enum_parse` and the four `tk_enum_tryparseN` are thin
+callers over them, none a new intrinsic.
+
+**§ 9's own rule — the include is part of the surface — restated without depending on
+`teko_prim.tk`'s own `tk_prim_need_include`,** which asks a question keyed on `tk_prim_is`
+an enum never answers yes to. `tk_enum_need_include` is the same three-part message
+(`teko: X needs #include "rt.tk" before it is used`) `TimeSpan` already established,
+independently written so the two mechanisms genuinely do not share code.
+
+**What N2b does NOT teach, and why**: `CompareTo`/`Equals` (the ordinal comparison is
+already free through `<`/`<=`/`>`/`>=`/`==`/`!=`, N2a, so these two are a thin wrapper best
+built once as `IComparable`/`IEquatable` conformance rather than one-off for `enum`);
+`GetNames()`/`GetValues()` (need a HEAP `T[]`/`str[]` filled at compile time from the two
+globals this crumb already writes — the array machinery is proven, filling one from a fixed
+global inside a generated body is not measured, so it is left rather than shipped unproven);
+`[Flags]`-style `ToString` decomposition (no attribute grammar). All three are recorded in
+[not-yet.md](docs/reference/not-yet.md) § Enums, not silently dropped.
+
+`tests/surface_enum_text.tk` (`expect-exit: 50`): `ToString` on a member, on an aliased
+value (the first name) and on two out-of-set values (positive and negative, over the
+default `i32` underlying); `Parse` round-tripping every member of two enums, aliased value
+included; `TryParse` on a good and a bad name, over BOTH an `i32`-underlying and a
+`u8`-underlying enum, the `out` slot left untouched on failure; `IsDefined` on a defined
+value, an undefined one, and a value shared by an alias — plus, over a NARROW signed (`:
+i16`) and a default `i32` enum each carrying a NEGATIVE member (`Neg = 0 - 100`/`Neg = 0 -
+5`), `ToString`, `Parse`, `TryParse` (including the sign-extended value written through
+`out`) and `IsDefined`, the review fix below's own regression cover.
+`tests/surface_enum_parse_panic.tk` (`expect-exit: 70`): `Color.Parse("Nope")`.
+
+**Review fix (`teko-org/teko-lang#696`): a negative member's own value collided with `-1`,
+the "not found" sentinel.** `tk_enum_value(names, vals, n, s)` returned the MEMBER'S VALUE on
+a match, `-1` on none — so `Signed.Parse("Neg")` on `enum Signed : i16 { Neg = 0 - 100, ...
+}` (already in `tests/surface_enum.tk`) panicked (exit 70) instead of answering `Signed.Neg`,
+and `Signed.TryParse("Neg", out s)` answered 0 without writing, because `Neg`'s own value
+(`-100`) reads exactly like "not found" to a `v < 0` test. Fixed at the root: `tk_enum_value`
+is now `tk_enum_find(names, n, s)`, answering the member's INDEX (or `-1`) rather than its
+value; `tk_enum_parse` and the four `tk_enum_tryparseN` read `vals[idx]` only once the index
+itself has cleared the `< 0` check, so no member's own value is ever read as a sentinel.
+`docs/reference/runtime.md`'s own `enum` text table corrected to match (it named
+`tk_enum_value`, "or `-1`" — the phrasing that hid the bug in the first read). Proof: the
+reproducer named in the review (`enum Small { A = 0 - 5, B = 0, C = 5 } ... Small.Parse("A")
+!= Small.A`) went from exit 70 to the expected answer; `tests/surface_enum_text.tk` gained
+the `Signed`/`SignedWide` negative-member coverage above (12 more `return N` checks, N
+picking up from 30 through 45, the fixture's own `expect-exit` moved from 42 to 50 to keep
+every code distinct from the success one).
+
+**Copilot finding (`teko-org/teko-lang#696`): `tk_i64_to_dec` negated `v` and so overflowed
+on `i64`'s minimum.** The formatter's own comment claimed no enum value reaches it; wrong —
+an enum over `i64` reaches it through an explicit cast, which C# does not range-check either
+(docs/specs/enum.md § 5), so `((Wide) (0 - 9223372036854775807 - 1)).ToString()` formatted
+garbage. Fixed at the root, the textbook way: the digits are peeled on the NON-POSITIVE side
+(a positive `v` is negated first, a negative one is kept), `'0' - v % 10` per digit since
+mc's `%` truncates toward zero and so keeps a non-positive remainder for a non-positive
+dividend. `tests/surface_enum_text.tk` gained `enum Wide : i64` and the three checks at the
+ends of the range (`i64` minimum, `i64` maximum, zero — `return 46..48`); the minimum's check
+answered 46 against the old formatter, 50 against the new one.
+
+**Copilot's second pass (`teko-org/teko-lang#696`), two smaller ones.** `tk_enum_ensure`
+refused "too many enums asked for text in one unit" at whatever `tk_line`/`tk_file` last
+held, since its three callers set them only after the call; it now takes the use site
+(`line`, `fl`) and refuses there — a no-op on accepted code, the 59 `--dump-ast` dumps
+byte-identical before and after. `docs/reference/not-yet.md` named `GetNames`/`GetValues`'s
+refusal as `teko: unknown static member of Color`; the enum path refuses earlier, as
+`teko: Color has no member GetNames` — the row now says so.
+
+Proof: `mc build . --config mc.macos.toml` clean; **59/59** fixtures at their `expect-exit`
+(the 57 existing — Q3's `tests/surface_definite.tk` among them — plus the two this crumb
+adds); `--dump-ast` of the 3 of the 57 existing fixtures that do not `#include
+"../lib/rt.tk"` (`hello`, `primitives_ptr`, `primitives_scalar`) byte-identical to
+`33c7485c`, compiled from scratch by both releases; the other 54 move — the appended new
+`lib/rt.tk` functions landing in their own `#include`, not called by any of them, no
+`Name__names`/`Name__vals` global among the moved lines, zero pre-existing function body
+touched (`diff` of `lib/rt.tk` against `33c7485c`'s own copy: `0` `<` lines, a pure append);
+`FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm` diff empty over 213151
+lines, 59/59 fixtures under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (562
+links, 378 diagnostics, 110 samples — 73 run, 37 no-run, the two this crumb adds among
+them); `mc limits . --config mc.macos.toml` verdict `ok`, `syntax` `15/30`, `passes`
+`15/30`, `intrin` `8/16`, `alias` `19/38`, `types` `11/22` — every row identical, element
+for element, to the same command run against `33c7485c` from scratch: N2b adds no syntax
+word, no pass and no intrinsic, exactly the spec's own § 10 prediction ("nothing" for every
+row `TimeSpan`'s own C1 did not already move). Five probes outside `tests/`
+(`build/probe/*.tk`, not committed) proving the five refusals this entry names, each with
+its exact message: a `TryParse` `out` argument of the wrong type (`teko: a value of type
+i64 does not convert to Color`), a wrong argument count (`teko: wrong number of arguments
+for Parse`), a missing include (`teko: Color needs #include "rt.tk" before it is used`),
+`ToString` without `()` (`teko: the member is a method; call it with (): ToString`), and
+`TryParse`'s second argument not `out` (`` teko: TryParse's second argument is `out <name>`
+``). `mc pkg hash .` after the review fix and the two Copilot passes above:
+`cc2d24556b11ae8a523b7ad91d4690a988149f8315ac08fb03d99e3321e30238`.

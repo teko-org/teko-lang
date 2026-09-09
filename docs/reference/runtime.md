@@ -85,6 +85,24 @@ caller's.
 |---|---|
 | `i64 tk_str_len(str s)` | the length of a NUL-terminated `str` |
 | `str tk_str_slice(str s, i64 from)` | a view of `s` from byte `from` to the same NUL — pointer arithmetic only, **zero copy** |
+| `i64 tk_str_eq(str a, str b)` | byte-wise equality, no allocation |
+
+## `enum` text
+
+What `.ToString()`, `Color.Parse(s)`, `TryParse` and `IsDefined` lower to
+([types.md § enum](types.md#tostring-parse-tryparse-isdefined), `docs/specs/enum.md` § 6).
+`names`/`vals` are the two globals `teko_enum.tk` writes per enum, the first time one of
+these four is spelled on it; `n` is their shared length. Called by generated code, not
+usually by hand.
+
+| signature | does |
+|---|---|
+| `str tk_enum_name(uptr names, uptr vals, i64 n, i64 v)` | the member's own name, or the decimal digits when `v` matches none |
+| `i64 tk_enum_find(uptr names, i64 n, str s)` | the INDEX of the member named `s` in `names`, or `-1` — kept apart from the member's own value so a negative member value is never mistaken for "not found" |
+| `i64 tk_enum_isdefined(uptr vals, i64 n, i64 v)` | 1 when some member carries `v` |
+| `i64 tk_enum_parse(uptr names, uptr vals, i64 n, str s, str msg)` | `vals[tk_enum_find(...)]`, or `panic(msg)` (exit 70) when `tk_enum_find` answers `-1` |
+| `i64 tk_enum_tryparse8/16/32/64(uptr names, uptr vals, i64 n, str s, uptr outp)` | 0/1, writing `vals[tk_enum_find(...)]` into `outp` at the width named (0, `outp` untouched, when `tk_enum_find` answers `-1`) — one per underlying width an enum may declare |
+| `i64 tk_i64_to_dec(i64 v, uptr buf)` | `v` in decimal, signed, NUL-terminated, into `buf` (24 bytes); the digits `tk_enum_name`'s own fallback formats |
 
 ## `f64` bits
 

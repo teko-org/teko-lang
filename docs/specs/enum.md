@@ -211,16 +211,31 @@ slots D33 enumerated at once, because they all end in that one function.
 ## 6. `ToString`, `Parse` and the rest
 
 These are the only part of `enum` that is not free, and they are a **second crumb** (§ 11,
-N2b) because they need the primitive-member lowering table
-(`docs/specs/datetime.md` § 2), which `TimeSpan` brings.
+N2b). N2b does **not** need `docs/specs/datetime.md`'s primitive-member lowering table:
+an enum already has a struct-table row (D39's own `TK_KENUM`), which that table's own
+types (`TimeSpan`, `DateTime`) never carry, so registering an enum there would make
+`tk_ty_binary` ask a question an enum's own bitwise/comparison operators (§ 4) never
+populate an answer for. N2b is instead a **parallel, self-contained mechanism** in
+`teko_enum.tk` — two globals per enum and a handful of ordinary calls into `lib/rt.tk`,
+dispatched by the enum's own struct-table row, not by `docs/specs/datetime.md`'s
+`type_new`-keyed table. Its only dependency is N2a.
 
 | static | instance |
 |---|---|
 | `Color.Parse(str)`, `TryParse(str, out Color)` | `.ToString()` |
-| `Color.IsDefined(i64)` | `.CompareTo(Color)`, `.Equals(Color)` |
-| `Color.GetNames()` → `str[]`, `GetValues()` → `Color[]` | — |
+| `Color.IsDefined(i64)` | — |
 
-The names live in **two ordinary globals per enum**, emitted by the declaration handler:
+`.CompareTo(Color)`, `.Equals(Color)`, `Color.GetNames()` → `str[]` and `GetValues()` →
+`Color[]` are **not** part of N2b — they stay out (§ 7's own table, and
+[not-yet.md](../reference/not-yet.md) § Enums), left for the crumb that adds
+`IComparable`/`IEquatable` conformance generally rather than one-off for `enum`
+(`CompareTo`/`Equals`), and for the crumb that proves filling a heap `T[]` from a fixed
+compile-time global inside a generated body (`GetNames`/`GetValues`) — the array machinery
+itself is already proven, that one step is not.
+
+The names live in **two ordinary globals per enum**, emitted **lazily** — the first time a
+program actually spells `ToString`/`Parse`/`TryParse`/`IsDefined` on that enum, never at
+the `enum` declaration itself, so an enum a program never asks text of pays nothing:
 
 ```
 str Color__names[3] = { "Red", "Green", "Blue" };
@@ -229,17 +244,23 @@ i64 Color__vals[3]  = { 0, 1, 2 };
 
 A global array whose elements are string literals is an ordinary `mc` initializer — proved
 on the tree, not assumed — so there is no `N_BLOB`, no relocation the compiler has to write
-by hand, and no generated function body per enum. One shared runtime pair in `lib/rt.tk`
-reads them:
+by hand, and no generated function body per enum. Runtime support lives in `lib/rt.tk`
+([runtime.md](../reference/runtime.md) § `enum` text carries the full, current list):
 
 ```
 str tk_enum_name(uptr names, uptr vals, i64 n, i64 v);   // the digits when no name matches
-i64 tk_enum_value(uptr names, uptr vals, i64 n, str s);  // -1 when no name matches
+i64 tk_enum_find(uptr names, i64 n, str s);               // the member's INDEX, or -1
 ```
 
-`ToString()` returns the member's name, or the decimal digits when the value matches none —
-C#'s own behaviour for a value cast in from outside the set. `Parse` panics on a name that
-is not a member (`teko: the string is not a Color`); `TryParse(s, out c)` answers `0`/`1`.
+`tk_enum_find` answers an INDEX, not the member's own value — a member's value may itself
+be negative (`Neg = 0 - 100`), which would collide with a `-1` "not found" sentinel if the
+value alone were returned; `Parse`/`TryParse` read `vals[idx]` only once the index itself
+has cleared the `< 0` check. `ToString()` returns the member's name, or the decimal digits
+when the value matches none — C#'s own behaviour for a value cast in from outside the set.
+`Parse` panics on a name that is not a member (`teko: the string is not a Color`);
+`TryParse(s, out c)` answers `0`/`1`, writing `c` only on success, through one of four
+width-specific writers (`lib/rt.tk`'s `tk_enum_tryparse8/16/32/64`) so a narrower enum's
+`out` slot (`Level : u8` is one byte wide) is never overrun.
 A **flags-style** `ToString` that decomposes `Perm.All` into `"Read, Write"` is C#'s
 `[Flags]` behaviour and is not taught: teko has no attribute grammar, and inventing one for
 a formatting rule would be a language feature bought for a string.
@@ -292,7 +313,7 @@ three-line follow-up inside `lib/time.tk`, carried by N2a's own gate.
 | `teko_ns.tk` | an `enum` name is mangled like a class name inside a `namespace` |
 | `teko_switch.tk` | **nothing**: a qualified folded constant is already a legal case label |
 | `teko.tk` | `#include` and `syntax("enum", &tk_enum)` |
-| `lib/rt.tk` | the two functions of § 6, and only when N2b lands |
+| `lib/rt.tk` | `tk_enum_name`, `tk_enum_find`, `tk_enum_isdefined`, `tk_enum_parse`, `tk_enum_tryparse8/16/32/64` and their small support (`tk_str_eq`, `tk_i64_to_dec`), and only when N2b lands |
 | `core_teko.mc`, `user.mc` | nothing: `teko_init()` is still the one registration site |
 
 The module count in [`CLAUDE.md`](../../CLAUDE.md) and [docs/README.md](../README.md) moves
@@ -322,8 +343,8 @@ An `enum` costs a program exactly what a `class` costs it — one `type_new` and
 | `tests/surface_enum.tk` | implicit and explicit member values; the default underlying type; `: u8` and `: i64`; both explicit casts; the six comparisons; `\| & ^ ~`; an enum field, global, array element, parameter and return; a duplicate value used as an alias | `42` |
 | `tests/surface_enum_switch.tk` | `switch` over an enum with `case Color.Red:`, a fallthrough pair, `default`, and a `switch` **expression** arm over the same labels | `42` |
 | `tests/surface_enum_ns.tk` | an `enum` inside `namespace geo`, reached as `geo.Color.Red` and, under a `using`, as `Color.Red` | `42` |
-| `tests/surface_enum_text.tk` | `ToString` on a member and on a value cast in from outside the set; `Parse` round-trip; `TryParse` on a good and a bad name; `IsDefined`; `GetNames().Length` | `42` |
-| `tests/surface_enum_parse_bad.tk` | `Color.Parse("Mauve")` | `70` |
+| `tests/surface_enum_text.tk` | `ToString` on a member, on an aliased value and on a value cast in from outside the set (default and narrow underlying, including a negative member); `Parse`/`TryParse` round-trip over the same, including a negative member's sign-extended `out` write; `IsDefined` | `50` |
+| `tests/surface_enum_parse_panic.tk` | `Color.Parse("Nope")` | `70` |
 
 The refusals of § 3 have no harness (D33's own note) and are documented with a `// no-run`
 fence in [diagnostics.md](../reference/diagnostics.md) and this page.
@@ -350,12 +371,13 @@ bare member name in a `case`), the new module in
 
 ### N2b — `ToString`, `Parse` and the statics (S)
 
-The two globals per enum, the two `lib/rt.tk` functions, and the member rows.
-**Depends on N2a and on `docs/specs/datetime.md`'s C1** for the primitive-member lowering
-table.
+The two globals per enum (built lazily), the `lib/rt.tk` functions of § 6, and the
+member-row dispatch. **Depends on N2a only** — a parallel, self-contained mechanism, not a
+reuse of `docs/specs/datetime.md`'s primitive-member lowering table (§ 6's own rationale).
 
-**Gate:** `tests/surface_enum_text.tk` at `42` and `_parse_bad.tk` at `70`; everything N2a
-gated on. **Owes:** [runtime.md](../reference/runtime.md) and the `enum` section of
+**Gate:** `tests/surface_enum_text.tk` at its own `expect-exit` and
+`surface_enum_parse_panic.tk` at `70`; everything N2a gated on. **Owes:**
+[runtime.md](../reference/runtime.md) and the `enum` section of
 types.md.
 
 ### N2c — `DateTimeKind` becomes an `enum` (S)

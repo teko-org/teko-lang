@@ -84,6 +84,14 @@ i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown);
 void tk_prim_own_cast_moved(i64 from, i64 to);
 i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb);
 
+// docs/specs/enum.md § 6 (N2b, D47): `c.ToString()` on a receiver only the
+// oracle can type -- a qualified constant (`Color.Red.ToString()`) is one,
+// since `tk_struct_of_expr` (teko_struct.tk) does not recognize a retyped
+// `N_INT` and defers it exactly like a parameter's own member would be.
+// Answers 0 for a name other than `ToString`, read by `tk_pend_emit` below
+// as "not ours".
+i64 tk_enum_pend(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown);
+
 // D226 compat crumb: `tk_pend_field`'s own store branch resolves the value
 // early when it is itself a deferred access, the same way a receiver already
 // does below
@@ -768,6 +776,15 @@ i64 tk_pend_emit(i64 pi, i64 si, uptr pty, uptr ppure, uptr pown) {
     }
     if (tk_prop_find(si, m) >= 0) return tk_pend_prop(pi, si, pty, ppure, pown);
     if (tk_method_named_find(si, m) >= 0) return tk_pend_method(pi, si, pty, ppure, pown);
+    // docs/specs/enum.md § 6 (N2b, D47): tried before the refusal, mirroring
+    // `tk_member_of`'s own parse-time twin (teko_expr.tk) -- a qualified
+    // enum constant chained straight into `.ToString()` never resolves at
+    // parse time (`tk_struct_of_expr` answers -1 for a retyped `N_INT`), so
+    // it is always resolved here instead.
+    if (tk_is_enum(si)) {
+        i64 r = tk_enum_pend(pi, si, pty, ppure, pown);
+        if (r != 0) return r;
+    }
     err_at2(tk_file, tk_line, tk_join("teko: unknown member of ", sr_name_at(si)), m);
     return 0;
 }

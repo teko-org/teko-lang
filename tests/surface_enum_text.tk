@@ -1,0 +1,110 @@
+// surface_enum_text.tk -- `enum` text (docs/specs/enum.md § 6, N2b, D47):
+// `.ToString()` on a member, on an aliased value (the FIRST name declared
+// with it, C#'s own rule) and on a value cast in from outside the set (the
+// decimal digits); `Color.Parse(name)` round-tripping every declared member;
+// `Color.TryParse(s, out c)` on a good and a bad name, the `out` slot left
+// untouched on failure; `Color.IsDefined(v)`. Two enums with different
+// underlying widths (the default `i32` and an explicit `: u8`), so the
+// four width-specific `TryParse` writers (lib/rt.tk) are both exercised.
+// Two more enums carry a NEGATIVE member (`: i16` and the default `i32`),
+// proving `tk_enum_find` (lib/rt.tk) -- not the member's own value -- is
+// what "not found" tests against: a negative value used to collide with the
+// `-1` sentinel `tk_enum_value` answered before the fix (`teko-org/teko-lang#696`).
+//
+// expect-exit: 50
+
+#include "../lib/rt.tk"
+
+enum Color { Red, Green, Blue }                                   // default underlying: i32
+enum Perm  { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
+enum Level : u8 { Low = 10, Mid, High }                            // an explicit narrow width
+enum Signed : i16 { Neg = 0 - 100, Zero = 0, Pos = 100 }           // negative, narrow width
+enum SignedWide { Neg = 0 - 5, Zero = 0, Pos = 5 }                 // negative, default i32
+enum Wide : i64 { One = 1 }                                        // the widest underlying
+
+i64 main() {
+    // ToString on a member
+    if (!tk_str_eq(Color.Red.ToString(), "Red")) return 1;
+    if (!tk_str_eq(Color.Green.ToString(), "Green")) return 2;
+    if (!tk_str_eq(Color.Blue.ToString(), "Blue")) return 3;
+
+    // ToString on an aliased value: the FIRST name declared with it
+    if (!tk_str_eq(Perm.All.ToString(), "All")) return 4;
+    if (!tk_str_eq(Perm.Alias.ToString(), "All")) return 5;
+
+    // ToString on a value cast in from outside the declared set: the digits
+    Color outside = (Color) 99;
+    if (!tk_str_eq(outside.ToString(), "99")) return 6;
+    Color neg = (Color) (0 - 1);
+    if (!tk_str_eq(neg.ToString(), "-1")) return 7;
+
+    // Parse round-trips every declared name
+    if (Color.Parse("Red") != Color.Red) return 8;
+    if (Color.Parse("Green") != Color.Green) return 9;
+    if (Color.Parse("Blue") != Color.Blue) return 10;
+    if (Perm.Parse("None") != Perm.None) return 11;
+    if (Perm.Parse("Read") != Perm.Read) return 12;
+    if (Perm.Parse("Write") != Perm.Write) return 13;
+    if (Perm.Parse("All") != Perm.All) return 14;
+    if (Perm.Parse("Alias") != Perm.All) return 15;      // parses to the shared value
+
+    // TryParse, i32-underlying: a good name, then a bad one that leaves the
+    // slot untouched
+    Color c1;
+    if (Color.TryParse("Blue", out c1) != 1) return 16;
+    if (c1 != Color.Blue) return 17;
+    Color c2 = Color.Red;
+    if (Color.TryParse("Nope", out c2) != 0) return 18;
+    if (c2 != Color.Red) return 19;
+
+    // TryParse, u8-underlying: the width-specific writer
+    Level l1;
+    if (Level.TryParse("High", out l1) != 1) return 20;
+    if (l1 != Level.High) return 21;
+    if ((i64) l1 != 12) return 22;
+    Level l2 = Level.Low;
+    if (Level.TryParse("Nope", out l2) != 0) return 23;
+    if (l2 != Level.Low) return 24;
+
+    // IsDefined
+    if (!Color.IsDefined(0)) return 25;
+    if (!Color.IsDefined(2)) return 26;
+    if (Color.IsDefined(99)) return 27;
+    if (Color.IsDefined(0 - 1)) return 28;
+    if (!Perm.IsDefined(3)) return 29;                    // the shared value both share
+
+    // a NEGATIVE member, narrow (i16) underlying: ToString, Parse, TryParse,
+    // IsDefined -- `tk_enum_find` (lib/rt.tk) must not mistake `Neg`'s own
+    // value for the "not found" sentinel
+    if (!tk_str_eq(Signed.Neg.ToString(), "Neg")) return 30;
+    if (Signed.Parse("Neg") != Signed.Neg) return 31;
+    if ((i64) Signed.Parse("Neg") != 0 - 100) return 32;
+    Signed s1 = Signed.Zero;
+    if (Signed.TryParse("Neg", out s1) != 1) return 33;
+    if (s1 != Signed.Neg) return 34;                      // written value round-trips
+    if ((i64) s1 != 0 - 100) return 35;                   // sign-extended, not zero-extended
+    Signed s2 = Signed.Pos;
+    if (Signed.TryParse("Nope", out s2) != 0) return 36;
+    if (s2 != Signed.Pos) return 37;                      // untouched on failure
+    if (!Signed.IsDefined(0 - 100)) return 38;
+
+    // a NEGATIVE member, default (i32) underlying
+    if (!tk_str_eq(SignedWide.Neg.ToString(), "Neg")) return 39;
+    if (SignedWide.Parse("Neg") != SignedWide.Neg) return 40;
+    SignedWide w1 = SignedWide.Zero;
+    if (SignedWide.TryParse("Neg", out w1) != 1) return 41;
+    if (w1 != SignedWide.Neg) return 43;
+    if ((i64) w1 != 0 - 5) return 44;
+    if (!SignedWide.IsDefined(0 - 5)) return 45;
+
+    // the digits at both ends of the widest underlying type: i64's minimum has
+    // no positive twin, so the formatter must not negate it
+    Wide lo = (Wide) (0 - 9223372036854775807 - 1);
+    if (!tk_str_eq(lo.ToString(), "-9223372036854775808")) return 46;
+    Wide hi = (Wide) 9223372036854775807;
+    if (!tk_str_eq(hi.ToString(), "9223372036854775807")) return 47;
+    Wide zero = (Wide) 0;
+    if (!tk_str_eq(zero.ToString(), "0")) return 48;
+
+    return 50;
+}
