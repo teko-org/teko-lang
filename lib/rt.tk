@@ -337,3 +337,152 @@ uptr tk_cap_putf32(uptr p, i64 off, f32 v) {
     return p;
 }
 
+// ---- enum text (docs/specs/enum.md § 6, N2b, D47) ----
+//
+// `str` is `uptr` with a NUL terminator (D207's own note: no `string`
+// object yet), so a name/value LOOKUP over the two globals a `Color` writes
+// (`Color__names`, `Color__vals`, teko_enum.tk's own `tk_enum_ensure`) needs
+// a byte-wise string equality and a decimal formatter this file did not have
+// yet -- neither is a compiler hook, both are ordinary program code, exactly
+// like every other function on this page.
+
+// byte-wise equality of two NUL-terminated strings; no allocation
+i64 tk_str_eq(str a, str b) {
+    i64 i = 0;
+    loop {
+        u8 ca = ld8(a + i);
+        u8 cb = ld8(b + i);
+        if (ca != cb) return 0;
+        if (ca == 0) return 1;
+        i = i + 1;
+    }
+}
+
+// `v` in decimal, signed, NUL-terminated, into `buf` (needs 24 bytes);
+// returns the length. Mirrors mc's own `examples/api/lib/rt.mc:itoa` (not
+// vendored, the same small idiom): `i64`'s minimum is not representable via
+// negation and is not handled -- no enum value reaches it, since an enum's
+// widest underlying type is `i64` itself and C# does not check an explicit
+// cast's range either (docs/specs/enum.md § 5).
+i64 tk_i64_to_dec(i64 v, uptr buf) {
+    u8 tmp[24];
+    i64 neg = 0;
+    i64 i = 24;
+    if (v < 0) {
+        neg = 1;
+        v = 0 - v;
+    }
+    loop {
+        i = i - 1;
+        st8(tmp + i, '0' + v % 10);
+        v = v / 10;
+        if (v == 0) break;
+    }
+    i64 n = 0;
+    if (neg) {
+        st8(buf, '-');
+        n = 1;
+    }
+    while (i < 24) {
+        st8(buf + n, ld8(tmp + i));
+        n = n + 1;
+        i = i + 1;
+    }
+    st8(buf + n, 0);
+    return n;
+}
+
+// the digits `ToString` answers for a value that matches no member (C#'s own
+// behaviour for a value cast in from outside the set): a fresh, heap-owned
+// buffer, since the caller may hold it past this call's own return.
+str tk_enum_digits(i64 v) {
+    uptr buf = rt_alloc(24);
+    tk_i64_to_dec(v, buf);
+    return buf;
+}
+
+// the member's own name, or the decimal digits when `v` matches none.
+// `names`/`vals` are the two globals teko_enum.tk writes per enum, `n` their
+// shared length; a forward scan is what makes an ALIASED value answer the
+// FIRST name declared with it, C#'s own rule, since the two globals keep
+// declaration order.
+str tk_enum_name(uptr names, uptr vals, i64 n, i64 v) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (ld64(vals + i * 8) == v) return ld64(names + i * 8);
+        i = i + 1;
+    }
+    return tk_enum_digits(v);
+}
+
+// the member named `s`, or `-1` when no member is spelled that way.
+i64 tk_enum_value(uptr names, uptr vals, i64 n, str s) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (tk_str_eq(ld64(names + i * 8), s)) return ld64(vals + i * 8);
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// `Color.IsDefined(v)`: 1 when SOME member carries the value `v`.
+i64 tk_enum_isdefined(uptr vals, i64 n, i64 v) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (ld64(vals + i * 8) == v) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// `Color.Parse(s)`: the member named `s`, or a panic (exit 70) when no
+// member is -- C#'s own `FormatException`, teko has no exceptions so the
+// answer is `panic`, the same road every other guard in this port takes.
+// `msg` is built at COMPILE time (`teko_enum.tk`'s own call site already
+// knows the enum's name), so no runtime string concatenation is needed here.
+i64 tk_enum_parse(uptr names, uptr vals, i64 n, str s, str msg) {
+    i64 v = tk_enum_value(names, vals, n, s);
+    if (v < 0) rt_panic(msg);
+    return v;
+}
+
+// `Color.TryParse(s, out c)`: 0/1, and `c` is written only on success --
+// FOUR width-specific writers, one per underlying width an enum may declare
+// (docs/specs/enum.md § 1: `u8`/`i8` at 1 byte, `u16`/`i16` at 2, the default
+// `i32` and `u32` at 4, `u64`/`i64` at 8). A single `st64` would overrun the
+// `out` slot of a narrower enum -- a `Level` variable (`: u8`) is one byte
+// wide, not eight -- so `teko_enum.tk`'s own call site picks the row that
+// matches the enum's own `type_width`, the same table `tk_stn`
+// (teko_struct.tk) already keys an indirect store by, mirrored here as plain
+// functions because these run at PROGRAM time, not at compile time.
+i64 tk_enum_tryparse8(uptr names, uptr vals, i64 n, str s, uptr outp) {
+    i64 v = tk_enum_value(names, vals, n, s);
+    if (v < 0) return 0;
+    st8(outp, v);
+    return 1;
+}
+
+i64 tk_enum_tryparse16(uptr names, uptr vals, i64 n, str s, uptr outp) {
+    i64 v = tk_enum_value(names, vals, n, s);
+    if (v < 0) return 0;
+    st16(outp, v);
+    return 1;
+}
+
+i64 tk_enum_tryparse32(uptr names, uptr vals, i64 n, str s, uptr outp) {
+    i64 v = tk_enum_value(names, vals, n, s);
+    if (v < 0) return 0;
+    st32(outp, v);
+    return 1;
+}
+
+i64 tk_enum_tryparse64(uptr names, uptr vals, i64 n, str s, uptr outp) {
+    i64 v = tk_enum_value(names, vals, n, s);
+    if (v < 0) return 0;
+    st64(outp, v);
+    return 1;
+}
+

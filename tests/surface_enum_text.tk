@@ -1,0 +1,70 @@
+// surface_enum_text.tk -- `enum` text (docs/specs/enum.md § 6, N2b, D47):
+// `.ToString()` on a member, on an aliased value (the FIRST name declared
+// with it, C#'s own rule) and on a value cast in from outside the set (the
+// decimal digits); `Color.Parse(name)` round-tripping every declared member;
+// `Color.TryParse(s, out c)` on a good and a bad name, the `out` slot left
+// untouched on failure; `Color.IsDefined(v)`. Two enums with different
+// underlying widths (the default `i32` and an explicit `: u8`), so the
+// four width-specific `TryParse` writers (lib/rt.tk) are both exercised.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+enum Color { Red, Green, Blue }                                   // default underlying: i32
+enum Perm  { None = 0, Read = 1, Write = 2, All = 3, Alias = 3 }   // Alias aliases All
+enum Level : u8 { Low = 10, Mid, High }                            // an explicit narrow width
+
+i64 main() {
+    // ToString on a member
+    if (!tk_str_eq(Color.Red.ToString(), "Red")) return 1;
+    if (!tk_str_eq(Color.Green.ToString(), "Green")) return 2;
+    if (!tk_str_eq(Color.Blue.ToString(), "Blue")) return 3;
+
+    // ToString on an aliased value: the FIRST name declared with it
+    if (!tk_str_eq(Perm.All.ToString(), "All")) return 4;
+    if (!tk_str_eq(Perm.Alias.ToString(), "All")) return 5;
+
+    // ToString on a value cast in from outside the declared set: the digits
+    Color outside = (Color) 99;
+    if (!tk_str_eq(outside.ToString(), "99")) return 6;
+    Color neg = (Color) (0 - 1);
+    if (!tk_str_eq(neg.ToString(), "-1")) return 7;
+
+    // Parse round-trips every declared name
+    if (Color.Parse("Red") != Color.Red) return 8;
+    if (Color.Parse("Green") != Color.Green) return 9;
+    if (Color.Parse("Blue") != Color.Blue) return 10;
+    if (Perm.Parse("None") != Perm.None) return 11;
+    if (Perm.Parse("Read") != Perm.Read) return 12;
+    if (Perm.Parse("Write") != Perm.Write) return 13;
+    if (Perm.Parse("All") != Perm.All) return 14;
+    if (Perm.Parse("Alias") != Perm.All) return 15;      // parses to the shared value
+
+    // TryParse, i32-underlying: a good name, then a bad one that leaves the
+    // slot untouched
+    Color c1;
+    if (Color.TryParse("Blue", out c1) != 1) return 16;
+    if (c1 != Color.Blue) return 17;
+    Color c2 = Color.Red;
+    if (Color.TryParse("Nope", out c2) != 0) return 18;
+    if (c2 != Color.Red) return 19;
+
+    // TryParse, u8-underlying: the width-specific writer
+    Level l1;
+    if (Level.TryParse("High", out l1) != 1) return 20;
+    if (l1 != Level.High) return 21;
+    if ((i64) l1 != 12) return 22;
+    Level l2 = Level.Low;
+    if (Level.TryParse("Nope", out l2) != 0) return 23;
+    if (l2 != Level.Low) return 24;
+
+    // IsDefined
+    if (!Color.IsDefined(0)) return 25;
+    if (!Color.IsDefined(2)) return 26;
+    if (Color.IsDefined(99)) return 27;
+    if (Color.IsDefined(0 - 1)) return 28;
+    if (!Perm.IsDefined(3)) return 29;                    // the shared value both share
+
+    return 42;
+}
