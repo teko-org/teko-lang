@@ -504,7 +504,8 @@ least one member. [diagnostics.md](diagnostics.md) has every one of these messag
 Four members, dispatched by name and built lazily — the two globals a text-using enum needs
 (`Color__names`, `Color__vals`) are written the first time one of these four is spelled on
 it, never at the `enum` itself, so an enum a program never asks text of costs nothing. They
-lower to [`lib/rt.tk`](runtime.md), behind the same include every fixture already carries:
+lower to [`lib/rt.tk`](runtime.md), behind the include a program that asks an enum for
+text has to carry (the one most fixtures already do):
 
 ```
 #include "rt.tk"
