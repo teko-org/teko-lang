@@ -2048,3 +2048,79 @@ moves is the arena's own high-water, `467792 → 1114960` bytes on the floor and
 `3211120 → 3858288` on the datetime leg (the two tables plus this crumb's own source,
 against a 33554432-byte reservation). `mc pkg hash .`:
 `f3c53a71be989bcf05fe302a040150a3cbf1289b2a1dce4b08ae7b55c482537d`.
+
+**Copilot finding, fourth pass — the CONVERSION was still made on the guess, and the
+oracle's new answer made one global honest and one dangerous.** Both were reproduced on
+`108391e1` before they were fixed.
+
+1. **A float column laundered what a cast column no longer could.** The third pass took the
+   guess out of the CHECK and left it in the conversion, and on a float column the
+   conversion IS the decision: `tk_num_widen` widens an integer and leaves everything else
+   alone. With an `i64 pick(i64)` declared ahead of a `DateTimeKind pick(i64, i64)`,
+   `TimeSpan.FromHours(pick(1, 2))` read the FIRST declaration, wrote `(f64)
+   pick__i64__i64(1, 2)` over a call that returns an enum, and `tk_rc_call_args`
+   (teko_rc.tk) saw exactly the `f64` the column asks for and had nothing to say — the same
+   laundering, one column over. The mirror pair, an `f64 pick(i64)` ahead of an `i64
+   pick(i64, i64)`, wrote NO cast over an integer return and fed the raw eight bytes to a
+   float parameter.
+
+   **The fix is that `cty` is what everything reads.** `tk_prim_arg` (teko_prim.tk) already
+   built the -1 an N_CALL deserves for the check; it now hands that same -1 to
+   `tk_prim_conv`, so no node is written on a guess: both cast arms never read the type at
+   all, the float arm writes nothing, and every other column's conversion is the identity
+   whatever the type is. `tk_prim_defers` adds the float column to the deferral table, and
+   `tk_prim_arg_widen` writes the cast once `tk_over_pass` has picked the symbol. The wrap
+   is IN PLACE (`tk_nd_moved`, the node-rewrite pattern teko_rc.tk's `tk_rc_assign` already
+   uses) because the argument was spliced into the lowered call's own list two passes ago
+   and nothing at that point holds the link it is; `nd_next` is the one field left behind,
+   since the sibling link belongs to the SLOT and not to the value. Only a CALL defers on a
+   float column, and the reason is WHERE the two resolvers run: `tk_prim_arg_pend` is
+   called from the middle of teko_ops.tk's own walk, over the very node it would rewrite,
+   and a call is exactly what it leaves to `tk_prim_arg_rest`. The rule itself moved to
+   `tk_num_widens` (teko_typeof.tk) so the two readers cannot drift. **All 61 dumps stayed
+   byte-identical** across this fix alone: no fixture had a call in a float column, and the
+   cast still lands where the literal already put it. `tests/surface_datetime_kind.tk`
+   gains codes 54-57 over both declaration orders and a float-returning overload; the
+   refusal (`teko: a value of type DateTimeKind does not convert to f64`) is in
+   diagnostics.md.
+
+2. **`tk_ty_global` has a side effect, and it is right twice and wrong once.** With the
+   oracle answering a global by its declaration, a global receiver stops falling through to
+   the by-name member search. Measured against `33c7485c` (main), which refuses all three:
+
+   - a PRIMITIVE global (`TimeSpan g; g.Days`, `g.TotalHours`, `g.Negate()`,
+     `g.CompareTo(t)`, `g.Equals(d)`, and a write followed by a read) is **right**, and
+     comes for free — not one line was added for it. `docs/reference/not-yet.md`'s row is
+     deleted, and so are the sentences in `timespan.md` and `datetime.md` that cited it;
+     `tests/surface_timespan.tk` reads `g_span` as a receiver (codes 70-76);
+   - a global declared `T?` over a REFERENCE is **right** too: its handle IS the pointer,
+     so `.HasValue`, `.Value`, `??` and `?.` read as a local's do and the object lives as
+     long as any other global's (`rt_live()` measured). `tests/surface_nullable_ref.tk`
+     gains `globalcheck()`, codes 110-119;
+   - a global declared `T?` over a VALUE is **wrong**, and the branch turned a silent hole
+     into a segfault. The box that type promises is built by the rc pass out of the SCOPE a
+     local lives in — `tk_rc_var` and `tk_rc_assign` (teko_rc.tk) both return at once for a
+     name no scope holds — so `i64? n; n = 5;` stored the bare 5, and `n.Value`, which on
+     main answers `teko: unknown member: Value`, became `ld64(tk_nl_ck(5) + 24)`: exit 139.
+
+   The DECLARATION is what is wrong, so the declaration is what is refused: `teko: a global
+   does not hold a nullable box`, from `tk_gs_check` (teko_array.tk) in the same sweep that
+   collects the slots, which closes `n = 5;` and not only the read. not-yet.md keeps its
+   row under the new message and `nullable.md` says which half of `T?` a global takes.
+
+Two nits with it: `docs/specs/datetime.md` § 11's inventory and `docs/specs/enum.md` § 12's
+N2c gate line now name `tests/surface_datetime_kind_panic.tk` (70) beside the 42 one.
+
+**Proof of the fourth pass**, mc **0.15.23**, macos/aarch64: `mc build . --config
+mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of all 61
+against `108391e1` — **58 byte-identical**, and the three that move are the three fixtures
+edited here, every one of whose diffs is pure ADDITION once the compiler's own `$gN`
+temporaries are normalized (no existing line moved);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (`teko1.o == teko2.o`
+on the first turn, `--dump-asm` of teko2 vs teko3 empty over 214416 lines, 61/61 fixtures
+under `teko1`); `sh scripts/check-docs.sh` green (564 links, **383** diagnostics, 115
+samples). `mc limits` verdict `ok` on both legs with every table unmoved from the third
+pass — floor (`tests/hello.tk`) `passes` 15/30, `syntax` 15, `alias` 18, `types` 11,
+`intrin` 8/16, heap 1114848, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias`
+21, `types` 14, heap 3858288 (against a 33554432-byte reservation). `mc pkg hash .`:
+`1f36848ed1779e8821b0f454e1b3ce19225ea8cd5b2bf6ddd8113247cc1a4c23`.
