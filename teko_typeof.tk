@@ -201,6 +201,17 @@ i64 tk_ty_of(i64 n);
 // as an assignment rather than as a read (D46, its own comment there).
 i64 tk_capread_is(i64 n);
 
+// teko_over.tk is included after this file: D49, the overload table asked as a
+// QUESTION. `tk_ov_find` says whether a name carries more than one signature,
+// and `tk_ov_pick(n, 0)` answers which of them a call site picks -- the pass's
+// own resolution with every rewrite and every refusal turned off, so the oracle
+// may ask it from anywhere, as often as it likes, and the tree does not move.
+// `tk_ov_prepare` is what fills that table, called at the top of the pass
+// below.
+void tk_ov_prepare(i64 root);
+i64 tk_ov_find(uptr name);
+i64 tk_ov_pick(i64 n, i64 commit);
+
 // teko_null.tk is included after this file: the three members a NULLABLE
 // receiver answers, at the deferred position this file owns (Q1a), and the
 // one node rule 1 does not judge -- a `null` this project wrote itself.
@@ -262,6 +273,16 @@ i64 tk_ty_of(i64 n) {
         return tk_ty_global(nd_name(n));            // a global slot, G1's `T[]` of heap included
     }
     if (k == N_CALL) {
+        // D49: a name that carries several signatures is typed by the PICK its
+        // own arguments make. `decl_find` answers the FIRST declaration of such
+        // a name, which is a guess every consumer of this oracle then acted on
+        // -- the operator pass lowered on it, the ternary compared arms on it,
+        // a primitive row's deferred argument was checked against it. The table
+        // is asked instead, and a site it cannot settle answers -1 like
+        // anything else this oracle cannot see. Once `tk_ov_pass` has rewritten
+        // the site, the name is the mangled one, `tk_ov_find` misses and
+        // `decl_find` below is exact again.
+        if (tk_ov_find(nd_name(n)) >= 0) return tk_ov_pick(n, 0);
         i64 d = decl_find(nd_name(n));
         if (d < 0) return 0 - 1;
         return decl_ret(d);
@@ -1074,6 +1095,10 @@ void tk_da_check(i64 root) {
 }
 
 i64 tk_typeof_pass(i64 root) {
+    // D49: FIRST of all, and of this pass's own rebuilds too -- the oracle
+    // answers a call to an overloaded name out of that table, and every
+    // consumer of the oracle is this pass or a later one.
+    tk_ov_prepare(root);
     if (tk_npend != 0 || tk_nmethod != 0) {
         tk_ty_pass_walk(root, &tk_pend_visit);
         tk_pend_check();

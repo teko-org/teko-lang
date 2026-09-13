@@ -324,6 +324,30 @@ void tk_ov_scan() {
     }
 }
 
+// ---- the table, built for the ORACLE and read by the pass (D49) ----
+// `tk_ty_of` (teko_typeof.tk) has to answer a call to an overloaded name by
+// the overload its own arguments pick, and every consumer of that answer --
+// the operator pass, the ternary, `??`/`?.`, a primitive row's argument, an
+// initializer -- runs BEFORE this pass. So the two sweeps that make the
+// question answerable are pulled up to the front of `tk_typeof_pass` (pass 6
+// of 15), which is ahead of all of them, and this pass asks for them again and
+// gets the same table: the flag makes the second call the no-op it must be,
+// since collecting twice would double every row.
+//
+// What moves with them is `tk_ov_scan`'s three refusals -- an overloaded
+// `main`, an overloaded `extern`, two overloads differing only by `ref`/`out`
+// -- which are now raised at pass 6 instead of pass 14, with the same message
+// at the same line. That is the whole cost, and it is one a declaration-level
+// refusal can pay: it depends on nothing any pass in between writes.
+i64 tk_ov_ready = 0;
+
+void tk_ov_prepare(i64 root) {
+    if (tk_ov_ready) return;
+    tk_ov_ready = 1;
+    tk_ov_collect(root);
+    tk_ov_scan();
+}
+
 void tk_ov_rename() {
     i64 i = 0;
     loop {
@@ -347,12 +371,14 @@ i64 tk_ov_int_ty(i64 t) {
     return 0;
 }
 
-i64 tk_ov_resolve(i64 n);
+i64 tk_ov_pick(i64 n, i64 commit);
 
 // the type of one argument. A call to a name still waiting for its symbol is
 // resolved FIRST -- its own arguments decide which overload it is, and that
-// overload's return type is what the outer call sees.
-i64 tk_ov_arg_ty(i64 a) {
+// overload's return type is what the outer call sees. `commit` travels down
+// with it: a QUERY resolves the nested call the same way and writes nothing
+// either (D49).
+i64 tk_ov_arg_ty(i64 a, i64 commit) {
     i64 rk = tk_rfarg_kind(a);
     if (rk != TK_RP_NONE) {
         i64 pty = tk_rfarg_pointee(a);
@@ -361,7 +387,7 @@ i64 tk_ov_arg_ty(i64 a) {
         return 0 - 1;
     }
     if (nd_kind(a) == N_CALL) {
-        if (tk_ov_find(nd_name(a)) >= 0) return tk_ov_resolve(a);
+        if (tk_ov_find(nd_name(a)) >= 0) return tk_ov_pick(a, commit);
     }
     return tk_ty_of(a);
 }
@@ -618,22 +644,40 @@ i64 tk_ov_nargs(i64 args) {
 // argument types are computed ONCE, into an array of this frame: resolving an
 // argument may resolve another call, and a table shared between the two would
 // be the reentrancy the `params` list already paid for once.
-i64 tk_ov_resolve(i64 n) {
+//
+// `commit` is the difference between the PASS and the ORACLE (D49). At
+// `commit == 1` this is the pass: the site is rewritten to the symbol, a
+// `params` list is expanded, the defaults are filled, and a site that resolves
+// to nothing is refused where it was written. At `commit == 0` it is a
+// question `tk_ty_of` (teko_typeof.tk) asks about a call it has to type, and
+// the answer is the chosen overload's return type ALONE: the function returns
+// before every rewrite below, so not one node moves while it is being asked --
+// which is what keeps `tk_pm_expand_call`/`tk_fill_defaults` running exactly
+// once, at the pass, over the tree the source wrote. Every refusal becomes -1
+// there, "not known", the answer the oracle already gives for anything else it
+// cannot type: a question never reports an error, because the pass is what
+// reaches the same site later and reports it once.
+i64 tk_ov_pick(i64 n, i64 commit) {
     uptr name = nd_name(n);
     i64 line = nd_line(n);
     uptr fl = nd_file(n);
     i64 args = nd_a(n);
     i64 na = tk_ov_nargs(args);
-    if (na > TK_MAXOARGS) err_at2(fl, line, "teko: too many arguments", name);
+    if (na > TK_MAXOARGS) {
+        if (!commit) return 0 - 1;
+        err_at2(fl, line, "teko: too many arguments", name);
+    }
     i64 tys[TK_MAXOARGS];
     i64 a = args;
     i64 i = 0;
     loop {
         if (a == 0) break;
-        i64 t = tk_ov_arg_ty(a);
-        if (t < 0 && nd_kind(a) != N_INT)
+        i64 t = tk_ov_arg_ty(a, commit);
+        if (t < 0 && nd_kind(a) != N_INT) {
+            if (!commit) return 0 - 1;
             err_at(fl, line, tk_join3(tk_join3("teko: the type of argument ", tk_ov_num(i + 1), " of "),
                                       name, " is not known here"));
+        }
         st64(tys + i * 8, t);
         i = i + 1;
         a = nd_next(a);
@@ -653,12 +697,16 @@ i64 tk_ov_resolve(i64 n) {
         expanded = r >= 0;
     }
     if (r < 0) {
+        if (!commit) return 0 - 1;
         tk_ov_float_refuse(name, args, na, tys, line, fl);
         err_at(fl, line, tk_join3("teko: no overload of ", name, " matches these arguments"));
     }
-    if (count > 1)
+    if (count > 1) {
+        if (!commit) return 0 - 1;
         err_at(fl, line, tk_join3("teko: more than one overload of ", name, " matches these arguments"));
+    }
     i64 d = od_node_at(r);
+    if (!commit) return decl_ret(d);              // the question ends here: nothing moves
     i64 np = decl_nparams(d);
     if (expanded) {
         tk_pm_expand_call(n, d, tys);
@@ -690,7 +738,7 @@ void tk_ov_visit(i64 n) {
     }
     if (k != N_CALL) return;
     if (tk_ov_find(nd_name(n)) < 0) return;
-    tk_ov_resolve(n);
+    tk_ov_pick(n, 1);
 }
 
 // a call the walk never reached -- one outside every function body -- would
@@ -714,8 +762,7 @@ void tk_ov_check_left() {
 // single node is read, let alone moved: the table is this module's own memory,
 // and the tree goes back exactly as it came.
 i64 tk_over_pass(i64 root) {
-    tk_ov_collect(root);
-    tk_ov_scan();
+    tk_ov_prepare(root);                 // already done at pass 6, unless the oracle never ran
     if (tk_nover > 0) {
         tk_ov_rename();
         tk_ty_pass_walk(root, &tk_ov_visit);
