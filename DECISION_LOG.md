@@ -2541,3 +2541,83 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 8/16, heap 1114880, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types`
 14, heap 3875392 (against a 33554432-byte reservation). `mc pkg hash .` over the source tree
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
+
+### D51 · A global falls back through every oracle that reads the pass-time SCOPE alone, `ref`/`out`'s own dedicated pointee check included (2026-09-13)
+
+D48 gave `tk_ty_of`'s own bare `N_IDENT` case a global fallback (`tk_ty_global`,
+teko_array.tk): a global is in scope in every body, so "not known here" was never true of
+one. Five OTHER sites read the SAME pass-time scope, `tk_ty_scope_find` (teko_typeof.tk), for
+a name shaped differently and never fell back once the scope answered -1: `tk_ty_of`'s own
+`N_ADDR` case (a `ref`/`out` argument whose pointee was not known at parse time,
+teko_typeof.tk), the overload matcher's own `tk_ov_arg_ty` (teko_over.tk), and three of
+`teko_deleg.tk`'s own dispatch points -- `tk_deleg_expr_ty`, `tk_deleg_assign`, and
+`tk_deleg_visit`'s `N_CALL` branch. Measured with a probe pair each: a `ref f64` parameter
+given an `i64` global compiled and passed the address through unchecked (`r2`), where the
+same mismatch on a LOCAL already refused, `teko: a value of type i64 does not convert to
+f64` (`r3`); an overload chosen by a `ref` global's own pointee refused a legal call,
+`teko: the type of argument 1 of pick is not known here` (`o2`); a delegate-typed GLOBAL,
+called (`g(1)`), fell through every one of `teko_deleg.tk`'s own dispatch points to a bare
+`N_CALL` of a name nothing declares, `unknown name` from the core -- never a `teko: ...`
+refusal, D20's own rule (`d1`). The fix is a fallback to `tk_ty_global` after
+`tk_ty_scope_find` at all five, through one new one-line helper, `tk_ty_scope_or_global`
+(teko_typeof.tk) -- the same order every other bare-name lookup in the oracle already reads
+a name in.
+
+**A sixth site, found by re-measuring rather than by the citation that named the first
+five.** Applying only that fallback left `r2` compiling AND THEN SEGFAULTING -- worse than
+the silent pass it started as. The refusal `r3` gets does not come from `tk_ty_of` at all: a
+`ref`/`out` call argument's pointee is checked by a SEPARATE, dedicated identity rule over a
+SEPARATE table, `tk_ref_check_pointee`/`tk_ref_arg_pointee` (teko_ref.tk), which runs ahead
+of the general per-argument compat/widen pass (`tk_rc_call_args`, teko_rc.tk -- `tk_ref_pass`
+is registered before `tk_rc_pass` in `teko.tk`). It already carried its own comment naming
+the gap: "a pointee the pass cannot name (a global, an ambiguous local) is silently
+skipped." Once `tk_ty_of`'s new fallback let a global's real type reach `tk_rc_call_args`
+first, that pass's own implicit-widen rule (D33: an integer converts to a float slot) took
+it at face value and wrapped the `ref`-tagged ADDRESS argument in the float cast meant for a
+VALUE -- `scvtf` on a pointer, the segfault. `tk_ref_arg_pointee` gets the identical
+one-line fallback (its own, not the shared helper: teko_ref.tk is included ahead of
+teko_typeof.tk in `teko.tk`, so `tk_ty_scope_or_global` does not exist yet where it is
+needed), and because the dedicated pointee check now runs to completion before
+`tk_rc_call_args` ever sees the argument, it refuses first, with the identical wording a
+local gets: both read `tk_reject_compat` over the same two type names.
+
+**`tk_pm_arg_ty` (teko_params.tk) widened too**, from `tk_ty_global_ha` (a global `T[]` of
+heap only) to the general `tk_ty_global`, deleting the now fully-subsumed
+`tk_ty_global_ha` (teko_array.tk) -- nothing else called it. Measured, not argued: a
+`params i64[]` call with an `f64` global in its tail already refused, at the same line, with
+the same wording, `teko: a value of type f64 does not convert to i64`, because
+`tk_rc_call_args` catches the generated `tkarr_put_i64` call's own argument downstream,
+through `tk_ty_of`'s pre-existing (D48) fallback, before this pass's own element check ever
+ran. The widen changes which pass answers first, not what is answered -- a global `T[]` of
+heap was never the only global `params` could see; it was the only one anything downstream
+had not already caught.
+
+**Nine other `tk_ty_scope_find` call sites are untouched.** `teko_ns.tk`'s own guard in the
+mangling pass (twice), `teko_this.tk`'s five "is this a local or a parameter?" guards, the
+guard `teko_over.tk`'s own member-access fallback takes before the field/`this` search, and
+the two "is this NOT a local?" wrap guards in `teko_deleg.tk` (`tk_deleg_coerce`'s own bare-
+name-to-thunk wrap and one more): each asks "is this a local?" only to fall through to a
+DIFFERENT table on a `no` -- a field, `this`, a plain function name to wrap -- and a global
+answering there would be the wrong table's own name to answer instead of the right one's.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
+clean; **63/63** fixtures at their `expect-exit` (`tests/surface_globals.tk`, exit 42, five
+sections: `ref`/`out` over a scalar global, an overload picked by a `ref` global, a
+delegate-typed global called both as a plain function and a lambda and from inside another
+function, `params` over a global scalar element, and a regression check over an enum global
+and `T?` over a reference global, D48's own two sites, untouched by this crumb);
+`--dump-ast` of the 62 fixtures that existed before, byte-identical to `da33ebd4`;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (63/63 under the
+self-hosted `teko1`; the compiler's own sources declare no `ref`/`out`/delegate/`params`
+over a global, so the ladder proves the fix is inert on itself, not that it is exercised by
+it); `sh scripts/check-docs.sh` green (568 links, 385 diagnostics, 118 samples -- one new
+`// no-run` sample, the `ref f64` global mismatch, in
+[diagnostics.md](docs/reference/diagnostics.md)); `mc limits . --config mc.macos.toml`
+verdict `ok` on both legs, measured back-to-back against `da33ebd4` under the identical
+command: the compiler-build leg's `nodes`/`strings`/`ins`/`symbols`/`heap` move by this
+crumb's own small source growth (heap 91598640 -> 92272832 of a 216793088/218103808
+ceiling), the `tests/hello.tk` leg's structural counts (`rules` through `intrin`) are BYTE
+IDENTICAL and only its own `heap` estimate moves (467824 -> 1114992 of a 33554432 ceiling,
+3.3%) -- D35's own precedent: the estimator is `mc`'s own and moves on its own account, and
+every table stays comfortably `ok`. `mc pkg hash .`:
+`20b55114d71b3d697136e60eedcffb6cce1902455a465043419addf02cde74b2`.
