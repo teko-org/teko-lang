@@ -86,7 +86,10 @@ three are why the design is this and not a compiler intrinsic:
   can recurse into the very operator it implements.
 - **Every existing check stays honest.** The argument
   [`teko_rc.tk`](../../teko_rc.tk)'s pass sees is an `i64` because it IS an `i64` by then,
-  and the result the oracle sees is a `TimeSpan` because the cast says so.
+  and the result the oracle sees is a `TimeSpan` because the cast says so. The cast is
+  therefore also what that pass can no longer judge the SOURCE's value by, which is why the
+  argument check is the compiler's own and is deferred rather than skipped when the parser
+  cannot type the value — the section below.
 - **No new intrinsic and no new pass** (D2/D21): `mc limits` shows `passes 15/30` and
   `intrin 8/16` unmoved.
 
@@ -139,6 +142,29 @@ the registration alone, macOS/aarch64, `mc` 0.15.23.
 | 5 | how does a `.` on such a receiver reach the compiler today? | through the deferred road: `teko_expr.tk` defers it, the oracle types the receiver in the pass, and `tk_reject_scalar_member` answered `teko: TimeSpan has no members: Ticks`. That is the exact line the member lookup replaces |
 | 6 | what does the registration cost in `mc limits`? | `types 9 → 10`, `alias 16 → 17` (a `type_new` moves both, D38's own finding), `syntax` unmoved at 15, `passes` 15, `intrin` 8. On the heaviest fixture (`tests/surface_enum.tk`, five type declarations of its own, single-file mode) `types` used goes 16 → 17 against a reserved 8 and the pre-existing `grew` verdict stays `grew` |
 
+## The argument the parser cannot type
+
+The same cast that makes the crossing honest is what a WRONG value would hide behind. An
+argument is checked against its column with `tk_check_scalar_compat` at the site that reads
+the row, and both oracles — `tk_pty_of` at parse time, `tk_ty_of` at pass time — answer -1
+for what they cannot see, which that check reads as "refuse nothing". For a column whose
+conversion is a cast (a primitive one, `(i64) t`, and an enum one, `(i64) k`) the silence
+used to be final: the value crossed as the `i64` the lowering symbol declares, and
+`tk_rc_call_args` saw an `i64` argument for an `i64` parameter. `new DateTime(1, k)` on an
+`i64 k` parameter compiled and reached the run-time kind guard (exit 70) where
+`docs/specs/enum.md` § 5 refuses it — the review finding on #697, D48.
+
+So those two columns, and only those two, remember the argument and judge it later
+(`tk_prim_arg_defer`/`tk_prim_arg_do`), on the operator pass's walk — after the oracle,
+under the scope the argument was written in, and with no pass of its own. Only the CHECK is
+deferred: on both cast arms `tk_prim_conv` never reads the argument's type, so the node
+written at parse time is the node it would write knowing it, and every `--dump-ast` of a
+program that compiles is byte-identical. A value nothing types even there is refused rather
+than taken raw (`teko: the type of this argument is not known here`), the same rule
+`tk_prim_binary` already holds for an operand; a local array's element is the one shape that
+reaches it, because `a[0]` lowers to `ld64(a + i * 8)` at parse time and its element type
+does not survive the lowering.
+
 ## The ceilings
 
 | table | cap | counts |
@@ -149,6 +175,7 @@ the registration alone, macOS/aarch64, `mc` 0.15.23.
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 | `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
 | `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
+| `TK_MAXPARG` | 128 | arguments of a primitive or `enum` position, in one unit, whose type only the pass can tell (D48) |
 
 `TimeSpan` uses 1, 30 and 12 of the first three; `DateTime` brings the totals to 2, 66 and
 22, with 41 parameter positions and one late type (`DateTimeKind`). The fourth is per compilation unit and not per registration: it grows with how much

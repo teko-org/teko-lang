@@ -349,6 +349,12 @@ messages reuse the wordings a declared type already gets; only a handful are its
   operand of an operator over a primitive is an expression the oracle cannot type, such as
   an array element. Bind it to a local first; a primitive operand is exactly where leaving
   the node to the core's raw arithmetic would answer a wrong number.
+- `"teko: the type of this argument is not known here"` — the same rule one position over:
+  an argument landing on a parameter of primitive or `enum` type, in a row of the member
+  table, whose type nothing can tell even after the oracle has run — a local array's
+  element (`new DateTime(t, a[0])`, `d.CompareTo(a[0])`) is today's one shape. That
+  position converts with a cast, so an unread value would cross under the column's name
+  instead of being refused. Bind it to a local first.
 - `"teko: this primitive has no constructor"` — `new` on a primitive whose table declares
   no constructor row. `TimeSpan` declares one, so nothing in v0.4.0 reaches this; it is the
   mechanism's own guard for the primitives the specs still have coming.
@@ -369,7 +375,7 @@ messages reuse the wordings a declared type already gets; only a handful are its
 
 `DateTimeKind` is an ordinary `enum` declared in `lib/time.tk` (N2c), not a compiler
 registration, so it refuses what [every enum refuses](#enums) and under the same wordings.
-Three of them are what the crumb bought, and each used to compile:
+Four of them are what the crumb bought, and each used to compile:
 
 ```teko
 // no-run
@@ -380,9 +386,43 @@ i64 main() {
     i64 n = d.Kind;              // teko: a value of type DateTimeKind does not convert to i64
     DateTimeKind k = 7;          // teko: a value of type i64 does not convert to DateTimeKind
     DateTime e = new DateTime(1, 7);   // teko: a value of type i64 does not convert to DateTimeKind
+    i64 s = d.Kind + DateTimeKind.Utc; // teko: no operator `+` takes these operands
     return 0;
 }
 ```
+
+**The same refusal when the value's type is only the PASS's to tell.** The constructor's
+kind argument converts with a cast, so an argument the parser cannot type used to cross as
+the underlying `i64` and reach the run-time kind guard instead; the check is deferred to
+the pass now, and every one of these is a compile-time refusal (D48, the review finding on
+[#697](https://github.com/teko-org/teko-lang/pull/697)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+struct S { public i64 k; }
+
+i64 seven() { return 7; }
+DateTime from_param(i64 k) { return new DateTime(1, k); }
+                             // teko: a value of type i64 does not convert to DateTimeKind
+
+i64 main() {
+    S s = new S();
+    s.k = 7;
+    DateTime a = new DateTime(1, s.k);      // teko: a value of type i64 does not convert to DateTimeKind
+    DateTime b = new DateTime(1, seven());  // teko: a value of type i64 does not convert to DateTimeKind
+    i64 arr[2];
+    arr[0] = 7;
+    DateTime c = new DateTime(1, arr[0]);   // teko: the type of this argument is not known here
+    return 0;
+}
+```
+
+The mirror holds as well: a `DateTimeKind` in the `i64` position of the same constructor —
+`new DateTime(k, DateTimeKind.Utc)` with `k` of enum type — is
+`teko: a value of type DateTimeKind does not convert to i64`. That position needs no cast,
+so it was never the leak; it is checked against the declaration itself.
 
 `(DateTimeKind) 7` is still accepted — an explicit cast into an enum is C#'s own, and the
 value is caught at run time by the range check of `tk_dt_from_ticks_kind` (`teko: a date
@@ -834,6 +874,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many primitive operators"` | 32 rows, over every primitive |
 | `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row |
 | `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
+| `"teko: too many primitive arguments of unknown type"` | 128 arguments of primitive or `enum` position, in one unit, whose type only the pass can tell |
 | `"teko: too many casts over a primitive in one unit"` | 4096 casts the compiler wrote itself, in one compilation unit |
 | `"teko: too many services"` | 32 marked classes |
 | ``"teko: too many `inject` sites"`` | 32 |

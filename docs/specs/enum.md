@@ -313,9 +313,9 @@ enum and the argument back down to its underlying integer. The whole of it is in
 [primitives.md](../internals/primitives.md).
 
 **What it cost the surface.** `DateTimeKind` is a library name now, so a program that
-forgot `#include "time.tk"` is no longer told which file it forgot: the friendly refusal
-C2 had cannot survive, because any registration keyed on the word makes it a taught TOKEN
-(`word_add`) and `enum DateTimeKind` would then fail at `tk_newname` with `teko: name of
+forgot `#include "time.tk"` is no longer told which file it forgot. The friendly refusal C2
+had cannot be kept: any registration keyed on the word makes it a taught TOKEN (`word_add`),
+and `enum DateTimeKind` in `lib/time.tk` would then fail at `tk_newname` with `teko: name of
 enum expected`. Recorded in [diagnostics.md](../reference/diagnostics.md) and D48.
 
 ## 9. The hooks, by module

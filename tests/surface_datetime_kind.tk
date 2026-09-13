@@ -14,16 +14,33 @@
 //   DateTimeKind.TryParse / IsDefined
 //   c ? DateTimeKind.Utc : ...         a ternary over two enum arms
 //   () use (k) => k                    a lambda's by-value capture
+//   new DateTime(t, k)                 ...with `k` a parameter, a call's
+//                                      return, a field or an array element --
+//                                      the four the PARSER cannot type, whose
+//                                      check the pass makes (D48)
 //
-// The three refusals the tightening buys -- `i64 n = d.Kind;`,
-// `DateTimeKind k = 7;` and `new DateTime(t, 7)` -- have no harness (D33) and
-// are written down in docs/reference/diagnostics.md.
+// The refusals the tightening buys -- `i64 n = d.Kind;`, `DateTimeKind k = 7;`,
+// `new DateTime(t, 7)`, `d.Kind + DateTimeKind.Utc`, and the same `i64` in the
+// kind position through a parameter, a field, a return or an array element --
+// have no harness (D33) and are written down in docs/reference/diagnostics.md.
 //
 // expect-exit: 42
 
 #include "../lib/time.tk"
 
 delegate DateTimeKind KindOp();
+
+// the four shapes the PARSER cannot type in a constructor argument -- a
+// parameter, a call's return, a field and an array element -- all of which
+// reach the enum column through the deferred check (D48, the Copilot finding
+// on #697). Their `i64` twins are refused, in docs/reference/diagnostics.md.
+struct Stamp {
+    public DateTimeKind kind;
+}
+
+DateTime at_kind(i64 t, DateTimeKind k) { return new DateTime(t, k); }
+
+DateTimeKind utc_kind() { return DateTimeKind.Utc; }
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same row
@@ -133,6 +150,21 @@ i64 main() {
     DateTimeKind cap = local.Kind;
     KindOp cap_f = () use (cap) => cap;
     if (cap_f() != DateTimeKind.Local) return 41;
+
+    // ---- the argument the parser cannot type, and the pass can ----
+    DateTime from_param = at_kind(t, DateTimeKind.Local);
+    if (from_param.Kind != DateTimeKind.Local) return 43;
+    if (from_param.Ticks != t) return 44;
+    DateTime from_ret = new DateTime(t, utc_kind());
+    if (from_ret.Kind != DateTimeKind.Utc) return 45;
+    Stamp st = new Stamp();
+    st.kind = DateTimeKind.Local;
+    DateTime from_field = new DateTime(t, st.kind);
+    if (from_field.Kind != DateTimeKind.Local) return 46;
+    DateTimeKind ks[2];
+    ks[0] = DateTimeKind.Utc;
+    DateTime from_elem = new DateTime(t, ks[0]);
+    if (from_elem.Kind != DateTimeKind.Utc) return 47;
 
     return 42;
 }

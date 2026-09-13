@@ -486,9 +486,11 @@ void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl) {
 // `atpass` picks the oracle: the parser's own (`tk_pty_of`, teko_struct.tk) at
 // a site the parser resolves, and the pass's (`tk_ty_of`, teko_typeof.tk) at a
 // deferred one. Both answer -1 for what they cannot see, which
-// `tk_check_scalar_compat` reads as "refuse nothing" -- and a pass-time
-// argument of the wrong type is still caught, by `tk_rc_call_args`
-// (teko_rc.tk), against the very declaration this row names.
+// `tk_check_scalar_compat` reads as "refuse nothing" -- and an argument of the
+// wrong type the parser could not see is still caught: by `tk_rc_call_args`
+// (teko_rc.tk) against the very declaration this row names when it crosses
+// under its own type, and by the deferred check below when the column's own
+// conversion is a cast that would hide it from that one.
 i64 tk_prim_ty_of(i64 n, i64 atpass) {
     if (atpass) return tk_ty_of(n);
     return tk_pty_of(n);
@@ -510,8 +512,107 @@ i64 tk_prim_conv(i64 pty, i64 e, i64 ety) {
     return tk_num_widen(pty, ety, e);
 }
 
+// ---- the column whose conversion is a CAST, and the check it cannot skip ----
+// `tk_prim_conv` writes a cast for exactly two columns -- a primitive one
+// (`(i64) t`) and an enum one (`(i64) k`) -- and that cast is what the lowering
+// symbol declares, so the argument reaches `tk_rc_call_args` (teko_rc.tk) as
+// the `i64` the declaration asks for and that late check has nothing left to
+// say. Every OTHER column crosses under the argument's own type and is judged
+// there: `new DateTime(k, DateTimeKind.Utc)` on a `DateTimeKind k` is refused
+// today with `teko: a value of type DateTimeKind does not convert to i64`,
+// measured, with no line here.
+//
+// So when the PARSER cannot type the argument (`tk_pty_of` answers -1 for a
+// parameter, for an array element, for anything only the pass resolves) and
+// the column is one of those two, the check is deferred rather than skipped.
+// Without it `new DateTime(1, k)` on an `i64 k` parameter compiled and reached
+// the run-time kind guard (`teko: a date kind is out of range`, exit 70) where
+// docs/specs/enum.md § 5 refuses it at compile time.
+//
+// The CONVERSION is not deferred, and needs no deferral: on both cast arms
+// `tk_prim_conv` never reads `ety` at all, so the node it wrote at parse time
+// is the one it would write knowing the type -- and a check that PASSES proves
+// the type was the column's own. Nothing moves in the tree, which is why every
+// `--dump-ast` of a program that compiles is byte-identical.
+i64 tk_prim_conv_casts(i64 pty) {
+    if (pty < 0) return 0;
+    if (tk_prim_is(pty)) return 1;
+    return tk_is_enum(tk_struct_by_ty(pty));
+}
+
+#define TK_MAXPARG 128                // such arguments waiting for the pass
+
+i64  pa_node[TK_MAXPARG];             // the argument, under the cast the column wrote
+i64  pa_ty[TK_MAXPARG];               // the type its POSITION asks for
+i64  pa_line[TK_MAXPARG];
+uptr pa_file[TK_MAXPARG];
+i64  pa_done[TK_MAXPARG];
+i64  tk_nparg = 0;
+
+i64  pa_node_at(i64 i) { return ld64(pa_node + i * 8); }
+i64  pa_ty_at(i64 i)   { return ld64(pa_ty + i * 8); }
+i64  pa_line_at(i64 i) { return ld64(pa_line + i * 8); }
+uptr pa_file_at(i64 i) { return ld64(pa_file + i * 8); }
+i64  pa_done_at(i64 i) { return ld64(pa_done + i * 8); }
+
+void tk_prim_arg_defer(i64 pty, i64 a, i64 line, uptr fl) {
+    if (tk_nparg == TK_MAXPARG)
+        err_at(fl, line, "teko: too many primitive arguments of unknown type");
+    st64(pa_node + tk_nparg * 8, a);
+    st64(pa_ty + tk_nparg * 8, pty);
+    st64(pa_line + tk_nparg * 8, line);
+    st64(pa_file + tk_nparg * 8, fl);
+    st64(pa_done + tk_nparg * 8, 0);
+    tk_nparg = tk_nparg + 1;
+}
+
+// ...and an argument NOTHING types, even here: it is not guessed at either.
+// The rule is `tk_prim_binary`'s own, one position over -- an operand the
+// oracle could not type is refused rather than taken raw, because a cast
+// column is exactly where the eight bytes would cross unread. It is what a
+// local array's element still is (`a[0]` lowers to `ld64(a + i * 8)` at parse
+// time and neither oracle types that call), so `new DateTime(1, a[0])` on an
+// `i64 a[2]` is refused here instead of reaching the run-time kind guard.
+void tk_prim_arg_do(i64 i) {
+    if (pa_done_at(i)) return;
+    st64(pa_done + i * 8, 1);
+    i64 n = pa_node_at(i);
+    i64 aty = tk_ty_of(n);
+    if (aty < 0)
+        err_at(pa_file_at(i), pa_line_at(i), "teko: the type of this argument is not known here");
+    tk_check_scalar_compat(pa_ty_at(i), aty, n, pa_line_at(i), pa_file_at(i));
+}
+
+// asked once per node the operator pass walks -- the walk that already carries
+// this file's own cast check (teko_ops.tk's `tk_ops_visit`), runs after the
+// oracle has typed every body and holds the scope a parameter is read under.
+// The argument is checked WHERE IT SITS, so a deferred `.` under it
+// (`new DateTime(1, other.Kind)` on a parameter) is already the call it stood
+// for by the time its type is asked for.
+void tk_prim_arg_pend(i64 n) {
+    i64 i = tk_nparg - 1;
+    loop {
+        if (i < 0) break;
+        if (pa_node_at(i) == n) tk_prim_arg_do(i);
+        i = i - 1;
+    }
+}
+
+// ...and the same check over what a BODY walk never reaches: a global's own
+// initializer, the half `tk_prim_cast_globals` answers for the cast. The oracle
+// runs there with no scope, which is exactly what a global is read under.
+void tk_prim_arg_rest() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nparg) break;
+        tk_prim_arg_do(i);
+        i = i + 1;
+    }
+}
+
 i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
     i64 aty = tk_prim_ty_of(a, atpass);
+    if (aty < 0 && tk_prim_conv_casts(pty)) tk_prim_arg_defer(pty, a, line, fl);
     tk_check_scalar_compat(pty, aty, a, line, fl);
     return tk_prim_conv(pty, a, aty);
 }

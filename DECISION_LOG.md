@@ -1901,14 +1901,16 @@ refusal, because they are compiler registrations; a library type is told apart b
 library, which is exactly what `DateTimeKind` now is. Written down in
 [diagnostics.md](docs/reference/diagnostics.md).
 
-**Fixtures: 60.** `tests/surface_datetime.tk` is UNCHANGED (byte-identical, still 42) —
-that is the proof the surface did not move — and `tests/surface_datetime_kind.tk` (42) is
-new: `DateTimeKind k = d.Kind;`, the three members as `switch` labels through a parameter
-and a local, both explicit casts, `new DateTime(t, k)` from a variable and from another
-date's own `.Kind`, `.ToString()` on a member/a property/a value outside the set,
-`Parse`/`TryParse` with `out`/`IsDefined`, a ternary over two enum arms, and a by-value
-capture. The four refusals above have no harness (D33) and are in `diagnostics.md` behind a
-`// no-run` fence.
+**Fixtures: 61.** `tests/surface_datetime.tk` is UNCHANGED (byte-identical, still 42) —
+that is the proof the surface did not move — and two are new:
+`tests/surface_datetime_kind.tk` (42), which is `DateTimeKind k = d.Kind;`, the three
+members as `switch` labels through a parameter and a local, both explicit casts,
+`new DateTime(t, k)` from a variable, from another date's own `.Kind`, from a parameter,
+from a call's return, from a field and from an array element, `.ToString()` on a member/a
+property/a value outside the set, `Parse`/`TryParse` with `out`/`IsDefined`, a ternary over
+two enum arms and a by-value capture; and `tests/surface_datetime_kind_panic.tk` (70), the
+run-time kind guard `(DateTimeKind) 7` still reaches. The refusals above have no harness
+(D33) and are in `diagnostics.md` behind a `// no-run` fence.
 
 **`--dump-ast`, and the two diffs that are NOT the accepted code moving.** 53 of the 59
 existing fixtures are byte-identical to `37417b63`. The six that are not are exactly the
@@ -1928,10 +1930,42 @@ six that `#include "../lib/time.tk"`, and their diffs are two facts and nothing 
 `CALL name=tk_dtk_utc`, `.Kind` gains a `CAST type=DateTimeKind` over the call, and the
 constructor's kind argument gains the `CAST type=i64` back down.
 
+**The Copilot finding on #697, and the root it had.** The tightening above was
+BYPASSABLE, and the review caught it: `new DateTime(1, k)` on an `i64 k` parameter compiled
+and reached the run-time kind guard (`teko: a date kind is out of range`, exit 70) where § 5
+refuses it at compile time. The cause is one line of `tk_prim_args`, which runs with
+`atpass = 0` for `new`: the parser's oracle (`tk_pty_of`) answers -1 for a parameter,
+`tk_check_scalar_compat` reads -1 as "refuse nothing" and returns, and `tk_prim_conv` then
+wrapped the argument in the enum column's own `(i64)` cast — so the value crossed under the
+`i64` the lowering symbol declares and `tk_rc_call_args` (teko_rc.tk), the late check that
+catches every other unresolved argument against that declaration, had nothing left to see.
+It is the CAST that laundered it, which is why the mirror position never leaked:
+`new DateTime(k, DateTimeKind.Utc)` with `k` of enum type is `teko: a value of type
+DateTimeKind does not convert to i64` today, with no line of this fix, and so are the field
+and the call-return spellings of the kind argument, which `tk_pty_of` does resolve.
+
+**The fix is the deferral, and only the check is deferred.** An argument the oracle cannot
+type, landing on a column whose conversion is a cast — a primitive one and an enum one, the
+only two — is remembered with the type its POSITION asks for (`tk_prim_arg_defer`, 128
+entries, its own capacity message) and judged in the operator pass, on the node itself,
+where teko_ops.tk's walk already carries this file's cast check: after the oracle, under the
+scope the argument was written in, and with no pass of its own (`passes` 15/30 unmoved).
+The CONVERSION is not deferred and needs no deferral — on both cast arms `tk_prim_conv`
+never reads the argument's type at all, so the node written at parse time is the node it
+would write knowing it, and a check that passes proves the type was the column's own. That
+is why **all 61 existing `--dump-ast` dumps are byte-identical** to `cd606290`.
+And an argument NOTHING types, even at pass time, is refused rather than guessed at:
+`teko: the type of this argument is not known here` — `tk_prim_binary`'s own rule one
+position over, and the one shape that reaches it is a local array's element, which lowers
+to `ld64(a + i * 8)` at parse time and loses its element type there (`new DateTime(t,
+a[0])`, `d.CompareTo(a[0])`, both of which used to compile and read raw bytes). The
+accepted twins — the same four shapes with a `DateTimeKind` value — are in
+`tests/surface_datetime_kind.tk` (codes 43-47), the refused ones in `diagnostics.md`.
+
 **Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config
 mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` as above;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (61/61 under the
-self-hosted `teko1`); `sh scripts/check-docs.sh` green (564 links, 379 diagnostics, 112 samples). `mc limits` verdict `ok` throughout — on the compiler's own floor (the
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (564 links, 381 diagnostics, 113 samples). `mc limits` verdict `ok` throughout — on the compiler's own floor (the
 `tests/hello.tk` leg) `alias` **19 → 18** (the deleted `type_alias`) with `syntax` 15,
 `types` 11, `passes` 15/30 and `intrin` 8/16 all unmoved; on a program that includes
 `lib/time.tk` (the `tests/surface_datetime.tk` leg) `types` **13 → 14** and `syntax`
@@ -1941,4 +1975,4 @@ cost § 10 publishes for any `enum` a program declares) with `alias` 21 → 21, 
 of "`alias` 14 stays 14" is right for the program and one too high for the compiler;
 `syntax` is the arena's own `T_SYNTAX` high-water mark over the four registries that share
 it, which is why removing one `syntax_expr` from the floor did not move it. `mc pkg hash .`:
-`9aeb988f053a379e7385f526dbf962a9116b08f9e7c7d2ccf500c9873a226fc7`.
+`d14f7c7519288990ee9d849b0de8b529c6cbe5c568fef8f880bcc7cb6a52d0dd`.
