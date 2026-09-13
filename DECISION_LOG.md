@@ -2889,3 +2889,76 @@ IDENTICAL, the compiler leg moving by this pass's own source growth (`nodes` use
 154187, `ins` 211752 -> 212286, `funcs` 3125 -> 3136, used heap 91629824 -> 92501344 of a
 218562560 reserve). `mc pkg hash .` at this pass's own code commit:
 `ea80f178f29b78b3456e57eb85ccd5532751f0892aa271f2628502ce76efb18d`.
+
+**Copilot finding, pass 4: the store the third pass taught to wait was judged where nothing
+can be judged.** The reviewer read the third pass against `tk_array_resolve_write` and found
+the other half of it: `tk_hg_resolve_write` (teko_array.tk) assembles a GLOBAL `T[]`'s own
+element store INSIDE `tk_array_pass`, and the third pass handed that store the same
+validator the parse-time one takes. A pass is not a site: no lexical scope stands around it,
+so the only rows in reach were the globals, and the escape rule the parse site runs
+(`tk_lam_escapes` in `tk_ha_index`, teko_heaparr.tk) did not run there at all. Four probes,
+each measured on `da33ebd4`, on the head of this crumb (`853f829e`) and on this fix, mc
+**0.15.23**, macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)` and `g_ops` a global `Op[]`:
+
+| probe | `da33ebd4` | `853f829e` | now |
+|---|---|---|---|
+| `g_ops[0] = new Op((i64 y) use (&x) => x + y)` | runs, 42 | runs, 42 | refuses, `teko: a lambda that captures by reference cannot leave its scope` |
+| the same on a LOCAL `Op[]` | refuses, same words | refuses | refuses |
+| `g_ops[0] = f` with `f` a lambda tainted by `use (&acc)` | runs, 42 | runs, 42 | refuses, the same words |
+| the same on a LOCAL `Op[]` | refuses, same words | refuses | refuses |
+| `dst[0] = g` with a local `i64 g` shadowing a delegate global `Op g` | `unknown name` (the core, at the global's own assignment) | compiles, **exit 139** | refuses, `teko: Op takes a function, another Op, or null` |
+| `dst[0] = f` with a local `Op f` beside a free function `f` | runs, 42 (the LOCAL) | runs, **141** (the FUNCTION) | runs, 42 (the LOCAL) |
+| `g_ops[0] = chooser(0)`, `chooser` a LOCAL delegate returning `Op` | runs, 42 | refuses, `teko: Op takes a function, another Op, or null` | runs, 42 |
+
+The base is right on two of those rows by not judging at all -- it coerced nothing, so the
+raw name reached the code generator and the innermost declaration answered, which is also
+why its own two remaining rows are `unknown name` from the core. The third pass judged, and
+judged in the one place where a name means whatever the globals say it means.
+
+**One rule, and it is the same one the crumb has been applying all along: judge where names
+have types.** A store built in a PASS judges NOTHING where it is built -- not the coercion,
+not the type of the value, not the escape -- and waits whole for `tk_deleg_walk`, which
+stands at the site with the lexical scope live (`tk_ty_scope_var`, a mark per block), every
+global row collected (`tk_array_pass` runs first, teko.tk) and the function that owns the
+store known (`tk_cur_fn_name`, which is exactly the owner `tk_lam_escapes` reads a taint
+under). ADDED: `tk_deleg_defer_all` and its one-line setter (teko_deleg.tk), forward-declared
+in teko_array.tk beside `tk_deleg_late_move` and set around the two lines of
+`tk_hg_resolve_write` that build the store; one column in the deferral table, `dl_esc`, so
+the escape is judged at the walk only for the store that could not judge it where it was
+written -- a LOCAL store's escape was already taken at its parse site, and taking it again
+at the walk would read a taint that site could not see yet, the position-blindness the
+verifier finding above already struck once. `tk_deleg_late_do` takes the escape first, in
+the same words and from the same `tk_lam_escapes` the parse site calls, then the coercion it
+already took.
+
+**Deletion, not addition, for the pass's own leftovers.** `tk_slv_find_unit`
+(teko_struct.tk) is gone: the second pass left it with no caller in the tree and the comment
+in teko_params.tk that names it says so now. The comment over `tk_ref_arg_pointee`
+(teko_ref.tk) attributed a "unit-wide most-recent-wins table" to `tk_slv_find`, which is the
+PARSER's own stack of locals still in scope -- the unit-wide one was `tk_slv_find_unit`, the
+function just deleted. It names the table for what it is: a stack that records a declaration
+and never a PARAMETER, so `lvl_c(ref x)` inside `lvl_b(ref i64 x)` answers -1, or the type
+of some unrelated local named `x` open around the call.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the seven probes above on the three
+builds; **63/63** fixtures at their `expect-exit`, with `tests/surface_globals.tk` (exit 42)
+gaining section 3c, `delegarrglobalcheck` -- a GLOBAL `Op[]` taking a lambda with no
+capture, a call through a LOCAL delegate, and a local of delegate type shadowing a free
+function of that name, the element read back and called in each case; the head of this crumb
+refuses that section at its second store. The two refusals are one `// no-run` sample in
+[diagnostics.md](docs/reference/diagnostics.md), whose escape entry now names an ELEMENT of
+a `T[]`, local or global, beside the field and the static field it already named. The
+`--dump-ast` of the **62** fixtures that existed at `da33ebd4`, byte-identical to that base;
+instrumented, `tk_deleg_late_rest` refusing any store that reaches it unjudged, the whole
+suite and every probe pass -- no pending store survives the walk (and the instrument is not
+vacuous: with `tk_deleg_late_pend` disabled it fires on the fixture at once);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (63/63 under `teko1`);
+`sh scripts/check-docs.sh` green (568 links, 385 diagnostics -- none added, the pass speaks
+in refusals that already existed -- **120** samples, the one added above);
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, measured back-to-back
+against `853f829e` from the same clean state: the `tests/hello.tk` leg IDENTICAL down to its
+`heap` (used 467824 of a 33554432 ceiling), the compiler leg moving by this pass's own
+source growth (`nodes` used 154187 -> 154215, `ins` 212286 -> 212326, `funcs` 3136 -> 3137,
+`globals` 922 -> 924, used heap 91854176 -> 91921088 of a 217448448 reserve). `mc pkg hash .`
+at this pass's own code commit:
+`766306c9be8a85b6788252ae2058b230cb2fe72726ae9ba665f4483afb1aca10`.

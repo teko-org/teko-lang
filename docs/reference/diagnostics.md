@@ -623,7 +623,8 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - `"teko: a capture by reference of a counted type is not taught yet"` — capture the object
   **by value**; the closure then holds a reference of its own.
 - `"teko: a lambda that captures by reference cannot leave its scope"` — such a closure
-  cannot be returned, nor stored in a field or a static field.
+  cannot be returned, nor stored in a field, a static field or an ELEMENT of a `T[]`,
+  whether the array is a local or a global.
 - ``"teko: a delegate declared below `new` is not taught yet"`` — move the `delegate`
   declaration above the `new` that names it.
 - `"teko: an array of this type is not taught yet"` — a fixed array whose element is a type
@@ -641,6 +642,32 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
   delegate `Op(...)`*, *`Op` takes a function, another `Op`, or null*, *`X` is not
   captured; add it to use (...)*, and *`X` is used but never declared*.
+
+An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
+of that type, and a GLOBAL array's element is judged exactly as a local array's. The store
+into a global one is built by a PASS, where no scope stands around it, so the whole
+judgement — the escape above, the conversion, and the type of the value — is taken at the
+site by the delegate walk instead, with the lexical scope of that site live (D51, fourth
+pass):
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+Op[] g_ops;
+i64 main() {
+    i64 x = 1;
+    g_ops = new Op[2];
+    g_ops[0] = new Op((i64 a) use (&x) => x + a);
+                  // teko: a lambda that captures by reference cannot leave its scope
+    i64 n = 5;
+    g_ops[1] = n;                   // teko: Op takes a function, another Op, or null
+    return 0;
+}
+```
+
+A local wins over a global of the same name at that store as it does everywhere else, and a
+local of delegate type wins over a free FUNCTION of that name: `Op f = addOne; g_ops[0] = f;`
+stores the local `f`, never a wrap of the function `f`.
 
 ## Arrays
 
