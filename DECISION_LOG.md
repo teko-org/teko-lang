@@ -2178,7 +2178,7 @@ table unmoved from the fourth pass -- floor (`tests/hello.tk`) `passes` 15/30, `
 `alias` 18, `types` 11, `intrin` 8/16, heap 1114960, and the `tests/surface_datetime.tk`
 leg `syntax` 16, `alias` 21, `types` 14, heap 3858176 (against a 33554432-byte
 reservation). `mc pkg hash .`:
-`e5a32e655c6d140f8e8116ccd95ea569723c0d6d5352048b00a488415715beb1`.
+`9b657a1299e88d46d919e47b3e8ed2da8c4641e3f80492364d1dc6bf56b7bd5e`.
 
 **Proof of the fourth pass**, mc **0.15.23**, macos/aarch64: `mc build . --config
 mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of all 61
