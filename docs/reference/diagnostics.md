@@ -927,13 +927,17 @@ Every one of these is [nullable.md](nullable.md)'s.
 ### A field store whose value only the pass can type
 
 A store is built where it is written, and the value's type is the one thing the site may
-not know then: a parameter is in no parse-time scope, an implicit `f = e` is rewritten from
-a pass with its right-hand side still a bare name, and a `static` field on a type declared
-below is resolved one pass ahead of the scope that would answer. None of that is a licence
-to write the raw bits — the check and the conversion are deferred to the pass, and a value
-the pass types is judged by the very rule every other slot is judged by (D50, the review
-finding on [#698](https://github.com/teko-org/teko-lang/pull/698)). What the deferral buys
-is a compile-time refusal where the eight bytes used to cross unread:
+not know then. A parameter is in no parse-time scope; an implicit `f = e` is rewritten from
+a pass with its right-hand side still a bare name; a `static` field on a type declared below
+is resolved one pass ahead of the scope that would answer; a **call to an overloaded name**
+is typed by the signature its arguments pick, which is written at the overload pass and is
+not always the first declaration of the name; and a **user operator** is not the call it
+stands for until the operator pass has lowered it. None of that is a licence to write the
+raw bits — the check and the conversion are deferred to one point, the end of the overload
+pass, where every one of those is already settled, and the value is then judged by the very
+rule every other slot is judged by (D50, the review findings on
+[#698](https://github.com/teko-org/teko-lang/pull/698)). What the deferral buys is a
+compile-time refusal where the eight bytes used to cross unread:
 
 ```teko
 // no-run
@@ -942,15 +946,27 @@ class Cell { public i64 v; }
 class Box { public Cell c; }
 class H { public static Cell c; }
 
+i64 pick(i64 a)         { return 5; }
+f64 pick(i64 a, i64 b)  { return 2.5; }
+
+class N {
+    public i64 n;
+    // the PICK is the two-argument one, whatever the first declaration returns
+    public N() { this.n = pick(1, 2); }   // teko: a value of type f64 does not convert to i64
+}
+
 void put(Box b, Color k, uptr raw, i64 n) {
-    Box bb = b;
-    bb.c = k;                    // teko: a value of type Color does not convert to Cell
-    bb.c = raw;                  // teko: a value of type uptr does not convert to Cell
+    b.c = k;                     // teko: a value of type Color does not convert to Cell
+    b.c = raw;                   // teko: a value of type uptr does not convert to Cell
     H.c = n;                     // teko: a value of type i64 does not convert to Cell
 }
 
 i64 main() { return 0; }
 ```
+
+The receiver above is a **parameter**, which the parser cannot type either: that store is
+rebuilt by the pass and goes through the same gate, so a `T?` field written through it boxes
+its value like every other site rather than taking the raw bits for a box handle.
 
 A value neither oracle can type even there is left alone, as every other *not known here*
 is: the rule refuses only what it is sure about.

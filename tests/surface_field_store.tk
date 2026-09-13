@@ -79,12 +79,33 @@ class Cell {
     public i64 v;
 }
 
+// the operator is a `public static` member that names both operands (D8), and
+// a store whose value is written with it is an N_BINARY until pass 11 (14).
+class GrandBase {
+    public i64 v;
+
+    public static i64 operator+(GrandBase g, i64 k) {
+        return g.v + k;
+    }
+}
+
+// two overloaded names, the PICKED signature declared SECOND in each and the
+// two orders mirrored, so a store converted by the first declaration is wrong
+// in one direction (a float field taking the picked integer raw) and in the
+// other (a cast written over a value that is already a float) -- 13.
+f64 pick(i64 a) { return 2.5; }
+i64 pick(i64 a, i64 b) { return 5; }
+
+i64 qick(i64 a) { return 5; }
+f64 qick(i64 a, i64 b) { return 2.5; }
+
 class H {
     public f64 rate;
     public static f64 total;
     public Cell? c;
     public Color kind;
     public i64? count;
+    public i64 sum;
 
     public H(i64 k) {
         this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
@@ -102,6 +123,18 @@ class H {
 
     public void bumpby(i64 k) {
         this.rate = k + 1;            // 7: an N_BINARY value, typed by no parser
+    }
+
+    public void setpick() {
+        this.rate = pick(1, 2);       // 13a: the pick returns i64, the field is f64
+    }
+
+    public void setqick() {
+        this.rate = qick(1, 2);       // 13b: the pick returns f64, no conversion
+    }
+
+    public void addop(GrandBase g) {
+        this.sum = g + 1;             // 14: `operator+(GrandBase, i64) -> i64`
     }
 }
 
@@ -138,6 +171,14 @@ void setstatic(i64 k) { H2.total = k; }
 void setinstance(H h, i64 k) {
     H hh = h;                         // a LOCAL: the receiver the PARSER types
     hh.rate = k;                      // 10: `k` is a free function's parameter
+}
+
+// the receiver is a PARAMETER, so the parser cannot type it at all and the
+// whole access waits for the pass (`tk_pend_field`, teko_typeof.tk) -- the
+// sixth site that builds a field store, box included (12).
+void setthrough(H h, i64 k) {
+    h.rate = k;
+    h.count = k;
 }
 
 i64 ctorcheck() {
@@ -223,6 +264,33 @@ i64 freefncheck() {
     return 0;
 }
 
+i64 pendcheck() {
+    H h = new H(0);
+    setthrough(h, 5);
+    if (h.rate != 5.0) return 1;
+    if (!h.count.HasValue) return 2;
+    if (h.count.Value != 5) return 3;
+    return 0;
+}
+
+i64 pickcheck() {
+    H h = new H(0);
+    h.setpick();
+    if (h.rate != 5.0) return 1;
+    h.setqick();
+    if (h.rate != 2.5) return 2;
+    return 0;
+}
+
+i64 opcheck() {
+    GrandBase g = new GrandBase();
+    g.v = 4;
+    H h = new H(0);
+    h.addop(g);
+    if (h.sum != 5) return 1;
+    return 0;
+}
+
 i64 rccheck() {
     if (rt_live() != 0) return 1;
     return 0;
@@ -262,8 +330,17 @@ i64 main() {
     bad = boxcheck();
     if (bad != 0) return 110 + bad;
 
-    bad = rccheck();
+    bad = pendcheck();
     if (bad != 0) return 120 + bad;
+
+    bad = pickcheck();
+    if (bad != 0) return 130 + bad;
+
+    bad = opcheck();
+    if (bad != 0) return 140 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 150 + bad;
 
     return 42;
 }

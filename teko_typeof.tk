@@ -559,6 +559,41 @@ i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
     return tk_nl_boxes(nl_of_at(ti));
 }
 
+// ---- the value's type, or "not known" when a LATER PASS is what decides it ----
+// The two oracles answer about the tree AS IT STANDS, and two node kinds are
+// not what they will be:
+//
+//   - an N_CALL to an overloaded name. `tk_pty_of` answers `decl_ret` of the
+//     FIRST declaration (D49 leaves that as the parse-time limit it is), and
+//     the site is rewritten to the symbol its ARGUMENTS pick at pass 14, so a
+//     store converted here is converted by a signature the call may not have:
+//     measured, `f64 rate; this.rate = pick(1, 2);` with `f64 pick(i64)`
+//     declared ahead of `i64 pick(i64, i64)` wrote the picked overload's raw
+//     integer into the float field, and the mirror pair hid a narrowing the
+//     pick does ask about. It is D48's own rule for a primitive row's
+//     argument (`tk_prim_arg`'s `cty = -1` for a call), one slot over.
+//   - an N_BINARY or an N_UNARY over a class that declares the operator. It
+//     is not a call until `tk_ops_pass` (11) writes one, so the oracle answers
+//     by the left operand's own rule -- `i64 total; this.total = g + 1;` with
+//     `operator+(GrandBase, i64) -> i64` was refused, `a value of type
+//     GrandBase does not convert to i64`, for a store that is an integer.
+//
+// Both are DEFERRED and judged once every pass that moves them has run
+// (`tk_field_store_judge`, at the end of `tk_over_pass`). A node the type
+// table already tags (`tk_xt_ty`, the lowered call a `new` or a load is) is
+// not a guess and answers here, exactly as `tk_pty_of`'s own first line does.
+i64 tk_fs_vty(i64 v) {
+    i64 t = tk_xt_ty(v);
+    if (t >= 0) return t;
+    i64 k = nd_kind(v);
+    if (k == N_CALL)   return 0 - 1;
+    if (k == N_BINARY) return 0 - 1;
+    if (k == N_UNARY)  return 0 - 1;
+    t = tk_pty_of(v);
+    if (t >= 0) return t;
+    return tk_ty_of(v);
+}
+
 // the value a field store actually writes, at every site that builds one --
 // the two PARSE-TIME ones (`p.f = e`/`this.f = e`, teko_expr.tk's
 // `tk_field_use`, and `p.items[i] = e`, teko_struct.tk's `tk_array_index`),
@@ -573,9 +608,9 @@ i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
 // slot like any other: `f64 w; p.w = 4;` writes four point zero, and
 // `i64 n; p.n = 2.5;` does not compile.
 //
-// G-e: `vty` tries the PARSE-TIME oracle FIRST (`tk_pty_of`, the one every
-// site already asked, unchanged when it answers) and falls back to the
-// PASS-TIME one (`tk_ty_of`) only when it does not -- which is exactly
+// G-e: `vty` is `tk_fs_vty`'s above -- the PARSE-TIME oracle FIRST
+// (`tk_pty_of`, the one every site already asked, unchanged when it answers)
+// and the PASS-TIME one (`tk_ty_of`) as the fallback -- which is exactly
 // `tk_this_assign`'s own case: its call lands here from `teko_typeof.tk`'s
 // walk, after the value's own scope (a parameter, D33's own "not known
 // here") has already closed on the parser's side, and `tk_ty_of` is what
@@ -586,8 +621,7 @@ i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
 // function only inside the pass), so the fallback is silent everywhere it is
 // not needed.
 i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
-    i64 vty = tk_pty_of(v);
-    if (vty < 0) vty = tk_ty_of(v);
+    i64 vty = tk_fs_vty(v);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
     // ...and a value NEITHER oracle types is not written raw: it waits for the
@@ -648,13 +682,25 @@ void tk_ty_pass_walk(i64 root, uptr visit) {
 // ---- ONE point of judgement for a deferred field store ----
 // The walk above is what a deferred store waited for: it enters each function,
 // pushes its parameters and its locals, and reaches the value node wherever
-// the store call put it. It runs as a walk of its OWN, after the one that
-// resolves the tree (`tk_pend_visit`), because both halves of the answer are
-// only there by then -- the implicit `f = e` has had its right-hand side
-// rewritten into the typed load it stands for (`tk_this_ident`, teko_this.tk)
-// and every deferred `.` has become the load or the call it stood for. No pass
-// is registered for it (`mc limits`' `passes` row does not move), exactly as
-// D48's own judgement rides `tk_over_pass`.
+// the store call put it. It runs as a walk of its OWN, at the END of
+// `tk_over_pass` (teko_over.tk, pass 14, beside D48's `tk_prim_arg_judge`),
+// which is the first point that has EVERY half of the answer:
+//
+//   - the SCOPE the value was written under, since a parameter has a type
+//     nowhere else -- that is `tk_ty_pass_walk`'s own doing;
+//   - the tree RESOLVED: the implicit `f = e` has had its right-hand side
+//     rewritten into the typed load it stands for (`tk_this_ident`,
+//     teko_this.tk) and every deferred `.` has become the load or the call it
+//     stood for (pass 6);
+//   - every user OPERATOR lowered to the call it is (`tk_ops_pass`, 11);
+//   - every overload PICK committed (`tk_ov_visit`, just above in that pass).
+//
+// The end of `tk_typeof_pass`, where this first ran, has only the first two,
+// measured: a user operator is still an N_BINARY the oracle types by its left
+// operand there, and an overloaded call still answers with its first
+// declaration (Copilot on #698, pass 2).
+// No pass is registered for it (`mc limits`' `passes` row does not move),
+// exactly as D48's own judgement rides the same pass.
 //
 // A value the PASS cannot type either is left alone: `-1` is "not known",
 // never a verdict (D226's own rule, the one every `ety < 0` in this file
@@ -806,9 +852,15 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
         i64 val = pd_arg_at(pi);
         i64 vp = tk_pend_at(val);
         if (vp >= 0) tk_pend_do(vp);
-        i64 vty = tk_ty_of(val);
-        tk_check_compat(fty, vty, val, tk_line, tk_file);
-        val = tk_num_widen(fty, vty, val);
+        // G-e: the SIXTH site that builds a field store, through the same gate
+        // as the other five (`tk_field_store_val`, above). It judged and
+        // widened on its own -- `tk_check_compat` and `tk_num_widen`, D34 and
+        // D33 -- and that is every rule of the store but ONE: Q1b's box. A
+        // `i64? count;` written through a receiver the parser cannot type
+        // (`void set(H h, i64 k) { h.count = k; }`) took the parameter's raw
+        // eight bytes AS A BOX HANDLE, a segfault, measured (Copilot on #698,
+        // pass 2). One door, so a rule added to it is added to every site.
+        val = tk_field_store_val(fty, val, tk_line, tk_file);
         tk_line = pd_line_at(pi);
         tk_file = pd_file_at(pi);
         return tk_os_mark(tk_call2(tk_stn(fty), addr, val), fty);
@@ -1244,11 +1296,12 @@ i64 tk_typeof_pass(i64 root) {
         tk_ty_pass_walk(root, &tk_pend_visit);
         tk_pend_check();
     }
-    // D50: after the walk above, because a deferred store's value may be the
-    // very node that walk rewrites -- an implicit `total = rate;` reads `rate`
-    // through `tk_this_ident` (teko_this.tk), and a deferred `.` is a load
-    // only once `tk_pend_do` has run.
-    tk_field_store_judge(root);
+    // D50: a deferred store is NOT judged here. Its value may be the very node
+    // this pass rewrites (an implicit `total = rate;` reads `rate` through
+    // `tk_this_ident`, and a deferred `.` is a load only once `tk_pend_do` has
+    // run), and it may equally be a node a LATER pass rewrites -- a user
+    // operator at 11, an overloaded call at 14. One point of judgement, after
+    // all of them: the end of `tk_over_pass` (teko_over.tk).
     tk_da_check(root);                           // Q3: after the `.` above is resolved
     return root;
 }
