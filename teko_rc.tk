@@ -363,17 +363,28 @@ void tk_rc_call_args(i64 n) {
         i64 pt = tk_decl_param_ty(d, i);
         i64 at = tk_ty_of(a);
         // D51, verifier finding: an ADDRESS is no numeric value. `tk_ty_of`
-        // answers an N_ADDR with its POINTEE, and the widen below would then
-        // put D33's own `scvtf` on the POINTER itself -- `bumpf(ref g)` over
-        // an `i64 g` and a `ref f64` parameter read a float out of an address
-        // and segfaulted. A `ref`/`out` argument is judged by the one rule
-        // that owns pointees, IDENTITY (`tk_ref_check_pointee`, teko_ref.tk,
-        // which refuses in the same words a value gets), and converted never.
+        // answers a `ref`/`out`-tagged N_ADDR with its POINTEE, and the widen
+        // below would then put D33's own `scvtf` on the POINTER itself --
+        // `bumpf(ref g)` over an `i64 g` and a `ref f64` parameter read a
+        // float out of an address and segfaulted. An N_ADDR is widened never,
+        // whatever the oracle says its pointee is.
+        //
+        // WHICH check it takes instead is the PARAMETER's question, not the
+        // argument's (D51, second pass). A `ref`/`out` parameter is judged by
+        // the one rule that owns pointees, IDENTITY (`tk_ref_check_pointee`,
+        // teko_ref.tk, which refuses in the same words a value gets) --
         // teko_ref.tk's own call check skips an OVERLOADED name, which by now
-        // carries its final symbol: this is where that one is judged.
+        // carries its final symbol, so this is where that one is judged. A
+        // parameter that is NOT by-reference takes the address as an ordinary
+        // value and reads the ordinary compatibility rule: skipping that one
+        // for every N_ADDR alike put a bare `&x` outside the check for good,
+        // where the oracle answering -1 for it (`tk_ty_of` types an UNTAGGED
+        // address with nothing, so nothing is refused on it today) is what
+        // says so, one pass, one rule.
         if (nd_kind(a) == N_ADDR) {
             i64 pn = tk_decl_param_node(d, i);
             if (tk_rp_kind(pn) != TK_RP_NONE) tk_ref_check_pointee(pn, a, nd_line(n), nd_file(n));
+            else tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
             prev = a;
             a = nxt;
             i = i + 1;

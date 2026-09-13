@@ -1000,7 +1000,6 @@ truncation; the fix is to split the unit.
 | `"teko: too many overloaded names in one unit"` | 64 |
 | `"teko: too many free-function declarations with parameters"` | 4096 |
 | `"teko: too many arguments"` | 64 at one call of an overloaded name |
-| `"teko: too many parameters in one declaration"` | 16, which the ABI's own 12 is under |
 | ``"teko: too many `params` lists in one unit"`` | 64 |
 | ``"teko: too many `params` declarations in one unit"`` | 64 |
 | ``"teko: too many `ref`/`out` parameters in one unit"`` | 512 |

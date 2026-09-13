@@ -74,12 +74,6 @@ i64  pmd_node[TK_MAXPMD];             // the declaration the three above came fr
 i64  pmd_over[TK_MAXPMD];             // 1 when the name carries a second signature (C3)
 i64  tk_npmd = 0;
 
-#define TK_MAXPMP 16                  // parameters of the declaration the walk is inside
-
-uptr pmp_name[TK_MAXPMP];             // its parameter names, for the normal-form test
-i64  pmp_ty[TK_MAXPMP];               // and their declared types
-i64  tk_npmp = 0;
-
 i64 tk_pm_open = 0;                   // a `params` was read in the declaration being parsed
 i64 tk_pm_hit = 0 - 1;                // the mark row `tk_pm_pos` last landed on
 
@@ -89,11 +83,6 @@ i64  pm_seen_at(i64 i) { return ld64(pm_seen + i * 8); }
 void set_pm_node_at(i64 i, i64 v) { st64(pm_node + i * 8, v); }
 void set_pm_ty_at(i64 i, i64 v)   { st64(pm_ty + i * 8, v); }
 void set_pm_seen_at(i64 i, i64 v) { st64(pm_seen + i * 8, v); }
-
-uptr pmp_name_at(i64 i) { return ld64(pmp_name + i * 8); }
-i64  pmp_ty_at(i64 i)   { return ld64(pmp_ty + i * 8); }
-void set_pmp_name_at(i64 i, uptr v) { st64(pmp_name + i * 8, v); }
-void set_pmp_ty_at(i64 i, i64 v)    { st64(pmp_ty + i * 8, v); }
 
 uptr pmd_name_at(i64 i)  { return ld64(pmd_name + i * 8); }
 i64  pmd_fixed_at(i64 i) { return ld64(pmd_fixed + i * 8); }
@@ -349,34 +338,6 @@ void tk_pm_check_orphans() {
 
 // ---- the call site ----
 
-// the parameters of the declaration the walk is inside. A PARAMETER is the one
-// name `tk_pty_of` cannot answer for -- teko_struct.tk's own table of locals
-// never sees one -- and it is exactly the name a `params` list is passed on
-// under, so the normal form has to be able to recognise it.
-void tk_pm_params_of(i64 f) {
-    tk_npmp = 0;
-    i64 p = nd_a(f);
-    loop {
-        if (p == 0) break;
-        if (tk_npmp == TK_MAXPMP)
-            err_at2(nd_file(f), nd_line(f), "teko: too many parameters in one declaration", nd_name(f));
-        set_pmp_name_at(tk_npmp, nd_name(p));
-        set_pmp_ty_at(tk_npmp, tk_param_ty(p));
-        tk_npmp = tk_npmp + 1;
-        p = nd_next(p);
-    }
-}
-
-i64 tk_pm_param_ty(uptr name) {
-    i64 i = tk_npmp - 1;
-    loop {
-        if (i < 0) break;
-        if (str_eq(pmp_name_at(i), name)) return pmp_ty_at(i);
-        i = i - 1;
-    }
-    return 0 - 1;
-}
-
 // the type an argument shows the pass by itself: a literal carries its own
 // (`1.5` is an N_INT of type f64, lib/float.mc's fl_lit), a cast the type it
 // names, and anything else answers through `tk_pty_of` (teko_struct.tk) -- a
@@ -396,14 +357,24 @@ i64 tk_pm_param_ty(uptr name) {
 // innermost declaration visible AT the site -- a local, a parameter -- then a
 // global of any type, G1's `T[]` of heap included, and -1, "not known here",
 // refusing nothing, when neither table holds the name.
+//
+// That scope is the WHOLE answer, PARAMETERS included (D51, second pass). The
+// function-wide parameter table this site used to ask FIRST (`pmp_name`/
+// `pmp_ty`, `tk_pm_param_ty`, `tk_pm_params_of`) had no position in it, so a
+// local never shadowed a parameter: inside `f(f64 x)`, a block's own
+// `i64 x = 2` still answered `f64`, and `sumi(1, x)` over a `params i64[]`
+// refused a legal call, `teko: a value of type f64 does not convert to i64`.
+// `tk_ty_scope_params` (teko_typeof.tk) already opens this pass's walk with
+// every parameter of the declaration being walked, under the same rule a
+// local joins by, so the table was a second oracle for a name the first one
+// already knew -- it is deleted, and with it its own 16-parameter ceiling,
+// which the scope answers -1 past instead of refusing.
 i64 tk_pm_arg_ty(i64 a) {
     i64 k = nd_kind(a);
     if (k == N_INT)  return nd_type(a);
     if (k == N_CAST) return nd_type(a);
     if (k == N_IDENT) {
-        i64 pt = tk_pm_param_ty(nd_name(a));
-        if (pt >= 0) return pt;
-        pt = tk_xt_ty(a);                        // a node the parse already tagged
+        i64 pt = tk_xt_ty(a);                    // a node the parse already tagged
         if (pt >= 0) return pt;
         return tk_ty_scope_or_global(nd_name(a));
     }
@@ -621,7 +592,6 @@ void tk_pm_walk_unit(i64 root, i64 last) {
     loop {
         if (f == 0) break;
         if (f < last && decl_valid(f)) {
-            tk_pm_params_of(f);
             tk_nscope = 0;
             tk_ty_scope_params(nd_a(f));
             tk_pm_walk(nd_b(f));

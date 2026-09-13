@@ -30,12 +30,21 @@
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
 //      mismatched element was already caught downstream by
 //      `tk_rc_call_args`, so widening it to `tk_ty_global` changes no
-//      observed message, only which pass answers first).
+//      observed message, only which pass answers first). `shadowparam` and
+//      `plainparam` add the other half: a local shadows a PARAMETER at the
+//      site, which the function-wide parameter table this site read first
+//      could not express (D51, second pass).
 //   6. `sibcheck`       -- a global two SIBLING blocks of one function shadow
 //      under two different types: `ref g_sib` inside a block is that block's
 //      own local, and the same `ref g_sib` written after both blocks have
 //      closed is the global -- one LEXICAL answer per site, never a body-wide
 //      scan calling the name "ambiguous" (D51, verifier finding).
+//   7. `addrcheck`      -- a bare `&x` at a parameter that is NOT `ref`/`out`:
+//      the N_ADDR guard `tk_rc_call_args` (teko_rc.tk) grew for D51 skipped
+//      the compatibility rule for EVERY address, where only a `ref`/`out`
+//      parameter has a different rule to take (the identity one over
+//      pointees). An untagged address takes the ordinary one now, and is
+//      widened never either way (D51, second pass).
 //   5. `regressioncheck` -- an enum global (D48) and `T?` over a reference
 //      global (D48) still read correctly: neither of those two sites is
 //      `tk_ty_scope_find`, and this crumb does not touch them, so this is a
@@ -139,11 +148,34 @@ f64 maskgi() {
     return g_i + 1.0;
 }
 
+// a LOCAL shadowing a PARAMETER of the SAME function. The function-wide
+// parameter table this pass asked BEFORE the scope (`tk_pm_param_ty`) carried
+// no position, so the `f64 x` of the signature answered for the `i64 x` the
+// block declares and the legal call below was refused, `teko: a value of type
+// f64 does not convert to i64` (D51, second pass). One lexical oracle answers
+// now: a parameter opens the scope, a local shadows it, and the innermost
+// declaration visible AT the site is the type.
+i64 shadowparam(f64 x) {
+    if (x > 0.0) {
+        i64 x = 2;
+        return sumall(1, x, 3);
+    }
+    return 0;
+}
+
+// the same call with NO shadow in sight: the parameter itself is what the
+// scope answers, which is what the deleted table used to be there for
+i64 plainparam(i64 x) {
+    return sumall(x, 4);
+}
+
 i64 paramscheck() {
     g_i = 5;
     if (sumall(1, g_i, 2) != 8) return 1;
     if (maskgi() != 2.5) return 2;
     if (g_i != 5) return 3;                       // the global is the one that was passed
+    if (shadowparam(1.5) != 6) return 4;          // 1 + 2 + 3, the LOCAL `x`
+    if (plainparam(6) != 10) return 5;            // 6 + 4, the PARAMETER `x`
     return 0;
 }
 
@@ -173,6 +205,24 @@ i64 sibcheck(i64 c) {
         if (g_sib != 3.0) return 2;
     }
     bumpi(ref g_sib);                             // outside both: the i64 global
+    return 0;
+}
+
+// ---- 7. a bare `&x` at a parameter that is NOT `ref`/`out` ----
+
+// `tk_rc_call_args` (teko_rc.tk) never widens an N_ADDR -- D51's own segfault
+// was D33's `scvtf` run on a pointer -- but WHICH check an address takes is
+// the PARAMETER's question, not the argument's (D51, second pass): a
+// `ref`/`out` parameter takes the identity rule over pointees, and any other
+// parameter takes the ordinary compatibility rule every value takes. An
+// untagged address is typed by nothing today (`tk_ty_of` answers -1 for it),
+// so nothing is refused on it and this call stands; what the line proves is
+// that it goes through the check at all instead of past it.
+i64 peek(uptr p) { return ld64(p); }
+
+i64 addrcheck() {
+    i64 v = 11;
+    if (peek(&v) != 11) return 1;
     return 0;
 }
 
@@ -221,6 +271,9 @@ i64 main() {
     bad = sibcheck(1);
     if (bad != 0) return 60 + bad;
     if (g_sib != 9) return 69;
+
+    bad = addrcheck();
+    if (bad != 0) return 70 + bad;
 
     return 42;
 }
