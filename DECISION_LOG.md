@@ -2692,6 +2692,22 @@ a mismatched pointee on an overloaded name is refused by the matcher itself,
 instead: the accepted `bumpi(ref g)` carries a bare `ADDR type=uptr name=g` with no CAST
 over it, where the head of this crumb printed `CAST type=f64` over that same node.
 
+Four probes, each run on four builds (`da33ebd4` the base, `98e18245` the first round,
+`3ba13535` the head the verifier reproved, and this fix), mc **0.15.23**, macos/aarch64.
+`g` is an `i64` global except where the row says otherwise, and the two sibling blocks
+declare `i64 g` and `f64 g`:
+
+| probe | `da33ebd4` | `98e18245` | `3ba13535` | now |
+|---|---|---|---|---|
+| `bumpf(ref g)` after both blocks | compiles, `g` silently corrupted (exit 2) | refuses | compiles, **exit 139** | refuses, `teko: a value of type i64 does not convert to f64` |
+| `bumpf(ref g)` inside the `f64` block | runs, 42 | refuses (the first round's regression) | runs, 42 | runs, 42 |
+| `bumpf(ref g)` inside the `i64` block, `f64` global | refuses | refuses | refuses | refuses |
+| `bumpi(ref g)` after both blocks, both declaring `f64 g` | refuses, `teko: a value of type f64 does not convert to i64` | refuses | refuses | runs, 42 |
+
+The last row is the scan's own verdict read out loud: a legal call, refused on the base and
+on both rounds of this crumb because a block that is CLOSED at the site still answered for
+the name. It is the line `tests/surface_globals.tk` gains.
+
 Proof of the finding's fix, mc **0.15.23**, macos/aarch64: the reproducer refuses,
 `teko: a value of type i64 does not convert to f64`, at the line that writes it; **63/63**
 fixtures at their `expect-exit`, with `tests/surface_globals.tk` section 6 extended by the
