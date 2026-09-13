@@ -353,7 +353,10 @@ void tk_pm_check_orphans() {
 // name `tk_pty_of` cannot answer for -- teko_struct.tk's own table of locals
 // never sees one -- and it is exactly the name a `params` list is passed on
 // under, so the normal form has to be able to recognise it.
+i64 tk_pm_cur_fn = 0;                  // the declaration the walk below is inside
+
 void tk_pm_params_of(i64 f) {
+    tk_pm_cur_fn = f;
     tk_npmp = 0;
     i64 p = nd_a(f);
     loop {
@@ -386,9 +389,16 @@ i64 tk_pm_param_ty(uptr name) {
 //
 // A bare NAME is the one that cannot go through `tk_pty_of` here. This is a
 // PASS: every scope of the unit closed while it was still parsing, so the
-// parser's own in-scope lookup has nothing left to answer with, and the
-// append-only rows are what the name is read from instead
-// (`tk_slv_find_unit`, teko_struct.tk's own header on the two questions).
+// parser's own in-scope lookup has nothing left to answer with. The table it
+// used to read instead, `tk_slv_find_unit` (teko_struct.tk), is UNIT-WIDE and
+// most-recent-wins: a local of the same name in ANOTHER function answered for
+// this one, so `sum(g)` over a global `i64 g` read the `f64 g` some unrelated
+// body declared last and refused a legal call (D51). The declaration being
+// walked is known right here (`tk_pm_cur_fn`), so the same scope discipline
+// `tk_ref_arg_pointee` takes answers instead: this function's own parameters,
+// then its own locals, then a global of any type -- G1's `T[]` of heap
+// included -- and an ambiguous local answers -1, "not known here", refusing
+// nothing (teko_ref.tk's own `tk_local_or_global_in`).
 i64 tk_pm_arg_ty(i64 a) {
     i64 k = nd_kind(a);
     if (k == N_INT)  return nd_type(a);
@@ -398,9 +408,7 @@ i64 tk_pm_arg_ty(i64 a) {
         if (pt >= 0) return pt;
         pt = tk_xt_ty(a);                        // a node the parse already tagged
         if (pt >= 0) return pt;
-        pt = tk_slv_find_unit(nd_name(a));
-        if (pt >= 0) return pt;
-        return tk_ty_global(nd_name(a));         // a global of any type, G1's `T[]` of heap included
+        return tk_local_or_global_in(tk_pm_cur_fn, nd_name(a));
     }
     return tk_pty_of(a);
 }

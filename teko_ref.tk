@@ -408,22 +408,43 @@ void tk_ref_scan_local(i64 n, uptr name) {
     }
 }
 
-// two sibling blocks may declare the same name under two types; that
-// ambiguity answers -1 rather than guess which one a given site meant
-i64 tk_ref_local_ty(uptr name) {
+// the type the LOCALS of one declaration give a name, -1 when the body
+// declares none under it. Two sibling blocks may declare the same name under
+// two types; that ambiguity answers -1 too rather than guess which one a
+// given site meant, and leaves `tk_ref_lamb` SET on the way out -- the one
+// bit that tells "the body declares no such local" apart from "it declares
+// two of them", which `tk_local_or_global_in` below is the reason to keep.
+i64 tk_local_ty_in(i64 fn, uptr name) {
     tk_ref_lty = 0 - 1;
     tk_ref_lamb = 0;
-    tk_ref_scan_local(nd_b(tk_ref_cur_fn), name);
+    if (fn == 0) return 0 - 1;
+    tk_ref_scan_local(nd_b(fn), name);
     if (tk_ref_lamb) return 0 - 1;
     return tk_ref_lty;
 }
 
-// a global falls back here too: a name neither a parameter nor a local of
-// the function being walked names is not "unknown", it is a global slot
-// (teko_array.tk's own `tk_ty_global`), and the strict identity check above
-// (`tk_ref_check_pointee`) was silently skipping every one -- the comment
-// there is the gap this line closes, a `ref`/`out` argument over a global of
-// the wrong type read as "cannot be named" instead of "does not convert".
+// the type a bare NAME reads as inside `fn`, for a PASS whose every scope
+// closed while the unit was still parsing: the locals of that one function
+// first, a GLOBAL slot second (teko_array.tk's own `tk_ty_global`) -- a name
+// the function itself declares nothing under is not "unknown", it is a global,
+// in scope in every body, exactly as D48 already made true for a bare read.
+// The one answer that does NOT fall through to a global is an AMBIGUOUS local:
+// the name IS a local there, just not one single type, so reading the global
+// would type a slot the site never meant. It stays -1, "not known here", which
+// every caller treats as "refuse nothing".
+i64 tk_local_or_global_in(i64 fn, uptr name) {
+    i64 t = tk_local_ty_in(fn, name);
+    if (t >= 0) return t;
+    if (tk_ref_lamb) return 0 - 1;
+    return tk_ty_global(name);
+}
+
+// the pointee of a NAMED `ref`/`out` argument: the enclosing function's own
+// parameters first (a parameter is in no scope table at parse time), then the
+// shared local-or-global rule above. The strict identity check below
+// (`tk_ref_check_pointee`) used to skip every global in silence -- a `ref`/`out`
+// argument over a global of the wrong type read as "cannot be named" instead
+// of "does not convert" -- and that is the gap the fallback closes.
 i64 tk_ref_arg_pointee(i64 a) {
     i64 k = nd_kind(a);
     if (k != N_ADDR && k != N_IDENT) return tk_rfarg_pointee(a);
@@ -432,9 +453,7 @@ i64 tk_ref_arg_pointee(i64 a) {
     if (tk_ref_cur_fn == 0) return 0 - 1;
     i64 t = tk_ref_param_ty(name);
     if (t >= 0) return t;
-    t = tk_ref_local_ty(name);
-    if (t >= 0) return t;
-    return tk_ty_global(name);
+    return tk_local_or_global_in(tk_ref_cur_fn, name);
 }
 
 uptr tk_pointee_name(i64 ty) {
@@ -451,9 +470,11 @@ uptr tk_pointee_name(i64 ty) {
 // `ref u8` too, since the callee stores eight bytes through a slot that
 // holds one. Type identity alone decides it, so the two aliases of one
 // primitive (`bool`/`byte`/`u8`, `char`/`u32`, `str`/`ptr`/`uptr`) are the
-// same pointee here, as they are everywhere else. A pointee the pass cannot
-// name (a global, an ambiguous local) is silently skipped, the same rule
-// `tk_check_field_store` gives an unknown source.
+// same pointee here, as they are everywhere else. A global IS named, through
+// the fallback above; the only pointee left that the pass cannot name is one
+// whose name means two types at once (an ambiguous local, two sibling blocks),
+// and that one is silently skipped, the same rule `tk_check_field_store` gives
+// an unknown source.
 void tk_ref_check_pointee(i64 pn, i64 a, i64 line, uptr fl) {
     i64 pty = tk_param_ty(pn);
     i64 aty = tk_ref_arg_pointee(a);

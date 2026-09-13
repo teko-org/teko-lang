@@ -83,6 +83,9 @@ Op g_op;
 
 i64 useOp(i64 v) { return g_op(v); }             // called from INSIDE another function
 
+i64 takeOp(Op h) { return h(3); }                // ...handed over as an argument
+Op giveOp() { return g_op; }                     // ...and handed back as a result
+
 i64 delegcheck() {
     g_op = addOne;                                // a plain function name
     if (g_op(10) != 11) return 1;
@@ -91,6 +94,20 @@ i64 delegcheck() {
     g_op = new Op((i64 x) => x * 2);              // reassigned to a lambda
     if (g_op(10) != 20) return 3;
     if (useOp(5) != 10) return 4;
+
+    // the delegate-typed global on the RIGHT of every slot that takes one.
+    // `tk_deleg_coerce`'s own wrap guard read the pass-time scope alone, so a
+    // global read there as "no slot declares this name" and was wrapped as a
+    // FUNCTION: `teko: unknown function: g_op` on a program with no error.
+    g_op = addOne;
+    Op h;
+    h = g_op;                                     // an assignment
+    if (h(10) != 11) return 5;
+    if (takeOp(g_op) != 4) return 6;              // a call argument
+    Op k = giveOp();                              // a `return`
+    if (k(1) != 2) return 7;
+    Op m = g_op;                                  // a var initializer
+    if (m(2) != 3) return 8;
 
     return 0;
 }
@@ -108,9 +125,42 @@ i64 sumall(params i64[] xs) {
     return t;
 }
 
+// a LOCAL of the same name as the global, in ANOTHER function: the unit-wide
+// most-recent-wins table this pass used to read (`tk_slv_find_unit`) answered
+// with THIS `f64` for the `g_i` of `sumall(1, g_i, 2)` below, masking the
+// global the call really passes
+f64 maskgi() {
+    f64 g_i = 1.5;
+    return g_i + 1.0;
+}
+
 i64 paramscheck() {
     g_i = 5;
     if (sumall(1, g_i, 2) != 8) return 1;
+    if (maskgi() != 2.5) return 2;
+    if (g_i != 5) return 3;                       // the global is the one that was passed
+    return 0;
+}
+
+// ---- 6. a global two SIBLING blocks shadow under two different types ----
+
+i64 g_sib = 7;
+
+// `tk_ref_local_ty` (teko_ref.tk) answers -1 for a name two sibling blocks
+// declare under two types -- "ambiguous", not "no such local" -- and the
+// `ref`/`out` pointee check has to keep those two answers apart: falling
+// through to the GLOBAL on an ambiguity types the wrong slot, and refuses
+// this legal `ref f64` over the `f64` sibling for the global's own `i64`
+i64 sibcheck(i64 c) {
+    if (c == 0) {
+        i64 g_sib = 1;
+        if (g_sib != 1) return 1;
+    }
+    if (c != 0) {
+        f64 g_sib = 2.0;
+        bumpf(ref g_sib);
+        if (g_sib != 3.0) return 2;
+    }
     return 0;
 }
 
@@ -152,6 +202,11 @@ i64 main() {
 
     bad = regressioncheck();
     if (bad != 0) return 50 + bad;
+
+    bad = sibcheck(0);
+    if (bad != 0) return 60 + bad;
+    bad = sibcheck(1);
+    if (bad != 0) return 60 + bad;
 
     return 42;
 }
