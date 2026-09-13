@@ -611,6 +611,9 @@ void tk_prim_arg_defer(i64 pty, i64 a, i64 line, uptr fl) {
 // reason `tk_num_widen` cuts it on the node it wraps.
 i64 tk_nd_moved(i64 n) {
     i64 m = tk_nd(nd_kind(n));
+    // the type table's own row goes with the value (teko_struct.tk's
+    // `tk_xt_move`): what `n` is about to become is not what it was typed as.
+    tk_xt_move(n, m);
     set_nd_op(m, nd_op(n));
     set_nd_type(m, nd_type(n));
     set_nd_val(m, nd_val(n));
@@ -653,27 +656,33 @@ void tk_prim_arg_do(i64 i) {
     tk_prim_arg_widen(pa_ty_at(i), n, aty);
 }
 
-// asked once per node the operator pass walks -- the walk that already carries
-// this file's own cast check (teko_ops.tk's `tk_ops_visit`), runs after the
-// oracle has typed every body and holds the scope a parameter is read under.
-// The argument is checked WHERE IT SITS, so a deferred `.` under it
-// (`new DateTime(1, other.Kind)` on a parameter) is already the call it stood
-// for by the time its type is asked for.
+// ---- ONE point of judgement: a walk of its own, at the end of the pick ----
+// asked once per node of every body, from `tk_prim_arg_judge` below, and that
+// is the only place a deferred argument is ever judged. The point has to
+// answer both halves of what the type of an argument depends on, and no
+// earlier one does:
 //
-// ONE shape is not judged here, and it is the one the walk's scope does
-// nothing for: a CALL. Its type is the callee's declared return type, which no
-// scope enters into -- and a call to an OVERLOADED name does not yet know its
-// callee at all, because `tk_over_pass` (teko_over.tk) picks the signature and
-// writes the symbol two passes after this walk. Read here, `tk_ty_of` answers
-// `decl_ret(decl_find(name))` -- the FIRST declaration of the name, not the one
-// the arguments pick -- so `new DateTime(1, pick(1, 2))` with a
-// `DateTimeKind pick(i64)` declared ahead of an `i64 pick(i64, i64)` saw an
-// enum, deferred nothing and let the `i64` cross under the column's own cast:
-// the very laundering this table exists to stop, measured on this branch.
-// A call is left pending for `tk_prim_arg_rest` below instead, which runs once
-// the symbol is picked (Copilot on #697, third pass).
+//   - the SCOPE it was written under, because a name (`k`, a parameter) has
+//     no type anywhere else -- so the walk is `tk_ty_pass_walk`'s, which
+//     enters each function and pushes its parameters and its locals;
+//   - every overload PICK already written, because a call's type is its
+//     callee's declared return type and `decl_find` answers the FIRST
+//     declaration of a name that may carry several -- so the walk runs after
+//     `tk_over_pass`'s own walk has rewritten every site to the symbol its
+//     arguments choose, whatever depth the call sits at under the argument.
+//
+// Riding teko_ops.tk's walk was the third pass's answer to the first half and
+// missed the second, so the arguments that are CALLS were left to a sweep at
+// the end of `tk_over_pass` with NO scope entered -- and that sweep then took
+// everything the walk had not reached, which is not only the calls:
+// `tk_ops_visit` returns early for an N_BINARY and for an N_UNARY, so
+// `new DateTime(1, k | DateTimeKind.Utc)` on a `DateTimeKind k` parameter --
+// legal, since a bitwise operator over an enum answers the enum (D39) -- was
+// refused with `teko: the type of this argument is not known here`, measured
+// on `d8d00572` (Copilot on #697, fifth pass). Moving the hook ahead of those
+// two returns would have judged the node before the pick under it; one walk,
+// after everything, is the rule that has both halves at once.
 void tk_prim_arg_pend(i64 n) {
-    if (nd_kind(n) == N_CALL) return;            // its callee is picked two passes down
     i64 i = tk_nparg - 1;
     loop {
         if (i < 0) break;
@@ -682,20 +691,19 @@ void tk_prim_arg_pend(i64 n) {
     }
 }
 
-// ...and everything the walk above left: a CALL, whose symbol the overload
-// pass has now written, and what a BODY walk never reaches at all -- a global's
-// own initializer, the half `tk_prim_cast_globals` answers for the cast. Both
-// are read with NO scope entered, which is exactly what they are written
-// under: a global initializer stands outside every body, and a call's type is
-// its callee's declared return type, the one answer of this oracle that no
-// scope enters into. Called at the end of `tk_over_pass` (teko_over.tk).
-void tk_prim_arg_rest() {
-    i64 i = 0;
-    loop {
-        if (i >= tk_nparg) break;
-        tk_prim_arg_do(i);
-        i = i + 1;
-    }
+// A unit that deferred nothing walks nothing: the table is this module's own
+// memory and an empty one has no node to visit. Called at the end of
+// `tk_over_pass` (teko_over.tk), and it adds no pass of its own.
+//
+// A body is where every deferred argument is, and the reason is what a global
+// initializer may be: mc requires it to be CONSTANT (`global initializer must
+// be constant`), so `DateTime g = new DateTime(1, gk);` never reaches a check
+// of this file at all, and the arguments that do survive there are the folded
+// ones the parser types by itself -- measured over `1 + 2`, `(i64) 3` and a
+// `const` name, none of which defers.
+void tk_prim_arg_judge(i64 root) {
+    if (tk_nparg == 0) return;
+    tk_ty_pass_walk(root, &tk_prim_arg_pend);
 }
 
 // A CALL is the one argument whose type NEITHER oracle decides here, and the

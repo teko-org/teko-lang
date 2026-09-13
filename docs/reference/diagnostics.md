@@ -468,6 +468,20 @@ i64 main() {
 declaration order, and an overload that answers a float of its own crosses with no cast at
 all.
 
+**An OPERATOR over one of those shapes is judged the same way**, because a bitwise
+operator over an enum answers the enum ([enum.md](../specs/enum.md) § 4): `k |
+DateTimeKind.Utc` on a `DateTimeKind` parameter is as legal in the kind position as `k` is,
+and the `i64` twin is refused with the type it really has rather than with "not known
+here":
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+DateTime f(i64 x) { return new DateTime(1, x | 1); }
+                    // teko: a value of type i64 does not convert to DateTimeKind
+```
+
 A GLOBAL is accepted wherever its declaration says the enum: `DateTimeKind g =
 DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function is the
 enum in the enum's own position. A global is in scope in every body, so its declared type

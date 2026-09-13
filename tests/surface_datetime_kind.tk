@@ -39,7 +39,8 @@ delegate DateTimeKind KindOp();
 // why the field below is read off a PARAMETER and `utc_kind` is declared after
 // `main`:
 //
-//   a parameter               `k` in `at_kind`
+//   a parameter               `k` in `at_kind`, and an OPERATOR over one
+//                             (`k | DateTimeKind.Utc` in `at_bitor`)
 //   a forward call's return   `utc_kind()`, declared at the bottom of this file
 //   a field of a parameter    `s.kind` in `at_field`, a deferred `.`
 //   a global                  `g_kind`, in scope in every body
@@ -86,6 +87,33 @@ DateTimeKind tpick(i64 a, i64 b) { return DateTimeKind.Local; }
 // the guess would have skipped the widening the integer one needs
 f64 fpick(i64 a, i64 b) { return 2.5; }
 i64 fpick(i64 a) { return 2; }
+
+// an argument that is an EXPRESSION over the shapes above: a bitwise operator
+// keeps the enum (docs/specs/enum.md § 4), so `k | DateTimeKind.Utc` on a
+// parameter is as legal in this column as `k` is -- and it is judged at the one
+// point the deferred check now has, after the overload pick and under the scope
+// `k` is read in (D48, Copilot on #697, fifth pass)
+DateTime at_bitor(i64 t, DateTimeKind k) { return new DateTime(t, k | DateTimeKind.Utc); }
+
+DateTime at_bitand(i64 t, DateTimeKind k) { return new DateTime(t, k & DateTimeKind.Local); }
+
+// `~` answers the enum too, and twice over is the value itself -- once is
+// always negative and is what the run-time kind guard is for
+DateTime at_twiddle(i64 t, DateTimeKind k) { return new DateTime(t, ~~k); }
+
+// a member call whose RECEIVER is a parameter: the `.` is a placeholder the
+// oracle's own pass rebuilds and registers a type for, and the float column
+// then wraps that very node in the cast the picked signature asks for. The
+// registration moves with the value (teko_struct.tk's `tk_xt_move`); left
+// behind on the wrapper it made the last pass widen a second time, `(f64)`
+// over `(f64)` (D48, Copilot on #697, fifth pass).
+class Hours {
+    i64 v;
+    public Hours(i64 v) { this.v = v; }
+    public i64 Get() { return this.v; }
+}
+
+TimeSpan at_member(Hours h) { return TimeSpan.FromHours(h.Get()); }
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same row
@@ -236,6 +264,20 @@ i64 main() {
     if (TimeSpan.FromHours(tpick(1)).Ticks != 252000000000) return 55;
     if (TimeSpan.FromHours(fpick(1)).Ticks != 72000000000) return 56;
     if (TimeSpan.FromHours(fpick(1, 2)).Ticks != 90000000000) return 57;
+
+    // ...and an argument that is an OPERATOR over one of those shapes, which is
+    // the same column reached through an `N_BINARY`/`N_UNARY` instead of a bare
+    // name -- accepted here because a bitwise operator over an enum answers the
+    // enum, and judged at the same one point (D48, Copilot on #697, fifth pass)
+    if (at_bitor(t, DateTimeKind.Unspecified).Kind != DateTimeKind.Utc) return 58;
+    if (at_bitand(t, DateTimeKind.Local).Kind != DateTimeKind.Local) return 59;
+    if (at_twiddle(t, DateTimeKind.Local).Kind != DateTimeKind.Local) return 60;
+    if (new DateTime(t, utc_kind() | DateTimeKind.Unspecified).Kind != DateTimeKind.Utc) return 61;
+
+    // ...and the float column under a member call the parser cannot type: one
+    // cast, not two
+    Hours hrs = new Hours(2);
+    if (at_member(hrs).Ticks != 72000000000) return 62;
 
     return 42;
 }
