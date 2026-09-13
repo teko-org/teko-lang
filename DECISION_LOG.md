@@ -2617,6 +2617,61 @@ a reference/number mismatch through a `static` field — are one `// no-run` sam
 [types.md](docs/reference/types.md), reusing the wording every mismatched value already
 gets; no new diagnostic string was added.
 
+**Copilot finding (pass 1 on [#698](https://github.com/teko-org/teko-lang/pull/698)): four
+threads and three suppressed ones, one root.** Routing every site through
+`tk_field_store_val` was half the rule; the other half is what the gate does when it cannot
+type the value. It wrote the RAW bits -- the very defect this entry opened on, left standing
+wherever the PARSER cannot see the value's type, which is most of the language:
+`void set(i64 k) { H.total = k; }` in a FREE function (no member body is being parsed, so
+the `tk_slv` push below never ran), the same function's `h.rate = k` through a local
+receiver, `H.total = k` on a type declared BELOW (resolved in `tk_fwd_pass`, one pass ahead
+of the scope that types `k`), `this.rate = k + 1` (an N_BINARY, which `tk_pty_of` does not
+type at all) and the implicit `total = rate` (`tk_this_assign` runs the gate BEFORE
+`tk_this_ident` rewrites `rate` into the typed load). Measured on `c7df7787`, each of the
+five read the parameter's eight bytes back as a double; `i64? count; this.count = k;` went
+further and stored them as a BOX HANDLE -- a segfault, since `tk_nl_wrap` is the identity
+when `ety < 0`.
+
+**One rule, at the one point that can hold it.** A value neither oracle types is DEFERRED
+rather than written: `tk_fs_defer` records the value node, the field's type and the site,
+and `tk_field_store_judge` -- a walk of its own at the end of `tk_typeof_pass`, AFTER the
+walk that resolves the tree, so every implicit read is a typed load and every deferred `.`
+is the load or the call it stood for -- asks `tk_ty_of` with the function's scope alive,
+judges with `tk_check_compat` and writes the conversion IN PLACE (`tk_nd_moved`,
+teko_prim.tk), because the value is a link of the store call's own argument list and
+nothing here knows which one. It is D48's
+`tk_prim_arg_defer`/`tk_prim_arg_do`/`tk_prim_arg_judge` one slot over, with no pass
+registered (`passes` 15/30). A value the PASS cannot type either is still left alone: `-1`
+is "not known", never a verdict (D226).
+
+**The reference predicate was narrower than the rule it serves.** `tk_check_field_store`,
+with the value's type in hand, refused an integer and a float only -- so an `enum`, a
+primitive with members, a raw `uptr` and an unrelated class all crossed into a field of
+reference type (measured: `b.c = raw;` and `b.c = k;` on a `Color k` both compiled). It
+asks `tk_check_compat` now, the very judge an assignment, an initializer, an argument and a
+`return` are given, Q1b's box exemption inside it.
+
+**And the push that prompted all of it is gone.** `tk_member_fn` pushed every parameter
+onto `tk_slv` for the length of the body; the deferral covers every site, the push covered
+only the bodies being parsed, and `tk_slv_add`'s own rule (D33) is that a parameter answers
+-1 there -- one table for two questions is exactly what that rule was written against.
+Deletion over addition: removed, and the 62 pre-existing dumps are byte-identical either
+way. The fixture's claim to cover the forward static was wrong as well (`H` was declared
+ABOVE the store, which is the DIRECT road); it covers it for real now, with a class declared
+below.
+
+**Proof of the second pass**, mc **0.15.23**, macos/aarch64: **63/63** fixtures, the
+extended `surface_field_store.tk` (twelve helpers) among them -- it exits **71** on
+`c7df7787` and **42** here; `--dump-ast` of the 62 fixtures that predate the crumb, against
+`da33ebd4`, **62 byte-identical**; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK`; `sh scripts/check-docs.sh` green (570 links, 386 diagnostics, 119 samples);
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, every table unmoved
+(`passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16);
+`mc pkg hash .` `35e6b6770344a25dc456b61b977cfdca345ddeb8dfe66c8337534780ef8a5301`. The one
+new diagnostic is the table's own ceiling, `teko: too many field stores of unknown type`
+(512), documented with the deferred judgement itself in
+[diagnostics.md](docs/reference/diagnostics.md).
+
 **Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
 clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of the **62** fixtures that
 existed before this crumb, taken against `da33ebd4` — **62 byte-identical**, since every

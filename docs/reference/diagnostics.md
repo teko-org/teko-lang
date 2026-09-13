@@ -924,6 +924,37 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: a "` — completed by *`<what>` needs a class*: a construct that only a class
   carries (a constructor, a destructor, a vtable slot) was written on another kind of type.
 
+### A field store whose value only the pass can type
+
+A store is built where it is written, and the value's type is the one thing the site may
+not know then: a parameter is in no parse-time scope, an implicit `f = e` is rewritten from
+a pass with its right-hand side still a bare name, and a `static` field on a type declared
+below is resolved one pass ahead of the scope that would answer. None of that is a licence
+to write the raw bits — the check and the conversion are deferred to the pass, and a value
+the pass types is judged by the very rule every other slot is judged by (D50, the review
+finding on [#698](https://github.com/teko-org/teko-lang/pull/698)). What the deferral buys
+is a compile-time refusal where the eight bytes used to cross unread:
+
+```teko
+// no-run
+enum Color { Red, Green, Blue }
+class Cell { public i64 v; }
+class Box { public Cell c; }
+class H { public static Cell c; }
+
+void put(Box b, Color k, uptr raw, i64 n) {
+    Box bb = b;
+    bb.c = k;                    // teko: a value of type Color does not convert to Cell
+    bb.c = raw;                  // teko: a value of type uptr does not convert to Cell
+    H.c = n;                     // teko: a value of type i64 does not convert to Cell
+}
+
+i64 main() { return 0; }
+```
+
+A value neither oracle can type even there is left alone, as every other *not known here*
+is: the rule refuses only what it is sure about.
+
 ## Capacity
 
 Every table the compiler keeps has a ceiling. Hitting one is a diagnostic, not a silent
@@ -968,6 +999,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many expressions whose type is known"` | 256 |
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
+| `"teko: too many field stores of unknown type"` | 512 field stores whose value no oracle types at the site, waiting for the pass |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |

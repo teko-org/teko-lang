@@ -292,6 +292,11 @@ i64 main() {
 }
 ```
 
+The rule does not weaken where the site cannot type the value — a parameter, an implicit
+`f = e` the pass rewrites, a `static` field on a type declared below. That store waits for
+the pass and is judged there, under the same rule and at its own line
+([diagnostics.md](diagnostics.md#a-field-store-whose-value-only-the-pass-can-type)).
+
 Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
 slot is neither converted nor refused ([not-yet.md](not-yet.md)).
 
