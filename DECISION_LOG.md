@@ -2348,15 +2348,17 @@ generated symbol by hand:
 |---|---|---|---|
 | struct implicit allocator | `stamp_new` | `teko: a value of type i64 does not convert to Stamp` (the wrong cause, at the `new`) | `teko: the name is the compiler's own: stamp_new` |
 | static field | `stamp_made` | `global name declared twice` (the core) | `teko: the name is the compiler's own: stamp_made` |
-| class method | `point_area` | `function declared twice` (the core) | `teko: the name is the compiler's own: point_area` |
-| class constructor | `point_ctor__i64` | `function declared twice` | `teko: the name is the compiler's own: point_ctor__i64` |
-| auto property accessor | `square_get_Side` | `function declared twice` | `teko: the name is the compiler's own: square_get_Side` |
-| arrow property accessor | `square_get_Area` | `function declared twice` | `teko: the name is the compiler's own: square_get_Area` |
+| class method | `point_area` | the core's `function declared twice`, `call to unknown function` or teko's `no overload of point_area matches these arguments`, by how the program uses it | `teko: the name is the compiler's own: point_area` |
+| class constructor | `point_ctor__i64` | the core's `function declared twice`, `call to unknown function` or teko's `no overload of point_ctor__i64 matches these arguments`, by how the program uses it | `teko: the name is the compiler's own: point_ctor__i64` |
+| auto property accessor | `square_get_Side` | the core's `function declared twice`, `call to unknown function` or teko's `no overload of square_get_Side matches these arguments`, by how the program uses it | `teko: the name is the compiler's own: square_get_Side` |
+| arrow property accessor | `square_get_Area` | the core's `function declared twice`, `call to unknown function` or teko's `no overload of square_get_Area matches these arguments`, by how the program uses it | `teko: the name is the compiler's own: square_get_Area` |
 | service getter | `svc_di_get` | `function declared twice` | `teko: the name is the compiler's own: svc_di_get` |
-| generic instance method | `box__circle__2_cap` | `Box__Circle__2 instantiated from f.tk:5:1: function declared twice` | `teko: the name is the compiler's own: box__circle__2_cap` |
+| generic instance method | `box__circle__2_cap` | `... instantiated from ...: function declared twice`, or `no overload of box__circle__2_cap matches these arguments`, by how the program uses it | `teko: the name is the compiler's own: box__circle__2_cap` |
 | namespace mangling | `geo__area` | `function declared twice` | `function declared twice` (deliberately unchanged, above) |
 
-The first row is the one that was a genuine hole rather than a worse message: the core never
+The first row is the one that was a genuine hole rather than a worse message (the verifier's
+own reproduction reached it the other way round, `a value of type Stamp does not convert to
+i64` at a caller that never wrote `new` -- the same silent misresolution): the core never
 saw two declarations, because a struct's allocator and the program's function differ in
 RETURN type, and the program's `Stamp stamp_new()` simply stood in for the generated one at
 the `new` site. The others gained the cause in place of the symptom. A name that merely
