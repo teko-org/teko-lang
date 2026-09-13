@@ -14,9 +14,10 @@
 //   DateTimeKind.TryParse / IsDefined
 //   c ? DateTimeKind.Utc : ...         a ternary over two enum arms
 //   () use (k) => k                    a lambda's by-value capture
-//   new DateTime(t, k)                 ...with `k` a parameter, a call's
-//                                      return, a field or an array element --
-//                                      the four the PARSER cannot type, whose
+//   new DateTime(t, k)                 ...with `k` a parameter, a forward
+//                                      call's return, a field of a parameter,
+//                                      a global or an overloaded call -- the
+//                                      shapes the PARSER cannot type, whose
 //                                      check the pass makes (D48)
 //
 // The refusals the tightening buys -- `i64 n = d.Kind;`, `DateTimeKind k = 7;`,
@@ -30,17 +31,50 @@
 
 delegate DateTimeKind KindOp();
 
-// the four shapes the PARSER cannot type in a constructor argument -- a
-// parameter, a call's return, a field and an array element -- all of which
-// reach the enum column through the deferred check (D48, the Copilot finding
-// on #697). Their `i64` twins are refused, in docs/reference/diagnostics.md.
+// the shapes the PARSER cannot type in a constructor argument, each reaching
+// the enum column through the deferred check (D48, Copilot on #697). Their
+// `i64` twins are refused, in docs/reference/diagnostics.md. What defers is
+// measured, not assumed -- a receiver or an array the parser CAN type carries
+// its type into the node and never reaches the deferred table at all, which is
+// why the field below is read off a PARAMETER and `utc_kind` is declared after
+// `main`:
+//
+//   a parameter               `k` in `at_kind`
+//   a forward call's return   `utc_kind()`, declared at the bottom of this file
+//   a field of a parameter    `s.kind` in `at_field`, a deferred `.`
+//   a global                  `g_kind`, in scope in every body
+//   an overloaded call        `kpick`/`tpick`, whose signature is picked by
+//                             `tk_over_pass`, two passes after the walk that
+//                             would otherwise have judged the argument
+//
+// A LOCAL `DateTimeKind` array's element (`ks[0]` in `main`) does NOT defer:
+// the load carries the element type the declaration gave it, so the parser
+// answers for it. It is its `i64` twin that loses its type at parse (a raw
+// `ld64`) and is refused by the deferred check, in diagnostics.md.
 struct Stamp {
     public DateTimeKind kind;
 }
 
 DateTime at_kind(i64 t, DateTimeKind k) { return new DateTime(t, k); }
 
-DateTimeKind utc_kind() { return DateTimeKind.Utc; }
+// the receiver of the `.` is a PARAMETER, so the field load is a placeholder
+// the oracle's own pass rebuilds -- untyped where the argument is written
+DateTime at_field(i64 t, Stamp s) { return new DateTime(t, s.kind); }
+
+// a global is in scope in every body, and its declared type is what the oracle
+// answers for it (teko_array.tk's own `tk_ty_global`)
+DateTimeKind g_kind = DateTimeKind.Local;
+
+DateTime at_global(i64 t) { return new DateTime(t, g_kind); }
+
+// two names, two signatures each, and the return type of the signature the
+// ARGUMENTS pick is the only true answer -- in both declaration orders, and in
+// the ticks position as well as the kind one
+DateTimeKind kpick(i64 a) { return DateTimeKind.Utc; }
+i64 kpick(i64 a, i64 b) { return 9; }
+
+i64 tpick(i64 a) { return 7; }
+DateTimeKind tpick(i64 a, i64 b) { return DateTimeKind.Local; }
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same row
@@ -159,12 +193,33 @@ i64 main() {
     if (from_ret.Kind != DateTimeKind.Utc) return 45;
     Stamp st = new Stamp();
     st.kind = DateTimeKind.Local;
-    DateTime from_field = new DateTime(t, st.kind);
+    DateTime from_field = at_field(t, st);
     if (from_field.Kind != DateTimeKind.Local) return 46;
     DateTimeKind ks[2];
     ks[0] = DateTimeKind.Utc;
-    DateTime from_elem = new DateTime(t, ks[0]);
+    DateTime from_elem = new DateTime(t, ks[0]);     // typed by the element itself
     if (from_elem.Kind != DateTimeKind.Utc) return 47;
+    DateTime from_local_field = new DateTime(t, st.kind);   // typed by the local
+    if (from_local_field.Kind != DateTimeKind.Local) return 48;
+
+    // ...a global, which the oracle answers for by its declaration
+    if (at_global(t).Kind != DateTimeKind.Local) return 49;
+
+    // ...and an overloaded call, whose return type is the PICKED signature's:
+    // `kpick`'s enum overload is declared first and `tpick`'s second, and the
+    // `i64` overload of `kpick` lands on the TICKS position, which takes the
+    // value under its own type
+    DateTime from_over = new DateTime(t, kpick(1));
+    if (from_over.Kind != DateTimeKind.Utc) return 50;
+    DateTime from_over2 = new DateTime(t, tpick(1, 2));
+    if (from_over2.Kind != DateTimeKind.Local) return 51;
+    DateTime over_ticks = new DateTime(kpick(1, 2));
+    if (over_ticks.Ticks != 9) return 52;
+    if (over_ticks.Kind != DateTimeKind.Unspecified) return 53;
 
     return 42;
 }
+
+// declared AFTER `main` on purpose: the call above is written before any
+// declaration of the name exists, so neither oracle types it at parse
+DateTimeKind utc_kind() { return DateTimeKind.Utc; }

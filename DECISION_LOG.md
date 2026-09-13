@@ -1976,3 +1976,75 @@ of "`alias` 14 stays 14" is right for the program and one too high for the compi
 `syntax` is the arena's own `T_SYNTAX` high-water mark over the four registries that share
 it, which is why removing one `syntax_expr` from the floor did not move it. `mc pkg hash .`:
 `d14f7c7519288990ee9d849b0de8b529c6cbe5c568fef8f880bcc7cb6a52d0dd`.
+
+**Copilot finding, third pass — three on the deferred check itself, and the one root under
+two of them.** The deferral above was right about WHEN to check and wrong about WHAT the
+oracle may be asked. All three were reproduced before they were fixed, on `f6a565f1`:
+
+1. **A global was refused for a type it plainly declares.** `DateTimeKind g =
+   DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function read
+   `teko: the type of this argument is not known here` — a regression against the alias,
+   which took any integer there. `tk_ty_of` (teko_typeof.tk) answered -1 for every global
+   but G1's `T[]` of heap, and its own header called that the truth. It is not: a global is
+   in scope in EVERY body of the unit, so the oracle now answers a global by its
+   declaration (`tk_ty_global`, teko_array.tk), off the sweep that already collected the
+   arrays — one more row per global SLOT, a global that holds one value, told from
+   `i64 a[4]` by `nd_val != 0`, the rule `tk_on_stmt` already reads for a local.
+   `TK_MAXGSLOT` 2048, **521** in the compiler's own unit (`mc_teko.tk`, mc's core
+   included), with its own capacity message.
+2. **An overloaded callee laundered the argument, and refused a legitimate one.** At the
+   check's own point a call to a top-level name still carries the name the source wrote,
+   and both oracles answer `decl_ret(decl_find(name))` for an N_CALL — the FIRST
+   declaration of a name that may carry several signatures, the one `tk_over_pass` replaces
+   two passes later with the symbol the ARGUMENTS pick. Measured, both ways: with
+   `DateTimeKind pick(i64)` ahead of `i64 pick(i64, i64)`, `new DateTime(1, pick(1, 2))`
+   saw an enum, deferred nothing and let the `i64` cross under the column's cast to the
+   run-time kind guard (exit 70); with the two in the other order, the same call was
+   REFUSED for a conversion the chosen overload never asks for, and so was `new
+   DateTime(pick(1, 2), DateTimeKind.Utc)` on the ticks column.
+
+   **The fix is that a call's type is not decided at the check's point at all.**
+   `tk_prim_arg` (teko_prim.tk) passes -1 to `tk_check_scalar_compat` for any N_CALL, so on
+   a CAST column the argument is deferred and judged by `tk_prim_arg_rest` once the symbol
+   is written, and on every OTHER column it crosses under its own type and
+   `tk_rc_call_args` (teko_rc.tk, the last pass of all) judges it against the very
+   declaration the row names — the division of labour D48 already had, with the guess
+   removed from both sides. The CONVERSION still reads the oracle's answer unchanged, which
+   is what keeps the float column widening `TimeSpan.FromHours(n)` and keeps every dump
+   still.
+
+   Two placements were weighed and one was taken. Resolving the nested overload EARLY would
+   mean running `tk_ov_collect`/`tk_ov_scan` before their pass, which moves the overload
+   refusals ahead of every other one; deferring and re-checking needs no new pass and no new
+   order, so `tk_prim_arg_rest` moved from the end of `tk_ops_pass` to the end of
+   `tk_over_pass` — the same one call, three passes later, and `tk_prim_arg_pend` leaves a
+   call to it instead of judging it in the walk. The walk's scope is what a NAME needs; a
+   call's type is its callee's declared return type, which no scope enters into, so nothing
+   was lost by moving it. `passes` stays **15/30**: no pass was added.
+3. **The fixture's own comment claimed coverage it did not have.** Of the four shapes
+   `tests/surface_datetime_kind.tk` said reached the deferred check, only the parameter did
+   — `utc_kind()` was declared above `main`, `st.kind` was a local's field and `ks[0]` a
+   local enum array's element, all three typed by the parser. Measured with a throwaway
+   build that accumulates the deferred lines: `DEFER: 41`, one entry. The fixture now
+   FORCES the shapes instead of claiming them — `utc_kind` is declared at the bottom of the
+   file, the field is read off a `Stamp` PARAMETER (`at_field`), the global and the two
+   overloaded callees are new — and the same instrumentation over it prints six entries,
+   one per intended line (`DEFER: 58 62 68 192 212 214`: parameter, field of a parameter,
+   global, forward call, and the two overloaded calls). What does NOT defer is written down
+   as what it is: a local enum array's element carries its element type into the load, and
+   it is the `i64` twin that loses it and is refused. **Fixtures stay 61**; the file gains
+   codes 48-53 and `tests/surface_datetime_kind.tk` is the ONLY dump that moves.
+
+**Proof of the third pass**, mc **0.15.23**, macos/aarch64: `mc build . --config
+mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of all 61
+against `f6a565f1` — **60 byte-identical**, the touched fixture the only diff;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (`teko1.o == teko2.o`
+on the first turn, `--dump-asm` of teko2 vs teko3 empty over 214044 lines, 61/61 fixtures
+under `teko1`); `sh scripts/check-docs.sh` green (564 links, 382 diagnostics, 114 samples).
+`mc limits` verdict `ok` on both legs with every table unmoved — floor (`tests/hello.tk`)
+`passes` 15/30, `syntax` 15, `alias` 18, `types` 11, `intrin` 8/16, and the
+`tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types` 14 — the only figure that
+moves is the arena's own high-water, `467792 → 1114960` bytes on the floor and
+`3211120 → 3858288` on the datetime leg (the two tables plus this crumb's own source,
+against a 33554432-byte reservation). `mc pkg hash .`:
+`f3c53a71be989bcf05fe302a040150a3cbf1289b2a1dce4b08ae7b55c482537d`.
