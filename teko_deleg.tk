@@ -447,6 +447,136 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
     return e;
 }
 
+// ---- the one caller of the validator that runs where NO oracle answers ----
+// `ops[i] = e` on an `Op[]` is coerced by `tk_ha_store` (teko_heaparr.tk), and
+// that store is built at PARSE time for a local array and inside
+// `tk_array_pass` for a global one -- both of them ahead of the scope walk and
+// of `tk_hg_collect`'s own global rows. So the guard above read -1 for every
+// NAME written there, whatever declared it, and wrapped it as a function:
+// `ops[0] = g_op;` (a global), `ops[0] = lo;` (a local), `ops[0] = p;` (a
+// parameter) and `ops[0] = laterFn;` (a function declared further down the
+// file) all died `teko: unknown function: ...` on a program with no error in
+// it, and `ops[0] = g_n;` on an `i64` global died with the same misleading
+// words instead of the delegate's own mismatch. A global `Op[]` was worse
+// still: `tk_array_resolve_write` (teko_array.tk) builds its store with no
+// coercion at all, so `g_ops[0] = addOne;` stored a raw function pointer and
+// the core refused the bare name, `unknown name` -- never a `teko: ...`
+// refusal (D20).
+//
+// The value is JUDGED WHERE NAMES HAVE TYPES, the same answer D48's own
+// `tk_prim_arg_defer` gives for the argument a parse-time column cannot type:
+// the store is recorded here and coerced during `tk_deleg_walk`, which is the
+// one walk that carries both halves of the question at once -- the LEXICAL
+// scope at the site (`tk_ty_scope_var`, a mark per block) and every global row
+// (`tk_array_pass` runs before `tk_deleg_pass`, teko.tk). Only a value nothing
+// in reach of the store can name waits: a name the scope or the globals
+// already answer, a name a `new Op(...)`/lambda/call already types, and a
+// FUNCTION declared ahead of the store are decided where they were written, so
+// no accepted program's tree moves (the 62 dumps of `da33ebd4`).
+#define TK_MAXDGLATE 64               // element stores waiting for the pass
+
+i64  dl_node[TK_MAXDGLATE];           // the store call, `stW(tk_arr_at(...), v)`
+i64  dl_si[TK_MAXDGLATE];             // the delegate row the ELEMENT type is
+i64  dl_line[TK_MAXDGLATE];
+uptr dl_file[TK_MAXDGLATE];
+i64  dl_done[TK_MAXDGLATE];
+i64  tk_ndglate = 0;
+
+i64  dl_node_at(i64 i) { return ld64(dl_node + i * 8); }
+i64  dl_si_at(i64 i)   { return ld64(dl_si + i * 8); }
+i64  dl_line_at(i64 i) { return ld64(dl_line + i * 8); }
+uptr dl_file_at(i64 i) { return ld64(dl_file + i * 8); }
+i64  dl_done_at(i64 i) { return ld64(dl_done + i * 8); }
+
+// "the store's own oracles cannot settle this name". Only two answers are
+// settled where the store is built, and everything else waits:
+//
+//   - the pass-time scope or a global row already names it (both are empty at
+//     parse time and both are live once `tk_array_pass` has run), so the
+//     validator reads the same type the pass would read;
+//   - nothing names it as a SLOT and a declaration seen so far gives it a
+//     body, which is the one table a wrap has -- `ops[0] = add;` with `add`
+//     written above, the shape every fixture holds today.
+//
+// A name the parser's own scoped table of locals holds (`tk_pty_of`,
+// teko_struct.tk) is a SLOT, even when a function of that name exists, and a
+// slot is judged by the type the validator reads from the scope, not by the
+// wrap -- so it waits. So does a name no table here knows at all: it may still
+// be a global, a parameter, or a function declared further down the file.
+i64 tk_deleg_store_late(i64 si, i64 v) {
+    if (si < 0) return 0;
+    if (nd_kind(v) != N_IDENT) return 0;
+    if (tk_ty_scope_or_global(nd_name(v)) >= 0) return 0;
+    if (tk_pty_of(v) >= 0) return 1;
+    return decl_find(nd_name(v)) < 0;
+}
+
+void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
+    if (tk_ndglate == TK_MAXDGLATE)
+        err_at(fl, line, "teko: too many element stores of unknown type");
+    st64(dl_node + tk_ndglate * 8, st);
+    st64(dl_si + tk_ndglate * 8, si);
+    st64(dl_line + tk_ndglate * 8, line);
+    st64(dl_file + tk_ndglate * 8, fl);
+    st64(dl_done + tk_ndglate * 8, 0);
+    tk_ndglate = tk_ndglate + 1;
+}
+
+// the value is the SECOND argument of the store (`tk_call2`, teko_struct.tk),
+// read from the list rather than remembered, so a pass that rewrote the node
+// in between is judged as it stands now. A wrap hands back a new node, and the
+// list link is what takes it -- the same splice `tk_deleg_check_call_args`
+// makes over an argument list, and no node ever has to change identity.
+void tk_deleg_late_do(i64 i) {
+    if (dl_done_at(i)) return;
+    st64(dl_done + i * 8, 1);
+    i64 a = nd_a(dl_node_at(i));
+    if (a == 0) return;
+    i64 v = nd_next(a);
+    if (v == 0) return;
+    i64 nv = tk_deleg_coerce(dl_si_at(i), v, dl_line_at(i), dl_file_at(i));
+    if (nv == v) return;
+    set_nd_next(nv, nd_next(v));
+    set_nd_next(a, nv);
+}
+
+// `tk_hg_resolve_write` (teko_array.tk) COPIES the store it just built into
+// the placeholder node the tree already holds (`node_assign`) and drops the
+// one it built, so a deferral recorded against that one points at an orphan no
+// walk will ever reach. It re-points here -- the same re-mark `tk_os_add`
+// makes one line below it, for the same reason.
+void tk_deleg_late_move(i64 from, i64 to) {
+    i64 i = tk_ndglate - 1;
+    loop {
+        if (i < 0) break;
+        if (dl_node_at(i) == from) st64(dl_node + i * 8, to);
+        i = i - 1;
+    }
+}
+
+void tk_deleg_late_pend(i64 n) {
+    i64 i = tk_ndglate - 1;
+    loop {
+        if (i < 0) break;
+        if (dl_node_at(i) == n) tk_deleg_late_do(i);
+        i = i - 1;
+    }
+}
+
+// ...and a store the walk never reached is judged all the same, with the
+// scope closed: a value no body's scope can name is a global or a function,
+// and the two tables that answer those are live for the whole pass. Silence
+// is the one answer this table may not give -- it exists because the guard
+// above was skipping a check, not because the check is optional.
+void tk_deleg_late_rest() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ndglate) break;
+        tk_deleg_late_do(i);
+        i = i + 1;
+    }
+}
+
 // `Op f = add;` / `Op f = new Op(mul);` / `Op maybe = null;` -- a local or
 // field initializer of delegate type `si`
 void tk_deleg_var(i64 n) {
@@ -513,6 +643,7 @@ void tk_deleg_check_call_args(i64 n) {
 
 void tk_deleg_visit(i64 n) {
     i64 k = nd_kind(n);
+    if (tk_ndglate > 0) tk_deleg_late_pend(n);    // an element store, judged in scope
     if (k == N_VAR)    { tk_deleg_var(n);    return; }
     if (k == N_ASSIGN) { tk_deleg_assign(n); return; }
     if (k == N_RETURN) { tk_deleg_return(n); return; }
@@ -1265,6 +1396,7 @@ i64 tk_deleg_pass(i64 root) {
     tk_deleg_cur_ns = 0;
     tk_deleg_cur_ret = 0 - 1;
     tk_cur_fn_name = 0;
+    tk_deleg_late_rest();
     tk_lam_resolve_globals(root);
     return root;
 }

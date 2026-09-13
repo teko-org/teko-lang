@@ -191,6 +191,13 @@ An element of delegate type is called like any other delegate value: read it int
 or write an argument list straight after the index — the element `ops[i]` followed by
 `(3, 4)` is the call.
 
+What may be written into such an element is what the delegate slot takes anywhere else: a
+function's name, whether it is declared above the store or further down the file; a lambda
+under `new Op(...)`; a call that answers the delegate type; and a name of that delegate
+type — a local, a parameter or a global alike, in a local array and in a global one.
+A value of any other type is refused in the delegate's own words, *`Op` takes a function,
+another `Op`, or null*.
+
 ### Elements of a counted type
 
 An element of class, interface, delegate or array type holds a reference: overwriting a

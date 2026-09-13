@@ -1005,6 +1005,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `ref`/`out` parameters in one unit"`` | 512 |
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |
+| `"teko: too many element stores of unknown type"` | 64 stores into an element of delegate type, in one unit, whose value only the pass can name |
 | `"teko: too many captures in one lambda"` | 32, summed across the lambdas being read |
 | `"teko: too many captures by value in one unit"` | 256, summed over every lambda: definite assignment reads each one's own node |
 | `"teko: too many capturing lambdas"` | 64 capturing by reference |

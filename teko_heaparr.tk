@@ -220,6 +220,17 @@ i64 tk_ha_load(i64 base, i64 ety, i64 idx) {
 // store builds, marked for teko_rc.tk's own pass to pick between `rt_store`/
 // `rt_store_own` when the element is counted -- zero new machinery there.
 i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v) {
+    // `ops[i] = e` on an `Op[]`: the one validator every slot of delegate type
+    // shares (`tk_deleg_coerce`, teko_deleg.tk), asked HERE rather than in
+    // `tk_ha_index` below, because this is the point BOTH element stores pass
+    // through -- a local array's, built by the parser, and a global array's,
+    // built by `tk_array_resolve_write` (teko_array.tk), which coerced nothing
+    // at all. A value nothing in reach of the store can name waits for
+    // `tk_deleg_pass` instead of being guessed to be a function (D51, third
+    // pass).
+    i64 dsi = tk_deleg_row(ety);
+    i64 late = tk_deleg_store_late(dsi, v);
+    if (dsi >= 0 && !late) v = tk_deleg_coerce(dsi, v, tk_line, tk_file);
     tk_check_field_store(ety, v, tk_line, tk_file);
     // Q1b: `ns[0] = 5;` on an `i64?[]` writes the box, the same wrap every
     // other store slot of the language takes. The scalar verdict is asked
@@ -232,7 +243,9 @@ i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v) {
         tk_check_scalar_compat(ety, vty, v, tk_line, tk_file);
         v = tk_nl_wrap(ety, vty, tk_num_widen(ety, vty, v));
     }
-    return tk_os_mark(tk_call2(tk_stn(ety), tk_ha_addr(base, idx, ety), v), ety);
+    i64 st = tk_os_mark(tk_call2(tk_stn(ety), tk_ha_addr(base, idx, ety), v), ety);
+    if (late) tk_deleg_store_defer(st, dsi, tk_line, tk_file);
+    return st;
 }
 
 // `xs[i] OP= e` / `xs[i]++` / `xs[i]--`: the address is built twice (once to
@@ -278,12 +291,11 @@ i64 tk_ha_index(i64 left, i64 si) {
         i64 v = parse_expr(0);
         tk_line = line;
         tk_file = fl;
-        i64 dsi = tk_deleg_row(ety);               // `ops[i] = add;`: the same coercion a
-        if (dsi >= 0) {                                        // delegate LOCAL/field takes (K1)
-            if (tk_lam_escapes(v))                              // D221/§41 K4b
-                err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
-            v = tk_deleg_coerce(dsi, v, line, fl);
-        }
+        // D221/§41 K4b -- a syntactic verdict over the lambda as it was
+        // written, so it stays at the site that reads it; the coercion itself
+        // belongs to `tk_ha_store` above, which every element store shares
+        if (tk_deleg_row(ety) >= 0 && tk_lam_escapes(v))
+            err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
         return tk_ha_store(left, ety, idx, v);
     }
     if (p_id() == tk_pluseq_tok || p_id() == tk_minuseq_tok) {
