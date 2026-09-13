@@ -482,12 +482,12 @@ DateTime f(i64 x) { return new DateTime(1, x | 1); }
                     // teko: a value of type i64 does not convert to DateTimeKind
 ```
 
-**...and the operator is judged AFTER the pick, not before it.** The walk that claims an
-operator runs three passes ahead of the overload mangling, so a call under the operator is
-typed there by the FIRST declaration of its name; in this position the operator is judged a
-second time, over the types the pick left behind, and an enum takes no integer operand
-(D48, the sixth review pass on
-[#697](https://github.com/teko-org/teko-lang/pull/697)):
+**...and the operator is judged on the PICK, wherever it is written.** The type of a call
+to an overloaded name is the return type of the signature its own arguments choose, and the
+oracle every pass asks answers that and not the first declaration of the name (D49, the
+seventh review pass on [#697](https://github.com/teko-org/teko-lang/pull/697)). An enum
+takes no integer operand ([enum.md](../specs/enum.md) § 4), so this is refused in a
+primitive row's argument and outside one alike:
 
 ```teko
 // no-run
@@ -499,18 +499,21 @@ DateTimeKind pick(i64 a) { return DateTimeKind.Utc; }
 i64 main() {
     DateTime d = new DateTime(1, pick(1) + 1);
     // teko: no operator `+` takes these operands
+    DateTimeKind k = pick(1) + 1;
+    // teko: no operator `+` takes these operands
     return 0;
 }
 ```
 
-The same refusal covers `pick(1) - 1`, `pick(1) * 2`, `1 + pick(1)` and the unary
-`-pick(1)`; all five used to compile and reach the run-time kind guard. `pick(1) |
-DateTimeKind.Utc` in that same program is refused too, and there the refusal is the one the
-operator pass itself raises on the guessed type — a row of [not-yet.md](not-yet.md), since
-declaring the enum overload first accepts it. A PRIMITIVE the guess hid is not refused but
-lowered to its own row: `TimeSpan.FromTicks(2).CompareTo(dpick(3) - epick(1))` on two
-`DateTime`-returning overloads subtracts through `lib/time.tk` — `Kind` bits masked,
-overflow checked — where the core's raw `-` carried the two top bits into the `TimeSpan`.
+The same refusal covers `pick(1) - 1`, `pick(1) * 2`, `1 + pick(1)`, the unary `-pick(1)`
+and the unary `+pick(1)` — `+` is the identity over a number and the identity over nothing
+else, so an enum operand refuses it where an `i64` one erases it. `pick(1) |
+DateTimeKind.Utc`, which a bitwise operator over an enum makes LEGAL, is accepted in that
+same program: it is the enum the pick answers on both sides, in either declaration order.
+A PRIMITIVE the first declaration hid is lowered to its own row rather than run raw:
+`TimeSpan.FromTicks(2).CompareTo(dpick(3) - epick(1))` on two `DateTime`-returning overloads
+subtracts through `lib/time.tk` — `Kind` bits masked, overflow checked — where the core's
+raw `-` carried the two top bits into the `TimeSpan`.
 
 A GLOBAL is accepted wherever its declaration says the enum: `DateTimeKind g =
 DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function is the

@@ -1,0 +1,100 @@
+// surface_overload_ops.tk -- an overloaded call UNDER an operator, a ternary
+// arm, a `??` and an enum's own bitwise operator (D49). What every line here
+// has in common is that the type of the call is the PICKED signature's return
+// type, never the first declaration of the name: each family below is declared
+// with the overload the site chooses SECOND, so a compiler that reads
+// `decl_find` answers the other one and gets the line wrong.
+//
+// Measured on `9784ad80`, the commit before the fix, in this same file's own
+// shapes:
+//
+//   TimeSpan.FromHours(gpick(1) + 1)   built 1h where it is 2.5h -- the `1` was
+//                                      not promoted, because the binary read an
+//                                      `i64` return
+//   i64 r = 2 + rpick(1)               `teko: no operator `+` takes these
+//                                      operands` -- an enum that is not there
+//   c ? tpick2(2, 3) : 9               `teko: the two arms of ?: have different
+//                                      types`
+//   npick(1) ?? d                      `teko: ?? needs a nullable on the left`
+//   bpick(1) | DateTimeKind.Unspecified  ``teko: no operator `|` takes these
+//                                      operands``, the row docs/reference/
+//                                      not-yet.md carried
+//
+// The refusals this closes in the other direction -- `DateTimeKind k =
+// bpick(1) + 1;` and `+bpick(1)`, both of which COMPILED on that commit -- have
+// no harness (D33) and are in docs/reference/diagnostics.md.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+// every family declares the overload the sites below pick SECOND...
+i64 gpick(i64 a, i64 b) { return 1; }
+f64 gpick(i64 a) { return 1.5; }
+
+i64 hpick(i64 a) { return 1; }
+f64 hpick(i64 a, i64 b) { return 2.5; }
+
+DateTimeKind rpick(i64 a, i64 b) { return DateTimeKind.Utc; }
+i64 rpick(i64 a) { return 40; }
+
+DateTimeKind tpick2(i64 a) { return DateTimeKind.Utc; }
+i64 tpick2(i64 a, i64 b) { return 5; }
+
+i64 npick(i64 a, i64 b) { return 3; }
+i64? npick(i64 a) { return 8; }
+
+i64 bpick(i64 a, i64 b) { return 3; }
+DateTimeKind bpick(i64 a) { return DateTimeKind.Utc; }
+
+// ...and this one declares it FIRST, so the two orders are both here and both
+// answer the same
+DateTimeKind cpick(i64 a) { return DateTimeKind.Local; }
+i64 cpick(i64 a, i64 b) { return 3; }
+
+i64 main() {
+    // ---- a float pick under a binary: the integer side is promoted, and the
+    // VALUE is what proves it (C# §12.4.7, teko_ops.tk's `tk_ops_promote`) ----
+    if (TimeSpan.FromHours(gpick(1) + 1).Ticks != 90000000000) return 1;      // 2.5h
+    if (TimeSpan.FromHours(hpick(1, 2) + 1).Ticks != 126000000000) return 2;  // 3.5h
+    f64 v = gpick(1) + 2;
+    if (TimeSpan.FromHours(v).Ticks != 126000000000) return 3;                // 3.5h
+
+    // ---- an integer pick under a binary, outside any argument: accepted, and
+    // with no cast the value would not survive ----
+    i64 r = 2 + rpick(1);
+    if (r != 42) return 4;
+    i64 r2 = rpick(1) + 2;
+    if (r2 != 42) return 5;
+
+    // ---- a ternary arm that is an overloaded call ----
+    i64 c = 1;
+    i64 t = c == 1 ? tpick2(2, 3) : 9;
+    if (t != 5) return 6;
+    i64 t2 = c == 0 ? 9 : tpick2(2, 3);
+    if (t2 != 5) return 7;
+
+    // ---- `??` over a call that returns `T?` ----
+    i64 d = 99;
+    if ((npick(1) ?? d) != 8) return 8;
+    if ((npick(1, 2) + 1) != 4) return 9;
+
+    // ---- a bitwise operator over the enum a pick answers (docs/specs/enum.md
+    // § 4), in both declaration orders ----
+    if ((bpick(1) | DateTimeKind.Unspecified) != DateTimeKind.Utc) return 10;
+    if ((cpick(1) | DateTimeKind.Unspecified) != DateTimeKind.Local) return 11;
+    if ((bpick(1) & DateTimeKind.Utc) != DateTimeKind.Utc) return 12;
+
+    // ...and the same operator inside a primitive row's own argument, which is
+    // where the deferred check reads it (D48)
+    DateTime dt = new DateTime(7, bpick(1) | DateTimeKind.Unspecified);
+    if (dt.Kind != DateTimeKind.Utc) return 13;
+    if (dt.Ticks != 7) return 14;
+
+    // ---- and the bare pick in its own slot, both orders ----
+    DateTimeKind k = bpick(1);
+    if (k != DateTimeKind.Utc) return 15;
+    DateTimeKind k2 = cpick(1);
+    if (k2 != DateTimeKind.Local) return 16;
+    return 42;
+}
