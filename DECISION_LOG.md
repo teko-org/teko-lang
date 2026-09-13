@@ -1929,10 +1929,9 @@ six that `#include "../lib/time.tk"`, and their diffs are two facts and nothing 
 constructor's kind argument gains the `CAST type=i64` back down.
 
 **Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config
-mc.macos.toml` clean; **60/60** fixtures at their `expect-exit`; `--dump-ast` as above;
-`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (60/60 under the
-self-hosted `teko1`); `sh scripts/check-docs.sh` green (562 links, samples and diagnostics
-included). `mc limits` verdict `ok` throughout — on the compiler's own floor (the
+mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` as above;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (61/61 under the
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (564 links, 379 diagnostics, 112 samples). `mc limits` verdict `ok` throughout — on the compiler's own floor (the
 `tests/hello.tk` leg) `alias` **19 → 18** (the deleted `type_alias`) with `syntax` 15,
 `types` 11, `passes` 15/30 and `intrin` 8/16 all unmoved; on a program that includes
 `lib/time.tk` (the `tests/surface_datetime.tk` leg) `types` **13 → 14** and `syntax`

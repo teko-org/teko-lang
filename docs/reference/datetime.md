@@ -121,8 +121,9 @@ you mean it — an explicit cast into an enum is C#'s own, and the constructor's
 check still panics on it.
 
 Because the type is declared by the library file and not by the compiler, it needs
-`#include "time.tk"` like everything else `lib/time.tk` carries; without it the name is an
-ordinary unknown identifier.
+`#include "time.tk"` like everything else `lib/time.tk` carries; without it `DateTimeKind.Utc`
+is refused as `teko: unknown member: Utc`, and a declaration such as `DateTimeKind k;` reaches
+the core's own `expected ; after expression` ([diagnostics](diagnostics.md)).
 
 The arithmetic **keeps** the `Kind` of the value it started from; the comparisons
 **ignore** it. Two dates of different `Kind` and equal ticks are equal, which is C#'s own

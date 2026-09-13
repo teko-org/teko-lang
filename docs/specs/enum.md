@@ -1,6 +1,7 @@
 # `enum`
 
-**Designed, not built.** Nothing on this page compiles today; every sample carries
+**Designed, partly built.** The sections marked **landed** run today, from the fixtures
+under `tests/`; the rest does not compile yet, and every sample on this page carries
 `// no-run` for that reason. What runs is [the type reference](../reference/types.md), and
 this page is kept apart from it on purpose ([the specs index](README.md)).
 
@@ -363,6 +364,7 @@ An `enum` costs a program exactly what a `class` costs it — one `type_new` and
 | `tests/surface_enum_text.tk` | `ToString` on a member, on an aliased value and on a value cast in from outside the set (default and narrow underlying, including a negative member); `Parse`/`TryParse` round-trip over the same, including a negative member's sign-extended `out` write; `IsDefined` | `50` |
 | `tests/surface_enum_parse_panic.tk` | `Color.Parse("Nope")` | `70` |
 
+| `tests/surface_datetime_kind_panic.tk` | N2c: `new DateTime(t, (DateTimeKind) 7)` — the explicit cast is the one road left to an out-of-range `Kind`, and the constructor's own guard still panics on it | `70` |
 | `tests/surface_datetime_kind.tk` | N2c: `DateTimeKind k = d.Kind;`; the three members as `switch` labels; both explicit casts; `new DateTime(t, k)` from a variable and from another date's own `.Kind`; `.ToString()` on a member, a property and a value outside the set; `Parse`/`TryParse`/`IsDefined`; a ternary over two enum arms; a by-value capture | `42` |
 
 The refusals of § 3 have no harness (D33's own note) and are documented with a `// no-run`
@@ -406,7 +408,7 @@ types.md.
 `lib/time.tk` it was not: see § 8 for the three additions `teko_prim.tk` took.
 
 **Gate met:** `tests/surface_datetime.tk` byte-identical and still at `42`;
-`tests/surface_datetime_kind.tk` added at `42`; 60/60 fixtures; `mc limits` `alias`
+`tests/surface_datetime_kind.tk` added at `42`; 61/61 fixtures; `mc limits` `alias`
 19 → **18** on the compiler's own floor, `types`/`passes`/`intrin` unmoved.
 
 ## 13. Risks and law tensions

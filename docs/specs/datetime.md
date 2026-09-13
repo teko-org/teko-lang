@@ -419,7 +419,7 @@ them, `FIXPOINT OK`, `mc limits` verdict `ok` with `passes` and `intrin` **not m
 
 ### C2 — `DateTime` (L)
 
-The second `type_new`, the `DateTimeKind` alias (an `enum` since N2c), the calendar, the components, the `Add*`
+The second `type_new`, the `DateTimeKind` enum (an alias until N2c), the calendar, the components, the `Add*`
 family, the operators mixing the two types, `"o"`/`"s"` in both directions, and the
 `Now`/`UtcNow`/`Today` refusal.
 

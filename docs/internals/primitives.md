@@ -147,9 +147,11 @@ the registration alone, macOS/aarch64, `mc` 0.15.23.
 | `TK_MAXPRIMM` | 96 | member rows, over every primitive |
 | `TK_MAXPRIMO` | 32 | operator rows, over every primitive |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
+| `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
+| `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
 
 `TimeSpan` uses 1, 30 and 12 of the first three; `DateTime` brings the totals to 2, 66 and
-22. The fourth is per compilation unit and not per registration: it grows with how much
+22, with 41 parameter positions and one late type (`DateTimeKind`). The fourth is per compilation unit and not per registration: it grows with how much
 date arithmetic one program writes, roughly two entries per member access, and a unit past
 it is `teko: too many casts over a primitive in one unit`.
 
