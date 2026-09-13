@@ -1,0 +1,157 @@
+// surface_globals.tk -- a GLOBAL, on the five oracle sites that only ever
+// asked the pass-time SCOPE (`tk_ty_scope_find`, teko_typeof.tk) and never
+// fell back to `tk_ty_global` (teko_array.tk) once that scope answered -1: a
+// global is not "not known here", it is in scope in every body, exactly as
+// D48 already made true for a bare `N_IDENT` read (D51).
+//
+// What each helper proves, in order:
+//
+//   1. `refoutcheck`   -- `ref`/`out` over a scalar global, `i64` and `f64`:
+//      the dedicated pointee check (`tk_ref_arg_pointee`, teko_ref.tk) used
+//      to answer "not known" for a global and skip its own identity check in
+//      silence -- the same gap the fallback here closes, over the SAME table
+//      `tk_ty_global` reads (a global not resolvable through it is a probe:
+//      `ref f64` given an `i64` global refuses `teko: a value of type i64
+//      does not convert to f64`, the wording a local of the wrong type
+//      already gets).
+//   2. `overloadcheck` -- two overloads that differ only by the pointee of a
+//      `ref` parameter, resolved by a GLOBAL argument (`teko_over.tk`'s own
+//      `tk_ov_arg_ty`): before this crumb, `pick(ref g_f)` refused `teko:
+//      the type of argument 1 of pick is not known here`, a legal call with
+//      no ambiguity at all.
+//   3. `delegcheck`    -- a GLOBAL of delegate type: assigned a plain
+//      function name, called; reassigned a lambda literal, called; and
+//      called from INSIDE another function (`useOp`), which is what exposed
+//      the sharpest form of the gap -- `teko_deleg.tk`'s own dispatch fell
+//      through to a bare `N_CALL` of a name nothing declares, `unknown name`
+//      from the core, never a `teko: ...` refusal (D20's own rule).
+//   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
+//      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
+//      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
+//      mismatched element was already caught downstream by
+//      `tk_rc_call_args`, so widening it to `tk_ty_global` changes no
+//      observed message, only which pass answers first).
+//   5. `regressioncheck` -- an enum global (D48) and `T?` over a reference
+//      global (D48) still read correctly: neither of those two sites is
+//      `tk_ty_scope_find`, and this crumb does not touch them, so this is a
+//      regression check, not new coverage.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 g_i = 7;
+f64 g_f = 1.5;
+
+// ---- 1. `ref`/`out` over a scalar global ----
+
+void bumpi(ref i64 x) { x = x + 1; }
+void bumpf(ref f64 x) { x = x + 1.0; }
+void outi(out i64 x) { x = 99; }
+void outf(out f64 x) { x = 9.5; }
+
+i64 refoutcheck() {
+    bumpi(ref g_i);
+    if (g_i != 8) return 1;
+    bumpf(ref g_f);
+    if (g_f != 2.5) return 2;
+    outi(out g_i);
+    if (g_i != 99) return 3;
+    outf(out g_f);
+    if (g_f != 9.5) return 4;
+    return 0;
+}
+
+// ---- 2. overload resolution over a `ref` global ----
+
+i64 pick(ref f64 x) { return 1; }
+i64 pick(ref i64 x) { return 2; }
+
+i64 overloadcheck() {
+    if (pick(ref g_f) != 1) return 1;
+    if (pick(ref g_i) != 2) return 2;
+    return 0;
+}
+
+// ---- 3. a delegate-typed global ----
+
+delegate i64 Op(i64 a);
+
+i64 addOne(i64 a) { return a + 1; }
+
+Op g_op;
+
+i64 useOp(i64 v) { return g_op(v); }             // called from INSIDE another function
+
+i64 delegcheck() {
+    g_op = addOne;                                // a plain function name
+    if (g_op(10) != 11) return 1;
+    if (useOp(20) != 21) return 2;
+
+    g_op = new Op((i64 x) => x * 2);              // reassigned to a lambda
+    if (g_op(10) != 20) return 3;
+    if (useOp(5) != 10) return 4;
+
+    return 0;
+}
+
+// ---- 4. `params` over a global scalar element ----
+
+i64 sumall(params i64[] xs) {
+    i64 t = 0;
+    i64 i = 0;
+    loop {
+        if (i >= xs.Length) break;
+        t = t + xs[i];
+        i = i + 1;
+    }
+    return t;
+}
+
+i64 paramscheck() {
+    g_i = 5;
+    if (sumall(1, g_i, 2) != 8) return 1;
+    return 0;
+}
+
+// ---- 5. regression: an enum global and `T?` over a reference global (D48) ----
+
+enum Color { Red, Green, Blue }
+Color g_color = Color.Blue;
+
+class Cell {
+    public i64 v;
+    public Cell(i64 x) { v = x; }
+}
+
+Cell? g_cell;
+
+i64 regressioncheck() {
+    if (g_color != Color.Blue) return 1;
+    if (g_cell.HasValue) return 2;
+    g_cell = new Cell(3);
+    if (!g_cell.HasValue) return 3;
+    Cell got = g_cell.Value;
+    if (got.v != 3) return 4;
+    g_cell = null;                                // written back through the slot
+    return 0;
+}
+
+i64 main() {
+    i64 bad = refoutcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = overloadcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = delegcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = paramscheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = regressioncheck();
+    if (bad != 0) return 50 + bad;
+
+    return 42;
+}
