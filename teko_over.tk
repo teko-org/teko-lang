@@ -330,21 +330,31 @@ void tk_ov_scan() {
 // the operator pass, the ternary, `??`/`?.`, a primitive row's argument, an
 // initializer -- runs BEFORE this pass. So the two sweeps that make the
 // question answerable are pulled up to the front of `tk_typeof_pass` (pass 6
-// of 15), which is ahead of all of them, and this pass asks for them again and
-// gets the same table: the flag makes the second call the no-op it must be,
-// since collecting twice would double every row.
+// of 15), which is ahead of all of them, and this pass asks for them again.
 //
-// What moves with them is `tk_ov_scan`'s three refusals -- an overloaded
-// `main`, an overloaded `extern`, two overloads differing only by `ref`/`out`
-// -- which are now raised at pass 6 instead of pass 14, with the same message
-// at the same line. That is the whole cost, and it is one a declaration-level
-// refusal can pay: it depends on nothing any pass in between writes.
-i64 tk_ov_ready = 0;
+// The declaration table is REBUILT on every call, because the unit grows after
+// pass 6: `tk_params_pass` (pass 12) emits the allocator, release and element
+// store of a `T[]` row a call site is the first to build, and a probe over the
+// fixtures measured `tests/surface_params.tk` at 84 declarations when the
+// oracle asks and 94 when this pass runs. Rebuilding costs one sweep of the
+// top-level list and makes the table at pass 14 exactly the table it was
+// before the oracle ever asked -- so what a call site picks does not depend on
+// whether anything asked earlier.
+//
+// The SCAN is what runs once, since its three refusals -- an overloaded `main`,
+// an overloaded `extern`, two overloads differing only by `ref`/`out` -- would
+// otherwise be raised twice, and it now raises them at pass 6 instead of pass
+// 14, with the same message at the same line. That is the whole cost of the
+// move, and it is one a declaration-level refusal can pay: it depends on
+// nothing any pass in between writes, and a declaration a later pass emits is
+// a compiler symbol of its own, never an overload of a name the source wrote.
+i64 tk_ov_scanned = 0;
 
 void tk_ov_prepare(i64 root) {
-    if (tk_ov_ready) return;
-    tk_ov_ready = 1;
+    tk_nodecl = 0;
     tk_ov_collect(root);
+    if (tk_ov_scanned) return;
+    tk_ov_scanned = 1;
     tk_ov_scan();
 }
 
@@ -762,7 +772,7 @@ void tk_ov_check_left() {
 // single node is read, let alone moved: the table is this module's own memory,
 // and the tree goes back exactly as it came.
 i64 tk_over_pass(i64 root) {
-    tk_ov_prepare(root);                 // already done at pass 6, unless the oracle never ran
+    tk_ov_prepare(root);                 // the table as the unit stands NOW; scanned once, at pass 6
     if (tk_nover > 0) {
         tk_ov_rename();
         tk_ty_pass_walk(root, &tk_ov_visit);
