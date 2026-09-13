@@ -32,7 +32,21 @@ function) pair.
 
 `Op g;` at top level is a **global** slot, and every form above works on it exactly as it
 does on a local: `g = add;`, `g = new Op(mul);`, and `g(3, 4)` from any function of the
-unit, the declaring one included (D51).
+unit, the declaring one included (D51). It reads the same on the RIGHT of every slot that
+takes a delegate — `h = g;`, `f(g)`, `return g;`, `Op m = g;` — where a *function's* name is
+wrapped in a thunk and a delegate value is passed as it is. A global of any other type on
+such a slot is the ordinary mismatch:
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+i64 n = 1;
+i64 main() {
+    Op h;
+    h = n;                          // teko: Op takes a function, another Op, or null
+    return h(1);
+}
+```
 
 ## Calling
 

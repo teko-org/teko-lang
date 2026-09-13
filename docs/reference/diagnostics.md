@@ -854,6 +854,13 @@ i64 main() {
     return 0;
 }
 ```
+
+A local of the same name wins over the global, as it does everywhere. The one pointee still
+read as "not known here", and refusing nothing, is a name TWO SIBLING BLOCKS of one function
+declare under two different types: it IS a local there, only not one single type, and the
+global is not what such a site means either — `if (c) { f64 g = 2.0; bump(ref g); }` beside
+another block's `i64 g` passes, global `g` or no global `g`.
+
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps
   the C symbol.

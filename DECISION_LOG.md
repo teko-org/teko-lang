@@ -2592,34 +2592,85 @@ the same wording, `teko: a value of type f64 does not convert to i64`, because
 through `tk_ty_of`'s pre-existing (D48) fallback, before this pass's own element check ever
 ran. The widen changes which pass answers first, not what is answered -- a global `T[]` of
 heap was never the only global `params` could see; it was the only one anything downstream
-had not already caught.
+had not already caught. (Item 3 of the Copilot pass below goes further: the table this site
+read BEFORE reaching any global was the wrong one too.)
 
-**Ten other `tk_ty_scope_find` call sites are untouched.** `teko_ns.tk`'s own guard in the
+**Nine other `tk_ty_scope_find` call sites are untouched.** `teko_ns.tk`'s own guard in the
 mangling pass (twice), `teko_this.tk`'s five "is this a local or a parameter?" guards, the
 guard `teko_over.tk`'s own member-access fallback takes before the field/`this` search, and
-the two "is this NOT a local?" wrap guards in `teko_deleg.tk` (`tk_deleg_coerce`'s own bare-
-name-to-thunk wrap and one more): each asks "is this a local?" only to fall through to a
-DIFFERENT table on a `no` -- a field, `this`, a plain function name to wrap -- and a global
-answering there would be the wrong table's own name to answer instead of the right one's.
+`teko_deleg.tk`'s own `tk_lam_check_name`: each asks "is this a local?" only to fall through
+to a DIFFERENT table on a `no` -- a field, `this`, a capture, a function name, a type -- and
+a global answering there would be the wrong table's own name to answer instead of the right
+one's. `tk_lam_check_name` is the sharpest of them: a global is exactly what it defers to
+`tk_lg_add`, the one point a global's own row is knowable.
+
+**Copilot finding, pass 1: the wrap guard was NOT one of them, the new fallback erased an
+answer, and the `params` oracle was the wrong table to begin with.** Three sites, each
+measured on its own probe before and after, `mc` 0.15.23:
+
+1. `tk_deleg_coerce`'s own bare-name-to-thunk wrap (teko_deleg.tk) was filed above as a
+   guard that must NOT see a global. It must: the table it falls through to on a `no` is
+   "the name of a FUNCTION to wrap", and a delegate-typed GLOBAL on the right of a slot is
+   not one. `Op h; h = g_op;`, `takeOp(g_op)`, `return g_op;` and `Op m = g_op;` all wrapped
+   a function nothing declares -- `teko: unknown function: g_op` on a program with no error
+   in it, on the base (`da33ebd4`) exactly as on this crumb's first round. It reads
+   `tk_ty_scope_or_global` now, like every dispatch point around it. A free function's own
+   name is in NO slot table, global or local, so it still answers -1 and is still wrapped
+   (probe: assignment, argument, `return` and initializer over a plain function, all
+   unchanged); a global of some OTHER type on a delegate slot now gets the delegate's own
+   mismatch, `teko: Op takes a function, another Op, or null`, where it used to get the
+   misleading `unknown function`.
+2. `tk_ref_arg_pointee`'s new fallback was UNCONDITIONAL, and that erased a deliberate
+   answer. `tk_ref_local_ty` returns -1 for two different things: "the body declares no such
+   local", and "two sibling blocks declare it under two types" (`tk_ref_lamb`) -- the second
+   is not "no local", it is "not one type", and reading the global there types a slot the
+   site never meant. A global `i64 g` beside `if (c) { f64 g = 2.0; bumpf(ref g); }` refused
+   the legal call, `teko: a value of type i64 does not convert to f64`: a REGRESSION this
+   crumb's own first round introduced (the base compiles and runs it). The two answers are
+   kept apart now, and only "no such local" falls through to the global.
+3. `tk_pm_arg_ty` (teko_params.tk) read `tk_slv_find_unit`, a UNIT-WIDE most-recent-wins
+   table: a local of the same name in ANOTHER function answered for this one. `i64 g = 3;`
+   with an `f64 g` declared last in some unrelated body refused `sum(1, g, 2)` over
+   `params i64[]` with `teko: a value of type f64 does not convert to i64` -- a legal program,
+   refused on the base too, so pre-existing rather than this crumb's, and the wrong oracle
+   either way. The declaration being walked is known right there, so it is recorded
+   (`tk_pm_cur_fn`, set by `tk_pm_params_of`) and the name is read under the function that
+   owns it.
+
+2 and 3 are one rule, so they are one piece of code: `tk_local_ty_in(fn, name)` (the body of
+the former `tk_ref_local_ty`, taking its function as an argument) and
+`tk_local_or_global_in(fn, name)` (that, then `tk_ty_global`, and -1 rather than a global on
+an ambiguity), both teko_ref.tk, which teko_params.tk reads as well -- teko_ref.tk is
+included ahead of it. `tk_ref_local_ty` is gone, its one caller rewritten.
+`tk_slv_find_unit` (teko_struct.tk) keeps its declaration with no caller left in the tree;
+deleting it belongs to the next crumb that opens that module. The comment over
+`tk_ref_check_pointee` is corrected too: a global IS named now, and the only pointee left
+unnamed is the ambiguous local.
 
 Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
-clean; **63/63** fixtures at their `expect-exit` (`tests/surface_globals.tk`, exit 42, five
+clean; **63/63** fixtures at their `expect-exit` (`tests/surface_globals.tk`, exit 42, six
 sections: `ref`/`out` over a scalar global, an overload picked by a `ref` global, a
-delegate-typed global called both as a plain function and a lambda and from inside another
-function, `params` over a global scalar element, and a regression check over an enum global
-and `T?` over a reference global, D48's own two sites, untouched by this crumb);
-`--dump-ast` of the 62 fixtures that existed before, byte-identical to `da33ebd4`;
+delegate-typed global called as a plain function, as a lambda, from inside another function
+and read on the RIGHT of an assignment, an argument, a `return` and an initializer, `params`
+over a global scalar element the last declaration of that name in the unit masks from
+another body, a regression check over an enum global and `T?` over a reference global (D48's
+own two sites, untouched by this crumb), and a `ref f64` over the `f64` one of two sibling
+blocks that shadow an `i64` global -- the pass-head build refuses that last one, the base
+refuses the delegate one); `--dump-ast` of the 62 fixtures that existed before,
+byte-identical to `da33ebd4`;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (63/63 under the
 self-hosted `teko1`; the compiler's own sources declare no `ref`/`out`/delegate/`params`
 over a global, so the ladder proves the fix is inert on itself, not that it is exercised by
-it); `sh scripts/check-docs.sh` green (568 links, 385 diagnostics, 118 samples -- one new
-`// no-run` sample, the `ref f64` global mismatch, in
-[diagnostics.md](docs/reference/diagnostics.md)); `mc limits . --config mc.macos.toml`
+it); `sh scripts/check-docs.sh` green (568 links, 385 diagnostics, 119 samples -- two new
+`// no-run` samples: the `ref f64` global mismatch in
+[diagnostics.md](docs/reference/diagnostics.md), whose paragraph also states the one pointee
+still read as unnamed, and a global of a non-delegate type on a delegate slot in
+[delegates.md](docs/reference/delegates.md)); `mc limits . --config mc.macos.toml`
 verdict `ok` on both legs, measured back-to-back against `da33ebd4` under the identical
-command: the compiler-build leg's `nodes`/`strings`/`ins`/`symbols`/`heap` move by this
-crumb's own small source growth (heap 91598640 -> 92272832 of a 216793088/218103808
-ceiling), the `tests/hello.tk` leg's structural counts (`rules` through `intrin`) are BYTE
-IDENTICAL and only its own `heap` estimate moves (467824 -> 1114992 of a 33554432 ceiling,
-3.3%) -- D35's own precedent: the estimator is `mc`'s own and moves on its own account, and
-every table stays comfortably `ok`. `mc pkg hash .`:
-`20b55114d71b3d697136e60eedcffb6cce1902455a465043419addf02cde74b2`.
+command: the compiler-build leg's `nodes`/`funcs`/`strings`/`ins`/`symbols`/`heap` move by
+this crumb's own small source growth (used heap 91606832 -> 92324032 of a
+203096064/218234880 reserve), the `tests/hello.tk` leg's structural counts (`tokens` through
+`intrin`) are BYTE IDENTICAL and only its own `heap` moves (476016 -> 1114992 of a 33554432
+ceiling, 3.3%) -- D35's own precedent: the estimator is `mc`'s own and moves on its own
+account, and every table stays comfortably `ok`. `mc pkg hash .`:
+`9de962f08ba2783e376da38789e9f4f2cc87d9001a250ec7f8e9e753164a36eb`.
