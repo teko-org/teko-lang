@@ -838,6 +838,22 @@ Every one of these is [nullable.md](nullable.md)'s.
   type.
 - `"teko: not a local array"` — `ref a[i]` where `a` is not a local array.
 - ``"teko: two overloads differ only by `ref`/`out`"`` — a site could not tell them apart.
+
+A `ref`/`out` argument that names a GLOBAL is checked exactly as one naming a local: the
+pointee identity rule above (`tk_ref_check_pointee`, teko_ref.tk) reads a global's own
+declared type (`tk_ty_global`, teko_array.tk) once the argument is neither a parameter nor a
+local of the function being walked, so `ref f64` refuses an `i64` global with the same
+wording a local of the wrong type already gets (D51):
+
+```teko
+// no-run
+i64 g = 7;
+void bump(ref f64 x) { x = x + 1.0; }
+i64 main() {
+    bump(ref g);                    // teko: a value of type i64 does not convert to f64
+    return 0;
+}
+```
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps
   the C symbol.

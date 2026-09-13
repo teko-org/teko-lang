@@ -30,6 +30,10 @@ Anything else is `teko: Op takes a function, another Op, or null`, and a functio
 signature does not match is refused by name. The thunk is generated once per (delegate,
 function) pair.
 
+`Op g;` at top level is a **global** slot, and every form above works on it exactly as it
+does on a local: `g = add;`, `g = new Op(mul);`, and `g(3, 4)` from any function of the
+unit, the declaring one included (D51).
+
 ## Calling
 
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
