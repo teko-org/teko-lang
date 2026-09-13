@@ -184,12 +184,13 @@ struct, an element of a fixed array or of a `T[]`, a `ref`/`out` pointee, a gene
 argument. It is never reference counted, because there is no object to count
 ([memory.md](memory.md)).
 
-Two places the type is not known are the two every scalar shares, and
-[not-yet.md](not-yet.md) carries both: a **global** as the receiver of a `.`
-(`teko: unknown member: Days`) and an **array element** as an operand: beside a typed
-operand (`xs[i] + t`) it is refused, ``teko: the type of the left side of `+` is not known
-here``; with array elements on both sides (`xs[i] + xs[j]`) the core's own `+` runs on the
-raw ticks, right in value and without the overflow check. Bind either one to a local first.
+A **global** is a receiver like any other — `g.Days`, `g.Negate()`, `g.CompareTo(t)` —
+since the oracle answers a global by its declaration (D48); the fixture reads one. The one
+place the type is still not known is an **array element** as an operand, which
+[not-yet.md](not-yet.md) carries: beside a typed operand (`xs[i] + t`) it is refused,
+``teko: the type of the left side of `+` is not known here``; with array elements on both
+sides (`xs[i] + xs[j]`) the core's own `+` runs on the raw ticks, right in value and
+without the overflow check. Bind those to locals first.
 
 ## Under the hood
 

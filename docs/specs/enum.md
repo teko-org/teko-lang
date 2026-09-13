@@ -408,8 +408,10 @@ types.md.
 `lib/time.tk` it was not: see § 8 for the three additions `teko_prim.tk` took.
 
 **Gate met:** `tests/surface_datetime.tk` byte-identical and still at `42`;
-`tests/surface_datetime_kind.tk` added at `42`; 61/61 fixtures; `mc limits` `alias`
-19 → **18** on the compiler's own floor, `types`/`passes`/`intrin` unmoved.
+`tests/surface_datetime_kind.tk` added at `42` and `tests/surface_datetime_kind_panic.tk`
+at `70` (the run-time kind guard `(DateTimeKind) 7` still reaches); 61/61 fixtures;
+`mc limits` `alias` 19 → **18** on the compiler's own floor, `types`/`passes`/`intrin`
+unmoved.
 
 ## 13. Risks and law tensions
 

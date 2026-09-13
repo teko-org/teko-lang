@@ -275,13 +275,36 @@ void tk_gs_add(uptr name, i64 ty) {
     tk_ngs = tk_ngs + 1;
 }
 
+// ...and the one type a global SLOT may not be declared: a `T?` over a VALUE.
+// That type promises a counted box, and the box is built by the rc pass out of
+// the SCOPE a local lives in (`tk_rc_var`/`tk_rc_assign`, teko_rc.tk, both of
+// which return at once for a name no scope holds) -- so `i64? n; n = 5;` put
+// the bare 5 in the slot. It was a silent hole while the oracle answered -1
+// for a global and every member read fell through to `teko: unknown member:
+// Value`; once the oracle above tells the truth about the declaration, the
+// same read becomes a load through the integer 5. The declaration is what is
+// wrong, so the declaration is what is refused (Copilot on #697, fourth pass).
+//
+// A `T?` over a REFERENCE is NOT this: its handle IS the pointer and nothing
+// is boxed, so `Cell? c;` at the top of a file is read, written, `.Value`d and
+// `??`d exactly as a local is -- measured, and covered by the fixture.
+void tk_gs_check(i64 n) {
+    i64 ti = tk_struct_by_ty(nd_type(n));
+    if (!tk_is_nl(ti)) return;
+    if (!tk_nl_boxes(nl_of_at(ti))) return;
+    err_at2(nd_file(n), nd_line(n), "teko: a global does not hold a nullable box", nd_name(n));
+}
+
 void tk_hg_collect() {
     i64 n = 1;
     loop {
         if (n >= nnodes) break;
         if (nd_kind(n) == N_GLOBAL) {
             if (tk_is_ha(tk_struct_by_ty(nd_type(n)))) tk_hg_add(nd_name(n), nd_type(n));
-            if (nd_val(n) == 0) tk_gs_add(nd_name(n), nd_type(n));
+            if (nd_val(n) == 0) {
+                tk_gs_check(n);
+                tk_gs_add(nd_name(n), nd_type(n));
+            }
         }
         n = n + 1;
     }

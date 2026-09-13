@@ -273,9 +273,9 @@ struct, an element of a fixed array or of a `T[]`, a `ref`/`out` pointee, a gene
 argument. It is never reference counted, because there is no object to count
 ([memory.md](memory.md)).
 
-The two places the type is not known are the two every primitive shares, and
-[not-yet.md](not-yet.md) carries both: a **global** as the receiver of a `.` and an
-**array element** as an operand. Bind either one to a local first.
+A **global** is a receiver like any other since the oracle answers one by its
+declaration (D48). The place the type is still not known is an **array element** as an
+operand, which [not-yet.md](not-yet.md) carries: bind it to a local first.
 
 ## Under the hood
 

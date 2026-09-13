@@ -651,6 +651,13 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: a nullable of a nullable is not taught"` — `T??`, and `T[]??`.
 - `"teko: a raw pointer has no nullable"` — `uptr?`, `ptr?`, `str?`. `0` is an ordinary
   value of a raw pointer, and `null` already lands in one.
+- `"teko: a global does not hold a nullable box"` — completed by the global's own name: a
+  GLOBAL declared `T?` over a VALUE (`i64? n;` at the top of a file). The box that type
+  promises is built by the rc pass out of the SCOPE a local lives in, and a global has
+  none, so the slot would hold the bare value and every read through it would follow it as
+  a pointer. Declare the global `T` and a local `T?`, or keep the state in a class. A `T?`
+  over a REFERENCE is a global like any other — its handle IS the pointer — and is read,
+  written, `.Value`d and `??`d exactly as a local is (D48).
 - `"teko: void? is not a type"` — `void?`.
 - `"teko: a nullable is not a generic argument yet"` — `Box<Cell?>`. A type argument
   travels as a spelling and `Cell?` is not one the lexer can form.

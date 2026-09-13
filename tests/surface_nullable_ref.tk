@@ -314,6 +314,39 @@ i64 rccheck() {
     return 0;
 }
 
+// ---- a GLOBAL declared `T?` over a REFERENCE (D48) ----
+// The oracle answers a global by its declaration now (`tk_ty_global`,
+// teko_array.tk), so the handle is read as the row it is instead of falling
+// through to the by-name member search. Nothing else was needed: a reference
+// nullable's handle IS the pointer, so the global slot holds exactly what the
+// type promises -- which is why the VALUE side of `T?` is refused at the
+// declaration instead (`teko: a global does not hold a nullable box`,
+// docs/reference/diagnostics.md).
+Cell? g_cell;
+
+i64 globalcheck() {
+    if (g_cell.HasValue) return 1;                // an unassigned handle is null
+    if (g_cell != null) return 2;
+
+    g_cell = new Cell(7);
+    if (!g_cell.HasValue) return 3;
+    Cell got = g_cell.Value;
+    if (got.v != 7) return 4;
+    if (got.get() != 7) return 5;
+
+    Cell fell = g_cell ?? new Cell(1);             // the live arm
+    if (fell.v != 7) return 6;
+    i64 reached = g_cell?.get() ?? 0;
+    if (reached != 7) return 7;
+
+    g_cell = null;                                 // written back through the slot
+    if (g_cell.HasValue) return 8;
+    Cell other = g_cell ?? new Cell(1);            // ...and the fallback arm
+    if (other.v != 1) return 9;
+    if (g_cell?.get() != null) return 10;
+    return 0;
+}
+
 i64 main() {
     i64 bad = declcheck();
     if (bad != 0) return 10 + bad;
@@ -344,6 +377,9 @@ i64 main() {
 
     bad = rccheck();
     if (bad != 0) return 100 + bad;
+
+    bad = globalcheck();
+    if (bad != 0) return 110 + bad;
 
     return 42;
 }

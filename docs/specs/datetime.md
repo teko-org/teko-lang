@@ -352,7 +352,8 @@ The P0 crumb measures it on the heaviest fixture before C1 is written.
 fixtures under the `surface_*` family the repository uses — `tests/surface_timespan.tk`
 (42), `tests/surface_timespan_overflow.tk` (70), `tests/surface_datetime.tk` (42, 106
 assertions) and `tests/surface_datetime_panic.tk` (70) — and N2c added
-`tests/surface_datetime_kind.tk` (42) beside them (D41 § 6, D48). Read every
+`tests/surface_datetime_kind.tk` (42) and `tests/surface_datetime_kind_panic.tk` (70)
+beside them (D41 § 6, D48). Read every
 `tests/primitives_*` name on this page as the `surface_*` one that carries it.
 
 Every one of them is a whole program with `#include "../lib/time.tk"`, returns `42` on

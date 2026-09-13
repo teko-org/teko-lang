@@ -551,7 +551,8 @@ initializer, a local array (`i64 a[4]` — the name **is** the storage), and a `
 `??=`, a lifted `==`, flow narrowing (`if (c != null) { c.v }`), `T?` as a generic
 argument, calling a nullable delegate, `T?` on a short type name inside a `namespace`,
 `x.GetValueOrDefault(fallback)`, a ternary whose arms are a value and `null`, an overload
-picked through the implicit `T` → `T?`, a member on a GLOBAL nullable and an assignment to
-a nullable PARAMETER of value type are each a row of [not-yet.md](not-yet.md), with the
-message each one answers. `ref T?` and `out T?` are taught. The design they come from is
+picked through the implicit `T` → `T?`, a GLOBAL declared `T?` over a VALUE and an
+assignment to a nullable PARAMETER of value type are each a row of
+[not-yet.md](not-yet.md), with the message each one answers. A global declared `T?` over a
+REFERENCE is read like any other: its handle is the pointer itself. `ref T?` and `out T?` are taught. The design they come from is
 [`../specs/nullable.md`](../specs/nullable.md).
