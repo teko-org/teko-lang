@@ -2564,7 +2564,9 @@ refusal, D20's own rule (`d1`). The fix is a fallback to `tk_ty_global` after
 a name in.
 
 **A sixth site, found by re-measuring rather than by the citation that named the first
-five.** Applying only that fallback left `r2` compiling AND THEN SEGFAULTING -- worse than
+five.** Applying only that fallback left `r2` compiling AND THEN SEGFAULTING (on the base
+itself, with no fallback at all, the same program compiles and silently corrupts the global
+through the bit-reinterpreting write) -- worse than
 the silent pass it started as. The refusal `r3` gets does not come from `tk_ty_of` at all: a
 `ref`/`out` call argument's pointee is checked by a SEPARATE, dedicated identity rule over a
 SEPARATE table, `tk_ref_check_pointee`/`tk_ref_arg_pointee` (teko_ref.tk), which runs ahead
@@ -2592,7 +2594,7 @@ ran. The widen changes which pass answers first, not what is answered -- a globa
 heap was never the only global `params` could see; it was the only one anything downstream
 had not already caught.
 
-**Nine other `tk_ty_scope_find` call sites are untouched.** `teko_ns.tk`'s own guard in the
+**Ten other `tk_ty_scope_find` call sites are untouched.** `teko_ns.tk`'s own guard in the
 mangling pass (twice), `teko_this.tk`'s five "is this a local or a parameter?" guards, the
 guard `teko_over.tk`'s own member-access fallback takes before the field/`this` search, and
 the two "is this NOT a local?" wrap guards in `teko_deleg.tk` (`tk_deleg_coerce`'s own bare-
