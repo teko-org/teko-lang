@@ -1,0 +1,170 @@
+// surface_field_store.tk -- one gate, four sites (G-e, D33/D34/D43/D44): every
+// field store -- `this.f = e` (explicit), the implicit `f = e` inside a
+// method or constructor, and `T.f = e` (a static field, both the direct
+// site and its forward-referenced twin) -- passes through the SAME
+// `tk_field_store_val` (teko_typeof.tk) the instance store `p.f = e`
+// already used. Before this crumb only that one site did: the other three
+// built the store CALL directly over the source's own value node, with no
+// widening, no narrowing refusal and no row check at all -- an integer
+// landing in an `f64` field kept its raw bits, silently, through every one
+// of them.
+//
+// The one wrinkle this crumb closes on the way: a bare PARAMETER's type
+// answers -1 at the PARSE-TIME oracle `tk_field_store_val` reads
+// (`tk_pty_of`, D33's own "not known here"), because a constructor or a
+// method's own parameters are pushed onto that table only for the length of
+// the body (`tk_member_fn`, teko_class.tk) and popped again before the
+// LATER pass ever asks. `this.rate = k` -- a parameter stored into a field
+// -- is exactly the shape that answer starves: `tk_field_store_val` now
+// falls back to the PASS-TIME oracle (`tk_ty_of`) when the parse-time one
+// does not know, which is silent everywhere the parse-time answer already
+// held and is what makes the implicit form (resolved from the PASS, D221's
+// own `tk_this_assign`) agree with the explicit one at all.
+//
+// What each helper proves, in order:
+//
+//   1. `ctorcheck`   -- `this.rate = k;` in a constructor, `k` an `i64`
+//                       PARAMETER: the field reads back 5.0, not the
+//                       parameter's raw bits;
+//   2. `implcheck`   -- the same store, spelled without `this.` (implicit,
+//                       resolved from the pass rather than at parse time);
+//   3. `methodcheck` -- `this.rate = this.rate + 1;` in an ordinary method:
+//                       the binary widens its own integer operand (D33,
+//                       unchanged by this crumb) and the store keeps the
+//                       result;
+//   4. `staticcheck` -- `H.total = 3;` then `H.total = H.total + 2;`, a
+//                       `static f64` field written and read back through
+//                       the same type;
+//   5. `nlfieldcheck` -- a `Cell?` instance field written through `this.`
+//                       with `null` and then with a live reference, boxing
+//                       and unboxing through `.HasValue`/`.Value` (D44);
+//   6. `enumcheck`    -- an `enum` instance field written through `this.`
+//                       with one of its own members;
+//   7. `rccheck`      -- `rt_live()` back to its floor once every object
+//                       this file allocated is released.
+//
+// A refusal has no exit code to assert (D33's own harness note): the
+// narrowing refusal, the reference/number mismatch (D34) and `null` in a
+// non-`T?` field, at all three sites this crumb touches, are probed outside
+// `tests/` and documented as `// no-run` in
+// docs/reference/diagnostics.md.
+//
+// Compound assignment on a field (`this.rate += 2;`, `H.total *= 2;`) is
+// not taught: the `+=`/`*=` sugar (`<teko-loop-prelude>`) takes a bare NAME
+// on its left and refuses anything else, `the rule expected a name on the
+// left`, which is unrelated to field-store widening and out of this
+// crumb's scope -- helper 3 above writes the same shape out by hand
+// instead (`this.rate = this.rate + 1;`).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+enum Color { Red, Green, Blue }
+
+class Cell {
+    public i64 v;
+}
+
+class H {
+    public f64 rate;
+    public static f64 total;
+    public Cell? c;
+    public Color kind;
+
+    public H(i64 k) {
+        this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
+        this.c = null;                // 5a: `null` written through `this.`
+    }
+
+    public void bump() {
+        this.rate = this.rate + 1;    // 3: the field read back into its own store
+    }
+
+    public void take(Cell cc) {
+        this.c = cc;                  // 5b: a live reference boxed into `Cell?`
+    }
+}
+
+class I {
+    public f64 rate;
+
+    public I(i64 k) {
+        rate = k;                     // 2: the implicit form, same shape
+    }
+}
+
+i64 ctorcheck() {
+    H h = new H(5);
+    if (h.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 implcheck() {
+    I i = new I(5);
+    if (i.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 methodcheck() {
+    H h = new H(5);
+    h.bump();
+    if (h.rate != 6.0) return 1;
+    return 0;
+}
+
+i64 staticcheck() {
+    H.total = 3;
+    if (H.total != 3.0) return 1;
+    H.total = H.total + 2;
+    if (H.total != 5.0) return 2;
+    return 0;
+}
+
+i64 nlfieldcheck() {
+    H h = new H(0);
+    if (h.c.HasValue) return 1;       // the constructor's own `this.c = null;`
+    Cell cc = new Cell();
+    cc.v = 9;
+    h.take(cc);
+    if (!h.c.HasValue) return 2;
+    if (h.c.Value.v != 9) return 3;
+    return 0;
+}
+
+i64 enumcheck() {
+    H h = new H(0);
+    h.kind = Color.Green;
+    if (h.kind != Color.Green) return 1;
+    return 0;
+}
+
+i64 rccheck() {
+    if (rt_live() != 0) return 1;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = ctorcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = implcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = methodcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = staticcheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = nlfieldcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = enumcheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 70 + bad;
+
+    return 42;
+}

@@ -500,16 +500,35 @@ void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     tk_reject_compat(ename, sr_name_at(ti), line, fl);
 }
 
-// the value a field store actually writes, at the two PARSE-TIME sites that
-// build one -- `p.f = e` (teko_expr.tk's `tk_field_use`) and `p.items[i] = e`
-// (teko_struct.tk's `tk_array_index`). The row check those two already had
+// the value a field store actually writes, at every site that builds one --
+// the two PARSE-TIME ones (`p.f = e`/`this.f = e`, teko_expr.tk's
+// `tk_field_use`, and `p.items[i] = e`, teko_struct.tk's `tk_array_index`),
+// the two static ones (`T.f = e`, teko_access.tk's `tk_static_use` and its
+// forward-referenced twin `tk_fwd_resolve_static_one`) and the implicit
+// `f = e` inside a method or constructor (teko_this.tk's `tk_this_assign`,
+// which the LAST of those runs from a PASS, after every parse-time scope has
+// closed). The row check those two parse-time sites already had
 // (`tk_check_field_store`) reads the value through `tk_struct_of_expr`, which
 // answers about objects only, so the two scalar verdicts are asked here
 // instead and the widened node is what the store is built over. A field is a
 // slot like any other: `f64 w; p.w = 4;` writes four point zero, and
 // `i64 n; p.n = 2.5;` does not compile.
+//
+// G-e: `vty` tries the PARSE-TIME oracle FIRST (`tk_pty_of`, the one every
+// site already asked, unchanged when it answers) and falls back to the
+// PASS-TIME one (`tk_ty_of`) only when it does not -- which is exactly
+// `tk_this_assign`'s own case: its call lands here from `teko_typeof.tk`'s
+// walk, after the value's own scope (a parameter, D33's own "not known
+// here") has already closed on the parser's side, and `tk_ty_of` is what
+// still knows it, through the pass's own scope table (`tk_ty_scope_find`,
+// populated per function as `tk_typeof_pass` walks it). Asked from PARSE
+// TIME, before any function's pass-time scope opens, `tk_ty_of` answers -1
+// exactly as it does today (`tk_nscope` starts at 0 and is reset per
+// function only inside the pass), so the fallback is silent everywhere it is
+// not needed.
 i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     i64 vty = tk_pty_of(v);
+    if (vty < 0) vty = tk_ty_of(v);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
     // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,

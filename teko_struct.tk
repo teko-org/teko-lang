@@ -1199,6 +1199,18 @@ void tk_reject_compat(uptr ename, uptr tname, i64 line, uptr fl) {
     err_at(fl, line, tk_join(tk_join3("teko: a value of type ", ename, " does not convert to "), tname));
 }
 
+// teko_typeof.tk is included after this file: the two questions D34 left the
+// field store still owing, once `ei` cannot answer them (a scalar value, not
+// a row) -- `tk_pty_of` is this same file's own parse-time oracle, asked here
+// only for the ONE thing `tk_struct_of_expr` cannot tell a numeric value from
+// "not known", `tk_ty_of` is its pass-time twin (G-e's own fallback, read by
+// `tk_field_store_val` for the same reason), and `tk_is_int_ty` is the
+// positive list that says a value is an integer by id rather than by kind
+// (D33's own rule).
+i64 tk_pty_of(i64 n);
+i64 tk_ty_of(i64 n);
+i64 tk_is_int_ty(i64 t);
+
 // `p.f = e` / `p.items[i] = e` once the receiver's type IS known, at parse
 // time: the field's own row against whatever `tk_struct_of_expr` can already
 // tell about `v` -- a local, a field load, a `new` -- and nothing else,
@@ -1218,7 +1230,30 @@ void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
         return;
     }
     i64 ei = tk_struct_of_expr(v);
-    if (ei < 0) return;
+    if (ei < 0) {
+        // D34's own leftover gap, closed here: a NUMBER reaching a field of
+        // ROW type converts nothing, in C# as much as the other direction
+        // already refuses (`tk_check_scalar_compat`'s own clause, the
+        // numeric-slot half of the same rule). `tk_struct_of_expr` answers
+        // about an OBJECT expression only, so a scalar value's type is asked
+        // through `tk_pty_of` instead, with `tk_ty_of` as the same PASS-TIME
+        // fallback `tk_field_store_val` uses -- a value neither oracle can
+        // type (`vty < 0`) is left alone, exactly as every other "not known
+        // here" is, rather than guessed at.
+        //
+        // Q1b's own exemption applies here too: a `T?` field BOXING a value
+        // (`i64? count; ... this.count = 5;`) is a row (`ti >= 0`) that DOES
+        // take a scalar of its own enclosed type -- `tk_check_scalar_compat`
+        // (called ahead of this, in `tk_field_store_val`) already judged it
+        // in full through `tk_nl_check_value`, and asking the row question
+        // here as well would refuse the very value that check just accepted.
+        if (tk_is_nl(ti) && tk_nl_boxes(nl_of_at(ti))) return;
+        i64 vty = tk_pty_of(v);
+        if (vty < 0) vty = tk_ty_of(v);
+        if (vty >= 0 && (tk_is_int_ty(vty) || type_kind(vty) == TK_FLOAT))
+            tk_reject_compat(type_name(vty), sr_name_at(ti), line, fl);
+        return;
+    }
     if (tk_row_fits(ti, ei)) return;
     tk_reject_compat(sr_name_at(ei), sr_name_at(ti), line, fl);
 }

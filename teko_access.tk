@@ -239,7 +239,10 @@ i64 tk_deleg_var_stmt(i64 si, i64 line, uptr fl);
 i64 tk_enum_static(i64 si, uptr m, i64 line, uptr fl);
 
 // `Name.field` / `Name.field = e` -- the global the static field lives in, read
-// or written at the field's own width
+// or written at the field's own width. G-e: the value goes through
+// `tk_field_store_val` (teko_typeof.tk), the same gate an instance store
+// passes through, before it was raw here -- an integer into a `static f64`
+// wrote the bit pattern, silently, exactly as the instance case did.
 i64 tk_static_use(i64 fi, i64 line, uptr fl) {
     i64 fty = fd_ty_at(fi);
     i64 addr = tk_id(fd_sym_at(fi));
@@ -252,6 +255,7 @@ i64 tk_static_use(i64 fi, i64 line, uptr fl) {
         tk_file = fl;
         if (tk_lam_escapes(v))
             err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
+        v = tk_field_store_val(fty, v, line, fl);
         return tk_os_mark(tk_call2(tk_stn(fty), addr, v), fty);
     }
     i64 r = tk_ld(fty, addr);
@@ -435,7 +439,11 @@ void tk_fwd_resolve_static_one(i64 i) {
         if (form == TK_STSTORE) {
             if (tk_lam_escapes(st_arg_at(i)))
                 err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
-            r = tk_os_mark(tk_call2(tk_stn(fty), addr, st_arg_at(i)), fty);
+            // G-e: the same gate as the direct site above (`tk_static_use`)
+            // and the instance store, on the FORWARD-referenced road -- a
+            // static field reached before its own type is read.
+            i64 v = tk_field_store_val(fty, st_arg_at(i), line, fl);
+            r = tk_os_mark(tk_call2(tk_stn(fty), addr, v), fty);
         } else {
             r = tk_ld(fty, addr);
             tk_xt_put(r, tk_struct_by_ty(fty), fty, 1, TK_BORROWED);

@@ -806,16 +806,36 @@ void tk_abstract_end(uptr m) {
     p_expect(K_SEMI, "expected ; after the abstract member");
 }
 
-// the body of one method, parsed by the CORE with the parameter list built here
+// the body of one method, parsed by the CORE with the parameter list built here.
+// G-e: a parameter's own type is pushed onto the SAME scoped table `tk_pty_of`
+// reads (`tk_slv`, teko_struct.tk) for the length of this body alone -- the
+// receiver "this" is skipped (its `param_new` type is the raw `TY_UPTR` slot
+// dispatch spends, not the class's own row, which `tk_local_add` above already
+// answers correctly) -- so a field store built while PARSING this body (`p.f =
+// k`, `this.f = k`, the implicit `f = k`) can widen a bare PARAMETER exactly as
+// it already widens a local, a literal or a cast. Before this, a parameter
+// answered -1 there ("not known here", D33's own honest answer), which a field
+// store's widening read as "nothing to widen" instead of "ask again once the
+// scope exists" -- the one slot of the nine D33 lists that runs at PARSE time
+// and had no later chance to ask.
 i64 tk_member_fn(i64 ci, i64 fty, uptr fn, i64 prs, i64 stat) {
     i64 mark = tk_nlocal;                        // the receiver belongs to this body alone
     if (!stat) tk_local_add(tk_this_name(), ci); // `this.field` inside the body
+    i64 slvmark = tk_nslv_live;
+    i64 p = prs;
+    if (!stat) p = nd_next(p);                   // the injected `this`, typed `uptr` here
+    loop {
+        if (p == 0) break;
+        tk_slv_add(nd_name(p), tk_param_ty(p));
+        p = nd_next(p);
+    }
     i64 keepstat = 0;
     i64 keep = tk_this_enter_body(ci, stat, &keepstat);
     i64 line = p_line();
     uptr fl = p_file();
     i64 f = parse_function(fty, fn, prs);
     tk_this_leave_body(keep, keepstat);
+    tk_nslv_live = slvmark;
     tk_nlocal = mark;
     set_nd_line(f, line);                        // the declaration starts at the {
     set_nd_file(f, fl);
