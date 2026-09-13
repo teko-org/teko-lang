@@ -69,12 +69,13 @@ Three shapes recur:
   ever not registered, the core's resolver would refuse the call outright rather than
   compile something wrong.
 - **generated declarations.** A vtable, a release function, a thunk, a `T[]` row's own three,
-  a nullable box's own four and a whole generic instance are declarations teko emits itself.
+  a nullable box's own four, a class member's mangled body, a property accessor, a static
+  field and a whole generic instance are declarations teko emits itself.
   Nothing that a program may not need is written into `lib/rt.tk` instead: everything there is
   parsed into every program that includes it, so a function added there would move the
-  `--dump-ast` of every fixture. Every one that can fire in
-  the middle of a declaration of the program's own goes through `tk_top_emit`
-  ([nodes-and-xt.md](nodes-and-xt.md)).
+  `--dump-ast` of every fixture. Every one of them goes through `tk_top_emit` or
+  `tk_top_emit_as` ([nodes-and-xt.md](nodes-and-xt.md)), which is both what keeps the parse
+  honest and what records the name as the compiler's own.
 
 ## The tables
 

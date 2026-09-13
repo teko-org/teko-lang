@@ -115,34 +115,46 @@ i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl);
 // name. Restoring it is what keeps a generator invisible to the parse it
 // interrupted (DECISION_LOG.md D27).
 //
-// Every `top_add` in this port is one of three (K6's own audit):
+// Every `top_add` a GENERATOR makes is one of three (K6's own audit), and all
+// three go through the pair below (D48, tenth pass):
 //
-//   (a) top level only -- inside a `class`/`struct`/`namespace` body read by
-//       `parse_top`: teko_class.tk's member bodies and constructors,
-//       teko_prop.tk's accessors, teko_struct.tk's static field and struct
-//       constructor, teko_ns.tk's namespace body and its function. No
-//       declaration of the program's own is open, so there is none to lose.
+//   (a) top level only -- inside a `class`/`struct` body read by `parse_top`:
+//       teko_class.tk's member bodies and constructors, teko_prop.tk's
+//       accessors, teko_struct.tk's static field and struct constructor. No
+//       declaration of the program's own is open, so there is none to lose:
+//       those call `tk_top_emit_as(n, 0)`, which leaves the name cleared
+//       exactly as a bare `top_add` did.
 //   (b) after the parse, from a `pass()`: teko_di.tk's memoized getter and its
 //       slot, teko_params.tk's `params` instance. `p_decl_name()` is 0 already
 //       and nobody reads it any more.
 //   (c) possibly MID-declaration, fired by an expression: teko_deleg.tk's
 //       thunk and its lambda, teko_heaparr.tk's three, `tk_ix` below, and
 //       everything `tk_class_close` (teko_class.tk) emits -- a partial class
-//       closes at its first `new`, which may stand in any body. Those go
-//       through this function. teko_generic.tk's replay is (c) as well and
-//       saves `p_decl_name()` with the rest of its scratch instead, since
+//       closes at its first `new`, which may stand in any body. Those call
+//       `tk_top_emit`, which puts the interrupted declaration's name back.
+//       teko_generic.tk's replay is (c) as well and saves `p_decl_name()` with
+//       the rest of its scratch instead, so it calls `tk_top_emit_as(n, 0)`:
 //       `parse_top` writes the name itself once per declaration the instance
 //       produces.
-// ---- the declarations the COMPILER writes (D48, ninth pass) ----
-// This function is the one door every GENERATED top-level declaration goes
-// through, so it is also the one place that can tell such a declaration from
-// one the source wrote. It records both: the NODE, which is the identity a
-// later pass asks about, and the NAME, which is what a program may collide
+//
+// What is NOT a generator, and so is not recorded: teko_ns.tk's two sites. A
+// `namespace` body and a namespaced function at top level are declarations the
+// PROGRAM wrote, which `tk_ns_rename_decl` mangles two passes later -- the node
+// still carries the short name the source spelled when it is added, so
+// recording it would reserve `area` for the program that wrote
+// `namespace geo { i64 area() }` rather than the `geo__area` the mangling
+// produces. That name has its own guard on the pass that writes it.
+// ---- the declarations the COMPILER writes (D48, ninth and tenth passes) ----
+// These two functions are the one door every GENERATED top-level declaration
+// goes through, so they are also the one place that can tell such a declaration
+// from one the source wrote. They record both: the NODE, which is the identity
+// a later pass asks about, and the NAME, which is what a program may collide
 // with. `tk_ov_collect` (teko_over.tk) reads the pair and refuses a
 // declaration of the program's own that carries a generated name -- `tkarr_*`,
-// `tk_nl_*`, a vtable, `Name__names` -- because the two would otherwise reach
-// the linker as one symbol and a call site would pick whichever the tables
-// answered first.
+// `tk_nl_*`, a vtable, `Name__names`, a member's `point_area`, a property's
+// `square_get_Side`, a struct's `point_new`, a static field's `point_made`, a
+// service's `svc_di_get` -- because the two would otherwise reach the linker as
+// one symbol and a call site would pick whichever the tables answered first.
 //
 // The name alone would not do: a generated declaration carries a generated
 // name too, and telling them apart by spelling would reserve a prefix for
@@ -185,8 +197,13 @@ i64 tk_emit_owns(uptr name) {
     return 0;
 }
 
-void tk_top_emit(i64 n) {
-    uptr owner = p_decl_name();
+// the registration, then `top_add`, then the name `owner` the caller says the
+// parse is to carry on with: the interrupted declaration's for (c), and 0 --
+// what `top_add` leaves behind on its own -- for (a) and (b). A generator that
+// produces nothing (`parse_top` answers 0 for a `class`, which adds its own
+// members) records nothing; `top_add(0)` is the no-op it already was.
+void tk_top_emit_as(i64 n, uptr owner) {
+    if (n == 0) { top_add(n); p_set_decl_name(owner); return; }
     if (tk_nemit == TK_MAXEMIT)
         err_at(nd_file(n), nd_line(n), "teko: too many generated declarations in one unit");
     set_tk_emit_name_at(tk_nemit, nd_name(n));
@@ -195,6 +212,8 @@ void tk_top_emit(i64 n) {
     top_add(n);
     p_set_decl_name(owner);
 }
+
+void tk_top_emit(i64 n) { tk_top_emit_as(n, p_decl_name()); }
 
 // what a row of the type table declares: struct/class/interface/delegate share
 // the table because a value of any of them is one 8-byte reference, and `.`
@@ -1415,7 +1434,7 @@ void tk_static_field(i64 si, uptr tname, uptr m, i64 fty, i64 nel, i64 vis) {
     uptr sym = tk_fname(tname, m);
     i64 n = nel;
     if (n == 0) n = 1;
-    top_add(tk_glb(TY_U8, sym, type_width(fty) * n));
+    tk_top_emit_as(tk_glb(TY_U8, sym, type_width(fty) * n), 0);   // `point_made` is the compiler's (D48)
     tk_field_add(si, m, 0, fty, nel, vis, sym);
 }
 
@@ -1562,5 +1581,5 @@ void tk_struct() {
     i64 size = tk_size_of(off);
     set_sr_size_at(si, size);
     def_add(tk_join(tk_case(name, 1), "_SIZE"), size, tk_line, tk_file);
-    top_add(tk_ctor(name, ty, size, 0));
+    tk_top_emit_as(tk_ctor(name, ty, size, 0), 0);   // `point_new` is the compiler's (D48)
 }

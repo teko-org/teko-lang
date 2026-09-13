@@ -8,7 +8,9 @@ back to them — the symptoms are what make them findable, because most of these
 
 **A generated declaration restores the name of the one being parsed.**
 `top_add` clears `p_decl_name()`, and restoring once at the end of a group does not work:
-each further `top_add` clears it again. Use `tk_top_emit`, or bracket the whole group.
+each further `top_add` clears it again. Use `tk_top_emit` (or `tk_top_emit_as(n, 0)` where
+there is no name to lose): a bare `top_add` also leaves the declaration out of the record
+that tells the compiler's own names from the program's (D48).
 *Symptom:* a construct that compiles alone crashes when something else is written **before**
 it in the same body — a module table keyed by the owner reads through a null name.
 

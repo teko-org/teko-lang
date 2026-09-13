@@ -173,26 +173,40 @@ declaration of the program's own is still being read, and two module tables are 
 that name — the escape check for a by-reference capture, and the row a parameter default
 opens.
 
-So a generated top-level declaration goes through `tk_top_emit`
-([`teko_struct.tk`](../../teko_struct.tk)):
+So a generated top-level declaration goes through one pair of functions
+([`teko_struct.tk`](../../teko_struct.tk)) — `tk_top_emit_as`, which says what name the
+parse carries on with, and `tk_top_emit`, which is that pair with the interrupted
+declaration's own name put back:
 
 ```mc
-void tk_top_emit(i64 n) {
-    uptr owner = p_decl_name();
+void tk_top_emit_as(i64 n, uptr owner) {
+    if (n == 0) { top_add(n); p_set_decl_name(owner); return; }
+    // ...the (node, name) row `tk_ov_collect` reads (D48)
     top_add(n);
     p_set_decl_name(owner);
 }
+
+void tk_top_emit(i64 n) { tk_top_emit_as(n, p_decl_name()); }
 ```
 
 Restoring **once, at the end** is not enough when several `top_add` calls follow one
-another: each of them clears the name again. Either every call goes through `tk_top_emit`,
-or the whole group is bracketed by one save and one restore — which is what the generic
-replay does, because the core writes the name itself once per declaration the replay
-produces.
+another: each of them clears the name again, so every generator calls one of the two.
 
-A `top_add` that runs at top level (inside a class or namespace body the core is reading)
-or from inside a `pass()` (where the parse is over and `p_decl_name()` is already 0) needs
-none of this. [passes.md](passes.md) lists which are which.
+A generator that runs at top level (inside a class or struct body the core is reading) or
+from inside a `pass()` (where the parse is over and `p_decl_name()` is already 0) has no
+name to lose, and says so by passing 0: `tk_top_emit_as(n, 0)` is a bare `top_add` plus the
+row. The generic replay passes 0 too — it saves `p_decl_name()` with the rest of its
+scratch, and the core writes the name itself once per declaration the replay produces.
+[passes.md](passes.md) lists which site is which.
+
+**The row is the second reason the door exists** (D48, ninth and tenth passes): the pair
+`(node, name)` it records is what tells a declaration the COMPILER wrote from one the
+program did, and `tk_ov_collect` ([`teko_over.tk`](../../teko_over.tk)) refuses a program's
+own declaration carrying a generated name — `point_area`, `square_get_Side`, `point_new`,
+`stamp_made`, `svc_di_get`, `box__circle__2_cap`, `tkarr_put_i64`, `tk_nl_ck` — with
+`teko: the name is the compiler's own`. A bare `top_add` outside this door is therefore a
+hole in that check, and the only ones left are teko_ns.tk's two, which add declarations the
+PROGRAM wrote (their own comment says so).
 
 ## Positions
 

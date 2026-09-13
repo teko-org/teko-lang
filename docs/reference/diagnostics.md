@@ -845,10 +845,18 @@ Every one of these is [nullable.md](nullable.md)'s.
   of the program's own carries a symbol some generator writes — `tkarr_new_i64`,
   `tkarr_put_i64` (a `params T[]` or a `new T[n]`), `tk_nl_ck`, `tk_nl_new`,
   `tk_nl_box_i64`, `tk_nl_dflt`, `tk_nl_vt` (a `T?`), a class's own `Name__vt`, an enum's
-  `Name__names`. The two would reach the linker as one symbol and a call site would pick
-  whichever table answered first. Only the EXACT name a generator wrote is taken, and only
-  against a declaration the compiler did not write: no prefix is reserved, so `tkarray` and
-  `tk_nl_boxer` are a program's own names like any other. Rename the declaration.
+  `Name__names`, and every symbol a type declaration lowers into: a method's `point_area`
+  and a constructor's `point_ctor__i64`, a property accessor's `square_get_Side` /
+  `square_set_Side`, a struct's own allocator `stamp_new`, a static field's global
+  `stamp_made`, a service's `svc_di_slot` / `svc_di_get`, and a generic instance's
+  `box__circle__2_cap`. The two would reach the linker as one symbol and a call site would
+  pick whichever table answered first. Only the EXACT name a generator wrote is taken, and
+  only against a declaration the compiler did not write: no prefix is reserved, so
+  `tkarray`, `tk_nl_boxer`, `point_areas` and `pointarea` are a program's own names like any
+  other. Rename the declaration. A function a `namespace` mangles (`geo__area` out of
+  `namespace geo { i64 area() }`) is NOT one of these: the program wrote that declaration,
+  and a program that also writes `geo__area` at top level reaches the core's own
+  `function declared twice`.
 - `"teko: cannot take the address of an overloaded function"` — `&f` needs one symbol.
 - `"teko: an overloaded call outside a function body has no arguments to resolve it"` — a
   call in a global initializer has no site to type.

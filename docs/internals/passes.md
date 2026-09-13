@@ -93,9 +93,10 @@ Four of these passes add a top-level declaration: pass 4 (a service's memoized g
 its slot), pass 12 (the allocator, release and element store of a `T[]` row a call site is
 the first to build), pass 1 (everything a class close emits) and pass 14 (nothing new, but
 it renames). Both run after the parse, where `p_decl_name()` is already 0 and nobody reads
-it any more, so pass 4's bare `top_add` is safe; pass 12 goes through `tk_top_emit` anyway,
-because the three declarations it asks for are the same ones `new T[n]` asks for **during**
-the parse, from one shared `tk_ha_ensure_put`.
+it any more, so neither has a name to lose; both go through `tk_top_emit` anyway, because
+that door is also what records the declaration as the compiler's own (D48, tenth pass) —
+and pass 12's three declarations are the same ones `new T[n]` asks for **during** the parse,
+from one shared `tk_ha_ensure_put`.
 
 Pass 1 is not, and neither is anything a handler emits **during** the parse. `top_add`
 clears `p_decl_name()` as a side effect, and teko generates declarations from expressions —
@@ -104,11 +105,13 @@ a thunk at `new Op(fn)`, the vtable and release of a class that closes at its fi
 those fires while a declaration of the program's own is still being read, and two module
 tables are keyed by exactly that name. So:
 
-> **Every top-level declaration teko emits from inside a body goes through
-> `tk_top_emit`** (`teko_struct.tk`), which saves `p_decl_name()`, calls `top_add` and puts
-> the name back. A generator that re-parses whole declarations saves and restores the name
-> with the rest of its scratch instead, because the core writes it itself once per
-> declaration the replay produces.
+> **Every top-level declaration teko emits goes through `tk_top_emit`/`tk_top_emit_as`**
+> (`teko_struct.tk`), which record the (node, name) pair and then `top_add`. `tk_top_emit`
+> saves `p_decl_name()` and puts it back, for a generator that interrupts a declaration of
+> the program's own; `tk_top_emit_as(n, 0)` leaves the name cleared, for a generator that
+> stands at top level, runs from a pass, or — like the generic replay — saves the name with
+> the rest of its scratch, because the core writes it itself once per declaration the replay
+> produces.
 
 The mirror of the same invariant: a handler that owns a declaration and reads its body
 **itself**, rather than letting the core read it, has to say whose the statements are. An
