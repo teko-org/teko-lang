@@ -2543,10 +2543,11 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in three passes over
+*This entry is the whole of D50 as it stands. It was written in four passes over
 [#698](https://github.com/teko-org/teko-lang/pull/698) and every earlier wording of it —
-including the `tk_member_fn` push described below and the two intermediate proof blocks — is
-**superseded in this entry**, which is the only current one.*
+including the `tk_member_fn` push described below, the two-oracle door the third pass
+removed and every intermediate proof block — is **superseded in this entry**, which is the
+only current one.*
 
 **The defect.** A field store had SIX code paths and only one of them ran the value through
 `tk_field_store_val` (teko_typeof.tk): D33's widening, its narrowing refusal, D43's `null`
@@ -2575,18 +2576,41 @@ gate defers whatever no oracle can type.** No new function for the splice —
 `teko_struct.tk`'s own forward declaration of it (already there for `tk_array_index`) is
 what every later file calls — and no new pass: `mc limits`' `passes` row does not move.
 
-**A value no oracle types at the site is DEFERRED, never written raw.** That is the root
-under every thread the review found. The value's type is the one thing a store site may not
-know: a PARAMETER is in no parse-time scope at all (`tk_slv`'s own rule, D33's "not known
-here"), an implicit `f = e` is rewritten from a PASS with its right-hand side still a bare
-name (`tk_this_assign` runs BEFORE `tk_this_ident` turns `rate` into the typed load), a
+**The door decides ONLY what the parse-time oracle types with certainty; everything else is
+DEFERRED, never written raw and never refused there.** That is the root under every thread
+the review found, and the one rule the whole gate now reads by. `tk_fs_vty` asks `tk_pty_of`
+(teko_struct.tk) and nothing else — a literal, a cast, a node the type table already tags
+(`tk_xt_ty`; a tag is not a guess) and a local whose declaration the parser has read — so
+`tk_fs_defer` records the value node, the field's type and the site, and the judgement
+happens once, later. The value's type is the one thing a store site may not know: a
+PARAMETER is in no parse-time scope at all (`tk_slv`'s own rule, D33's "not known here"), an
+implicit `f = e` is rewritten from a PASS with its right-hand side still a bare name
+(`tk_this_assign` runs BEFORE `tk_this_ident` turns `rate` into the typed load), a
 `T.f = e` on a type declared BELOW is resolved in `tk_fwd_pass`, one pass ahead of the scope
-that would answer, and a FREE function's `H.total = k` was never inside a member body at
-all. Writing the bits anyway is the very defect this entry opened on. So `tk_fs_defer`
-records the value node, the field's type and the site, and the judgement happens once, later.
+that would answer, and a FREE function's `H.total = k` was never inside a member body at all.
 
-**Two more values are "not known" even where an oracle answers, because a LATER PASS decides
-them** (`tk_fs_vty`, the gate's own question):
+**The pass-time oracle is NOT a second answer at the door.** An earlier wording of this entry
+had `tk_ty_of` as `tk_fs_vty`'s fallback and claimed it was "silent everywhere it is not
+needed", on the grounds that a parse-time site has no function scope. The claim was false:
+`tk_ty_of` reads the GLOBAL table for a bare name (`tk_ty_global`, teko_array.tk), and a
+global is in scope in every body — so a global a parameter or a FIELD *shadows* answered for
+the shadowing name, at a site with no scope at all and at the two sites that run from a pass
+BEFORE the walk that resolves the name. Measured (Copilot on #698, pass 3): with a global
+`f64 step` beside a class that declares `i64 step`, the implicit `rate = step;` was typed
+`f64`, converted nothing and was not deferred — the store did not land at all, the field
+kept what the constructor had left in it — and the mirror (`i64 cnt; cnt = step;`) was
+REFUSED for a narrowing nobody wrote. One oracle at the door, one judgement later.
+
+**The ROW check is behind the deferral too, not in front of it.** `tk_check_field_store`
+reads the same parse-time oracle for a value `tk_struct_of_expr` cannot see, so an
+overloaded call answered with the FIRST declaration of its name and
+`Cell rc; this.rc = rick(1, 2);` was refused — `teko: a value of type i64 does not convert
+to Cell?` — for a store that is a `Cell` (Copilot on #698, pass 3). `tk_field_store_val`
+defers on `vty < 0` BEFORE either check runs; `tk_fs_do` is the first point with the final
+type, and `tk_check_compat` there is the scalar verdicts and the row one in one call.
+
+**Two kinds are "not known" even where the parse-time oracle answers, because a LATER PASS
+decides them** (`tk_fs_vty`, the gate's own question):
 
 - an **N_CALL to an overloaded name**. `tk_pty_of` answers `decl_ret` of the FIRST
   declaration — D49 leaves that as the parse-time limit it is — while the site is rewritten
@@ -2600,9 +2624,6 @@ them** (`tk_fs_vty`, the gate's own question):
   `operator+(GrandBase, i64) -> i64` was refused — `teko: a value of type GrandBase does not
   convert to i64` — for a store that is an integer.
 
-A node the type table already tags (`tk_xt_ty`) answers here as it always did: a tag is not a
-guess.
-
 **ONE point of judgement: the end of `tk_over_pass`** (pass 14), beside D48's
 `tk_prim_arg_judge` and by the same reasoning. `tk_field_store_judge` walks with
 `tk_ty_pass_walk`, so the scope a parameter is read under is alive; by then the tree is
@@ -2613,6 +2634,12 @@ the value is a link of the store call's own argument list and nothing there know
 The end of `tk_typeof_pass`, where the judgement first ran, has only the first of those four
 halves and a half: it was what left the pick and the operator wrong. A value the PASS cannot
 type either is still left alone — `-1` is "not known", never a verdict (D226).
+
+**The site a deferred RECEIVER reports is its own.** `tk_pend_field` (teko_typeof.tk)
+resolves a value that is itself a deferred member first (`tk_pend_do`), and that call leaves
+`tk_line`/`tk_file` on the row IT resolved — so `h.n = k.d;` written over two lines refused
+the store at the inner access's line. The table's own row (`pd_line_at`/`pd_file_at`) is
+what the gate is given.
 
 **The reference predicate is the full one.** `tk_check_field_store` (teko_struct.tk), with
 the value's type in hand, refused an integer and a float only — so an `enum`, a primitive
@@ -2628,7 +2655,7 @@ parameter answers -1 there — one table for two questions is what that rule was
 against. Deletion over addition: there is no such push, and the 62 pre-existing dumps are
 byte-identical either way.
 
-**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), fifteen helpers: the
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), seventeen helpers: the
 constructor's explicit `this.rate = k` and the implicit `rate = k`; a method's
 `this.rate = this.rate + 1`; a `static f64` written and read back; a `Cell?` field boxing
 `null` and a live reference; an `enum` field; `this.rate = k + 1` (an N_BINARY); `rate =
@@ -2636,10 +2663,16 @@ step` (implicit on both sides); a forward static (`H2` declared BELOW its writer
 from a member's own parameter; a FREE function's parameter into a static field and into an
 instance one; an `i64?` field boxed from a parameter; a receiver that is a PARAMETER, with
 both the `f64` widening and the `i64?` box; `this.rate = pick(1, 2)` with the picked overload
-declared SECOND, in BOTH orders; `this.sum = g + 1` over a user operator; and `rt_live()`
-back to its floor. The file exits **71** on `c7df7787` (the first head of the PR); on
-`5ecae153` it is REFUSED at the operator store, exits **139** with that helper neutralised
-(the box segfault) and **131** with the box neutralised too (the pick).
+declared SECOND, in BOTH orders; `this.sum = g + 1` over a user operator; the two SHADOWED
+roads in both directions — a global `f64 k` over every `i64 k` parameter and a global
+`f64 step` over the `i64 step` field, each written into an `f64` field and into an `i64` one;
+`this.rc = rick(1, 2)` on a `Cell?` field whose pick returns a ROW while the first
+declaration returns `i64`; and `rt_live()` back to its floor. The file exits **71** on
+`c7df7787` (the first head of the PR); on `5ecae153` it is REFUSED at the operator store,
+exits **139** with that helper neutralised (the box segfault) and **131** with the box
+neutralised too (the pick); on `bb05ed0e` (the third head) it is REFUSED at the row pick,
+and exits **81** — the field-to-field store the global shadows — with the pick helper and
+the two mirror stores neutralised.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
 NAME on its left, ``the rule expected a name on the left``, a pre-existing and unrelated gap,
@@ -2662,7 +2695,7 @@ self-hosted `teko1`); `sh scripts/check-docs.sh` green (570 links, 386 diagnosti
 samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table unmoved — `passes`
 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new pass, no new
 intrinsic (D2, D21). `mc pkg hash .` over the source tree of this entry's code commits:
-`c4aa0d3da50732e26a2963b0b7caaa089be3b65a5f2f976e73e5a12886c4a7a6`.
+`8e38bf7755f013d590aa29bba76b43cfa6368ba84106680de65fa469490380e5`.
 
 A throwaway instrumentation after the judgement — every row of the deferral table asserted
 `done` — proved that no deferred store survives it, over the 63 fixtures and the whole
