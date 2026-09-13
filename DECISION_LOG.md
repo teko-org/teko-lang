@@ -2577,11 +2577,16 @@ skipped." Once `tk_ty_of`'s new fallback let a global's real type reach `tk_rc_c
 first, that pass's own implicit-widen rule (D33: an integer converts to a float slot) took
 it at face value and wrapped the `ref`-tagged ADDRESS argument in the float cast meant for a
 VALUE -- `scvtf` on a pointer, the segfault. `tk_ref_arg_pointee` gets the identical
-one-line fallback (its own, not the shared helper: teko_ref.tk is included ahead of
-teko_typeof.tk in `teko.tk`, so `tk_ty_scope_or_global` does not exist yet where it is
-needed), and because the dedicated pointee check now runs to completion before
+one-line fallback, and because the dedicated pointee check now runs to completion before
 `tk_rc_call_args` ever sees the argument, it refuses first, with the identical wording a
-local gets: both read `tk_reject_compat` over the same two type names.
+local gets: both read `tk_reject_compat` over the same two type names. It reads the SHARED
+helper, `tk_ty_scope_or_global` (teko_typeof.tk), like every other site here: teko_ref.tk is
+included AHEAD of teko_typeof.tk in `teko.tk`, so the name is not defined yet where it is
+used -- which is what the forward declaration at the head of teko_ref.tk is for, the same
+device that file already uses for `tk_default_decl_count`. (The first round of this crumb
+did write a private fallback of its own there, on the reasoning that the include order
+forbade the helper; the verifier's rewrite below replaced the whole function and took the
+forward declaration instead. Copilot, second pass, read the paragraph against the code.)
 
 **`tk_pm_arg_ty` (teko_params.tk) widened too**, from `tk_ty_global_ha` (a global `T[]` of
 heap only) to the general `tk_ty_global`, deleting the now fully-subsumed
@@ -2750,3 +2755,58 @@ this crumb's own small source growth (used heap 91606832 -> 92324032 of a
 ceiling, 3.3%) -- D35's own precedent: the estimator is `mc`'s own and moves on its own
 account, and every table stays comfortably `ok`. `mc pkg hash .`:
 `9de962f08ba2783e376da38789e9f4f2cc87d9001a250ec7f8e9e753164a36eb`.
+
+**Copilot finding, pass 2: an address guard wider than its own reason, and a `params` oracle
+that still had a second table in front of it.** Both measured on `da33ebd4` and on the head
+of this crumb (`37f90714`) before either was touched, mc **0.15.23**:
+
+1. The N_ADDR guard above skipped the compatibility check for EVERY address, where only a
+   `ref`/`out` parameter has a different rule to take. The premise it was filed under does
+   not survive measurement: `take(&x)` at a class, an `i64?`, an `enum` and a `TimeSpan`
+   parameter compiles on the BASE exactly as it does on the head, and the ADDRESS is never
+   cast on either -- `tk_ty_of` types an UNTAGGED address with nothing at all. Its pointee
+   branch is entered only by a node `ref`/`out` TAGGED (`tk_rfarg_kind`), and a bare `&x`
+   falls past every case of the oracle to -1, which refuses nothing, which is also why
+   `tk_num_widen` had nothing to widen there (`tk_num_widens(f64, -1)` is 0, and `uptr` is
+   outside `tk_is_int_ty` by name in any case). So the guard removed no refusal that
+   existed -- and it was still the wrong shape, because it answered the ARGUMENT's question
+   where the rule belongs to the PARAMETER. It is split: `ref`/`out` takes the identity rule
+   over pointees, anything else takes the ordinary `tk_check_compat` every value takes, and
+   the widen is out of reach of both. The day the oracle learns to type a bare `&x`, one
+   pass answers it instead of nothing answering at all.
+2. `tk_pm_arg_ty` (teko_params.tk) still asked a table BEFORE the lexical scope, the
+   function-wide `pmp_name`/`pmp_ty` filled by `tk_pm_params_of` and read by
+   `tk_pm_param_ty`. A table with no position in it cannot be shadowed: inside `f(f64 x)`,
+   a block's own `i64 x = 2` still answered `f64`, so `sumi(1, x)` over a `params i64[]`
+   was refused, `teko: a value of type f64 does not convert to i64` -- a legal program,
+   refused on the base and on the head alike. The verifier's own rewrite had already put
+   every parameter of the declaration being walked into the scope the walk keeps live
+   (`tk_ty_scope_params`, teko_typeof.tk, in `tk_pm_walk_unit`), so the table was a second
+   oracle for a name the first one already knew. DELETED: `TK_MAXPMP`, `pmp_name`/`pmp_ty`/
+   `tk_npmp` and their four accessors, `tk_pm_params_of` and `tk_pm_param_ty` -- and with
+   them the refusal ``teko: too many parameters in one declaration``, that table's own
+   16-row ceiling, struck from
+   [diagnostics.md](docs/reference/diagnostics.md): the scope answers -1 past its end
+   (`tk_ty_scope_add`) rather than refusing, "not known here", which refuses nothing.
+   Deletion over addition: 43 lines out of teko_params.tk, 13 of comment back in, and the
+   one call site that read them is a line shorter.
+3. The sixth-site paragraph above described code that the verifier's own rewrite had already
+   replaced: `tk_ref_arg_pointee` reads the SHARED `tk_ty_scope_or_global`, through the
+   forward declaration at the head of teko_ref.tk, not a private fallback of its own. The
+   paragraph says so now.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: **63/63** fixtures at their
+`expect-exit`, with `tests/surface_globals.tk` (exit 42) gaining section 4's `shadowparam`
+(a local shadowing a PARAMETER at a `params` call, accepted with the LOCAL's type) and
+`plainparam` (no shadow: the parameter itself answers), and a new section 7, `addrcheck` --
+a bare `&v` at a plain `uptr` parameter, which now goes THROUGH the ordinary compatibility
+rule instead of past it; the `--dump-ast` of the **62** fixtures that existed at `da33ebd4`,
+byte-identical to that base, the guard's own proof that no address gained a `CAST` and no
+accepted program moved; `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`
+(63/63 under `teko1`); `sh scripts/check-docs.sh` green (568 links, **384** diagnostics --
+the one struck above -- 119 samples); `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs, the `tests/hello.tk` leg's structural counts and heap (1114992) byte-identical to
+the head of this crumb, the compiler leg giving back what the deleted table cost (`nodes`
+used 153967 -> 153815, `ins` 211960 -> 211752, `funcs` 3131 -> 3125, heap 92311424 ->
+92276992 of a 218169344 reserve). `mc pkg hash .` at this pass's own code commit:
+`c037572671bf559c85096676e3908fa8cd153b0df15dc81023e43b1cd313fa18`.
