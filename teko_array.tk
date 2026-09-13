@@ -67,6 +67,7 @@
 #define TK_MAXGARR  512                // global arrays declared in one source
 #define TK_MAXGDEF  512                // deferred writes into a possibly-global array
 #define TK_MAXHG    32                 // global `T[]` of heap declared in one source
+#define TK_MAXGSLOT 2048               // global SLOTS declared in one source (521 in the compiler's own unit)
 
 #define TK_ASTORE    0                 // a[i] = e
 #define TK_ACOMPOUND 1                 // a[i] += e / -= e / ++ / --
@@ -87,6 +88,17 @@ i64  tk_ngv = 0;
 uptr hg_name[TK_MAXHG];
 i64  hg_ty[TK_MAXHG];                  // the `T[]` row type itself (teko_heaparr.tk's tk_ha_row)
 i64  tk_nhg = 0;
+
+// ---- every global SLOT and the type it was declared with, collected in that
+// same sweep, for the oracle (`tk_ty_of`, teko_typeof.tk) ----
+// A SLOT is a global that holds one value -- a scalar, a reference, a `T[]` of
+// heap -- and `nd_val != 0` is what tells it from `i64 a[4]`, whose name is the
+// address of four elements and no value of its own: the very rule
+// `tk_on_stmt` (teko_struct.tk) already reads for a local, and the reason the
+// global-array row above stays this file's own business.
+uptr gs_name[TK_MAXGSLOT];
+i64  gs_ty[TK_MAXGSLOT];
+i64  tk_ngs = 0;
 
 // teko_heaparr.tk is included after this file: the run-time-checked
 // address/load/store/compound a heap array's LOCAL, FIELD and PARAMETER
@@ -132,6 +144,11 @@ uptr hg_name_at(i64 i) { return ld64(hg_name + i * 8); }
 i64  hg_ty_at(i64 i)   { return ld64(hg_ty + i * 8); }
 void set_hg_name_at(i64 i, uptr v) { st64(hg_name + i * 8, v); }
 void set_hg_ty_at(i64 i, i64 v)    { st64(hg_ty + i * 8, v); }
+
+uptr gs_name_at(i64 i) { return ld64(gs_name + i * 8); }
+i64  gs_ty_at(i64 i)   { return ld64(gs_ty + i * 8); }
+void set_gs_name_at(i64 i, uptr v) { st64(gs_name + i * 8, v); }
+void set_gs_ty_at(i64 i, i64 v)    { st64(gs_ty + i * 8, v); }
 
 i64  gd_node_at(i64 i) { return ld64(gd_node + i * 8); }
 i64  gd_base_at(i64 i) { return ld64(gd_base + i * 8); }
@@ -251,12 +268,21 @@ void tk_hg_add(uptr name, i64 ty) {
     tk_nhg = tk_nhg + 1;
 }
 
+void tk_gs_add(uptr name, i64 ty) {
+    if (tk_ngs == TK_MAXGSLOT) err_at(tk_file, tk_line, "teko: too many globals");
+    set_gs_name_at(tk_ngs, name);
+    set_gs_ty_at(tk_ngs, ty);
+    tk_ngs = tk_ngs + 1;
+}
+
 void tk_hg_collect() {
     i64 n = 1;
     loop {
         if (n >= nnodes) break;
-        if (nd_kind(n) == N_GLOBAL && tk_is_ha(tk_struct_by_ty(nd_type(n))))
-            tk_hg_add(nd_name(n), nd_type(n));
+        if (nd_kind(n) == N_GLOBAL) {
+            if (tk_is_ha(tk_struct_by_ty(nd_type(n)))) tk_hg_add(nd_name(n), nd_type(n));
+            if (nd_val(n) == 0) tk_gs_add(nd_name(n), nd_type(n));
+        }
         n = n + 1;
     }
 }
@@ -266,13 +292,29 @@ void tk_hg_collect() {
 // `tk_struct_by_ty` finds for the type `tk_hg_add` recorded.
 i64 tk_hg_ety_at(i64 i) { return ha_ety_at(tk_struct_by_ty(hg_ty_at(i))); }
 
-// the type of a global `T[]`, for teko_typeof.tk's oracle (`tk_ty_of`) --
-// -1 for anything else, a global SCALAR included, so the oracle keeps
-// answering "not known" for one the way it always has.
+// the type of a global `T[]`, for teko_params.tk's own argument oracle
+// (`tk_pm_arg_ty`) -- -1 for anything else, a global SCALAR included, so a
+// `params` call site keeps reading exactly what it always read.
 i64 tk_ty_global_ha(uptr name) {
     i64 hi = tk_hg_find(name);
     if (hi < 0) return 0 - 1;
     return hg_ty_at(hi);
+}
+
+// the type of a global SLOT, for teko_typeof.tk's oracle (`tk_ty_of`), which
+// is what the whole unit reads a global under: a global is in scope in every
+// body, so "the type is not known here" was never the truth about one, and a
+// check that reads the oracle was refusing what a declaration plainly says
+// (measured on `DateTimeKind g = DateTimeKind.Utc;` in a constructor
+// argument, D48's own deferred check).
+i64 tk_ty_global(uptr name) {
+    i64 i = tk_ngs - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(gs_name_at(i), name)) return gs_ty_at(i);
+        i = i - 1;
+    }
+    return 0 - 1;
 }
 
 // ---- shared address/load/store machinery, LOCAL and GLOBAL alike ----

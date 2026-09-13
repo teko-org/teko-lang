@@ -589,7 +589,21 @@ void tk_prim_arg_do(i64 i) {
 // The argument is checked WHERE IT SITS, so a deferred `.` under it
 // (`new DateTime(1, other.Kind)` on a parameter) is already the call it stood
 // for by the time its type is asked for.
+//
+// ONE shape is not judged here, and it is the one the walk's scope does
+// nothing for: a CALL. Its type is the callee's declared return type, which no
+// scope enters into -- and a call to an OVERLOADED name does not yet know its
+// callee at all, because `tk_over_pass` (teko_over.tk) picks the signature and
+// writes the symbol two passes after this walk. Read here, `tk_ty_of` answers
+// `decl_ret(decl_find(name))` -- the FIRST declaration of the name, not the one
+// the arguments pick -- so `new DateTime(1, pick(1, 2))` with a
+// `DateTimeKind pick(i64)` declared ahead of an `i64 pick(i64, i64)` saw an
+// enum, deferred nothing and let the `i64` cross under the column's own cast:
+// the very laundering this table exists to stop, measured on this branch.
+// A call is left pending for `tk_prim_arg_rest` below instead, which runs once
+// the symbol is picked (Copilot on #697, third pass).
 void tk_prim_arg_pend(i64 n) {
+    if (nd_kind(n) == N_CALL) return;            // its callee is picked two passes down
     i64 i = tk_nparg - 1;
     loop {
         if (i < 0) break;
@@ -598,9 +612,13 @@ void tk_prim_arg_pend(i64 n) {
     }
 }
 
-// ...and the same check over what a BODY walk never reaches: a global's own
-// initializer, the half `tk_prim_cast_globals` answers for the cast. The oracle
-// runs there with no scope, which is exactly what a global is read under.
+// ...and everything the walk above left: a CALL, whose symbol the overload
+// pass has now written, and what a BODY walk never reaches at all -- a global's
+// own initializer, the half `tk_prim_cast_globals` answers for the cast. Both
+// are read with NO scope entered, which is exactly what they are written
+// under: a global initializer stands outside every body, and a call's type is
+// its callee's declared return type, the one answer of this oracle that no
+// scope enters into. Called at the end of `tk_over_pass` (teko_over.tk).
 void tk_prim_arg_rest() {
     i64 i = 0;
     loop {
@@ -610,10 +628,36 @@ void tk_prim_arg_rest() {
     }
 }
 
+// A CALL is the one argument whose type NEITHER oracle decides here, and the
+// reason is the overload pick: both answer `decl_ret(decl_find(name))` for an
+// N_CALL, and `decl_find` gives the FIRST declaration of a name that may carry
+// several signatures -- the one `tk_over_pass` (teko_over.tk) replaces two
+// passes later with the symbol the arguments actually pick. Read here it is a
+// guess, and it was wrong both ways, measured on this branch: a
+// `DateTimeKind pick(i64)` declared ahead of an `i64 pick(i64, i64)` let
+// `new DateTime(1, pick(1, 2))` cross under the column's own cast (the
+// laundering this table exists to stop), and the same pair in the other order
+// refused `new DateTime(1, pick(1, 2))` for a conversion the chosen overload
+// never asks for. So the CHECK is not made on a guess:
+//
+//   - on a CAST column it is deferred, judged by `tk_prim_arg_rest` once the
+//     symbol is written -- where `decl_find` is exact, because the name is
+//     unique by then;
+//   - on every OTHER column the argument crosses under its OWN type, and
+//     `tk_rc_call_args` (teko_rc.tk, the last pass of all) is the late check
+//     that judges it against the very declaration this row names -- the same
+//     division of labour D48 wrote down.
+//
+// The CONVERSION still reads the oracle's answer, unchanged: on both cast arms
+// `tk_prim_conv` never looks at it, and on a float column it is what widens
+// `TimeSpan.FromHours(n)` to `FromHours((f64) n)` -- so not one node of the
+// tree moves for this (every `--dump-ast` is byte-identical).
 i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
     i64 aty = tk_prim_ty_of(a, atpass);
-    if (aty < 0 && tk_prim_conv_casts(pty)) tk_prim_arg_defer(pty, a, line, fl);
-    tk_check_scalar_compat(pty, aty, a, line, fl);
+    i64 cty = aty;
+    if (nd_kind(a) == N_CALL) cty = 0 - 1;       // not decided until the pick
+    if (cty < 0 && tk_prim_conv_casts(pty)) tk_prim_arg_defer(pty, a, line, fl);
+    tk_check_scalar_compat(pty, cty, a, line, fl);
     return tk_prim_conv(pty, a, aty);
 }
 

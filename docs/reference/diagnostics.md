@@ -419,6 +419,34 @@ i64 main() {
 }
 ```
 
+**And an argument that is a CALL is judged by the signature the ARGUMENTS pick.** A name
+may carry more than one, and the symbol a site calls is written two passes after the walk
+that would otherwise judge the argument, so the check waits for it — in both declaration
+orders, and with no wording of its own:
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+DateTimeKind pick(i64 a) { return DateTimeKind.Utc; }
+i64 pick(i64 a, i64 b) { return 7; }
+
+i64 main() {
+    DateTime d = new DateTime(1, pick(1, 2));
+    // teko: a value of type i64 does not convert to DateTimeKind
+    return 0;
+}
+```
+
+`new DateTime(1, pick(1))` in that same program is accepted, and so is the mirror pair —
+an `i64` overload landing on the ticks position of a name whose other overload answers the
+enum. What decides is the overload, never the first declaration of the name.
+
+A GLOBAL is accepted wherever its declaration says the enum: `DateTimeKind g =
+DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function is the
+enum in the enum's own position. A global is in scope in every body, so its declared type
+is what the check reads, exactly as a local's is.
+
 The mirror holds as well: a `DateTimeKind` in the `i64` position of the same constructor —
 `new DateTime(k, DateTimeKind.Utc)` with `k` of enum type — is
 `teko: a value of type DateTimeKind does not convert to i64`. That position needs no cast,
@@ -835,6 +863,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many local arrays"` | 1024 declarations in scope |
 | `"teko: too many global arrays"` | 512 in one source |
 | ``"teko: too many global `T[]` of heap"`` | 32 in one source |
+| `"teko: too many globals"` | 2048 global slots in one source — every global that holds one value, which is what the oracle answers for by name |
 | `"teko: too many array writes waiting to be resolved"` | 512 |
 | `"teko: too many array-field accesses"` | 128 |
 | ``"teko: too many `T[]` parameters in one declaration"`` | 32 |

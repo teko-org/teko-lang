@@ -81,6 +81,11 @@
 // builds the array is teko_params.tk's own (`tk_pm_expand_call`) -- one
 // expansion, called from the two places that know which list a site means.
 
+// teko_prim.tk is included after this file: the check of a primitive row's
+// argument that had to wait for the symbol this pass writes, run at the end of
+// `tk_over_pass` below (D48, Copilot on #697).
+void tk_prim_arg_rest();
+
 #define TK_MAXODECL 8192              // declarations of one unit
 #define TK_MAXOVER  64                // names declared at more than one signature
 #define TK_MAXOARGS 64                // arguments at one site, all typed at once
@@ -711,9 +716,19 @@ void tk_ov_check_left() {
 i64 tk_over_pass(i64 root) {
     tk_ov_collect(root);
     tk_ov_scan();
-    if (tk_nover == 0) return root;
-    tk_ov_rename();
-    tk_ty_pass_walk(root, &tk_ov_visit);
-    tk_ov_check_left();
+    if (tk_nover > 0) {
+        tk_ov_rename();
+        tk_ty_pass_walk(root, &tk_ov_visit);
+        tk_ov_check_left();
+    }
+    // ...and the arguments of a primitive row that are CALLS, which this pass
+    // is what the check had to wait for: the symbol a call carries is the
+    // signature picked just above, so `tk_ty_of` answers the return type of the
+    // overload the site actually calls instead of the first declaration of the
+    // name (teko_prim.tk's own `tk_prim_arg_rest`, D48). It runs whether or not
+    // this unit overloads anything -- the global initializers in that same
+    // table are the half no body walk ever reached -- and adds no pass of its
+    // own.
+    tk_prim_arg_rest();
     return root;
 }
