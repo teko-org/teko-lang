@@ -21,7 +21,9 @@ tells a compiler-written cast from a hand-written one.
 ## The two tables
 
 A **member row** is
-`(type id, member name, kind, how many arguments, their type, symbol, result type)`:
+`(type id, member name, kind, how many arguments, a head into the pool of per-position
+argument types, symbol, result type)` — a position may carry a late type NAME (an id below
+-1) until the site reads it:
 
 | kind | reached as | example |
 |---|---|---|
@@ -164,8 +166,9 @@ guess would write the wrong node and then hide the value behind it.
 `tk_ty_pass_walk` at the END of `tk_over_pass` (teko_over.tk), not on the operator pass's
 walk. That is the only place where both halves of what types an argument are true at once —
 the scope a parameter is read under is live, and every call under the argument already
-carries the symbol its own arguments picked, `decl_find` answering the FIRST declaration of
-an overloaded name everywhere earlier. It adds no pass (`passes` 15/30), and a unit that
+carries the symbol its own arguments picked and committed — the pass-time oracle asks the
+overload table since D49, but the parser's cannot, and the judgement wants the committed
+symbol, not a query. It adds no pass (`passes` 15/30), and a unit that
 deferred nothing walks nothing.
 
 The two cast columns defer only the CHECK: `tk_prim_conv` never reads the argument's type

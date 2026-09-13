@@ -2246,6 +2246,17 @@ wrote into not-yet.md -- `DateTimeKind k = pick(1) + 1;` compiling outside an ar
 a legal `pick(1) | DateTimeKind.Utc` refused -- is CLOSED, both directions, and the row is
 replaced by what is left of it there.
 
+**Copilot finding, eighth pass -- one latent arity slip, five stale sentences.**
+`tk_prim_member`, the one-argument registration helper, tested `p0 >= 0` to tell "no
+argument" from "one", but a late type name (`tk_prim_late`, D48) is an id BELOW -1, so a
+one-argument row over a late type would have been stored with arity zero. No row does that
+yet (the only late column sits in the two-argument constructor, registered by position), so
+the 62 dumps are byte-identical before and after; the test is `p0 != -1` now, the sentinel
+itself. The five sentences (`teko_prim.tk`'s two rationales, `docs/internals/primitives.md`'s
+row schema and walk rationale, `docs/specs/enum.md`'s gate count) still described the
+first-declaration guess D49 removed, or the one-type row N2c widened, or 61 fixtures; they
+say what the code does now.
+
 **Proof of the sixth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
 --config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
 all 61 against `38826cb4` -- **60 byte-identical**, and the one that moves is the fixture
@@ -2385,4 +2396,4 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 — floor (`tests/hello.tk`) `passes` **15/30**, `syntax` 15, `alias` 18, `types` 11, `intrin`
 8/16, heap 1114880, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types`
 14, heap 3875392 (against a 33554432-byte reservation). `mc pkg hash .` over the source tree
-of this entry's code commits: `8415eb317fc1a085b70b3c6b50e139b0cdaa7bea62bfd7090da1134cbfb6abd7`.
+of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.

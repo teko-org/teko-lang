@@ -237,10 +237,11 @@ void tk_prim_member2(i64 ty, uptr name, i64 kind, i64 t0, i64 t1, uptr sym, i64 
     tk_prim_memberp(ty, name, kind, 2, pp, sym, ret);
 }
 
-// the shape most rows have: no argument (`p0` -1) or exactly one.
+// the shape most rows have: no argument (`p0` exactly -1) or one -- and a
+// late type name (`tk_prim_late`, an id below -1) is one argument too.
 void tk_prim_member(i64 ty, uptr name, i64 kind, i64 p0, uptr sym, i64 ret) {
     i64 np = 0;
-    if (p0 >= 0) np = 1;
+    if (p0 != 0 - 1) np = 1;
     tk_prim_membern(ty, name, kind, np, p0, sym, ret);
 }
 
@@ -666,11 +667,11 @@ void tk_prim_arg_do(i64 i) {
 //   - the SCOPE it was written under, because a name (`k`, a parameter) has
 //     no type anywhere else -- so the walk is `tk_ty_pass_walk`'s, which
 //     enters each function and pushes its parameters and its locals;
-//   - every overload PICK already written, because a call's type is its
-//     callee's declared return type and `decl_find` answers the FIRST
-//     declaration of a name that may carry several -- so the walk runs after
-//     `tk_over_pass`'s own walk has rewritten every site to the symbol its
-//     arguments choose, whatever depth the call sits at under the argument.
+//   - every overload PICK already COMMITTED: since D49 the pass-time oracle
+//     asks the overload table for a call's type, but the judgement wants the
+//     site rewritten to its final symbol (what `tk_rc_call_args` will check
+//     against), so the walk runs after `tk_over_pass`'s own walk has written
+//     every pick, whatever depth the call sits at under the argument.
 //
 // Riding teko_ops.tk's walk was the third pass's answer to the first half and
 // missed the second, so the arguments that are CALLS were left to a sweep at
@@ -707,12 +708,13 @@ void tk_prim_arg_judge(i64 root) {
     tk_ty_pass_walk(root, &tk_prim_arg_pend);
 }
 
-// A CALL is the one argument whose type NEITHER oracle decides here, and the
-// reason is the overload pick: both answer `decl_ret(decl_find(name))` for an
-// N_CALL, and `decl_find` gives the FIRST declaration of a name that may carry
-// several signatures -- the one `tk_over_pass` (teko_over.tk) replaces two
-// passes later with the symbol the arguments actually pick. Read here it is a
-// guess, and it was wrong both ways, measured on this branch: a
+// A CALL is the one argument whose type is NOT decided here, and the reason
+// is the overload pick: this runs at parse time, when the overload table does
+// not exist yet (a later declaration in the file may still add a signature),
+// so the parser's oracle can only answer `decl_ret(decl_find(name))`, the
+// FIRST declaration of a name that may carry several. Since D49 the pass-time
+// oracle asks the table instead (teko_typeof.tk), but here the answer would
+// still be a guess, and a guess was wrong both ways, measured on this branch: a
 // `DateTimeKind pick(i64)` declared ahead of an `i64 pick(i64, i64)` let
 // `new DateTime(1, pick(1, 2))` cross under the column's own cast (the
 // laundering this table exists to stop), and the same pair in the other order
