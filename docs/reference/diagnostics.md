@@ -841,6 +841,14 @@ Every one of these is [nullable.md](nullable.md)'s.
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps
   the C symbol.
+- `"teko: the name is the compiler's own"` — completed by the name: a top-level declaration
+  of the program's own carries a symbol some generator writes — `tkarr_new_i64`,
+  `tkarr_put_i64` (a `params T[]` or a `new T[n]`), `tk_nl_ck`, `tk_nl_new`,
+  `tk_nl_box_i64`, `tk_nl_dflt`, `tk_nl_vt` (a `T?`), a class's own `Name__vt`, an enum's
+  `Name__names`. The two would reach the linker as one symbol and a call site would pick
+  whichever table answered first. Only the EXACT name a generator wrote is taken, and only
+  against a declaration the compiler did not write: no prefix is reserved, so `tkarray` and
+  `tk_nl_boxer` are a program's own names like any other. Rename the declaration.
 - `"teko: cannot take the address of an overloaded function"` — `&f` needs one symbol.
 - `"teko: an overloaded call outside a function body has no arguments to resolve it"` — a
   call in a global initializer has no site to type.
@@ -953,6 +961,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
 | `"teko: too many declarations in one unit"` | 8192 |
+| `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |
 | `"teko: too many free-function declarations with parameters"` | 4096 |
 | `"teko: too many arguments"` | 64 at one call of an overloaded name |

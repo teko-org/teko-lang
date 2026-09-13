@@ -2257,6 +2257,64 @@ row schema and walk rationale, `docs/specs/enum.md`'s gate count) still describe
 first-declaration guess D49 removed, or the one-type row N2c widened, or 61 fixtures; they
 say what the code does now.
 
+**Copilot finding, ninth pass -- the table was rebuilt and judged once, and the compiler's
+own names were nobody's.** D49 pulled `tk_ov_prepare` up to pass 6 and rebuilt its rows on
+every call, but a flag (`tk_ov_scanned`) kept the JUDGEMENT at the first call: every
+declaration the unit gains afterwards -- the `tkarr_new_T`/`tkarr_release_T`/`tkarr_put_T`
+group `tk_params_pass` (12) emits, which is exactly the growth D49 measured at 84 rows to 94
+-- was never scanned, so it was never marked and never mangled. A program declaring one of
+those names by hand kept its own plain symbol beside the generated one and the site picked
+whichever table answered first. Measured on `665c7442`, `i64 tkarr_put_i64(i64 a)` beside an
+`i64 total(params i64[] xs)` and a `total(1, 2, 3)`: `teko: a value of type i64[] does not
+convert to i64` at the CALL, a legal program refused for the wrong reason -- the generated
+helper had been type-checked against the program's own function.
+
+**The root is that nothing told a generated declaration from a written one**, and rescanning
+alone does not fix it: with the scan repaired the same program reads `teko: no overload of
+tkarr_put_i64 matches these arguments`, a better message for a program that is still legal.
+Reserving the `tkarr_`/`tk_nl_` SPELLINGS was tried and is wrong twice over: those helpers
+are emitted during the PARSE (`tk_ha_ensure_gen`, teko_heaparr.tk; `tk_nl_ensure_ck`,
+teko_null.tk), so they are already in the pass-6 table and a prefix rule refuses 14 of the
+fixtures outright; and the compiler's own sources declare `tk_nl_box_fn` and `tk_nl_boxname`,
+so the bootstrap would refuse itself.
+
+**So the mark is on the NODE, at the one door every generator uses.** `tk_top_emit`
+(teko_struct.tk) is where a generated top-level declaration is added -- K6's own audit
+already names it as the point every mid-declaration generator goes through -- and it now
+records the pair (node, name) in a table of its own (`TK_MAXEMIT` 512, capacity message,
+134 used by `tests/surface_lambda.tk`, the busiest fixture, and 0 by `tests/hello.tk`).
+`tk_ov_collect` then refuses a top-level declaration the compiler did NOT emit whose name
+one it DID emit carries: `teko: the name is the compiler's own: tkarr_put_i64`, and the same
+for `tk_nl_ck`, `tk_nl_box_i64`, `tk_nl_new`, `tk_nl_dflt`, a `tk_nl_vt`/`Name__vt` global
+or an enum's `Name__names`. It is the node and never the spelling, so the generated
+declaration itself passes, and a name that merely LOOKS like one is a program's own:
+`tkarray` and `tk_nl_boxer` beside a `params` list and an `i64?` compile and run (exit 49).
+Globals are checked too, though they are collected by nobody: `tk_nl_vt` is a generated
+GLOBAL and a program declaring one would clash with it exactly as a function does.
+
+**The memoization was audited, and no generator keys on `decl_find`** -- the worst case
+would be a generator deciding "already emitted" because the PROGRAM declared the name, and
+the program's function then silently standing in for the helper. Every one keys on a table
+of its own: `ha_gen_at`/`ha_put_at` (teko_heaparr.tk), `tk_nl_ck_gen`/`tk_nl_box_gen`/the
+`nl_box` payload list (teko_null.tk), `tk_enum_slot` (teko_enum.tk), `dgi_row_at`/`dgi_fn_at`
+(teko_deleg.tk), `tk_ix_emitted` (teko_struct.tk). The three `decl_find` memos that exist
+are include checks and name resolution (`tk_prim_need_include_of`, `tk_enum_need_include`,
+`tk_deleg_resolve_fn`), not generators. Proved rather than argued: on `665c7442`,
+`i64 tk_nl_box_i64(i64 v)` declared ABOVE the first `i64?` reached
+mc's own `function declared twice` -- the generator had emitted its own anyway -- and it is
+`teko: the name is the compiler's own: tk_nl_box_i64` now.
+
+**Proof of the ninth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
+--config mc.macos.toml` clean; **62/62** fixtures at their `expect-exit`; `--dump-ast` of all
+62 against `665c7442` -- **62 byte-identical**, which is what says the rescan and the mark
+change no accepted program; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (62/62 under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (567
+links, **385** diagnostics, 117 samples). `mc limits` verdict `ok` on both legs with every
+table unmoved -- floor (`tests/hello.tk`) `passes` **15/30**, `syntax` 15, `alias` 18,
+`types` 11, `intrin` 8/16, heap 1114992, and the `tests/surface_datetime.tk` leg `syntax`
+16, `alias` 21, `types` 14, heap 3875504 (against a 33554432-byte reservation).
+`mc pkg hash .`: `5516de82a24b18f001eca4f4e8eed83843450129e328ba2c48f9efe08229f428`.
+
 **Proof of the sixth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
 --config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
 all 61 against `38826cb4` -- **60 byte-identical**, and the one that moves is the fixture
@@ -2327,11 +2385,12 @@ recon weighed). `tk_ov_resolve` becomes `i64 tk_ov_pick(i64 n, i64 commit)`:
 
 `tk_ov_prepare(root)` is what fills the table, called at the TOP of `tk_typeof_pass` (pass
 6, ahead of every consumer) and again at the top of `tk_over_pass`. It REBUILDS the
-declaration rows on each call and scans once: the unit grows between the two, since
-`tk_params_pass` (12) emits the allocator, release and element store of a `T[]` row a call
-site is the first to build — measured, `tests/surface_params.tk` carries 84 top-level
-declarations at pass 6 and 94 at pass 14 — so a table collected once would have made the
-pick depend on whether anything asked earlier.
+declaration rows on each call and scans them again (D48's ninth pass corrects this entry — it
+scanned ONCE as first written): the unit grows between the two, since `tk_params_pass` (12)
+emits the allocator, release and element store of a `T[]` row a call site is the first to
+build — measured, `tests/surface_params.tk` carries 84 top-level declarations at pass 6 and
+94 at pass 14 — so a table collected once would have made the pick depend on whether
+anything asked earlier, and a table SCANNED once judged only the rows pass 6 could see.
 
 **The consumers this closes**, every one measured on `9784ad80` before and after, with the
 picked overload declared SECOND so the guess and the pick disagree:
@@ -2363,8 +2422,10 @@ removing that one line makes `tests/surface_datetime_kind.tk` answer 1 instead o
 overloaded `main`, an overloaded `extern`, two overloads differing only by `ref`/`out` — now
 fire at pass 6 instead of pass 14, with the same message at the same line; a program whose
 only error is one of those sees it earlier than another error it also has. Keeping the scan
-at 14 was possible (a second flag) and was not taken: the marks it writes are exactly what
-`tk_ov_find` reads, so the oracle would have had to duplicate the judgement. Re-entrancy is
+at 14 only was possible (a second flag) and was not taken: the marks it writes are exactly
+what `tk_ov_find` reads, so the oracle would have had to duplicate the judgement — and
+scanning at 6 ONLY, which is what this entry first shipped, left every row the later passes
+add unjudged, which is what D48's ninth pass fixes. Re-entrancy is
 bounded by the tree: a question descends into its own arguments and never back up. Cost is a
 re-resolution per question rather than a cache — the compiler's own source declares no
 overload at all (mc's core is what it is built from), so `scripts/bootstrap.sh` measures the
