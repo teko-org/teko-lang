@@ -2647,6 +2647,66 @@ deleting it belongs to the next crumb that opens that module. The comment over
 `tk_ref_check_pointee` is corrected too: a global IS named now, and the only pointee left
 unnamed is the ambiguous local.
 
+**Verifier finding: that "ambiguity" was the bug, and two oracles were answering one name.**
+The reviewer's own reproducer -- `bumpf(ref g)` written OUTSIDE the two sibling blocks that
+shadow an `i64` global `g`, where nothing is ambiguous at all -- compiled on the head of
+this crumb and exited 139, `EXC_BAD_ACCESS` at `ldr d17, [x10]`. `--dump-ast` prints the
+whole story in two lines: `CAST type=f64` over `ADDR type=uptr name=g`, D33's own `scvtf`
+run on an ADDRESS. Item 2 above kept the "ambiguous local" answer apart from "no such
+local", and that is exactly what broke it: `tk_ref_scan_local` decided ambiguity by scanning
+the WHOLE body, blind to the position of the site, so it answered "ambiguous, refuse
+nothing" for every `ref g` in the function -- including one written where no block declaring
+`g` is open -- while `tk_rc_call_args` (teko_rc.tk), reading the LEXICAL scope through
+`tk_ty_of`, answered the global's `i64` and widened the address on it. Two oracles for one
+name, one of them position-blind.
+
+The fix is that there is only ONE oracle, and no such thing as an ambiguous name. A name at
+a point is the innermost declaration visible THERE, or, when no block open there declares
+it, the global -- which is what `tk_ty_scope_or_global` (teko_typeof.tk) already answers,
+and what `tk_ty_of`, `tk_ov_arg_ty` and teko_deleg.tk's dispatch points already read.
+`tk_ref_pass` runs AFTER `tk_typeof_pass` (teko.tk), so the oracle's own scope stack is
+available to it: `tk_ref_fn` opens it with the function's parameters and `tk_ref_walk` keeps
+it live exactly as `tk_ty_walk_list` does -- a mark at every block, cut back at its `}`, a
+local in scope only after the statement that declares it has been walked -- and
+`tk_ref_arg_pointee` is three lines that ask it. teko_params.tk, the other caller, does the
+same in `tk_pm_walk`/`tk_pm_walk_unit` and asks the same helper. DELETED with the scan:
+`tk_ref_scan_local`, `tk_ref_lty`, `tk_ref_lamb`, `tk_local_ty_in`, `tk_local_or_global_in`
+(teko_ref.tk), `tk_ref_param_ty` (teko_ref.tk -- `tk_ty_scope_params` records a `ref`/`out`
+parameter under its own pointee, so the private parameter lookup had nothing left to add)
+and `tk_pm_cur_fn` (teko_params.tk). ADDED: `tk_ty_scope_mark`/`tk_ty_scope_cut`
+(teko_typeof.tk), two one-line accessors, because teko_ref.tk is included ahead of that file
+and cannot name `tk_nscope` itself. Item 2's own probe still passes and now for the right
+reason: `ref g` INSIDE the block that declares `f64 g` is that block's local and is
+accepted; the same `ref g` after the block has closed is the global and is judged against
+it.
+
+**And an invariant of its own, so no second oracle can ever cast an address again.**
+`tk_rc_call_args` widens an N_ADDR never -- an address is not a numeric value, whatever
+`tk_ty_of` says its pointee is. A `ref`/`out` argument is judged there by the one rule that
+owns pointees, identity (`tk_ref_check_pointee`), which refuses in the same words a value
+gets; that is also the site that judges an OVERLOADED name's pointee, which teko_ref.tk's
+own call check (declared exactly once) leaves to the matcher. With the lexical oracle in
+place, every user-written mismatch is refused before this guard is reached -- measured:
+a mismatched pointee on an overloaded name is refused by the matcher itself,
+`teko: no overload of f matches these arguments` -- so the guard is proved by `--dump-ast`
+instead: the accepted `bumpi(ref g)` carries a bare `ADDR type=uptr name=g` with no CAST
+over it, where the head of this crumb printed `CAST type=f64` over that same node.
+
+Proof of the finding's fix, mc **0.15.23**, macos/aarch64: the reproducer refuses,
+`teko: a value of type i64 does not convert to f64`, at the line that writes it; **63/63**
+fixtures at their `expect-exit`, with `tests/surface_globals.tk` section 6 extended by the
+outside-the-blocks call (`bumpi(ref g_sib)`, accepted, and `main` checks the global really
+was bumped, 7 -> 8 -> 9); the `--dump-ast` of the **62** fixtures that existed at
+`da33ebd4`, byte-identical to that base; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` -> `FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green
+(568 links, 385 diagnostics, 119 samples); `mc limits . --config mc.macos.toml` verdict `ok`
+on both legs, the `tests/hello.tk` leg's structural counts byte-identical to the head of
+this crumb and its heap 1114880 estimated against 1114992 used of a 33554432 ceiling, the
+compiler leg's used heap 92311424 of a 218234880 reserve (the deletions give back what the
+scan cost: `nodes` used 154066 -> 153967, `ins` 212163 -> 211960, `funcs` 3133 -> 3131).
+`mc pkg hash .` at this fix's own code commit:
+`050f35870ffdd4349e216d19da851a21ae66af4fa312328a72ad3d2028263e3e`.
+
 Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
 clean; **63/63** fixtures at their `expect-exit` (`tests/surface_globals.tk`, exit 42, six
 sections: `ref`/`out` over a scalar global, an overload picked by a `ref` global, a
