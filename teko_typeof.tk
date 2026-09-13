@@ -459,12 +459,28 @@ i64 tk_num_widens(i64 tty, i64 ety) {
     return tk_is_int_ty(ety);
 }
 
+// an INDIRECT call declares its return type by the cast that sits DIRECTLY on
+// it -- `tk_callp_ret`'s own contract with the core (teko_array.tk, mc
+// src/gen_resolve.mc), which is why a wide integer return carries NO cast at
+// all (the core already types the node `TY_I64`). A widening cast written
+// straight over such a `callp` is read as that declaration instead of as a
+// conversion: the core takes the call for one that returns `f64`, moves `d0`
+// into the destination and converts nothing. Measured at the surface, mc
+// 0.15.23: `f64 x = (f64)(a.M());` on an `i64 M()` reached through a vtable
+// read garbage, and `(f64)((i64)(a.M()))` read 5.0. So the integer's OWN
+// declaring cast goes in between, and the widening converts that node.
+i64 tk_is_callp(i64 n) {
+    if (nd_kind(n) != N_CALL) return 0;
+    return str_eq(nd_name(n), "callp");
+}
+
 i64 tk_num_widen(i64 tty, i64 ety, i64 e) {
     if (e == 0) return e;
     if (!tk_num_widens(tty, ety)) return e;
     tk_line = nd_line(e);
     tk_file = nd_file(e);
     set_nd_next(e, 0);
+    if (tk_is_callp(e)) e = tk_cast(ety, e);
     return tk_cast(tty, e);
 }
 
@@ -711,17 +727,27 @@ void tk_ty_pass_walk(i64 root, uptr visit) {
 // No pass is registered for it (`mc limits`' `passes` row does not move),
 // exactly as D48's own judgement rides the same pass.
 //
-// A value the PASS cannot type either is left alone: `-1` is "not known",
-// never a verdict (D226's own rule, the one every `ety < 0` in this file
-// reads), so a store that reached the run unchecked before still does rather
-// than being refused on a guess.
+// A value the PASS cannot type either is REFUSED, and this is the invariant
+// the whole gate rests on: a store is judged, or it is refused; it is never
+// written raw. An earlier wording of this judge returned in silence on `-1`,
+// reading D226's "not known is never a verdict" as a licence to emit the
+// store unchecked -- and that silence is exactly what a value no oracle
+// answers for needs protection FROM, since what reaches the machine then is
+// the value's own eight bytes in a slot of another type. Measured (Copilot on
+// #698, pass 4): a virtual `i64 M()` stored into an `f64` field wrote the
+// integer's raw bits, because a `callp` carried no type for anyone to read.
+// D226's rule holds where it was written -- an ORACLE answers -1 rather than
+// guessing -- and this is the one point that turns the unanswered question
+// into a refusal instead of into machine code (the same sentence D48 gives a
+// primitive row's deferred argument, one slot over).
 void tk_fs_do(i64 i) {
     if (fst_done_at(i)) return;
     st64(fst_done + i * 8, 1);
     i64 n = fst_node_at(i);
     i64 fty = fst_ty_at(i);
     i64 vty = tk_ty_of(n);
-    if (vty < 0) return;
+    if (vty < 0)
+        err_at(fst_file_at(i), fst_line_at(i), "teko: the type of this value is not known here");
     // the SAME judge every other slot of the language uses -- the two scalar
     // verdicts and the row one, in one call -- which is what tells an `enum`,
     // a primitive with members, a raw `uptr` and an unrelated class apart from

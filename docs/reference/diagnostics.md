@@ -968,8 +968,32 @@ The receiver above is a **parameter**, which the parser cannot type either: that
 rebuilt by the pass and goes through the same gate, so a `T?` field written through it boxes
 its value like every other site rather than taking the raw bits for a box handle.
 
-A value neither oracle can type even there is left alone, as every other *not known here*
-is: the rule refuses only what it is sure about.
+An **element of a `T[]`** is that same slot: `xs[i] = e` is judged by the very gate, after
+the pick, so a narrowing into an `i64[]` is refused, an integer into an `f64[]` is widened
+and an `i64?[]` boxes what it is given.
+
+```teko
+// no-run
+class Cell { public i64 v; }
+
+i64 rick(i64 a)         { return 5; }
+Cell rick(i64 a, i64 b) { Cell c = new Cell(); c.v = 7; return c; }
+
+i64 main() {
+    i64[] ns = new i64[2];
+    ns[0] = 1.5;                 // teko: a value of type f64 does not convert to i64
+    Cell[] cs = new Cell[2];
+    cs[0] = null;                // teko: null needs a slot declared Cell?
+    cs[1] = rick(1, 2);          // ...and this one compiles: the PICK returns a Cell
+    return 0;
+}
+```
+
+- `"teko: the type of this value is not known here"` — the deferred store reached its one
+  point of judgement and **no** oracle could type the value even there. A store is judged or
+  it is refused; it is never written raw, because what crosses unread is the value's own
+  eight bytes in a slot of another type. Bind the value to a local of the right type first,
+  the same answer *the type of this argument is not known here* gives one position over.
 
 ## Capacity
 

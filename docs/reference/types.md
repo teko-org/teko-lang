@@ -261,9 +261,9 @@ integer of its own accord, and only a value the type table has a row for (or the
 literal above) is judged here.
 
 **A field store is one rule, at every site that writes one.** `p.f = e`, `this.f = e`, the
-implicit `f = e` inside a method or a constructor, and a `static` field `T.f = e` (through
-its type, whether or not the type is already known where the store is written) all pass
-through the same check: the widening above, the narrowing refusal, `null` only in a `T?`
+implicit `f = e` inside a method or a constructor, a `static` field `T.f = e` (through its
+type, whether or not the type is already known where the store is written) and an ELEMENT
+of a `T[]`, `xs[i] = e`, all pass through the same check: the widening above, the narrowing refusal, `null` only in a `T?`
 field ([nullable.md](nullable.md)), an `enum` field converting from nothing but itself, and
 the reference/number mismatch (D34), in both directions.
 
@@ -293,8 +293,10 @@ i64 main() {
 ```
 
 The rule does not weaken where the site cannot type the value — a parameter, an implicit
-`f = e` the pass rewrites, a `static` field on a type declared below. That store waits for
-the pass and is judged there, under the same rule and at its own line
+`f = e` the pass rewrites, a `static` field on a type declared below, a call to an
+overloaded name, a user operator. That store waits for the pass and is judged there, under
+the same rule and at its own line; a value that has no type even then is refused rather
+than written raw
 ([diagnostics.md](diagnostics.md#a-field-store-whose-value-only-the-pass-can-type)).
 
 Two floats of different widths do not convert to each other yet: an `f32` in an `f64`

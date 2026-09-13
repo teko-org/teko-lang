@@ -54,7 +54,18 @@
 //  11. `boxcheck`     -- an `i64?` field written from a parameter: the Q1b
 //                       box is built in the judge, and the raw eight bytes
 //                       used to be stored as a handle (a segfault, measured);
-//  12. `rccheck`      -- `rt_live()` back to its floor once every object
+//  12. `vcallcheck`   -- a VIRTUAL `i64 M()` and an INTERFACE `i64 M()` into
+//                       an `f64` field, on both roads: a receiver the parser
+//                       types and a receiver only the pass does. The call is
+//                       a `callp`, which names no callee and carries no cast
+//                       when it returns a wide integer, so nothing could type
+//                       it and the store wrote the integer's raw bits;
+//  13. `elemcheck`    -- an ELEMENT of a `T[]` of heap, the sixth store site:
+//                       the overloaded pick that returns a ROW, the compound
+//                       over a load nobody typed, the widening an `f64[]`
+//                       writes and the box an `i64?[]` wraps -- one door, the
+//                       same verdicts a field gets;
+//  14. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released.
 //
 // A refusal has no exit code to assert (D33's own harness note): the
@@ -217,6 +228,85 @@ void setinstance(H h, i64 k) {
 void setthrough(H h, i64 k) {
     h.rate = k;
     h.count = k;
+}
+
+// the two INDIRECT calls, the shapes `tk_callp_ret` (teko_array.tk) leaves
+// with no cast at all: a VIRTUAL method reached through the vtable and an
+// INTERFACE method reached through the itab. `callp` names no callee, so the
+// core types the node `TY_I64` by itself and teko registered nothing for a
+// scalar return -- `f64 rate; this.rate = b.M();` reached the judge with no
+// type and the raw eight bytes of an integer landed in a float field. A float
+// RETURN never had the bug: its own declaring cast is what every oracle reads
+// it by, which is why `fromfloat` is here beside the other two.
+class Base {
+    public virtual i64 M() { return 3; }
+    public virtual f64 F() { return 2.5; }
+}
+
+class Derived : Base {
+    public override i64 M() { return 5; }
+    public override f64 F() { return 2.5; }
+}
+
+interface IM {
+    i64 M();
+}
+
+class Impl : IM {
+    public i64 M() { return 5; }
+}
+
+class V {
+    public f64 rate;
+
+    // the receiver is a PARAMETER, so the whole access waits for the pass
+    public void fromvirt(Base b) { this.rate = b.M(); }
+    public void fromiface(IM m) { this.rate = m.M(); }
+    public void fromfloat(Base b) { this.rate = b.F(); }
+}
+
+i64 vcallcheck() {
+    Derived d = new Derived();
+    Impl im = new Impl();
+    V v = new V();
+    v.fromvirt(d);
+    if (v.rate != 5.0) return 1;
+    v.fromiface(im);
+    if (v.rate != 5.0) return 2;
+    v.fromfloat(d);
+    if (v.rate != 2.5) return 3;
+    Base b = d;                       // a LOCAL: the receiver the PARSER types
+    IM mi = im;
+    v.rate = b.M();
+    if (v.rate != 5.0) return 4;
+    v.rate = mi.M();
+    if (v.rate != 5.0) return 5;
+    return 0;
+}
+
+// the sixth site: an ELEMENT of a `T[]` of heap (teko_heaparr.tk's
+// `tk_ha_store`), which called the row check ALONE -- before the pick, with
+// no scalar verdict of its own and no deferral of its own.
+i64 elemcheck() {
+    f64[] fs = new f64[2];
+    fs[0] = 1;                        // the widening a field gets
+    if (fs[0] != 1.0) return 1;
+    i64[] ns = new i64[2];
+    ns[0] = 2;
+    ns[0] += 100;                     // the compound, over a load nobody typed
+    if (ns[0] != 102) return 2;
+    i64?[] bs = new i64?[2];
+    bs[0] = 5;                        // Q1b's box, the element's own
+    if (!bs[0].HasValue) return 3;
+    if (bs[0].Value != 5) return 4;
+    i64 floor = rt_live();            // the three arrays above are live objects
+    {
+        Cell[] cs = new Cell[2];
+        cs[0] = rick(1, 2);           // the pick returns a ROW, not `i64`
+        if (cs[0].v != 7) return 5;
+    }
+    if (rt_live() != floor) return 6;
+    return 0;
 }
 
 i64 ctorcheck() {
@@ -417,8 +507,14 @@ i64 main() {
     bad = rowpickcheck();
     if (bad != 0) return 160 + bad;
 
-    bad = rccheck();
+    bad = vcallcheck();
     if (bad != 0) return 170 + bad;
+
+    bad = elemcheck();
+    if (bad != 0) return 180 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 190 + bad;
 
     return 42;
 }
