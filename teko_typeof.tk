@@ -560,9 +560,23 @@ i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
 }
 
 // ---- the value's type, or "not known" when a LATER PASS is what decides it ----
-// The two oracles answer about the tree AS IT STANDS, and two node kinds are
-// not what they will be:
+// ONE oracle answers at this door, and it is the PARSE-TIME one: `tk_pty_of`
+// (teko_struct.tk) -- a literal, a cast, a node the type table already tags,
+// and a local whose declaration the parser has read. That is what the door
+// always knew, and everything else is "not known" and DEFERRED, because every
+// other answer here is a guess a later pass overturns:
 //
+//   - `tk_ty_of`, the PASS-TIME oracle, was read as a fallback, and it reads
+//     the GLOBAL table (teko_array.tk's `tk_ty_global`) for a bare name. A
+//     global a parameter or a FIELD shadows then answered for the shadowing
+//     name, since a parse-time site has no function scope at all and the two
+//     sites that run from a pass reach this door BEFORE the walk that
+//     resolves the name. Measured (Copilot on #698, pass 3): with a global
+//     `f64 rate` beside a class that declares `i64 rate`, the implicit
+//     `total = rate;` was typed `f64`, converted nothing and was not
+//     deferred, and `tk_this_ident` then rewrote that name into the `i64`
+//     field's own load -- raw eight bytes in an `f64` field; the mirror
+//     (`i64 total`) REFUSED a store that is an integer.
 //   - an N_CALL to an overloaded name. `tk_pty_of` answers `decl_ret` of the
 //     FIRST declaration (D49 leaves that as the parse-time limit it is), and
 //     the site is rewritten to the symbol its ARGUMENTS pick at pass 14, so a
@@ -578,10 +592,12 @@ i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
 //     `operator+(GrandBase, i64) -> i64` was refused, `a value of type
 //     GrandBase does not convert to i64`, for a store that is an integer.
 //
-// Both are DEFERRED and judged once every pass that moves them has run
-// (`tk_field_store_judge`, at the end of `tk_over_pass`). A node the type
-// table already tags (`tk_xt_ty`, the lowered call a `new` or a load is) is
-// not a guess and answers here, exactly as `tk_pty_of`'s own first line does.
+// Every one of them is DEFERRED and judged once, when every pass that moves
+// them has run (`tk_field_store_judge`, at the end of `tk_over_pass`): the
+// scope is alive there, the name is the load it stands for and the call is
+// the overload its arguments picked. A node the type table already tags
+// (`tk_xt_ty`, the lowered call a `new` or a load is) is not a guess and
+// answers here, exactly as `tk_pty_of`'s own first line does.
 i64 tk_fs_vty(i64 v) {
     i64 t = tk_xt_ty(v);
     if (t >= 0) return t;
@@ -589,9 +605,7 @@ i64 tk_fs_vty(i64 v) {
     if (k == N_CALL)   return 0 - 1;
     if (k == N_BINARY) return 0 - 1;
     if (k == N_UNARY)  return 0 - 1;
-    t = tk_pty_of(v);
-    if (t >= 0) return t;
-    return tk_ty_of(v);
+    return tk_pty_of(v);
 }
 
 // the value a field store actually writes, at every site that builds one --
@@ -608,26 +622,21 @@ i64 tk_fs_vty(i64 v) {
 // slot like any other: `f64 w; p.w = 4;` writes four point zero, and
 // `i64 n; p.n = 2.5;` does not compile.
 //
-// G-e: `vty` is `tk_fs_vty`'s above -- the PARSE-TIME oracle FIRST
-// (`tk_pty_of`, the one every site already asked, unchanged when it answers)
-// and the PASS-TIME one (`tk_ty_of`) as the fallback -- which is exactly
-// `tk_this_assign`'s own case: its call lands here from `teko_typeof.tk`'s
-// walk, after the value's own scope (a parameter, D33's own "not known
-// here") has already closed on the parser's side, and `tk_ty_of` is what
-// still knows it, through the pass's own scope table (`tk_ty_scope_find`,
-// populated per function as `tk_typeof_pass` walks it). Asked from PARSE
-// TIME, before any function's pass-time scope opens, `tk_ty_of` answers -1
-// exactly as it does today (`tk_nscope` starts at 0 and is reset per
-// function only inside the pass), so the fallback is silent everywhere it is
-// not needed.
+// G-e: `vty` is `tk_fs_vty`'s above, and the DEFERRAL comes FIRST -- before
+// the scalar verdict and before the row one. A value this door cannot type
+// is one no check here may judge either: the row check reads the same
+// parse-time oracle for a value `tk_struct_of_expr` cannot see
+// (`tk_check_field_store`, teko_struct.tk), so an overloaded call answered
+// with the FIRST declaration of its name and `Foo f; this.f = pick(1, 2);`
+// was refused, `a value of type i64 does not convert to Foo`, for a store
+// that is a `Foo` (Copilot on #698, pass 3). `tk_fs_do` is the first point
+// with the final type, and it asks `tk_check_compat` -- the scalar verdicts
+// and the row one in one call -- over exactly the same node.
 i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     i64 vty = tk_fs_vty(v);
+    if (vty < 0) return tk_fs_defer(fty, v, line, fl);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
-    // ...and a value NEITHER oracle types is not written raw: it waits for the
-    // one point that can ask (`tk_field_store_judge`), where the same three
-    // steps are taken over the same node.
-    if (vty < 0) return tk_fs_defer(fty, v, line, fl);
     // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,
     // the same way the widening beside it writes the float conversion.
     return tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, v));
@@ -860,9 +869,15 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
         // (`void set(H h, i64 k) { h.count = k; }`) took the parameter's raw
         // eight bytes AS A BOX HANDLE, a segfault, measured (Copilot on #698,
         // pass 2). One door, so a rule added to it is added to every site.
-        val = tk_field_store_val(fty, val, tk_line, tk_file);
+        // ...and the SITE is this access's own, not whatever the nested
+        // resolution above left in `tk_line`/`tk_file`: `tk_pend_do` sets
+        // those to the row IT resolves (`pd_line_at`, above), so a value
+        // that is itself a deferred member (`h.n = k.d;` written over two
+        // lines) reported the store's refusal at the inner access's line
+        // (Copilot on #698, pass 3). The table's own row is the truth.
         tk_line = pd_line_at(pi);
         tk_file = pd_file_at(pi);
+        val = tk_field_store_val(fty, val, pd_line_at(pi), pd_file_at(pi));
         return tk_os_mark(tk_call2(tk_stn(fty), addr, val), fty);
     }
     st64(pty, fty);

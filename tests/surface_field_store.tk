@@ -73,6 +73,16 @@
 // expect-exit: 42
 #include "../lib/rt.tk"
 
+// the two GLOBALS whose names the code below SHADOWS: `k` is every `i64`
+// parameter of this file and `step` is class I's own `i64` field. A global is
+// in scope in every body, so the pass-time oracle answers `f64` for both
+// names -- and that answer is not about the name the store actually writes
+// (15, 16). The door asks the PARSE-TIME oracle alone for exactly this
+// reason: what it cannot type is deferred, and the judge reads the name once
+// it is the parameter's own slot or the field's own load.
+f64 k = 1.5;
+f64 step = 2.5;
+
 enum Color { Red, Green, Blue }
 
 class Cell {
@@ -99,6 +109,17 @@ i64 pick(i64 a, i64 b) { return 5; }
 i64 qick(i64 a) { return 5; }
 f64 qick(i64 a, i64 b) { return 2.5; }
 
+// ...and a third pair whose picked signature returns a ROW: the first
+// declaration answers `i64`, which is what the row check read for a value
+// `tk_struct_of_expr` cannot see, so `Cell rc; this.rc = rick(1, 2);` was
+// refused for a store that is a `Cell` (17).
+i64 rick(i64 a) { return 5; }
+Cell rick(i64 a, i64 b) {
+    Cell c = new Cell();
+    c.v = 7;
+    return c;
+}
+
 class H {
     public f64 rate;
     public static f64 total;
@@ -106,6 +127,7 @@ class H {
     public Color kind;
     public i64? count;
     public i64 sum;
+    public Cell? rc;
 
     public H(i64 k) {
         this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
@@ -136,18 +158,34 @@ class H {
     public void addop(GrandBase g) {
         this.sum = g + 1;             // 14: `operator+(GrandBase, i64) -> i64`
     }
+
+    public void setrow() {
+        this.rc = rick(1, 2);         // 17: the pick returns a ROW, not `i64`
+    }
 }
 
 class I {
     public f64 rate;
     public i64 step;
+    public i64 cnt;
 
     public I(i64 k) {
-        rate = k;                     // 2: the implicit form, same shape
+        rate = k;                     // 2 and 15: `k` is also a global `f64`
     }
 
     public void copy() {
-        rate = step;                  // 8: implicit on BOTH sides, field to field
+        rate = step;                  // 8 and 16: `step` is also a global `f64`
+    }
+
+    // the MIRROR of the two above: an `i64` field written from the same two
+    // shadowed names, where reading the global's `f64` refuses a store that
+    // is an integer instead of writing raw bits.
+    public void setcnt() {
+        cnt = step;                   // 16b: field to field, `i64` to `i64`
+    }
+
+    public void setfrom(i64 k) {
+        cnt = k;                      // 15b: parameter to field, `i64` to `i64`
     }
 }
 
@@ -291,6 +329,40 @@ i64 opcheck() {
     return 0;
 }
 
+// 15/15b and 16/16b: the two SHADOWED roads, in both directions. The store
+// the pass rewrites (`tk_this_assign`) reached the door with its value still
+// a bare NAME, and the door's pass-time fallback answered about the GLOBAL of
+// that name: `rate = step;` was typed `f64` by the global rather than `i64`
+// by the field, converted nothing, was not deferred -- measured, the store
+// did not land at all and the field kept what the constructor had left in it
+// -- and the mirror stores into `cnt` were REFUSED for a narrowing nobody
+// wrote. `k` is the same shadow one step over, on a PARAMETER: the pass scope
+// answers that one, so it is the guard that the global must never win there.
+i64 shadowcheck() {
+    I i = new I(5);
+    if (i.rate != 5.0) return 1;      // 15: parameter, shadowed by `f64 k`
+    i.step = 7;
+    i.copy();
+    if (i.rate != 7.0) return 2;      // 16: field, shadowed by `f64 step`
+    i.setcnt();
+    if (i.cnt != 7) return 3;         // 16b: the same name into an `i64` field
+    i.setfrom(9);
+    if (i.cnt != 9) return 4;         // 15b: the parameter into an `i64` field
+    if (k != 1.5) return 5;           // ...and the globals themselves untouched
+    if (step != 2.5) return 6;
+    return 0;
+}
+
+// 17: the picked signature returns a ROW. The row check read the FIRST
+// declaration's `i64` for it and refused the store; the judge reads the pick.
+i64 rowpickcheck() {
+    H h = new H(0);
+    h.setrow();
+    if (!h.rc.HasValue) return 1;
+    if (h.rc.Value.v != 7) return 2;
+    return 0;
+}
+
 i64 rccheck() {
     if (rt_live() != 0) return 1;
     return 0;
@@ -339,8 +411,14 @@ i64 main() {
     bad = opcheck();
     if (bad != 0) return 140 + bad;
 
-    bad = rccheck();
+    bad = shadowcheck();
     if (bad != 0) return 150 + bad;
+
+    bad = rowpickcheck();
+    if (bad != 0) return 160 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 170 + bad;
 
     return 42;
 }
