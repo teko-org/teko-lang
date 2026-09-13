@@ -2810,3 +2810,82 @@ the head of this crumb, the compiler leg giving back what the deleted table cost
 used 153967 -> 153815, `ins` 211960 -> 211752, `funcs` 3131 -> 3125, heap 92311424 ->
 92276992 of a 218169344 reserve). `mc pkg hash .` at this pass's own code commit:
 `c037572671bf559c85096676e3908fa8cd153b0df15dc81023e43b1cd313fa18`.
+
+**Copilot finding, pass 3: the validator has ONE caller that runs where no oracle
+answers, and it was guessing "function" for every name.** The reviewer read the wrap guard
+above against `teko_heaparr.tk` and found the site the first pass's measurement could not
+reach from a slot: `ops[i] = e` on an `Op[]` is coerced by `tk_deleg_coerce` from
+`tk_ha_index`, at PARSE time, where `tk_ty_scope_find` is empty (the scope walk has not
+run) and `tk_ty_global` is empty as well (`tk_hg_collect` fills it in `tk_array_pass`, the
+fifth pass). So the fallback the first pass gave the guard cannot help there, and every
+NAME written at an element store read -1 and was wrapped as a function. Measured on
+`da33ebd4`, on the head of this crumb (`2664c87c`) and on this fix, mc **0.15.23**,
+macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)`, `g_op` a global of it, `lo` a local, `p`
+a parameter, `g_n` an `i64` global:
+
+| probe | `da33ebd4` | `2664c87c` | now |
+|---|---|---|---|
+| `ops[0] = g_op;` then `ops[0](1)` | `teko: unknown function: g_op` | same | runs, 42 |
+| `ops[0] = lo;` | `teko: unknown function: lo` | same | runs, 42 |
+| `ops[0] = p;` (a parameter) | `teko: unknown function: p` | same | runs, 42 |
+| `ops[0] = addOne;` (declared above) | runs, 42 | runs, 42 | runs, 42 |
+| `ops[0] = laterFn;` (declared below) | `teko: unknown function: laterFn` | same | runs, 42 |
+| `Op h = ops[0];` (read back) | runs, 42 | runs, 42 | runs, 42 |
+| `g_ops[0] = addOne;` on a GLOBAL `Op[]` | `unknown name` (the core) | same | runs, 42 |
+| `ops[0] = g_n;` | `teko: unknown function: g_n` | same | `teko: Op takes a function, another Op, or null` |
+| `Op h; h = g_n;` (pass 1's own site) | `teko: unknown function: g_n` | `teko: Op takes a function, another Op, or null` | unchanged |
+
+Three things the table says. The guess was never about GLOBALS: a local and a parameter
+died exactly as the global did, so a parse-time resolver for `tk_ty_global` -- the cheaper
+alternative -- would have fixed one row of five and left the rest. A function declared
+BELOW the store died too, because `decl_find` at parse time only knows what has been read
+so far. And a GLOBAL `Op[]` was not coerced at all: `tk_array_resolve_write`
+(teko_array.tk) builds its store inside `tk_array_pass` and called `tk_ha_store` with the
+raw value, so the bare name reached the core, `unknown name` -- never a `teko: ...`
+refusal, D20's own rule again.
+
+**The fix is D48's, applied to the one caller that needed it.** The coercion moves from
+`tk_ha_index` to `tk_ha_store` (teko_heaparr.tk), the one point BOTH element stores pass
+through, and a value the store's own oracles cannot settle is recorded
+(`tk_deleg_store_defer`, teko_deleg.tk) and coerced during `tk_deleg_walk` -- the same
+device `tk_prim_arg_defer` (D48) is for an argument a parse-time column cannot type, and
+the same reasoning the verifier finding above used to pick its walk: `tk_deleg_walk` is the
+one place that carries both halves of the question at once, the LEXICAL scope at the site
+(`tk_ty_scope_var`, a mark per block) and every global row (`tk_array_pass` runs before
+`tk_deleg_pass`, teko.tk). The judgement reads the value out of the store's own argument
+list rather than remembering it, so a pass that rewrote the node in between is judged as it
+stands, and a wrap is spliced into the list link -- no node ever changes identity. A store
+the walk never reaches is judged all the same at the end of the pass, with the scope
+closed: silence is the one answer this table may not give.
+
+**Only what nothing can name waits.** `tk_deleg_store_late` defers a bare identifier the
+pass-time scope and the global rows do not answer for AND that is either a SLOT the
+parser's own scoped table of locals holds (`tk_pty_of`, teko_struct.tk -- a local shadowing
+a function of that name is the local, not the function) or a name no declaration read so
+far gives a body to. Everything else is settled where it is written: `null`, a
+`new Op(...)`, a lambda, a call, an element read, and a function declared above the store.
+That is what keeps the 62 dumps identical -- `tk_deleg_wrap` emits four declarations
+through `tk_top_emit`, so deferring a wrap that already worked would move them in the tree
+of a program that did not change. One line moves in teko_array.tk too
+(`tk_deleg_late_move`, forward-declared there as `tk_ha_store` already is): the global
+write COPIES the store it built into the node the tree holds (`node_assign`) and drops the
+one it built, so the deferral re-points at the node the walk will actually reach -- the
+same re-mark `tk_os_add` makes one line above it. ADDED: one refusal, ``teko: too many
+element stores of unknown type`` (64 in one unit), in
+[diagnostics.md](docs/reference/diagnostics.md).
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the nine probes above, each run on the
+three builds; **63/63** fixtures at their `expect-exit`, with `tests/surface_globals.tk`
+(exit 42) gaining section 3b, `delegarrcheck` -- an `Op[]` taking a global, a local, a
+function declared above and one declared below, the element read back into a name, a
+parameter stored from another body (`storeParam`), and a GLOBAL `Op[]` taking a function
+and a local; the `--dump-ast` of the **62** fixtures that existed at `da33ebd4`,
+byte-identical to that base; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green (568 links, **385**
+diagnostics -- the one added above -- 119 samples); `mc limits . --config mc.macos.toml`
+verdict `ok` on both legs, measured back-to-back against `2664c87c` under the identical
+command: the `tests/hello.tk` leg's structural counts (`tokens` through `intrin`) BYTE
+IDENTICAL, the compiler leg moving by this pass's own source growth (`nodes` used 153815 ->
+154187, `ins` 211752 -> 212286, `funcs` 3125 -> 3136, used heap 91629824 -> 92501344 of a
+218562560 reserve). `mc pkg hash .` at this pass's own code commit:
+`ea80f178f29b78b3456e57eb85ccd5532751f0892aa271f2628502ce76efb18d`.
