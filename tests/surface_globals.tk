@@ -31,6 +31,11 @@
 //      mismatched element was already caught downstream by
 //      `tk_rc_call_args`, so widening it to `tk_ty_global` changes no
 //      observed message, only which pass answers first).
+//   6. `sibcheck`       -- a global two SIBLING blocks of one function shadow
+//      under two different types: `ref g_sib` inside a block is that block's
+//      own local, and the same `ref g_sib` written after both blocks have
+//      closed is the global -- one LEXICAL answer per site, never a body-wide
+//      scan calling the name "ambiguous" (D51, verifier finding).
 //   5. `regressioncheck` -- an enum global (D48) and `T?` over a reference
 //      global (D48) still read correctly: neither of those two sites is
 //      `tk_ty_scope_find`, and this crumb does not touch them, so this is a
@@ -146,11 +151,17 @@ i64 paramscheck() {
 
 i64 g_sib = 7;
 
-// `tk_ref_local_ty` (teko_ref.tk) answers -1 for a name two sibling blocks
-// declare under two types -- "ambiguous", not "no such local" -- and the
-// `ref`/`out` pointee check has to keep those two answers apart: falling
-// through to the GLOBAL on an ambiguity types the wrong slot, and refuses
-// this legal `ref f64` over the `f64` sibling for the global's own `i64`
+// The pointee is read LEXICALLY, at the site, by the one oracle every pass
+// shares (`tk_ty_scope_or_global`, teko_typeof.tk): INSIDE the second block
+// `g_sib` is that block's own `f64`, so `ref g_sib` there is a legal
+// `ref f64`; AFTER both blocks have closed no block declares the name, so the
+// same `ref g_sib` is the `i64` global, and `bumpi` is what takes it --
+// `bumpf(ref g_sib)` written there refuses instead, `teko: a value of type
+// i64 does not convert to f64` (diagnostics.md). The body-wide SCAN the check
+// used to take was blind to the site: it called the name "ambiguous" for the
+// whole function and skipped its own check, while `tk_rc_call_args`
+// (teko_rc.tk), reading the scope, answered the global and widened the
+// ADDRESS into a float -- D51's own verifier finding, a segfault.
 i64 sibcheck(i64 c) {
     if (c == 0) {
         i64 g_sib = 1;
@@ -161,6 +172,7 @@ i64 sibcheck(i64 c) {
         bumpf(ref g_sib);
         if (g_sib != 3.0) return 2;
     }
+    bumpi(ref g_sib);                             // outside both: the i64 global
     return 0;
 }
 
@@ -205,8 +217,10 @@ i64 main() {
 
     bad = sibcheck(0);
     if (bad != 0) return 60 + bad;
+    if (g_sib != 8) return 68;                    // the global, bumped as an `i64`
     bad = sibcheck(1);
     if (bad != 0) return 60 + bad;
+    if (g_sib != 9) return 69;
 
     return 42;
 }

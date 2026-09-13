@@ -855,11 +855,15 @@ i64 main() {
 }
 ```
 
-A local of the same name wins over the global, as it does everywhere. The one pointee still
-read as "not known here", and refusing nothing, is a name TWO SIBLING BLOCKS of one function
-declare under two different types: it IS a local there, only not one single type, and the
-global is not what such a site means either — `if (c) { f64 g = 2.0; bump(ref g); }` beside
-another block's `i64 g` passes, global `g` or no global `g`.
+A local of the same name wins over the global, as it does everywhere — and it wins
+LEXICALLY, at the site: `if (c) { f64 g = 2.0; bump(ref g); }` passes, global `g` or no
+global `g`, because inside that block the name IS the `f64` local; the same `bump(ref g)`
+written after the block has closed names the global again and refuses. One answer per site,
+from the scope open there (`tk_ty_scope_or_global`, teko_typeof.tk) — the same oracle that
+types the argument downstream, which is what keeps the check and the conversion from
+disagreeing (D51, verifier finding: they disagreed, and an ADDRESS was widened into a
+float). The one pointee still read as "not known here", refusing nothing, is a name neither
+the scope open at the site nor the table of globals holds a row for.
 
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps

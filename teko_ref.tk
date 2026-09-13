@@ -86,6 +86,16 @@ i64 tk_ref_cur_fn = 0;                 // the N_FUNC this pass is walking right 
 
 i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
 
+// teko_typeof.tk, included after this file -- but this pass RUNS after that
+// one (`teko.tk`: `tk_typeof_pass`, then `tk_ref_pass`), so the oracle's own
+// scope stack is exactly the table this walk keeps live and reads a bare name
+// in. One oracle for one name (D51, verifier finding).
+i64  tk_ty_scope_or_global(uptr name);
+void tk_ty_scope_var(i64 n);
+void tk_ty_scope_params(i64 p);
+i64  tk_ty_scope_mark();
+void tk_ty_scope_cut(i64 m);
+
 // ---- side table: parameter NODE -> (kind, pointee type) ----
 i64 rp_node[TK_MAXRP];
 i64 rp_kind[TK_MAXRP];
@@ -375,85 +385,26 @@ void tk_ref_rewrite_assign(i64 n, i64 pn) {
 // The parse-time tag (`tk_rfarg_pointee`) falls back to `tk_slv_find`, a
 // unit-wide most-recent-wins table that never sees a PARAMETER -- so
 // `lvl_c(ref x)` inside `lvl_b(ref i64 x)` answers with whatever unrelated
-// local was declared last under that name. At PASS time the enclosing
-// function is known, so the declaration itself answers: its own parameter
-// list first, then the `N_VAR` its body declares.
-i64 tk_ref_param_ty(uptr name) {
-    i64 p = nd_a(tk_ref_cur_fn);
-    loop {
-        if (p == 0) break;
-        if (nd_name(p) != 0 && str_eq(nd_name(p), name)) return tk_param_ty(p);
-        p = nd_next(p);
-    }
-    return 0 - 1;
-}
-
-i64 tk_ref_lty = 0 - 1;                // the local type the scan below found
-i64 tk_ref_lamb = 0;                   // ...and 1 once a second, different one showed up
-
-// `nd_val` is the array length, so `Point tbl[4]` is skipped exactly as
-// teko_struct.tk's own on_stmt hook skips it
-void tk_ref_scan_local(i64 n, uptr name) {
-    loop {
-        if (n == 0) break;
-        if (nd_kind(n) == N_VAR && nd_val(n) == 0 && nd_name(n) != 0 && str_eq(nd_name(n), name)) {
-            if (tk_ref_lty >= 0 && tk_ref_lty != nd_type(n)) tk_ref_lamb = 1;
-            tk_ref_lty = nd_type(n);
-        }
-        tk_ref_scan_local(nd_a(n), name);
-        tk_ref_scan_local(nd_b(n), name);
-        tk_ref_scan_local(nd_c(n), name);
-        tk_ref_scan_local(nd_d(n), name);
-        n = nd_next(n);
-    }
-}
-
-// the type the LOCALS of one declaration give a name, -1 when the body
-// declares none under it. Two sibling blocks may declare the same name under
-// two types; that ambiguity answers -1 too rather than guess which one a
-// given site meant, and leaves `tk_ref_lamb` SET on the way out -- the one
-// bit that tells "the body declares no such local" apart from "it declares
-// two of them", which `tk_local_or_global_in` below is the reason to keep.
-i64 tk_local_ty_in(i64 fn, uptr name) {
-    tk_ref_lty = 0 - 1;
-    tk_ref_lamb = 0;
-    if (fn == 0) return 0 - 1;
-    tk_ref_scan_local(nd_b(fn), name);
-    if (tk_ref_lamb) return 0 - 1;
-    return tk_ref_lty;
-}
-
-// the type a bare NAME reads as inside `fn`, for a PASS whose every scope
-// closed while the unit was still parsing: the locals of that one function
-// first, a GLOBAL slot second (teko_array.tk's own `tk_ty_global`) -- a name
-// the function itself declares nothing under is not "unknown", it is a global,
-// in scope in every body, exactly as D48 already made true for a bare read.
-// The one answer that does NOT fall through to a global is an AMBIGUOUS local:
-// the name IS a local there, just not one single type, so reading the global
-// would type a slot the site never meant. It stays -1, "not known here", which
-// every caller treats as "refuse nothing".
-i64 tk_local_or_global_in(i64 fn, uptr name) {
-    i64 t = tk_local_ty_in(fn, name);
-    if (t >= 0) return t;
-    if (tk_ref_lamb) return 0 - 1;
-    return tk_ty_global(name);
-}
-
-// the pointee of a NAMED `ref`/`out` argument: the enclosing function's own
-// parameters first (a parameter is in no scope table at parse time), then the
-// shared local-or-global rule above. The strict identity check below
-// (`tk_ref_check_pointee`) used to skip every global in silence -- a `ref`/`out`
-// argument over a global of the wrong type read as "cannot be named" instead
-// of "does not convert" -- and that is the gap the fallback closes.
+// local was declared last under that name.
+//
+// ONE oracle answers it instead, the same one `tk_ty_of` reads: the LEXICAL
+// scope live at the site (teko_typeof.tk's own `tk_ty_scope_or_global` --
+// this walk keeps that stack live below, exactly as `tk_ty_walk_list` does),
+// then a global. Lexically there is no such thing as an ambiguous name: `g`
+// at a given point is the innermost `g` visible there, or -- when no block
+// open at that point declares one -- the global. The body-wide SCAN this
+// function used to take (`tk_ref_scan_local`, and the "two sibling blocks
+// declare it under two types" bit it set) was blind to the position of the
+// site, so it answered "ambiguous, refuse nothing" where the source is not
+// ambiguous at all, while `tk_rc_call_args` -- reading the scope -- answered
+// the global and widened an ADDRESS into a float (D51, verifier finding).
+// Two oracles, one of them position-blind: the scan is gone.
 i64 tk_ref_arg_pointee(i64 a) {
     i64 k = nd_kind(a);
     if (k != N_ADDR && k != N_IDENT) return tk_rfarg_pointee(a);
     uptr name = nd_name(a);
     if (name == 0) return tk_rfarg_pointee(a);
-    if (tk_ref_cur_fn == 0) return 0 - 1;
-    i64 t = tk_ref_param_ty(name);
-    if (t >= 0) return t;
-    return tk_local_or_global_in(tk_ref_cur_fn, name);
+    return tk_ty_scope_or_global(name);
 }
 
 uptr tk_pointee_name(i64 ty) {
@@ -470,11 +421,12 @@ uptr tk_pointee_name(i64 ty) {
 // `ref u8` too, since the callee stores eight bytes through a slot that
 // holds one. Type identity alone decides it, so the two aliases of one
 // primitive (`bool`/`byte`/`u8`, `char`/`u32`, `str`/`ptr`/`uptr`) are the
-// same pointee here, as they are everywhere else. A global IS named, through
-// the fallback above; the only pointee left that the pass cannot name is one
-// whose name means two types at once (an ambiguous local, two sibling blocks),
-// and that one is silently skipped, the same rule `tk_check_field_store` gives
-// an unknown source.
+// same pointee here, as they are everywhere else. A local, a parameter and a
+// global are all named now, by the lexical rule above; what is left unnamed is
+// a pointee no scope and no global table holds a row for (-1), and that one is
+// silently skipped, the same rule `tk_check_field_store` gives an unknown
+// source. It is called from `tk_rc_call_args` (teko_rc.tk) as well, for the
+// overloaded name this pass leaves alone.
 void tk_ref_check_pointee(i64 pn, i64 a, i64 line, uptr fl) {
     i64 pty = tk_param_ty(pn);
     i64 aty = tk_ref_arg_pointee(a);
@@ -578,13 +530,23 @@ void tk_ref_walk(i64 n) {
                 }
             }
         }
+        // the LEXICAL scope, kept exactly as `tk_ty_walk_list` (teko_typeof.tk)
+        // keeps it: a block pushes a mark and cuts back to it at its `}`, and a
+        // local joins the scope only after the statement that declares it has
+        // been walked, so its own initializer still reads the outer name. That
+        // stack is what `tk_ref_arg_pointee` answers a `ref x` from -- the same
+        // table, at the same point, that `tk_ty_of` answers the very same node
+        // from downstream.
         if (k == N_BLOCK) {
+            i64 mark = tk_ty_scope_mark();
             tk_ref_walk(nd_a(n));
+            tk_ty_scope_cut(mark);
         } else {
             tk_ref_walk(nd_a(n));
             tk_ref_walk(nd_b(n));
             tk_ref_walk(nd_c(n));
             tk_ref_walk(nd_d(n));
+            tk_ty_scope_var(n);
         }
         n = nd_next(n);
     }
@@ -637,7 +599,13 @@ void tk_ref_out_prologue(i64 f) {
 // `tk_ref_check_call` above has to see
 void tk_ref_fn(i64 f) {
     tk_ref_cur_fn = f;
+    // the parameters open the scope -- `tk_ty_scope_params` records a
+    // `ref`/`out` one under its POINTEE (`tk_param_ty`), which is what a
+    // repassed `ref x` points at
+    tk_ty_scope_cut(0);
+    tk_ty_scope_params(nd_a(f));
     tk_ref_walk(nd_b(f));
+    tk_ty_scope_cut(0);
     if (tk_ref_fn_has_refout(f)) {
         tk_ref_check_out_assigned(f);
         tk_ref_out_prologue(f);

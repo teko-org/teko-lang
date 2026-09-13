@@ -353,10 +353,7 @@ void tk_pm_check_orphans() {
 // name `tk_pty_of` cannot answer for -- teko_struct.tk's own table of locals
 // never sees one -- and it is exactly the name a `params` list is passed on
 // under, so the normal form has to be able to recognise it.
-i64 tk_pm_cur_fn = 0;                  // the declaration the walk below is inside
-
 void tk_pm_params_of(i64 f) {
-    tk_pm_cur_fn = f;
     tk_npmp = 0;
     i64 p = nd_a(f);
     loop {
@@ -393,12 +390,12 @@ i64 tk_pm_param_ty(uptr name) {
 // used to read instead, `tk_slv_find_unit` (teko_struct.tk), is UNIT-WIDE and
 // most-recent-wins: a local of the same name in ANOTHER function answered for
 // this one, so `sum(g)` over a global `i64 g` read the `f64 g` some unrelated
-// body declared last and refused a legal call (D51). The declaration being
-// walked is known right here (`tk_pm_cur_fn`), so the same scope discipline
-// `tk_ref_arg_pointee` takes answers instead: this function's own parameters,
-// then its own locals, then a global of any type -- G1's `T[]` of heap
-// included -- and an ambiguous local answers -1, "not known here", refusing
-// nothing (teko_ref.tk's own `tk_local_or_global_in`).
+// body declared last and refused a legal call (D51). The walk below keeps the
+// oracle's own scope live instead, so the ONE answer every other pass reads a
+// bare name by answers here too (`tk_ty_scope_or_global`, teko_typeof.tk): the
+// innermost declaration visible AT the site -- a local, a parameter -- then a
+// global of any type, G1's `T[]` of heap included, and -1, "not known here",
+// refusing nothing, when neither table holds the name.
 i64 tk_pm_arg_ty(i64 a) {
     i64 k = nd_kind(a);
     if (k == N_INT)  return nd_type(a);
@@ -408,7 +405,7 @@ i64 tk_pm_arg_ty(i64 a) {
         if (pt >= 0) return pt;
         pt = tk_xt_ty(a);                        // a node the parse already tagged
         if (pt >= 0) return pt;
-        return tk_local_or_global_in(tk_pm_cur_fn, nd_name(a));
+        return tk_ty_scope_or_global(nd_name(a));
     }
     return tk_pty_of(a);
 }
@@ -593,13 +590,24 @@ void tk_pm_expand_call(i64 n, i64 d, uptr tys) {
 // ---- the walk ----
 // Children first, then the node: an argument that is itself a `params` call is
 // packed before the call that carries it packs it.
+// the LEXICAL scope is kept live here exactly as `tk_ty_walk_list`
+// (teko_typeof.tk) keeps it -- a block pushes a mark and cuts back to it, and
+// a local joins the scope after the statement that declares it -- because that
+// stack is what `tk_pm_arg_ty` above reads a bare argument name in.
 void tk_pm_walk(i64 n) {
     loop {
         if (n == 0) break;
-        tk_pm_walk(nd_a(n));
-        tk_pm_walk(nd_b(n));
-        tk_pm_walk(nd_c(n));
-        tk_pm_walk(nd_d(n));
+        if (nd_kind(n) == N_BLOCK) {
+            i64 mark = tk_nscope;
+            tk_pm_walk(nd_a(n));
+            tk_nscope = mark;
+        } else {
+            tk_pm_walk(nd_a(n));
+            tk_pm_walk(nd_b(n));
+            tk_pm_walk(nd_c(n));
+            tk_pm_walk(nd_d(n));
+            tk_ty_scope_var(n);
+        }
         if (nd_kind(n) == N_CALL) tk_pm_lower_call(n);
         n = nd_next(n);
     }
@@ -614,7 +622,10 @@ void tk_pm_walk_unit(i64 root, i64 last) {
         if (f == 0) break;
         if (f < last && decl_valid(f)) {
             tk_pm_params_of(f);
+            tk_nscope = 0;
+            tk_ty_scope_params(nd_a(f));
             tk_pm_walk(nd_b(f));
+            tk_nscope = 0;
         }
         f = nd_next(f);
     }

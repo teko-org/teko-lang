@@ -362,6 +362,23 @@ void tk_rc_call_args(i64 n) {
         i64 nxt = nd_next(a);
         i64 pt = tk_decl_param_ty(d, i);
         i64 at = tk_ty_of(a);
+        // D51, verifier finding: an ADDRESS is no numeric value. `tk_ty_of`
+        // answers an N_ADDR with its POINTEE, and the widen below would then
+        // put D33's own `scvtf` on the POINTER itself -- `bumpf(ref g)` over
+        // an `i64 g` and a `ref f64` parameter read a float out of an address
+        // and segfaulted. A `ref`/`out` argument is judged by the one rule
+        // that owns pointees, IDENTITY (`tk_ref_check_pointee`, teko_ref.tk,
+        // which refuses in the same words a value gets), and converted never.
+        // teko_ref.tk's own call check skips an OVERLOADED name, which by now
+        // carries its final symbol: this is where that one is judged.
+        if (nd_kind(a) == N_ADDR) {
+            i64 pn = tk_decl_param_node(d, i);
+            if (tk_rp_kind(pn) != TK_RP_NONE) tk_ref_check_pointee(pn, a, nd_line(n), nd_file(n));
+            prev = a;
+            a = nxt;
+            i = i + 1;
+            continue;
+        }
         tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
         i64 fixed = tk_nl_wrap(pt, at, tk_num_widen(pt, at, a));
         if (fixed != a) {
