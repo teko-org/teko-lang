@@ -154,16 +154,40 @@ used to be final: the value crossed as the `i64` the lowering symbol declares, a
 `i64 k` parameter compiled and reached the run-time kind guard (exit 70) where
 `docs/specs/enum.md` § 5 refuses it — the review finding on #697, D48.
 
-So those two columns, and only those two, remember the argument and judge it later
-(`tk_prim_arg_defer`/`tk_prim_arg_do`), on the operator pass's walk — after the oracle,
-under the scope the argument was written in, and with no pass of its own. Only the CHECK is
-deferred: on both cast arms `tk_prim_conv` never reads the argument's type, so the node
-written at parse time is the node it would write knowing it, and every `--dump-ast` of a
-program that compiles is byte-identical. A value nothing types even there is refused rather
-than taken raw (`teko: the type of this argument is not known here`), the same rule
-`tk_prim_binary` already holds for an operand; a local array's element is the one shape that
-reaches it, because `a[0]` lowers to `ld64(a + i * 8)` at parse time and its element type
-does not survive the lowering.
+So a column whose answer the parser's silence would hide remembers the argument and judges
+it later (`tk_prim_arg_defer`, and `tk_prim_arg_do` once the wait is over). Three columns
+do it: the two CAST ones above, and the FLOAT one — there the argument's type decides the
+conversion itself (`tk_num_widen` widens an integer and leaves everything else alone), so a
+guess would write the wrong node and then hide the value behind it.
+
+**The wait ends at ONE point, and it is a walk of its own**: `tk_prim_arg_judge` drives
+`tk_ty_pass_walk` at the END of `tk_over_pass` (teko_over.tk), not on the operator pass's
+walk. That is the only place where both halves of what types an argument are true at once —
+the scope a parameter is read under is live, and every call under the argument already
+carries the symbol its own arguments picked, `decl_find` answering the FIRST declaration of
+an overloaded name everywhere earlier. It adds no pass (`passes` 15/30), and a unit that
+deferred nothing walks nothing.
+
+The two cast columns defer only the CHECK: `tk_prim_conv` never reads the argument's type
+on either arm, so the node written at parse time is the node it would write knowing it. The
+float column defers the conversion with it, and `tk_prim_arg_widen` writes the cast where
+the literal already put it — so every `--dump-ast` of a program that compiled before is
+byte-identical either way. A value nothing types even there is refused rather than taken raw
+(`teko: the type of this argument is not known here`), the same rule `tk_prim_binary`
+already holds for an operand; a local array's element is the one shape that reaches it,
+because `a[0]` lowers to `ld64(a + i * 8)` at parse time and its element type does not
+survive the lowering.
+
+**An OPERATOR under a deferred argument is judged there a second time.** The operator pass
+ran three passes earlier and typed every call in the argument by the first declaration of
+its name, so its verdict is a guess wherever an overload was picked otherwise:
+`tk_prim_arg_do` asks `tk_ops_rejudge` (teko_ops.tk) for the node before it reads its type,
+which re-asks the enum, nullable and primitive claims with the types the pick left behind.
+Without it `new DateTime(1, pick(1) + 1)` on a `DateTimeKind pick(i64)` was raw integer
+arithmetic that answered the enum, and the check saw exactly the type the column asks for.
+What it does NOT reach is [not-yet.md](../reference/not-yet.md)'s own row: outside a
+deferred argument, an operator over an overloaded call is still typed by the first
+declaration.
 
 ## The ceilings
 

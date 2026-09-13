@@ -482,6 +482,36 @@ DateTime f(i64 x) { return new DateTime(1, x | 1); }
                     // teko: a value of type i64 does not convert to DateTimeKind
 ```
 
+**...and the operator is judged AFTER the pick, not before it.** The walk that claims an
+operator runs three passes ahead of the overload mangling, so a call under the operator is
+typed there by the FIRST declaration of its name; in this position the operator is judged a
+second time, over the types the pick left behind, and an enum takes no integer operand
+(D48, the sixth review pass on
+[#697](https://github.com/teko-org/teko-lang/pull/697)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 pick(i64 a, i64 b) { return 7; }
+DateTimeKind pick(i64 a) { return DateTimeKind.Utc; }
+
+i64 main() {
+    DateTime d = new DateTime(1, pick(1) + 1);
+    // teko: no operator `+` takes these operands
+    return 0;
+}
+```
+
+The same refusal covers `pick(1) - 1`, `pick(1) * 2`, `1 + pick(1)` and the unary
+`-pick(1)`; all five used to compile and reach the run-time kind guard. `pick(1) |
+DateTimeKind.Utc` in that same program is refused too, and there the refusal is the one the
+operator pass itself raises on the guessed type — a row of [not-yet.md](not-yet.md), since
+declaring the enum overload first accepts it. A PRIMITIVE the guess hid is not refused but
+lowered to its own row: `TimeSpan.FromTicks(2).CompareTo(dpick(3) - epick(1))` on two
+`DateTime`-returning overloads subtracts through `lib/time.tk` — `Kind` bits masked,
+overflow checked — where the core's raw `-` carried the two top bits into the `TimeSpan`.
+
 A GLOBAL is accepted wherever its declaration says the enum: `DateTimeKind g =
 DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function is the
 enum in the enum's own position. A global is in scope in every body, so its declared type

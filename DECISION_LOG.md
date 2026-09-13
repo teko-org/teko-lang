@@ -2167,6 +2167,79 @@ moves takes its type with it.** Both were reproduced on `d8d00572` before they w
    and the value is what moved. `tests/surface_datetime_kind.tk` gains code 62 and its
    dump carries one cast.
 
+**Copilot finding, sixth pass -- the deferred judgement trusted a type the operator pass
+had guessed.** Reproduced on `38826cb4` before it was fixed.
+
+The fifth pass gave the deferred argument ONE point of judgement, at the end of
+`tk_over_pass`, and that point asks `tk_ty_of` for the argument's type. For an N_BINARY
+`tk_ty_of` is `tk_ty_binary` (teko_typeof.tk), which answers from its operands -- and the
+operands were TYPED by a pass that ran three earlier. `tk_ops_pass` reads a call as
+`decl_ret(decl_find(name))`, the FIRST declaration of a name that may carry several, so
+with an `i64 pick(i64, i64)` declared AHEAD of a `DateTimeKind pick(i64)` the walk saw two
+integers in `new DateTime(1, pick(1) + 1)`, left the node to the core as raw arithmetic,
+and `tk_over_pass` then rewrote the call to the enum overload. The deferred check asked
+`tk_ty_binary`, got `DateTimeKind` -- the LEFT operand's type, the core's own rule -- and
+accepted the argument for exactly the type the column asks for. `k + 1` on an enum
+parameter is ``teko: no operator `+` takes these operands`` (§ 4); `pick(1) + 1` compiled
+and reached the run-time kind guard, and so did `pick(1) - 1`, `pick(1) * 2` and
+`-pick(1)` (exit 70). It is the third pass's laundering one level up: the guess was taken
+out of the check and out of the conversion, and stayed in the SUBTREE the check reads.
+
+**The fix is that the claim is re-asked, not that the type is re-read.** `tk_prim_arg_do`
+(teko_prim.tk) calls `tk_ops_rejudge` (teko_ops.tk) on the argument before it reads its
+type, and that function is `tk_ops_binary`'s own three claims -- nullable, enum, primitive
+-- in `tk_ops_binary`'s own order, over the types the pick left behind, with the operands
+re-judged first for the same reason `tk_ops_operand` resolves them first. The enum and the
+nullable claim only CHECK, so re-asking them is a no-op whenever the pick changed nothing,
+which is why the 60 other dumps do not move; the primitive claim LOWERS, and it lowers here
+exactly as it would have lowered there -- in place, with `tk_rc_pass` still to come --
+because a primitive operand the guess hid is the one shape whose raw arithmetic is wrong
+rather than merely untyped. Measured both ways on `38826cb4`: `t.CompareTo(spick(1) +
+spick(2))` over two `TimeSpan.MaxValue` returns added eight bytes to eight bytes and
+answered a wrapped number where the row panics (`teko: a time span overflowed`, exit 70),
+and `TimeSpan.FromTicks(2).CompareTo(dpick(3) - epick(1))` over two `DateTime` returns
+carried the two `Kind` bits into the `TimeSpan` (`1 << 62` ticks) where `tk_dt_sub` masks
+them off. The USER-operator arm is not re-asked: a node it owns is already an N_CALL by
+then (`tk_ops_emit` replaced it) and a node it left to the core is the pointer arithmetic
+teko_ops.tk's own header allows.
+
+**What it does NOT fix, and that is written down rather than worked around.** The guess is
+still what `tk_ops_pass` judges everywhere OUTSIDE a deferred primitive argument, in both
+directions: `DateTimeKind k = pick(1) + 1;` compiles, and a LEGAL `pick(1) |
+DateTimeKind.Utc` -- a bitwise operator over an enum answers the enum -- is REFUSED with
+``teko: no operator `|` takes these operands`` when the enum overload is not the first
+declaration, inside a primitive argument as well as outside one, because that refusal is
+raised three passes before the re-judgement exists. Closing it means resolving the
+overloads ahead of the operator pass, which moves every overload refusal ahead of every
+other one and is not this crumb's to do; the row is in
+[not-yet.md](docs/reference/not-yet.md) under both spellings. The accumulated table over
+the eight shapes the review named, in both declaration orders, is the fixture's own codes
+63-64 for what is accepted and diagnostics.md for what is refused.
+
+**Fixtures stay 61.** `tests/surface_datetime_kind.tk` gains codes 63 (an overloaded call
+under a legal bitwise operator, the enum overload first) and 64 (the `DateTime - DateTime`
+above, whose two overloads are declared `i64` first, and which answers 64 on the build
+before this fix). Two nits with it: `docs/internals/primitives.md` still described the
+first design of the deferred check -- two cast columns, judged on `tk_ops_pass`'s walk --
+where it is three columns judged by `tk_prim_arg_judge`'s own walk at the end of
+`tk_over_pass`; and `docs/reference/nullable.md`'s "Only locals" now says which half of the
+sentence belongs to the definite-assignment walk (which never judges a global) and which to
+the DECLARATION check `tk_gs_check` makes over a global declared `T?` over a value.
+
+**Proof of the sixth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
+--config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
+all 61 against `38826cb4` -- **60 byte-identical**, and the one that moves is the fixture
+edited here, a pure ADDITION once the compiler's own `$gN` temporaries are normalized (81
+lines added, none removed); `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (`teko1.o == teko2.o` on the first turn, `--dump-asm` of teko2 vs teko3 empty
+over 214672 lines, 61/61 fixtures under `teko1`); `sh scripts/check-docs.sh` green (567
+links, 383 diagnostics, 117 samples). `mc limits` verdict `ok` on both legs with every
+table unmoved from the fifth pass -- floor (`tests/hello.tk`) `passes` 15/30, `syntax` 15,
+`alias` 18, `types` 11, `intrin` 8/16, heap 1114848, and the `tests/surface_datetime.tk`
+leg `syntax` 16, `alias` 21, `types` 14, heap 3858176 (against a 33554432-byte
+reservation). `mc pkg hash .`:
+`1c76727914a271be8d92f6bb0516a2f27d4efb8ffc82f46d465ea6ea1a1578af`.
+
 **Proof of the fifth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
 --config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
 all 61 against `d8d00572` -- **60 byte-identical**, and the one that moves is the fixture

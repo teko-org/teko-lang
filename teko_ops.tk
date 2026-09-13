@@ -852,6 +852,63 @@ void tk_ops_unary(i64 n) {
     tk_ops_emit(n, r, a, line, fl);
 }
 
+// ---- the same claim, asked again once the overload pick is written ----
+// `tk_ops_pass` runs three passes AHEAD of `tk_over_pass`, so every type it
+// reads through an N_CALL is `decl_find`'s own answer: the FIRST declaration
+// of a name that may carry several signatures (D48, third pass). Over a node
+// the CORE owns that guess is harmless -- the arithmetic is the same eight
+// bytes either way -- but over a node one of the three claims above owns it
+// is a verdict on a type the callee does not have, and inside the deferred
+// argument of a primitive row it was a silent ACCEPT: with an
+// `i64 pick(i64, i64)` declared ahead of a `DateTimeKind pick(i64)`,
+// `new DateTime(1, pick(1) + 1)` was left as raw integer arithmetic by the
+// walk, answered `DateTimeKind` from `tk_ty_binary` once the pick was written,
+// and the deferred check then saw exactly the type the column asks for --
+// where `k + 1` on an enum parameter is ``teko: no operator `+` takes these
+// operands`` (docs/specs/enum.md § 4). Measured on `38826cb4`, and the same
+// for `-`, `*` and the unary `-` (Copilot on #697, sixth pass).
+//
+// So a deferred argument is judged TWICE and the second time is the one that
+// counts: `tk_prim_arg_do` (teko_prim.tk) calls this before it reads the
+// node's type, at the one point where every call under the argument already
+// carries the symbol its own arguments picked. The claims are `tk_ops_binary`'s
+// own, in its own order, over the types the pick left behind; the operands are
+// re-judged first for the same reason `tk_ops_operand` resolves them first, so
+// a nested operator answers with what it became. The enum and the nullable
+// claim only CHECK, so asking them twice is a no-op whenever the pick changed
+// nothing; the primitive one lowers, and it lowers here exactly as it would
+// have lowered there -- in place, with `tk_rc_pass` still to come -- because a
+// primitive operand the guess hid is the one shape whose raw arithmetic is
+// wrong rather than merely untyped (§ 13, and the probe that measured `a * b`
+// over two `TimeSpan` values answering 40).
+//
+// The USER-operator arm is not re-asked. A node it owns is already an N_CALL
+// by the time this runs (`tk_ops_emit` replaced it), and a node it left to the
+// core is the pointer arithmetic this file's own header allows; re-resolving
+// one here would emit a call under a rule no other site follows. What that
+// leaves is the limit docs/reference/not-yet.md writes down: OUTSIDE a
+// deferred primitive argument, an operator over an overloaded call is still
+// typed by the first declaration of the name.
+void tk_ops_rejudge(i64 n) {
+    i64 k = nd_kind(n);
+    if (k != N_BINARY && k != N_UNARY) return;
+    tk_ops_rejudge(nd_a(n));
+    i64 ta = tk_ty_of(nd_a(n));
+    i64 sa = tk_op_row(ta);
+    if (k == N_UNARY) {
+        if (tk_is_nl(sa)) { tk_nl_unary_check(n, sa); return; }
+        if (tk_is_enum(sa)) { tk_enum_unary_check(n); return; }
+        if (tk_prim_is(ta)) tk_prim_unary(n, ta);
+        return;
+    }
+    tk_ops_rejudge(nd_b(n));
+    i64 tb = tk_ty_of(nd_b(n));
+    i64 sb = tk_op_row(tb);
+    if (tk_is_nl(sa) || tk_is_nl(sb)) { tk_nl_binary_check(n, sa, sb, nd_a(n), nd_b(n)); return; }
+    if (tk_is_enum(sa) || tk_is_enum(sb)) { tk_enum_binary_check(n, sa, sb, ta, tb); return; }
+    if (tk_prim_is(ta) || tk_prim_is(tb)) tk_prim_binary(n, ta, tb);
+}
+
 void tk_ops_visit(i64 n) {
     if (n == tk_ops_addr) {
         tk_ops_addr_step(n);

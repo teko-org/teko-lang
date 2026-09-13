@@ -161,6 +161,7 @@ a dominator pass nobody has asked for here.
 | `f(out i64 a)` declaring the variable at the call site | not taught: declare it first |
 | a `.` on a receiver the parse cannot type | ``teko: the type of the left side of `.` is not known here`` |
 | `b.x += 1` on such a receiver | the same |
+| an **operator** over a call to an **overloaded** name | the operator pass runs three passes ahead of the overload pick, so it types the call by the FIRST declaration of the name and judges the operator on that. With an `i64 pick(i64, i64)` declared ahead of a `DateTimeKind pick(i64)`: `DateTimeKind k = pick(1) + 1;` compiles as raw integer arithmetic, where the same line over an enum LOCAL is ``teko: no operator `+` takes these operands``; and `pick(1) \| DateTimeKind.Utc`, which a bitwise operator over an enum makes legal, is refused with that very message for a left operand the callee does not have. Inside the argument of a primitive row the FALSE ACCEPT is closed — the argument is judged again after the pick (`new DateTime(1, pick(1) + 1)` is refused), and the false refusal stays, because the operator pass raises it before that second judgement is ever reached. Bind the call to a local first, `DateTimeKind p = pick(1);` |
 
 ## `switch`
 

@@ -88,6 +88,16 @@ DateTimeKind tpick(i64 a, i64 b) { return DateTimeKind.Local; }
 f64 fpick(i64 a, i64 b) { return 2.5; }
 i64 fpick(i64 a) { return 2; }
 
+// ...and a pair whose picked signature answers a PRIMITIVE, declared `i64`
+// FIRST so the operator pass reads two integers where the program wrote two
+// dates: the operator over them is left to the core there and is judged again
+// at the one point that knows the pick (D48, Copilot on #697, sixth pass)
+i64 dpick(i64 a, i64 b) { return 0; }
+DateTime dpick(i64 a) { return new DateTime(a, DateTimeKind.Utc); }
+
+i64 epick(i64 a, i64 b) { return 0; }
+DateTime epick(i64 a) { return new DateTime(a); }
+
 // an argument that is an EXPRESSION over the shapes above: a bitwise operator
 // keeps the enum (docs/specs/enum.md § 4), so `k | DateTimeKind.Utc` on a
 // parameter is as legal in this column as `k` is -- and it is judged at the one
@@ -278,6 +288,18 @@ i64 main() {
     // cast, not two
     Hours hrs = new Hours(2);
     if (at_member(hrs).Ticks != 72000000000) return 62;
+
+    // ...and an operator over an OVERLOADED call, judged once the pick is
+    // written and not by the first declaration of the name (D48, Copilot on
+    // #697, sixth pass). `kpick`'s enum overload is what `kpick(1)` calls, so
+    // the bitwise operator answers the enum the column asks for...
+    if (new DateTime(t, kpick(1) | DateTimeKind.Unspecified).Kind != DateTimeKind.Utc) return 63;
+
+    // ...and here the pick answers a PRIMITIVE where the operator pass read an
+    // `i64`, so the node the core would have subtracted raw becomes the row's
+    // own call: `DateTime - DateTime` masks the two `Kind` bits off, and the
+    // raw eight bytes carry them into the `TimeSpan` (`1 << 62` ticks) instead
+    if (TimeSpan.FromTicks(2).CompareTo(dpick(3) - epick(1)) != 0) return 64;
 
     return 42;
 }
