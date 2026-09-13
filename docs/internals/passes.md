@@ -20,7 +20,7 @@ about a static type a deferred access does not carry.
 | 3 | `tk_fwd_pass` | `teko_fwd.tk` | a name the pre-scan reserved and no declaration ever adopted is `is used but never declared`; then resolves the `new` and `Type.member` sites deferred against a type declared below |
 | 4 | `tk_di_pass` | `teko_di.tk` | resolves every `inject` placeholder into a getter call or a scope local, emits the memoized getters and prepends the locals to their blocks |
 | 5 | `tk_array_pass` | `teko_array.tk` | rewrites an index into a **global** fixed array, which parse time could not see |
-| 6 | `tk_typeof_pass` | `teko_typeof.tk` | the oracle: rewrites every deferred `.` into the load, store or call it stands for, now that the whole unit can be asked about |
+| 6 | `tk_typeof_pass` | `teko_typeof.tk` | the oracle: collects the overload table so a call can be typed by the signature its arguments pick (D49), then rewrites every deferred `.` into the load, store or call it stands for, now that the whole unit can be asked about |
 | 7 | `tk_ref_pass` | `teko_ref.tk` | a `ref`/`out` parameter reads and writes through its pointer |
 | 8 | `tk_deleg_pass` | `teko_deleg.tk` | a call on a delegate-typed name becomes a typed `callp` through the object's code pointer |
 | 9 | `tk_ternary_pass` | `teko_ternary.tk` | the `?:` placeholder becomes a local plus an `if`, hoisted above the statement that used it — and, from inside the same walk, so do the `??` and `?.` placeholders (`teko_null.tk`, D45), which is why neither operator registers a pass |
@@ -63,6 +63,15 @@ the index it was recorded at.
 
 **Pass 11 before pass 14.** The call `tk_ops_pass` puts in the tree already names the
 member's own symbol, so a mangling pass has nothing left to pick there.
+
+**...and pass 11 asks pass 14's own table, without pass 14 having run.** An operator over a
+call to an overloaded name has to know WHICH overload, and so do the ternary (pass 9),
+`??`/`?.` (pass 9), a primitive row's deferred argument and an initializer. Moving the
+mangling up would move every overload refusal ahead of every other one; instead the
+resolution is asked as a QUESTION (`tk_ov_pick(n, 0)`, teko_over.tk), which answers the
+chosen signature's return type and rewrites nothing, over a table pass 6 collects and pass
+14 rebuilds before it commits (D49). Only `tk_ov_scan`'s three declaration refusals moved
+with it, from pass 14 to pass 6, at the same line with the same message.
 
 **Pass 13 before pass 14, and only for a name declared once.** A name declared more than
 once is left untouched by the default fill on purpose; the overload resolution has a round

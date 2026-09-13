@@ -326,7 +326,7 @@ Measured on `6b868f0c` with `mc limits . --config teko.toml`, the gate's own con
 | row | today | after | why |
 |---|---|---|---|
 | `types` | 7 | **10** | `decimal`, `DateTime`, `TimeSpan` — this page owns two of the three |
-| `alias` | 14 | **15** | `DateTimeKind` (N2c gave the alias back: the measured floor is 18 today, and the `enum`'s own `type_new` puts one alias back per program that includes `lib/time.tk`) |
+| `alias` | 14 | **14** | net zero. N2c DELETED the `type_alias("DateTimeKind", ty_i32)` this row was written for, and the `enum` that replaced it registers one alias of its own through `type_new`: measured, the compiler's own floor went 19 → 18 (the alias deleted, no enum declared there) and a program that includes `lib/time.tk` stayed 21 → 21 (the alias deleted, the enum's own put back) |
 | `syntax` | 14 | **17** | one `syntax_expr` per type word that opens an expression |
 | `passes` | 15 | **15** | by design: the mechanism adds no pass |
 | `intrin` | 8 | **8** | by design: teko still registers none |

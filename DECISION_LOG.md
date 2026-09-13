@@ -2074,10 +2074,14 @@ oracle's new answer made one global honest and one dangerous.** Both were reprod
    uses) because the argument was spliced into the lowered call's own list two passes ago
    and nothing at that point holds the link it is; `nd_next` is the one field left behind,
    since the sibling link belongs to the SLOT and not to the value. Only a CALL defers on a
-   float column, and the reason is WHERE the two resolvers run: `tk_prim_arg_pend` is
-   called from the middle of teko_ops.tk's own walk, over the very node it would rewrite,
-   and a call is exactly what it leaves to `tk_prim_arg_rest`. The rule itself moved to
-   `tk_num_widens` (teko_typeof.tk) so the two readers cannot drift. **All 61 dumps stayed
+   float column, and the reason is WHOSE type a later pass still moves: a call's is its
+   callee's, which the overload pick may replace, while every other argument crosses under
+   the type it already has and `tk_rc_call_args` (teko_rc.tk, the last pass of all) both
+   judges it and writes the widening against the declaration the row names --
+   `TimeSpan.FromHours(x + 1)` on an `i64 x` parameter is three hours with no entry in this
+   table, measured. (The fifth pass below replaced the two resolvers this sentence first
+   named with one walk; the invariant is unchanged and its reason is this one.) The rule
+   itself moved to `tk_num_widens` (teko_typeof.tk) so the two readers cannot drift. **All 61 dumps stayed
    byte-identical** across this fix alone: no fixture had a call in a float column, and the
    cast still lands where the literal already put it. `tests/surface_datetime_kind.tk`
    gains codes 54-57 over both declaration orders and a float-returning overload; the
@@ -2226,6 +2230,22 @@ where it is three columns judged by `tk_prim_arg_judge`'s own walk at the end of
 sentence belongs to the definite-assignment walk (which never judges a global) and which to
 the DECLARATION check `tk_gs_check` makes over a global declared `T?` over a value.
 
+**Copilot finding, seventh pass -- the ROOT under all six, and what it made redundant.**
+Every pass above fixed one consumer of one wrong answer: `tk_ty_of` typed a call to an
+overloaded name by `decl_ret(decl_find(name))`, the FIRST declaration of a name that may
+carry several. The seventh pass fixes the ANSWER instead, in D49 below,
+and the machinery this entry built around the guess shrinks with it: `tk_ops_rejudge`,
+the sixth pass's second judgement, is DELETED (57 lines), because the operator pass now
+sees the picked type on its first visit. What STAYS is the parse-time half, measured: a
+`new DateTime(...)` argument is lowered while the unit is still being read, where
+`tk_pty_of` (teko_struct.tk) cannot ask an overload table that does not exist yet -- so
+`tk_prim_arg`'s `cty = -1` for a call, the deferral table and `tk_prim_arg_widen`/
+`tk_xt_move` are all still what they were. Removing that one line makes
+`tests/surface_datetime_kind.tk` answer 1 instead of 42. The limit this entry's sixth pass
+wrote into not-yet.md -- `DateTimeKind k = pick(1) + 1;` compiling outside an argument, and
+a legal `pick(1) | DateTimeKind.Utc` refused -- is CLOSED, both directions, and the row is
+replaced by what is left of it there.
+
 **Proof of the sixth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
 --config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
 all 61 against `38826cb4` -- **60 byte-identical**, and the one that moves is the fixture
@@ -2266,3 +2286,103 @@ pass — floor (`tests/hello.tk`) `passes` 15/30, `syntax` 15, `alias` 18, `type
 `intrin` 8/16, heap 1114848, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias`
 21, `types` 14, heap 3858288 (against a 33554432-byte reservation). `mc pkg hash .`:
 `1f36848ed1779e8821b0f454e1b3ce19225ea8cd5b2bf6ddd8113247cc1a4c23`.
+
+### D49 · The oracle asks the overload table: a call is typed by the pick, never by the first declaration (2026-09-13)
+The seventh review pass on [#697](https://github.com/teko-org/teko-lang/pull/697), and the
+ROOT of the family D48's third, fourth, fifth and sixth passes each patched one consumer of.
+`tk_ty_of` (teko_typeof.tk) answered an N_CALL with `decl_ret(decl_find(name))` — the FIRST
+declaration of a name that may carry several signatures — and the pass that replaces a site
+with the symbol its ARGUMENTS pick is `tk_over_pass`, number **14** of the fifteen. Every
+consumer of the oracle runs before it: the operator pass (11), the ternary and `??`/`?.` (9),
+a primitive row's deferred argument, an initializer. Each of the four earlier passes taught
+one of them to distrust the answer; this one makes the answer true.
+
+**The design is a flag, not a new pass and not a new table** (option iii of the three the
+recon weighed). `tk_ov_resolve` becomes `i64 tk_ov_pick(i64 n, i64 commit)`:
+
+- at `commit == 1` it is the pass, unchanged to the byte — the rounds, then
+  `tk_pm_expand_call` or `tk_fill_defaults`, then `set_nd_name`;
+- at `commit == 0` it is a QUESTION. It runs the same five rounds over the same argument
+  types (`tk_ov_arg_ty` takes the flag too, so a nested overloaded call is resolved the same
+  way) and returns `decl_ret` of the chosen declaration **before every rewrite**. Not one
+  node moves while it is asked, which is what keeps the `params` expansion and the default
+  fill happening exactly once, at the pass, over the tree the source wrote.
+- each of the four `err_at` sites becomes `-1` under `commit == 0`: too many arguments, an
+  argument of unknown type, no overload matching, more than one matching. **-1 is never a
+  guess** — it is the "not known" this oracle already answers for anything it cannot see,
+  and no consumer refuses on it (`tk_check_scalar_compat`, `tk_ops_binary`, `tk_enum_*`,
+  `tk_prim_binary` all state that rule in their own headers). A question reports nothing,
+  because the pass reaches the same site later and reports it once.
+
+`tk_ov_prepare(root)` is what fills the table, called at the TOP of `tk_typeof_pass` (pass
+6, ahead of every consumer) and again at the top of `tk_over_pass`. It REBUILDS the
+declaration rows on each call and scans once: the unit grows between the two, since
+`tk_params_pass` (12) emits the allocator, release and element store of a `T[]` row a call
+site is the first to build — measured, `tests/surface_params.tk` carries 84 top-level
+declarations at pass 6 and 94 at pass 14 — so a table collected once would have made the
+pick depend on whether anything asked earlier.
+
+**The consumers this closes**, every one measured on `9784ad80` before and after, with the
+picked overload declared SECOND so the guess and the pick disagree:
+
+| consumer | written | on `9784ad80` | now |
+|---|---|---|---|
+| `tk_ops_promote` (11) | `TimeSpan.FromHours(gpick(1) + 1)`, `f64 gpick(i64)` | 1h: the `1` was not promoted | 2.5h |
+| `tk_ops_binary` (11) | `i64 r = 2 + rpick(1)`, `i64 rpick(i64)` | ``no operator `+` takes these operands`` | 42 |
+| `tk_ops_binary`, enum arm | `bpick(1) \| DateTimeKind.Unspecified` | ``no operator `\|` takes these operands`` (a row of not-yet.md) | the enum, both declaration orders |
+| `tk_ops_binary`, enum arm | `DateTimeKind k = pick(1) + 1;` | COMPILED as raw arithmetic | ``no operator `+` takes these operands`` |
+| `tk_ops_unary` | `new DateTime(1, +pick(1))` | the `+` erased over an enum, then a bogus "overloaded call outside a function body" | ``no operator `+` takes these operands`` |
+| `tk_ternary_pass` (9) | `c ? tpick2(2, 3) : 9` | `the two arms of ?: have different types` | 5 |
+| `tk_nl_co_lower` (9) | `npick(1) ?? d`, `i64? npick(i64)` | ``?? needs a nullable on the left`` | 8 |
+| `tk_prim_arg_judge` (14) | `new DateTime(7, bpick(1) \| ...)` | refused as above | the enum |
+| an initializer | `DateTimeKind k = bpick(1);` | already right (`tk_check_scalar_compat` reads the same oracle) | unchanged |
+
+**What it deletes.** `tk_ops_rejudge` (teko_ops.tk), the sixth pass's second judgement of an
+operator under a deferred argument: 57 lines, gone, because pass 11 now sees the picked type
+on its first visit — it refuses `pick(1) + 1` where the pick is an enum and lowers
+`dpick(3) - epick(1)` to the row's own call where the pick is a primitive, at the pass where
+every other operator is judged. The two fixture codes that measured it, 63 and 64, pass with
+it gone. **What it does NOT delete, measured rather than argued**: the parse-time deferral.
+A `new DateTime(...)` argument is lowered while the unit is still being read, where
+`tk_pty_of` (teko_struct.tk) cannot ask a table that does not exist yet, so `tk_prim_arg`'s
+`cty = -1` for a call, `tk_prim_arg_defer`, `tk_prim_arg_widen` and `tk_xt_move` all stay —
+removing that one line makes `tests/surface_datetime_kind.tk` answer 1 instead of 42.
+
+**The risks, and which way each was taken.** `tk_ov_scan`'s three declaration refusals — an
+overloaded `main`, an overloaded `extern`, two overloads differing only by `ref`/`out` — now
+fire at pass 6 instead of pass 14, with the same message at the same line; a program whose
+only error is one of those sees it earlier than another error it also has. Keeping the scan
+at 14 was possible (a second flag) and was not taken: the marks it writes are exactly what
+`tk_ov_find` reads, so the oracle would have had to duplicate the judgement. Re-entrancy is
+bounded by the tree: a question descends into its own arguments and never back up. Cost is a
+re-resolution per question rather than a cache — the compiler's own source declares no
+overload at all (mc's core is what it is built from), so `scripts/bootstrap.sh` measures the
+zero case and `FIXPOINT OK` holds.
+
+**The limits that STAY**, both now in not-yet.md under what they really are:
+
+- **parse time**. `tk_pty_of` types a node while the unit is incomplete, and a `switch`
+  subject's temporary is written there: `switch (pick(1))` types `$t` by the first
+  declaration of `pick`, and a `case` label of the picked overload's own type is then
+  ``teko: no operator `==` takes these operands``. Bind the call to a local first.
+- **a USER operator read by a pass that runs ahead of pass 11**: `c ? v + 1 : 9` on a class
+  that declares `operator+` is `teko: the two arms of ?: have different types`, and the same
+  expression on the right of `??` or behind `?.` gets that position's own message. Nothing to
+  do with overloads — the ternary, `??` and `?.` are rewritten at pass 9 and `tk_ops_emit`
+  has not written the call yet.
+
+**Fixtures: 62.** `tests/surface_overload_ops.tk` (exit 42, 16 codes) is the accepted half of
+the table above, in both declaration orders; the refused half is in
+[diagnostics.md](docs/reference/diagnostics.md) behind `// no-run`, and the file is REFUSED
+by the compiler built from `9784ad80`, at its first ternary.
+
+**Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
+clean; **62/62** fixtures at their `expect-exit`; `--dump-ast` of the 61 that existed before
+against `9784ad80` — **61 byte-identical**, the root fix and the deletion each measured on
+their own; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (62/62 under
+the self-hosted `teko1`); `sh scripts/check-docs.sh` green (567 links, 383 diagnostics, 117
+samples). `mc limits` verdict `ok` on both legs with every table unmoved from the sixth pass
+— floor (`tests/hello.tk`) `passes` **15/30**, `syntax` 15, `alias` 18, `types` 11, `intrin`
+8/16, heap 1114880, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types`
+14, heap 3875392 (against a 33554432-byte reservation). `mc pkg hash .` over the source tree
+of this entry's code commits: `8415eb317fc1a085b70b3c6b50e139b0cdaa7bea62bfd7090da1134cbfb6abd7`.

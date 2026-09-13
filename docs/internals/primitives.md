@@ -178,16 +178,16 @@ already holds for an operand; a local array's element is the one shape that reac
 because `a[0]` lowers to `ld64(a + i * 8)` at parse time and its element type does not
 survive the lowering.
 
-**An OPERATOR under a deferred argument is judged there a second time.** The operator pass
-ran three passes earlier and typed every call in the argument by the first declaration of
-its name, so its verdict is a guess wherever an overload was picked otherwise:
-`tk_prim_arg_do` asks `tk_ops_rejudge` (teko_ops.tk) for the node before it reads its type,
-which re-asks the enum, nullable and primitive claims with the types the pick left behind.
-Without it `new DateTime(1, pick(1) + 1)` on a `DateTimeKind pick(i64)` was raw integer
-arithmetic that answered the enum, and the check saw exactly the type the column asks for.
-What it does NOT reach is [not-yet.md](../reference/not-yet.md)'s own row: outside a
-deferred argument, an operator over an overloaded call is still typed by the first
-declaration.
+**An OPERATOR under a deferred argument needs nothing of its own** since D49. The operator
+pass runs three passes earlier, and what made its verdict a guess was the oracle, not the
+distance: `tk_ty_of` answered a call to an overloaded name by the FIRST declaration of the
+name, so `new DateTime(1, pick(1) + 1)` on a `DateTimeKind pick(i64)` was left as raw
+integer arithmetic and then answered the enum once the pick was written. With the oracle
+asking the overload table ([passes.md](passes.md), pass 6), pass 11 sees the picked type on
+its first visit: it refuses the `+` over an enum where it is written, in an argument or
+outside one, and it lowers an operator over a primitive the guess used to hide. The second
+judgement (`tk_ops_rejudge`) that stood here is DELETED -- 57 lines -- and the fixture codes
+that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it.
 
 ## The ceilings
 
