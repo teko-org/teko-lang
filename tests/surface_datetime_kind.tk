@@ -47,6 +47,11 @@ delegate DateTimeKind KindOp();
 //                             `tk_over_pass`, two passes after the walk that
 //                             would otherwise have judged the argument
 //
+// The float column is the same call one row over, and there the picked
+// signature decides the CONVERSION and not only the check: `fpick` is declared
+// float-first so an integer return the guess would not have widened is widened
+// here (`TimeSpan.FromHours`, D48).
+//
 // A LOCAL `DateTimeKind` array's element (`ks[0]` in `main`) does NOT defer:
 // the load carries the element type the declaration gave it, so the parser
 // answers for it. It is its `i64` twin that loses its type at parse (a raw
@@ -75,6 +80,12 @@ i64 kpick(i64 a, i64 b) { return 9; }
 
 i64 tpick(i64 a) { return 7; }
 DateTimeKind tpick(i64 a, i64 b) { return DateTimeKind.Local; }
+
+// ...and a pair over the FLOAT column, where the picked signature decides the
+// CONVERSION and not only the check: the float overload is declared first so
+// the guess would have skipped the widening the integer one needs
+f64 fpick(i64 a, i64 b) { return 2.5; }
+i64 fpick(i64 a) { return 2; }
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same row
@@ -216,6 +227,15 @@ i64 main() {
     DateTime over_ticks = new DateTime(kpick(1, 2));
     if (over_ticks.Ticks != 9) return 52;
     if (over_ticks.Kind != DateTimeKind.Unspecified) return 53;
+
+    // ...and the same call on a FLOAT column, where the picked signature
+    // decides the conversion itself (D48, Copilot on #697, fourth pass): an
+    // integer return is widened where it stands, a float one crosses
+    // untouched, and both declaration orders are here.
+    if (TimeSpan.FromHours(kpick(1, 2)).Ticks != 324000000000) return 54;
+    if (TimeSpan.FromHours(tpick(1)).Ticks != 252000000000) return 55;
+    if (TimeSpan.FromHours(fpick(1)).Ticks != 72000000000) return 56;
+    if (TimeSpan.FromHours(fpick(1, 2)).Ticks != 90000000000) return 57;
 
     return 42;
 }

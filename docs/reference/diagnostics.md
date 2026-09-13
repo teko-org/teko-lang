@@ -442,6 +442,32 @@ i64 main() {
 an `i64` overload landing on the ticks position of a name whose other overload answers the
 enum. What decides is the overload, never the first declaration of the name.
 
+**A FLOAT position of a primitive row waits for that pick too**, because there the picked
+signature decides the conversion and not only the check: an integer return is widened to
+the float the lowering symbol declares (`TimeSpan.FromHours(2)` is `FromHours(2.0)`) and
+anything else is not, so a guess would write the wrong node and then hide the argument
+behind it. Deciding it late is what makes this a refusal instead of a value read as a
+mantissa (D48, the fourth review pass on
+[#697](https://github.com/teko-org/teko-lang/pull/697)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 pick(i64 a) { return a; }
+DateTimeKind pick(i64 a, i64 b) { return DateTimeKind.Utc; }
+
+i64 main() {
+    TimeSpan t = TimeSpan.FromHours(pick(1, 2));
+    // teko: a value of type DateTimeKind does not convert to f64
+    return 0;
+}
+```
+
+`TimeSpan.FromHours(pick(1))` in that same program is accepted and widened, in either
+declaration order, and an overload that answers a float of its own crosses with no cast at
+all.
+
 A GLOBAL is accepted wherever its declaration says the enum: `DateTimeKind g =
 DateTimeKind.Utc;` at the top of a file and `new DateTime(t, g)` inside a function is the
 enum in the enum's own position. A global is in scope in every body, so its declared type

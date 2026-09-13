@@ -540,6 +540,33 @@ i64 tk_prim_conv_casts(i64 pty) {
     return tk_is_enum(tk_struct_by_ty(pty));
 }
 
+// ---- the OTHER column the parse-time answer cannot settle: the float one ----
+// A cast column hides a wrong argument from the late check; a FLOAT column
+// does worse, because its conversion is DECIDED by the argument's type
+// (`tk_num_widen` widens an integer and leaves everything else alone) -- so an
+// answer that is a guess writes the wrong node and then launders it.
+// Measured on this branch, with an `i64 pick(i64)` declared ahead of a
+// `DateTimeKind pick(i64, i64)`: `TimeSpan.FromHours(pick(1, 2))` read the
+// FIRST declaration, wrote `(f64) pick(1, 2)` over a call that returns an
+// enum, and `tk_rc_call_args` (teko_rc.tk) then saw an `f64` where the column
+// asks for one and had nothing to say. The mirror pair, `f64 pick(i64)` ahead
+// of an `i64 pick(i64, i64)`, wrote NO cast over a call that returns an
+// integer and fed the raw eight bytes to a float parameter.
+//
+// So the conversion is deferred with the check: `tk_prim_arg` writes nothing
+// for a call on this column and `tk_prim_arg_do` wraps the node once the
+// symbol is picked. Only a CALL is deferred here, and the reason is WHERE the
+// two resolvers run: `tk_prim_arg_pend` is called from the middle of
+// teko_ops.tk's own walk, over the very node it would rewrite, while
+// `tk_prim_arg_rest` runs after every walk is done -- and a call is exactly
+// what `tk_prim_arg_pend` leaves to it (Copilot on #697, fourth pass).
+i64 tk_prim_defers(i64 pty, i64 a) {
+    if (tk_prim_conv_casts(pty)) return 1;
+    if (nd_kind(a) != N_CALL) return 0;
+    if (pty < 0) return 0;
+    return type_kind(pty) == TK_FLOAT;
+}
+
 #define TK_MAXPARG 128                // such arguments waiting for the pass
 
 i64  pa_node[TK_MAXPARG];             // the argument, under the cast the column wrote
@@ -573,6 +600,48 @@ void tk_prim_arg_defer(i64 pty, i64 a, i64 line, uptr fl) {
 // local array's element still is (`a[0]` lowers to `ld64(a + i * 8)` at parse
 // time and neither oracle types that call), so `new DateTime(1, a[0])` on an
 // `i64 a[2]` is refused here instead of reaching the run-time kind guard.
+// ---- the conversion a deferred argument still owes, written IN PLACE ----
+// `tk_num_widen` hands its cast BACK, because its callers hold the slot the
+// value sits in. This one does not: the argument was spliced into the lowered
+// call's own list at parse time and nothing here knows which link it is. So
+// the wrap is done the way teko_rc.tk already rewrites a statement -- the node
+// keeps its identity and BECOMES the cast, while a fresh node takes over
+// everything it was. `nd_next` is the one field that stays behind, because the
+// sibling link belongs to the SLOT and not to the value, which is the very
+// reason `tk_num_widen` cuts it on the node it wraps.
+i64 tk_nd_moved(i64 n) {
+    i64 m = tk_nd(nd_kind(n));
+    set_nd_op(m, nd_op(n));
+    set_nd_type(m, nd_type(n));
+    set_nd_val(m, nd_val(n));
+    set_nd_name(m, nd_name(n));
+    set_nd_a(m, nd_a(n));
+    set_nd_b(m, nd_b(n));
+    set_nd_c(m, nd_c(n));
+    set_nd_d(m, nd_d(n));
+    set_nd_sect(m, nd_sect(n));
+    set_nd_line(m, nd_line(n));
+    set_nd_file(m, nd_file(n));
+    return m;
+}
+
+// the same rule `tk_num_widen` writes (`tk_num_widens`, teko_typeof.tk), asked
+// once the type is no longer a guess. Every other column wrote its node at
+// parse time and reads nothing here.
+void tk_prim_arg_widen(i64 pty, i64 n, i64 aty) {
+    if (!tk_num_widens(pty, aty)) return;
+    i64 inner = tk_nd_moved(n);
+    set_nd_kind(n, N_CAST);
+    set_nd_op(n, 0);
+    set_nd_type(n, pty);
+    set_nd_val(n, 0);
+    set_nd_name(n, 0);
+    set_nd_a(n, inner);
+    set_nd_b(n, 0);
+    set_nd_c(n, 0);
+    set_nd_d(n, 0);
+}
+
 void tk_prim_arg_do(i64 i) {
     if (pa_done_at(i)) return;
     st64(pa_done + i * 8, 1);
@@ -581,6 +650,7 @@ void tk_prim_arg_do(i64 i) {
     if (aty < 0)
         err_at(pa_file_at(i), pa_line_at(i), "teko: the type of this argument is not known here");
     tk_check_scalar_compat(pa_ty_at(i), aty, n, pa_line_at(i), pa_file_at(i));
+    tk_prim_arg_widen(pa_ty_at(i), n, aty);
 }
 
 // asked once per node the operator pass walks -- the walk that already carries
@@ -638,27 +708,29 @@ void tk_prim_arg_rest() {
 // `new DateTime(1, pick(1, 2))` cross under the column's own cast (the
 // laundering this table exists to stop), and the same pair in the other order
 // refused `new DateTime(1, pick(1, 2))` for a conversion the chosen overload
-// never asks for. So the CHECK is not made on a guess:
+// never asks for. So NOTHING is decided on a guess -- `cty` is -1 for a call
+// and it is what both the check and the conversion are given:
 //
-//   - on a CAST column it is deferred, judged by `tk_prim_arg_rest` once the
-//     symbol is written -- where `decl_find` is exact, because the name is
-//     unique by then;
-//   - on every OTHER column the argument crosses under its OWN type, and
-//     `tk_rc_call_args` (teko_rc.tk, the last pass of all) is the late check
-//     that judges it against the very declaration this row names -- the same
-//     division of labour D48 wrote down.
+//   - on a CAST column and on a FLOAT one the argument is deferred, judged and
+//     converted by `tk_prim_arg_rest` once the symbol is written -- where
+//     `decl_find` is exact, because the name is unique by then;
+//   - on every OTHER column the conversion is the identity whatever the type
+//     is, so the argument crosses under its OWN and `tk_rc_call_args`
+//     (teko_rc.tk, the last pass of all) is the late check that judges it
+//     against the very declaration this row names -- the same division of
+//     labour D48 wrote down.
 //
-// The CONVERSION still reads the oracle's answer, unchanged: on both cast arms
-// `tk_prim_conv` never looks at it, and on a float column it is what widens
-// `TimeSpan.FromHours(n)` to `FromHours((f64) n)` -- so not one node of the
-// tree moves for this (every `--dump-ast` is byte-identical).
+// A call on a float column is the one node this moves, and it moves it to
+// exactly where the literal already put it: `TimeSpan.FromHours(n)` is still
+// `FromHours((f64) n)`, written by `tk_prim_arg_widen` instead of at parse
+// time, so every `--dump-ast` that compiled before is byte-identical.
 i64 tk_prim_arg(i64 pty, i64 a, i64 atpass, i64 line, uptr fl) {
     i64 aty = tk_prim_ty_of(a, atpass);
     i64 cty = aty;
     if (nd_kind(a) == N_CALL) cty = 0 - 1;       // not decided until the pick
-    if (cty < 0 && tk_prim_conv_casts(pty)) tk_prim_arg_defer(pty, a, line, fl);
+    if (cty < 0 && tk_prim_defers(pty, a)) tk_prim_arg_defer(pty, a, line, fl);
     tk_check_scalar_compat(pty, cty, a, line, fl);
-    return tk_prim_conv(pty, a, aty);
+    return tk_prim_conv(pty, a, cty);
 }
 
 // the argument list of a row, checked and converted position by position. The
