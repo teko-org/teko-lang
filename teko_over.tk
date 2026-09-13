@@ -160,11 +160,31 @@ void tk_ov_decl_add(i64 n) {
     tk_nodecl = tk_nodecl + 1;
 }
 
+// D48, ninth pass: a declaration the SOURCE wrote whose name is one the compiler
+// GENERATES. The two reach the linker as one symbol and every table keyed by
+// name -- `decl_find`, the rows below, the generator's own memo -- answers
+// about whichever it met first, so the program silently gets the wrong one:
+// `i64 tkarr_put_i64(i64)` beside a `params i64[]` call site made the site's
+// own helper type-check against the program's function. The name a generator
+// writes is the compiler's, and a program that spells it is told so.
+//
+// It is the node, never the spelling, that says which side a row is on: the
+// generated declaration carries the same name and must pass.
+void tk_ov_gen_clash(i64 n) {
+    if (!tk_emit_owns(nd_name(n))) return;
+    if (tk_emit_is(n)) return;
+    err_at2(nd_file(n), nd_line(n), "teko: the name is the compiler's own", nd_name(n));
+}
+
 void tk_ov_collect(i64 root) {
     i64 n = root;
     loop {
         if (n == 0) break;
         i64 k = nd_kind(n);
+        // a global is checked too, and collected by nobody: `tk_nl_vt` and
+        // `Name__names` are generated GLOBALS, and a program declaring one
+        // would clash with them exactly as a function does
+        if (k == N_FUNC || k == N_PROTO || k == N_EXTERN || k == N_GLOBAL) tk_ov_gen_clash(n);
         if (k == N_FUNC || k == N_PROTO || k == N_EXTERN) tk_ov_decl_add(n);
         n = nd_next(n);
     }
@@ -341,20 +361,20 @@ void tk_ov_scan() {
 // before the oracle ever asked -- so what a call site picks does not depend on
 // whether anything asked earlier.
 //
-// The SCAN is what runs once, since its three refusals -- an overloaded `main`,
-// an overloaded `extern`, two overloads differing only by `ref`/`out` -- would
-// otherwise be raised twice, and it now raises them at pass 6 instead of pass
-// 14, with the same message at the same line. That is the whole cost of the
-// move, and it is one a declaration-level refusal can pay: it depends on
-// nothing any pass in between writes, and a declaration a later pass emits is
-// a compiler symbol of its own, never an overload of a name the source wrote.
-i64 tk_ov_scanned = 0;
-
+// The SCAN is rebuilt with it (D48, ninth pass). Scanning once was the pass-6 table's
+// verdict for the whole compilation, so a name whose rows arrive later -- the
+// `tkarr_*` group `tk_params_pass` (12) emits -- was never judged and never
+// marked, and a program declaring one of those names kept its own unmangled
+// symbol beside the generated one. The scan is IDEMPOTENT: it either refuses
+// (and the compilation ends) or marks, and `tk_nover` is cleared here so the
+// marks are exactly the ones this table's rows earn. Its three refusals -- an
+// overloaded `main`, an overloaded `extern`, two overloads differing only by
+// `ref`/`out` -- are raised at pass 6 rather than pass 14, with the same
+// message at the same line, because pass 6 is the first table that sees them.
 void tk_ov_prepare(i64 root) {
     tk_nodecl = 0;
+    tk_nover = 0;
     tk_ov_collect(root);
-    if (tk_ov_scanned) return;
-    tk_ov_scanned = 1;
     tk_ov_scan();
 }
 
@@ -772,7 +792,7 @@ void tk_ov_check_left() {
 // single node is read, let alone moved: the table is this module's own memory,
 // and the tree goes back exactly as it came.
 i64 tk_over_pass(i64 root) {
-    tk_ov_prepare(root);                 // the table as the unit stands NOW; scanned once, at pass 6
+    tk_ov_prepare(root);                 // the table as the unit stands NOW, rebuilt and scanned again
     if (tk_nover > 0) {
         tk_ov_rename();
         tk_ty_pass_walk(root, &tk_ov_visit);

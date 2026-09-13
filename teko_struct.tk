@@ -133,8 +133,65 @@ i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl);
 //       saves `p_decl_name()` with the rest of its scratch instead, since
 //       `parse_top` writes the name itself once per declaration the instance
 //       produces.
+// ---- the declarations the COMPILER writes (D48, ninth pass) ----
+// This function is the one door every GENERATED top-level declaration goes
+// through, so it is also the one place that can tell such a declaration from
+// one the source wrote. It records both: the NODE, which is the identity a
+// later pass asks about, and the NAME, which is what a program may collide
+// with. `tk_ov_collect` (teko_over.tk) reads the pair and refuses a
+// declaration of the program's own that carries a generated name -- `tkarr_*`,
+// `tk_nl_*`, a vtable, `Name__names` -- because the two would otherwise reach
+// the linker as one symbol and a call site would pick whichever the tables
+// answered first.
+//
+// The name alone would not do: a generated declaration carries a generated
+// name too, and telling them apart by spelling would reserve a prefix for
+// every program, which the compiler's own sources (`tk_nl_box_fn`,
+// `tk_nl_boxname`) would then trip over on the bootstrap.
+#define TK_MAXEMIT 512                  // top-level declarations one unit generates
+
+uptr tk_emit_name[TK_MAXEMIT];           // the symbol the generator wrote
+i64  tk_emit_node[TK_MAXEMIT];           // the node itself, the identity of the row
+
+i64 tk_nemit = 0;
+
+uptr tk_emit_name_at(i64 i) { return ld64(tk_emit_name + i * 8); }
+i64  tk_emit_node_at(i64 i) { return ld64(tk_emit_node + i * 8); }
+
+void set_tk_emit_name_at(i64 i, uptr v) { st64(tk_emit_name + i * 8, v); }
+void set_tk_emit_node_at(i64 i, i64 v)  { st64(tk_emit_node + i * 8, v); }
+
+// 1 when this very node is one the compiler emitted
+i64 tk_emit_is(i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nemit) break;
+        if (tk_emit_node_at(i) == n) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 1 when some declaration the compiler emitted carries `name`
+i64 tk_emit_owns(uptr name) {
+    if (name == 0) return 0;
+    if (cstrlen(name) == 0) return 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nemit) break;
+        if (str_eq(tk_emit_name_at(i), name)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
 void tk_top_emit(i64 n) {
     uptr owner = p_decl_name();
+    if (tk_nemit == TK_MAXEMIT)
+        err_at(nd_file(n), nd_line(n), "teko: too many generated declarations in one unit");
+    set_tk_emit_name_at(tk_nemit, nd_name(n));
+    set_tk_emit_node_at(tk_nemit, n);
+    tk_nemit = tk_nemit + 1;
     top_add(n);
     p_set_decl_name(owner);
 }
