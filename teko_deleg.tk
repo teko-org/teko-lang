@@ -480,6 +480,7 @@ i64  dl_si[TK_MAXDGLATE];             // the delegate row the ELEMENT type is
 i64  dl_line[TK_MAXDGLATE];
 uptr dl_file[TK_MAXDGLATE];
 i64  dl_done[TK_MAXDGLATE];
+i64  dl_esc[TK_MAXDGLATE];            // ...and whose ESCAPE is unjudged as well
 i64  tk_ndglate = 0;
 
 i64  dl_node_at(i64 i) { return ld64(dl_node + i * 8); }
@@ -487,6 +488,33 @@ i64  dl_si_at(i64 i)   { return ld64(dl_si + i * 8); }
 i64  dl_line_at(i64 i) { return ld64(dl_line + i * 8); }
 uptr dl_file_at(i64 i) { return ld64(dl_file + i * 8); }
 i64  dl_done_at(i64 i) { return ld64(dl_done + i * 8); }
+i64  dl_esc_at(i64 i)  { return ld64(dl_esc + i * 8); }
+
+// ---- a store built where NOTHING can be judged (D51, fourth pass) ----
+// A GLOBAL `T[]`'s own element store is assembled inside `tk_array_pass`
+// (`tk_hg_resolve_write`, teko_array.tk) -- a pass, with no lexical scope
+// around it at all: no local, no parameter and no shadow of a global is
+// visible there, and the parser's own tables were cut back long ago. The
+// third pass gave that store the SAME validator the parse-time one has, which
+// judged it against the only rows in reach, the globals: a local `i64 g`
+// shadowing a delegate global `Op g` typed as the GLOBAL and stored the
+// local's bits; a local `Op f` beside a free function `f` was read as the
+// FUNCTION and wrapped; a call through a local delegate (`g_ops[0] =
+// chooser(0)`) could not be typed at all and was refused outright. And the
+// escape rule `tk_ha_index` runs at its own parse site never ran there, so
+// `g_ops[0] = new Op((i64 y) use (&x) => x + y)` parked a capture by the
+// ADDRESS of a local in a global that outlives it.
+//
+// One flag, one rule: a store built in the pass judges NOTHING where it is
+// built -- not the coercion, not the type of the value, not the escape -- and
+// the whole of it waits for `tk_deleg_walk`, which stands at the site with the
+// lexical scope live, the globals collected and the function that owns the
+// store known (`tk_cur_fn_name`, the escape rule's own owner). One judgement
+// point for a local store (the parse site) and one for a global store (the
+// walk), and the same decision function at both.
+i64 tk_deleg_defer_all = 0;
+
+void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 
 // "the store's own oracles cannot settle this name". Only two answers are
 // settled where the store is built, and everything else waits:
@@ -505,6 +533,7 @@ i64  dl_done_at(i64 i) { return ld64(dl_done + i * 8); }
 // be a global, a parameter, or a function declared further down the file.
 i64 tk_deleg_store_late(i64 si, i64 v) {
     if (si < 0) return 0;
+    if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
     if (nd_kind(v) != N_IDENT) return 0;
     if (tk_ty_scope_or_global(nd_name(v)) >= 0) return 0;
     if (tk_pty_of(v) >= 0) return 1;
@@ -519,6 +548,7 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
     st64(dl_line + tk_ndglate * 8, line);
     st64(dl_file + tk_ndglate * 8, fl);
     st64(dl_done + tk_ndglate * 8, 0);
+    st64(dl_esc + tk_ndglate * 8, tk_deleg_defer_all);
     tk_ndglate = tk_ndglate + 1;
 }
 
@@ -527,6 +557,14 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
 // in between is judged as it stands now. A wrap hands back a new node, and the
 // list link is what takes it -- the same splice `tk_deleg_check_call_args`
 // makes over an argument list, and no node ever has to change identity.
+//
+// The escape comes first, and only for a store that was built where the rule
+// could not run (`dl_esc`, the global `T[]` write above): it is the same
+// verdict over the same value `tk_ha_index` takes at a local store's own parse
+// site, in the same words, from the one walk that knows which function owns
+// the store (`tk_cur_fn_name`, read by `tk_taint_owner`). A local store's
+// escape was already judged where it was written, and judging it again here
+// would read a taint the site itself could not see yet.
 void tk_deleg_late_do(i64 i) {
     if (dl_done_at(i)) return;
     st64(dl_done + i * 8, 1);
@@ -534,6 +572,9 @@ void tk_deleg_late_do(i64 i) {
     if (a == 0) return;
     i64 v = nd_next(a);
     if (v == 0) return;
+    if (dl_esc_at(i) && tk_lam_escapes(v))
+        err_at(dl_file_at(i), dl_line_at(i),
+               "teko: a lambda that captures by reference cannot leave its scope");
     i64 nv = tk_deleg_coerce(dl_si_at(i), v, dl_line_at(i), dl_file_at(i));
     if (nv == v) return;
     set_nd_next(nv, nd_next(v));

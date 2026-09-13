@@ -34,6 +34,13 @@
 //      `teko: unknown function: ...`. A global `Op[]` was coerced by nothing
 //      at all and handed the bare name to the core, `unknown name`. The value
 //      waits for `tk_deleg_pass` now (D51, third pass).
+//   3c. `delegarrglobalcheck` -- the same store on a GLOBAL `Op[]`, which is
+//      built inside `tk_array_pass` with no lexical scope around it at all:
+//      judging it there read the GLOBAL rows for a name a local shadows, the
+//      FUNCTION for a name a local of delegate type shadows, nothing at all
+//      for a call through a local delegate -- and never ran the escape rule
+//      the parse site runs. The whole store waits for the walk now (D51,
+//      fourth pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -193,6 +200,50 @@ i64 delegarrcheck() {
 
 i64 addLater(i64 a) { return a + 3; }
 
+// ---- 3c. the same element store on a GLOBAL `Op[]`, judged at the WALK
+// (D51, fourth pass) ----
+
+Op[] g_ops2;
+
+i64 shadowed(i64 a) { return a + 100; }           // a free function of that name
+
+delegate Op Chooser(i64 k);
+
+Op pickOp(i64 k) {
+    if (k == 0) return addOne;
+    return addTwo;
+}
+
+i64 delegarrglobalcheck() {
+    g_ops2 = new Op[3];
+
+    // a lambda with no by-reference capture: nothing escapes with it, so the
+    // store the pass builds is accepted -- the one that DOES capture by
+    // reference is refused in the same words a local array's store is
+    // (docs/reference/diagnostics.md)
+    g_ops2[0] = new Op((i64 a) => a * 3);
+
+    // a call through a LOCAL delegate: only the walk's own lexical scope
+    // names `chooser`, so the pass that builds the store could not type this
+    // value at all and refused a legal program
+    Chooser chooser = pickOp;
+    g_ops2[1] = chooser(1);
+
+    // a local of delegate type SHADOWING a free function of the same name:
+    // a name at a point is the innermost declaration visible THERE, so the
+    // store holds the local and never a wrap of the function
+    Op shadowed = addOne;
+    g_ops2[2] = shadowed;
+
+    Op b0 = g_ops2[0];
+    Op b1 = g_ops2[1];
+    Op b2 = g_ops2[2];
+    if (b0(10) != 30) return 1;
+    if (b1(10) != 12) return 2;
+    if (b2(10) != 11) return 3;                   // 110 if the FUNCTION had won
+    return 0;
+}
+
 // ---- 4. `params` over a global scalar element ----
 
 i64 sumall(params i64[] xs) {
@@ -328,6 +379,9 @@ i64 main() {
 
     bad = delegarrcheck();
     if (bad != 0) return 80 + bad;
+
+    bad = delegarrglobalcheck();
+    if (bad != 0) return 90 + bad;
 
     bad = paramscheck();
     if (bad != 0) return 40 + bad;
