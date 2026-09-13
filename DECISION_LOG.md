@@ -2111,6 +2111,75 @@ oracle's new answer made one global honest and one dangerous.** Both were reprod
 Two nits with it: `docs/specs/datetime.md` § 11's inventory and `docs/specs/enum.md` § 12's
 N2c gate line now name `tests/surface_datetime_kind_panic.tk` (70) beside the 42 one.
 
+**Copilot finding, fifth pass -- the check had TWO points and needed one, and a node that
+moves takes its type with it.** Both were reproduced on `d8d00572` before they were fixed.
+
+1. **A legal argument was refused, because the point that judged it was dead for its
+   shape.** The third pass split the judgement in two -- `tk_prim_arg_pend` inside
+   teko_ops.tk's walk for what a scope answers, `tk_prim_arg_rest` at the end of
+   `tk_over_pass` for what the overload pick answers -- and the first half is UNREACHABLE
+   for an argument that is an `N_BINARY` or an `N_UNARY`: `tk_ops_visit` returns from both
+   of those arms before the hook at the bottom of the function. So the node fell to the
+   sweep, which runs with NO scope entered, and `new DateTime(1, k | DateTimeKind.Utc)` on
+   a `DateTimeKind k` parameter -- legal, since a bitwise operator over an enum answers the
+   enum (§ 4 of the spec) -- read `teko: the type of this argument is not known here`.
+   The same for `k & DateTimeKind.Local` and for `~~k`.
+
+   **The fix is that there is one point again, and it is a walk of its own**:
+   `tk_prim_arg_judge` (teko_prim.tk) drives `tk_ty_pass_walk` at the end of
+   `tk_over_pass`, after that pass's own walk has written every picked symbol. That is the
+   only place where BOTH halves of what types an argument are true at once -- the scope a
+   parameter is read under is live, and every overload under the argument is already the
+   signature its own arguments chose, at whatever depth. Moving the hook ahead of the two
+   returns in `tk_ops_visit` was the smaller diff and the wrong one: it judges the node
+   BEFORE the pick under it, which is exactly the laundering the third pass removed.
+   Hooking `tk_ov_visit` itself does not work either, because `tk_ty_walk_list` visits a
+   node before its children and a nested call is picked after its parent is visited.
+   `tk_prim_arg_rest` is DELETED: nothing is left for a sweep. That a body walk reaches
+   every deferred argument was measured rather than argued -- a throwaway build that
+   errors on any entry the walk did not mark fired on none of the 61 fixtures nor on the
+   compiler's own source under `scripts/bootstrap.sh` -- and the reason is what a global
+   initializer may be: mc requires it to be CONSTANT, so a row's call never stands there
+   (`DateTime g = new DateTime(1, gk);` is `global initializer must be constant`) and the
+   constant arguments that do (`1 + 2`, `(i64) 3`, a `const` name) are typed by the parser
+   and never defer. `passes` stays **15/30**, and a unit that deferred nothing walks
+   nothing (the table is this module's own memory, and `tk_prim_arg_judge` returns on an
+   empty one).
+
+   The refusals do not move, and one of them gets the better wording for free: `new
+   DateTime(1, x | 1)` on an `i64 x` parameter was `the type of this argument is not known
+   here` and is now `teko: a value of type i64 does not convert to DateTimeKind`, the type
+   it really has. `tests/surface_datetime_kind.tk` gains codes 58-61.
+
+2. **A node rewritten in place kept a type that was no longer its own.**
+   `tk_prim_arg_widen` wraps the argument by moving what the node WAS into a fresh node
+   (`tk_nd_moved`) and making the original the `N_CAST`; a row of teko_struct.tk's
+   expression-type table (`tk_xt_put`) is keyed on the NODE, so a registration the argument
+   already had stayed on the wrapper. `tk_ty_of` reads that table BEFORE the node's own
+   kind, so the `(f64)` then answered `i64` -- the type of what it wraps -- and
+   `tk_rc_call_args` (teko_rc.tk), the last pass of all, widened it a second time.
+   Measured: `TimeSpan.FromHours(h.Get())` with `h` a PARAMETER (so the `.` is a
+   placeholder the oracle's pass rebuilds AND registers a type for) dumped `CAST type=f64`
+   over `CAST type=f64` over the call. A local receiver does not reach it -- the parser
+   types it, so the argument never defers -- which is why no fixture had caught it.
+   **The fix is in the move, not in the caller**: `tk_xt_move` (teko_struct.tk) repoints
+   every row of the node onto the fresh one, because the registration describes the VALUE
+   and the value is what moved. `tests/surface_datetime_kind.tk` gains code 62 and its
+   dump carries one cast.
+
+**Proof of the fifth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
+--config mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of
+all 61 against `d8d00572` -- **60 byte-identical**, and the one that moves is the fixture
+edited here, a pure ADDITION once the compiler's own `$gN` temporaries are normalized (218
+lines added, none removed); `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (61/61 under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (565
+links, 383 diagnostics, 116 samples). `mc limits` verdict `ok` on both legs with every
+table unmoved from the fourth pass -- floor (`tests/hello.tk`) `passes` 15/30, `syntax` 15,
+`alias` 18, `types` 11, `intrin` 8/16, heap 1114960, and the `tests/surface_datetime.tk`
+leg `syntax` 16, `alias` 21, `types` 14, heap 3858176 (against a 33554432-byte
+reservation). `mc pkg hash .`:
+`e5a32e655c6d140f8e8116ccd95ea569723c0d6d5352048b00a488415715beb1`.
+
 **Proof of the fourth pass**, mc **0.15.23**, macos/aarch64: `mc build . --config
 mc.macos.toml` clean; **61/61** fixtures at their `expect-exit`; `--dump-ast` of all 61
 against `108391e1` — **58 byte-identical**, and the three that move are the three fixtures
