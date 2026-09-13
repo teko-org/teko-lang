@@ -42,7 +42,6 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
 | an integer argument at a **virtual** or an **interface** call, written as a bare **parameter** name (`a.by(n)` inside `g(i64 n)`) | not converted: those two are shaped at parse time and a parameter carries no type the parser can read, so the argument passes its own bits |
 | `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |
-| `h.f = 5;` on a field of class/struct/interface/delegate type, the value written by a PARSE-TIME field store (`p.f = e`) | neither converted nor refused: `tk_check_field_store` (teko_struct.tk) reads the value through `tk_struct_of_expr`, which answers about an OBJECT expression only, so a scalar value silently answers "not known" and the store proceeds, writing the integer's bit pattern where a pointer is expected. D34 fixed the opposite direction (a reference reaching a NUMERIC field); this is the same defect class, the other way round, at this one site — every other numeric-into-reference slot (an initializer, an assignment, an argument, a `return`) already refuses through `tk_check_compat`'s row check |
 
 ## Generics and delegates
 

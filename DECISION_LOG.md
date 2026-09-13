@@ -2541,3 +2541,96 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 8/16, heap 1114880, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types`
 14, heap 3875392 (against a 33554432-byte reservation). `mc pkg hash .` over the source tree
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
+
+### D50 · Every field store is one gate, not four (G-e, 2026-09-13)
+A field store had FOUR independent code paths, and only one of them — `p.f = e` on a
+receiver the parser could type, `tk_field_use` (teko_expr.tk) — ran the value through
+`tk_field_store_val` (teko_typeof.tk): D33's widening, its narrowing refusal, D43's `null`
+only in a `T?` field, D34's reference/number mismatch, Q1b's box wrap. The other three built
+the store CALL directly over the source's own value node: `this.rate = k;` and the implicit
+`rate = k;` inside a method or a constructor (`tk_this_assign`, teko_this.tk), and a `static`
+field `T.f = e` on BOTH its roads — the direct site (`tk_static_use`, teko_access.tk) and its
+forward-referenced twin, resolved once the type it names is finally read
+(`tk_fwd_resolve_static_one`, same file). `public H(i64 k) { this.rate = k; }` with `f64
+rate` stored the PARAMETER's raw eight bytes — read back as a double near 2.5e-323, not
+5.0 — and a `static f64` receiving an integer did the same; neither refused a class value
+landing in an `i64` field either, the D34 gap `not-yet.md` already named for the one PARSE-
+TIME site, `h.f = 5;`, now closed everywhere a field is written.
+
+**The three raw sites now build the value through `tk_field_store_val` before the store,
+the exact splice `tk_field_use` already made.** No new function: `teko_struct.tk`'s own
+forward declaration of it (already there for `tk_array_index`) is what every later file
+calls. `tk_check_field_store` (teko_struct.tk) closes its own half of D34's leftover gap the
+same way — a scalar value into a field of ROW type, which `tk_struct_of_expr` answers
+"not known" about and used to let through — asking `tk_pty_of`/`tk_ty_of` for the value's
+type where the row question cannot be asked, with the Q1b box exemption carried over so a
+`T?` field over a value (which correctly DOES take a bare scalar) is not caught by its own
+new guard.
+
+**One value-type oracle was silently incomplete, and it was never this crumb's construct
+to guess around.** `tk_field_store_val` reads the value's type through `tk_pty_of`
+(teko_struct.tk), the PARSE-TIME table `tk_slv` -- and a PARAMETER answers -1 there by
+design (D33's own words, "not known here"), because `tk_member_fn` (teko_class.tk) never
+pushed a parameter onto it at all -- only `tk_local_add`'s "this" was. `this.rate = k` is
+exactly the shape that starves: the widening never fired, silently, which is the whole bug
+measured above. `tk_member_fn` now pushes every parameter's own type onto `tk_slv`
+(`tk_param_ty`, teko_ref.tk) for the length of the body alone -- scoped by the same
+`tk_nslv_live` mark-and-restore `tk_local`'s "this" already used -- skipping the injected
+receiver, whose `param_new` type is the raw dispatch slot `uptr`, not the class's own row.
+This alone fixes the EXPLICIT form (`this.rate = k`, resolved at PARSE time by
+`tk_field_use`) and every static/instance site whose receiver is directly typed.
+
+**The IMPLICIT form is resolved from a PASS, not from the parser, and needed a second
+fallback.** `rate = k;` with no `this.` is rewritten by `tk_this_assign`, called from
+`tk_this_fix` -- which `teko_typeof.tk`'s own walk drives, AFTER every function's
+parse-time scope (`tk_slv_live`) has already been cut back to zero by `tk_member_fn`'s own
+restore. `tk_field_store_val` now falls back to the PASS-TIME oracle, `tk_ty_of`
+(`tk_ty_scope_find`, populated per function as `tk_typeof_pass` walks it), when the
+parse-time one answers -1 -- silent everywhere the parse-time answer already held, since
+`tk_ty_of` asked from PARSE time (before any function's pass-time scope opens, `tk_nscope`
+still at its initial 0) answers -1 exactly as before. This is the "mystery" the measurement
+asked to be explained: two sibling stores of the identical shape, `this.rate = k` and `rate
+= k`, ran through DIFFERENT phases of the compiler (one at parse time, called from
+`tk_field_use`; the other from the pass, called through `tk_this_fix`), so a fix aimed at
+only one of the two oracles would have made one right and left the other silently wrong —
+which is exactly why the task names "one point, one rule" rather than a fix per call site.
+A THIRD, already-correct code path exists beside these four for a receiver the parser
+cannot type at all (`h.rate = k;` with `h` a PARAMETER, deferred to `tk_pend_field`,
+teko_typeof.tk) — it already used `tk_ty_of` and `tk_check_compat` on its own, which is why
+`pr1`'s probe (a free function storing a parameter through a parameter receiver) was never
+part of the bug; it is a fifth, narrower path this crumb leaves as it found it, since D34's
+scalar clause and D33's widening already held there.
+
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`): a constructor's explicit
+`this.rate = k` and the implicit `rate = k` (both `k` an `i64` parameter, into an `f64`
+field); a method's `this.rate = this.rate + 1`; a `static f64 total` written and read back
+through its type; a `Cell?` instance field written through `this.` with `null` (the
+constructor's own store) and then a live reference, boxing and unboxing through
+`.HasValue`/`.Value`; an `enum` instance field written through `this.`; `rt_live()` back to
+its floor. Compound assignment on a field (`this.rate += 2;`, `H.total *= 2;`) is not
+taught — the `+=`/`*=` sugar takes a bare NAME on its left and refuses anything else,
+``the rule expected a name on the left``, a pre-existing and unrelated gap, out of this
+crumb's scope, so the method helper writes the same shape by hand
+(`this.rate = this.rate + 1;`) instead. The refusals — narrowing through `this.`, `null` in
+a non-`T?` field through `this.`, an `enum` field through `this.` taking a bare integer, and
+a reference/number mismatch through a `static` field — are one `// no-run` sample in
+[types.md](docs/reference/types.md), reusing the wording every mismatched value already
+gets; no new diagnostic string was added.
+
+**Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
+clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of the **62** fixtures that
+existed before this crumb, taken against `da33ebd4` — **62 byte-identical**, since every
+site this crumb touches only changes a program that was previously silently WRONG, never
+one that was already accepted correctly; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK` (`teko2.o == teko3.o` on the first turn, `--dump-asm` diff empty,
+63/63 fixtures under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (569 links,
+385 diagnostics, 118 samples). `mc limits . --config mc.macos.toml` verdict `ok` on both
+legs, every table unmoved — `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11,
+`intrin` 8/16 — no new pass, no new intrinsic (D2, D21). `mc pkg hash .` over the source
+tree of this entry's code commits: `7db061bfe04bb2d2e8ac34814fea8a436708d5d22b41c2816b96c49589b4fe5c`.
+A probe matrix outside `tests/` (not committed) proved the measured bug at every one of the
+four sites before the fix and its absence after: a constructor and a free function each
+storing a parameter into an instance field, a `static` field alone and one preceded by an
+unrelated instance store (the ordering the measurement flagged as suspicious — both now
+agree, both correct, since all four sites share one gate), the narrowing refusal, D34's two
+directions and the `T?` box, each at `this.`, the implicit form and a `static` field.

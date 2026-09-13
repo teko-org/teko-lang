@@ -260,6 +260,38 @@ A raw `uptr`/`ptr` value is left alone in a numeric slot — the core converts i
 integer of its own accord, and only a value the type table has a row for (or the `null`
 literal above) is judged here.
 
+**A field store is one rule, at every site that writes one.** `p.f = e`, `this.f = e`, the
+implicit `f = e` inside a method or a constructor, and a `static` field `T.f = e` (through
+its type, whether or not the type is already known where the store is written) all pass
+through the same check: the widening above, the narrowing refusal, `null` only in a `T?`
+field ([nullable.md](nullable.md)), an `enum` field converting from nothing but itself, and
+the reference/number mismatch (D34), in both directions.
+
+```teko
+// no-run
+class Foo { public i64 v; }
+enum Color { Red, Green, Blue }
+
+class H {
+    public i64 n;
+    public Color c;
+    public static Foo f;
+
+    public H(f64 x) {
+        this.n = x;                              // teko: a value of type f64 does not convert to i64
+    }
+
+    public void set(i64 k) {
+        c = k;                                    // teko: a value of type i64 does not convert to Color
+    }
+}
+
+i64 main() {
+    H.f = 5;                                      // teko: a value of type i64 does not convert to Foo
+    return 0;
+}
+```
+
 Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
 slot is neither converted nor refused ([not-yet.md](not-yet.md)).
 
