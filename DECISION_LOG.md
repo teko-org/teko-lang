@@ -2304,6 +2304,87 @@ are include checks and name resolution (`tk_prim_need_include_of`, `tk_enum_need
 mc's own `function declared twice` -- the generator had emitted its own anyway -- and it is
 `teko: the name is the compiler's own: tk_nl_box_i64` now.
 
+**Copilot finding, tenth pass -- the record of the compiler's own names had one door and
+eight ways around it.** The ninth pass put the pair (node, name) of every generated
+top-level declaration in a table of `tk_top_emit`'s own (teko_struct.tk) and taught
+`tk_ov_collect` to refuse a program's declaration carrying one of those names. The door was
+real and incomplete: `grep -n 'top_add(' teko_*.tk` answered fourteen sites, and eight of
+them were generators that never went through it -- a class method's mangled body and a
+constructor's (`tk_member_body`, `tk_member_ctor`, teko_class.tk), both property accessor
+forms (`tk_prop_auto_body`, `tk_prop_arrow_body`, teko_prop.tk), a static field's global and
+a struct's implicit allocator (`tk_static_field`, `tk_struct`, teko_struct.tk), a service's
+slot and memoized getter (`tk_di_getter_sym`, teko_di.tk) and every declaration a generic
+instance replays (`tk_gen_replay`, teko_generic.tk). Their symbols are as much the
+compiler's as `tkarr_put_i64` is: the program never spells `point_area`, the mangling does.
+
+**The fix is one door with two spellings, and the second is the first's own body.**
+`tk_top_emit_as(i64 n, uptr owner)` records the pair, calls `top_add` and then sets
+`p_decl_name()` to `owner`; `tk_top_emit(i64 n)` is `tk_top_emit_as(n, p_decl_name())`, the
+mid-declaration form D27 asks for, unchanged to the byte for its eleven existing callers. A
+generator that stands at TOP LEVEL -- inside a `class`/`struct` body the core is reading --
+passes `0`, which is exactly what `top_add` leaves behind on its own, so those seven sites
+gained the row and nothing else; the two in `tk_di_getter_sym` run from pass 4, where the
+name is already 0, and take the plain door. `tk_gen_replay` keeps its own save of
+`p_decl_name()` with the rest of its scratch and passes 0 too, because `parse_top` writes
+the name itself once per declaration the instance produces -- and it answers 0 for a `class`,
+whose members add themselves, which is why the function records nothing for a null node.
+**That is the whole reason the 62 dumps do not move**: not one migrated site changed what
+`p_decl_name()` is after it returns.
+
+**Two sites are NOT recorded, and the reason is in the code.** teko_ns.tk's `tk_ns_top`
+(a namespaced type's function at top level) and the `namespace A { ... }` body's own loop
+add declarations the PROGRAM wrote; `tk_ns_rename_decl` mangles them two passes later, so
+the node still carries the SHORT name here. Recording it would reserve `area` against the
+very program that wrote `namespace geo { i64 area() }`, and it would say "the compiler's
+own" about a body the compiler never wrote. The collision that family really has -- a
+top-level `i64 geo__area()` beside that namespace -- is a program colliding with its own
+mangled name, and it reaches the core's `function declared twice` before and after this
+pass, unchanged.
+
+**Measured, on `448c6154` and on this commit**, each family a program declaring the
+generated symbol by hand:
+
+| family | the name | on `448c6154` | now |
+|---|---|---|---|
+| struct implicit allocator | `stamp_new` | `teko: a value of type i64 does not convert to Stamp` (the wrong cause, at the `new`) | `teko: the name is the compiler's own: stamp_new` |
+| static field | `stamp_made` | `global name declared twice` (the core) | `teko: the name is the compiler's own: stamp_made` |
+| class method | `point_area` | `function declared twice` (the core) | `teko: the name is the compiler's own: point_area` |
+| class constructor | `point_ctor__i64` | `function declared twice` | `teko: the name is the compiler's own: point_ctor__i64` |
+| auto property accessor | `square_get_Side` | `function declared twice` | `teko: the name is the compiler's own: square_get_Side` |
+| arrow property accessor | `square_get_Area` | `function declared twice` | `teko: the name is the compiler's own: square_get_Area` |
+| service getter | `svc_di_get` | `function declared twice` | `teko: the name is the compiler's own: svc_di_get` |
+| generic instance method | `box__circle__2_cap` | `Box__Circle__2 instantiated from f.tk:5:1: function declared twice` | `teko: the name is the compiler's own: box__circle__2_cap` |
+| namespace mangling | `geo__area` | `function declared twice` | `function declared twice` (deliberately unchanged, above) |
+
+The first row is the one that was a genuine hole rather than a worse message: the core never
+saw two declarations, because a struct's allocator and the program's function differ in
+RETURN type, and the program's `Stamp stamp_new()` simply stood in for the generated one at
+the `new` site. The others gained the cause in place of the symptom. A name that merely
+LOOKS generated is still a program's own: `point_areas` and `pointarea` beside a
+`class Point { i64 area() }` compile and run.
+
+**`TK_MAXEMIT` stays 512, with the worst case measured rather than argued.** A throwaway
+build that reports `tk_nemit` at the last pass, run over all 62 fixtures on both commits:
+the busiest is `tests/surface_lambda.tk` at **134 -> 142**, then `tests/surface_di.tk`
+67 -> 103, `tests/surface_nullable_ref.tk` 48 -> 59, `tests/order_types.tk` 45 -> 55,
+`tests/surface_namespace.tk` 44 -> 52; `tests/hello.tk` is 0 on both. The compiler's own
+source is 0 as well -- `mc_teko.tk` is written in the mc subset teko does not generate for,
+and the same throwaway build reports `EMIT: 0` for it -- so the bootstrap has no worst case
+of its own. 142 of 512 is 28% of the reservation, and the capacity message
+(`teko: too many generated declarations in one unit`) is the one the ninth pass wrote.
+
+**Proof of the tenth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
+--config mc.macos.toml` clean; **62/62** fixtures at their `expect-exit`; `--dump-ast` of all
+62 against `448c6154` -- **62 byte-identical**, which is what says the seven top-level sites
+kept `p_decl_name()` exactly where a bare `top_add` left it; `sh scripts/bootstrap.sh --os
+macos --arch aarch64` -> `FIXPOINT OK` (62/62 under the self-hosted `teko1`);
+`sh scripts/check-docs.sh` green (**568** links, 385 diagnostics, 117 samples). `mc limits`
+verdict `ok` on both legs with every table unmoved from the ninth pass -- floor
+(`tests/hello.tk`) `passes` **15/30**, `syntax` 15, `alias` 18, `types` 11, `intrin` 8/16,
+heap 1114992, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias` 21, `types` 14,
+heap 3875504 (against a 33554432-byte reservation). `mc pkg hash .`:
+`0b8e9993f94b8faf2fc4da8688c40aa06346bc5e106e3d3973bab0c841a15a96`.
+
 **Proof of the ninth pass**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build .
 --config mc.macos.toml` clean; **62/62** fixtures at their `expect-exit`; `--dump-ast` of all
 62 against `665c7442` -- **62 byte-identical**, which is what says the rescan and the mark
