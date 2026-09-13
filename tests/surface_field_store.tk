@@ -1,25 +1,23 @@
-// surface_field_store.tk -- one gate, four sites (G-e, D33/D34/D43/D44): every
-// field store -- `this.f = e` (explicit), the implicit `f = e` inside a
-// method or constructor, and `T.f = e` (a static field, both the direct
-// site and its forward-referenced twin) -- passes through the SAME
-// `tk_field_store_val` (teko_typeof.tk) the instance store `p.f = e`
-// already used. Before this crumb only that one site did: the other three
-// built the store CALL directly over the source's own value node, with no
-// widening, no narrowing refusal and no row check at all -- an integer
-// landing in an `f64` field kept its raw bits, silently, through every one
-// of them.
+// surface_field_store.tk -- one gate, every site (G-e, D50; D33/D34/D43/D44):
+// every field store -- `p.f = e`, `this.f = e` (explicit), the implicit
+// `f = e` inside a method or a constructor, and `T.f = e` (a static field,
+// both the direct site and its forward-referenced twin) -- passes through the
+// SAME `tk_field_store_val` (teko_typeof.tk). Before this crumb only `p.f = e`
+// on a receiver the parser could type did: the others built the store CALL
+// directly over the source's own value node, with no widening, no narrowing
+// refusal and no row check at all -- an integer landing in an `f64` field kept
+// its raw bits, silently, through every one of them.
 //
-// The one wrinkle this crumb closes on the way: a bare PARAMETER's type
-// answers -1 at the PARSE-TIME oracle `tk_field_store_val` reads
-// (`tk_pty_of`, D33's own "not known here"), because a constructor or a
-// method's own parameters are pushed onto that table only for the length of
-// the body (`tk_member_fn`, teko_class.tk) and popped again before the
-// LATER pass ever asks. `this.rate = k` -- a parameter stored into a field
-// -- is exactly the shape that answer starves: `tk_field_store_val` now
-// falls back to the PASS-TIME oracle (`tk_ty_of`) when the parse-time one
-// does not know, which is silent everywhere the parse-time answer already
-// held and is what makes the implicit form (resolved from the PASS, D221's
-// own `tk_this_assign`) agree with the explicit one at all.
+// The wrinkle the first pass of this crumb only half closed: the value's own
+// TYPE is the one thing a store site may not know. A PARAMETER is in no
+// parse-time scope (`tk_slv`'s own rule, D33's "not known here"), an implicit
+// `f = e` is rewritten from a pass with its right-hand side still a bare name,
+// and a `T.f = e` on a type declared below is resolved one pass ahead of the
+// scope that would answer. `-1` is not a licence to write the raw bits: the
+// store is DEFERRED and judged once, in `tk_field_store_judge`, with the scope
+// alive and the tree resolved -- the discipline D48 wrote for a primitive
+// row's argument. Every helper below is a shape that answered -1 at its own
+// site.
 //
 // What each helper proves, in order:
 //
@@ -27,7 +25,7 @@
 //                       PARAMETER: the field reads back 5.0, not the
 //                       parameter's raw bits;
 //   2. `implcheck`   -- the same store, spelled without `this.` (implicit,
-//                       resolved from the pass rather than at parse time);
+//                       rewritten by the pass rather than by the parser);
 //   3. `methodcheck` -- `this.rate = this.rate + 1;` in an ordinary method:
 //                       the binary widens its own integer operand (D33,
 //                       unchanged by this crumb) and the store keeps the
@@ -40,14 +38,30 @@
 //                       and unboxing through `.HasValue`/`.Value` (D44);
 //   6. `enumcheck`    -- an `enum` instance field written through `this.`
 //                       with one of its own members;
-//   7. `rccheck`      -- `rt_live()` back to its floor once every object
+//   7. `binarycheck`  -- `this.rate = k + 1;`, an N_BINARY value: no
+//                       parse-time oracle types a binary at all;
+//   8. `fieldtofieldcheck` -- `rate = step;`, implicit on BOTH sides: the
+//                       right-hand side is a bare name until `tk_this_ident`
+//                       has rewritten it into the typed load;
+//   9. `fwdstaticcheck` -- `H2.total = k;` written where `H2` is declared
+//                       BELOW, from a member whose own parameter is the
+//                       value: the store is resolved in `tk_fwd_pass`, one
+//                       pass before the scope that types `k`;
+//  10. `freefncheck`  -- a FREE function's own parameter into a static field
+//                       and into an instance one through a local receiver:
+//                       no member body is being parsed, so no parse-time
+//                       scope ever held that name;
+//  11. `boxcheck`     -- an `i64?` field written from a parameter: the Q1b
+//                       box is built in the judge, and the raw eight bytes
+//                       used to be stored as a handle (a segfault, measured);
+//  12. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released.
 //
 // A refusal has no exit code to assert (D33's own harness note): the
 // narrowing refusal, the reference/number mismatch (D34) and `null` in a
-// non-`T?` field, at all three sites this crumb touches, are probed outside
-// `tests/` and documented as `// no-run` in
-// docs/reference/diagnostics.md.
+// non-`T?` field are probed outside `tests/` and documented as `// no-run`
+// in [types.md](../docs/reference/types.md) and
+// [diagnostics.md](../docs/reference/diagnostics.md).
 //
 // Compound assignment on a field (`this.rate += 2;`, `H.total *= 2;`) is
 // not taught: the `+=`/`*=` sugar (`<teko-loop-prelude>`) takes a bare NAME
@@ -57,7 +71,6 @@
 // instead (`this.rate = this.rate + 1;`).
 //
 // expect-exit: 42
-
 #include "../lib/rt.tk"
 
 enum Color { Red, Green, Blue }
@@ -71,10 +84,12 @@ class H {
     public static f64 total;
     public Cell? c;
     public Color kind;
+    public i64? count;
 
     public H(i64 k) {
         this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
         this.c = null;                // 5a: `null` written through `this.`
+        this.count = k;               // 11: the Q1b BOX, built from a parameter
     }
 
     public void bump() {
@@ -84,14 +99,45 @@ class H {
     public void take(Cell cc) {
         this.c = cc;                  // 5b: a live reference boxed into `Cell?`
     }
+
+    public void bumpby(i64 k) {
+        this.rate = k + 1;            // 7: an N_BINARY value, typed by no parser
+    }
 }
 
 class I {
     public f64 rate;
+    public i64 step;
 
     public I(i64 k) {
         rate = k;                     // 2: the implicit form, same shape
     }
+
+    public void copy() {
+        rate = step;                  // 8: implicit on BOTH sides, field to field
+    }
+}
+
+// the FORWARD-referenced static twin, for real: `H2` is declared BELOW this
+// class, so `H2.total = k` is resolved by `tk_fwd_resolve_static_one`
+// (teko_access.tk) in `tk_fwd_pass` -- one pass ahead of the scope that types
+// `k`, a member's own parameter (9).
+class W {
+    public void put(i64 k) { H2.total = k; }
+}
+
+class H2 {
+    public static f64 total;
+}
+
+// a FREE function's own parameter: no member body is being parsed, so nothing
+// ever pushed `k` onto a parse-time scope -- into a static field and into an
+// instance one through a receiver the parser types (10).
+void setstatic(i64 k) { H2.total = k; }
+
+void setinstance(H h, i64 k) {
+    H hh = h;                         // a LOCAL: the receiver the PARSER types
+    hh.rate = k;                      // 10: `k` is a free function's parameter
 }
 
 i64 ctorcheck() {
@@ -139,6 +185,44 @@ i64 enumcheck() {
     return 0;
 }
 
+i64 boxcheck() {
+    H h = new H(5);
+    if (!h.count.HasValue) return 1;
+    if (h.count.Value != 5) return 2;
+    return 0;
+}
+
+i64 binarycheck() {
+    H h = new H(0);
+    h.bumpby(4);
+    if (h.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 fieldtofieldcheck() {
+    I i = new I(0);
+    i.step = 5;
+    i.copy();
+    if (i.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 fwdstaticcheck() {
+    W w = new W();
+    w.put(5);
+    if (H2.total != 5.0) return 1;
+    return 0;
+}
+
+i64 freefncheck() {
+    setstatic(7);
+    if (H2.total != 7.0) return 1;
+    H h = new H(0);
+    setinstance(h, 5);
+    if (h.rate != 5.0) return 2;
+    return 0;
+}
+
 i64 rccheck() {
     if (rt_live() != 0) return 1;
     return 0;
@@ -163,8 +247,23 @@ i64 main() {
     bad = enumcheck();
     if (bad != 0) return 60 + bad;
 
-    bad = rccheck();
+    bad = binarycheck();
     if (bad != 0) return 70 + bad;
+
+    bad = fieldtofieldcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = fwdstaticcheck();
+    if (bad != 0) return 90 + bad;
+
+    bad = freefncheck();
+    if (bad != 0) return 100 + bad;
+
+    bad = boxcheck();
+    if (bad != 0) return 110 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 120 + bad;
 
     return 42;
 }

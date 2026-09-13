@@ -1210,6 +1210,8 @@ void tk_reject_compat(uptr ename, uptr tname, i64 line, uptr fl) {
 i64 tk_pty_of(i64 n);
 i64 tk_ty_of(i64 n);
 i64 tk_is_int_ty(i64 t);
+// ...and the judge itself (teko_typeof.tk), the one every other slot is given
+void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl);
 
 // `p.f = e` / `p.items[i] = e` once the receiver's type IS known, at parse
 // time: the field's own row against whatever `tk_struct_of_expr` can already
@@ -1231,27 +1233,26 @@ void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
     }
     i64 ei = tk_struct_of_expr(v);
     if (ei < 0) {
-        // D34's own leftover gap, closed here: a NUMBER reaching a field of
+        // D34's own leftover gap, closed here: a value reaching a field of
         // ROW type converts nothing, in C# as much as the other direction
-        // already refuses (`tk_check_scalar_compat`'s own clause, the
-        // numeric-slot half of the same rule). `tk_struct_of_expr` answers
-        // about an OBJECT expression only, so a scalar value's type is asked
-        // through `tk_pty_of` instead, with `tk_ty_of` as the same PASS-TIME
-        // fallback `tk_field_store_val` uses -- a value neither oracle can
-        // type (`vty < 0`) is left alone, exactly as every other "not known
-        // here" is, rather than guessed at.
+        // already refuses. `tk_struct_of_expr` answers about an OBJECT
+        // expression only, so the value's type is asked through `tk_pty_of`
+        // instead, with `tk_ty_of` as the same PASS-TIME fallback
+        // `tk_field_store_val` uses -- a value neither oracle can type
+        // (`vty < 0`) is left alone, exactly as every other "not known here"
+        // is, rather than guessed at (D50 defers that store instead).
         //
-        // Q1b's own exemption applies here too: a `T?` field BOXING a value
-        // (`i64? count; ... this.count = 5;`) is a row (`ti >= 0`) that DOES
-        // take a scalar of its own enclosed type -- `tk_check_scalar_compat`
-        // (called ahead of this, in `tk_field_store_val`) already judged it
-        // in full through `tk_nl_check_value`, and asking the row question
-        // here as well would refuse the very value that check just accepted.
-        if (tk_is_nl(ti) && tk_nl_boxes(nl_of_at(ti))) return;
+        // The verdict is `tk_check_compat`'s, the very judge an assignment, an
+        // initializer, an argument and a `return` are given: a number was only
+        // half of what a field of reference type does not take, and an `enum`,
+        // a primitive with members, a raw `uptr` and an unrelated class each
+        // crossed under the narrower clause that named the other two (Copilot
+        // on #698, pass 1). Q1b's own exemption is inside that judge, so a
+        // `T?` field BOXING a value (`i64? count; ... this.count = 5;`) is
+        // still not caught by the row question its own slot never asks.
         i64 vty = tk_pty_of(v);
         if (vty < 0) vty = tk_ty_of(v);
-        if (vty >= 0 && (tk_is_int_ty(vty) || type_kind(vty) == TK_FLOAT))
-            tk_reject_compat(type_name(vty), sr_name_at(ti), line, fl);
+        tk_check_compat(fty, vty, v, line, fl);
         return;
     }
     if (tk_row_fits(ti, ei)) return;

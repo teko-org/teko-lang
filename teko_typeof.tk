@@ -500,6 +500,65 @@ void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     tk_reject_compat(ename, sr_name_at(ti), line, fl);
 }
 
+// ---- the field store whose VALUE no oracle types yet (D50, Copilot pass 1) ----
+// A store is built at the moment its site is parsed, and the value's type is
+// the one thing the site may not know then: a PARAMETER is in no parse-time
+// scope at all (`tk_slv`'s own rule, D33's "not known here"), an implicit
+// `f = e` is rewritten from a PASS with its right-hand side still a bare name,
+// and a `T.f = e` on a type declared below is resolved by `tk_fwd_pass`, one
+// pass earlier than the scope that would answer. `-1` is not a licence to
+// write the raw bits: the checks and the conversion are DEFERRED to the one
+// point that has the scope alive and the tree already resolved
+// (`tk_field_store_judge` below), which is the discipline D48 wrote for a
+// primitive row's argument (`tk_prim_arg_defer`/`tk_prim_arg_do`, teko_prim.tk).
+#define TK_MAXFS 512                  // field stores of unknown value type
+
+i64  fst_node[TK_MAXFS];               // the VALUE node, as the store was built over it
+i64  fst_ty[TK_MAXFS];                 // the field's own declared type
+i64  fst_line[TK_MAXFS];
+uptr fst_file[TK_MAXFS];
+i64  fst_done[TK_MAXFS];
+i64  tk_nfs = 0;
+
+i64  fst_node_at(i64 i) { return ld64(fst_node + i * 8); }
+i64  fst_ty_at(i64 i)   { return ld64(fst_ty + i * 8); }
+i64  fst_line_at(i64 i) { return ld64(fst_line + i * 8); }
+uptr fst_file_at(i64 i) { return ld64(fst_file + i * 8); }
+i64  fst_done_at(i64 i) { return ld64(fst_done + i * 8); }
+
+// teko_prim.tk is included after this file: the in-place rewrite D48 already
+// owns -- the node keeps its identity and BECOMES the conversion, while a
+// fresh node takes over everything it was -- which is what a deferred store
+// needs, since the value was spliced into the store call's own argument list
+// and nothing here knows which link it is.
+i64 tk_nd_moved(i64 n);
+
+i64 tk_fs_defer(i64 fty, i64 v, i64 line, uptr fl) {
+    if (v == 0) return v;
+    if (tk_nfs == TK_MAXFS) err_at(fl, line, "teko: too many field stores of unknown type");
+    st64(fst_node + tk_nfs * 8, v);
+    st64(fst_ty + tk_nfs * 8, fty);
+    st64(fst_line + tk_nfs * 8, line);
+    st64(fst_file + tk_nfs * 8, fl);
+    st64(fst_done + tk_nfs * 8, 0);
+    tk_nfs = tk_nfs + 1;
+    return v;
+}
+
+// 1 when the conversion a KNOWN value type asks for would move the node at
+// all: D33's widening into a float field, or Q1b's box into a `T?` over a
+// value. Everything else is the identity, and a store that converts nothing is
+// left exactly as the parser built it -- no node is allocated for it and no
+// `--dump-ast` moves.
+i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
+    if (tk_is_null_lit(n)) return 0;
+    if (tk_num_widens(fty, vty)) return 1;
+    if (fty == vty) return 0;
+    i64 ti = tk_struct_by_ty(fty);
+    if (!tk_is_nl(ti)) return 0;
+    return tk_nl_boxes(nl_of_at(ti));
+}
+
 // the value a field store actually writes, at every site that builds one --
 // the two PARSE-TIME ones (`p.f = e`/`this.f = e`, teko_expr.tk's
 // `tk_field_use`, and `p.items[i] = e`, teko_struct.tk's `tk_array_index`),
@@ -531,6 +590,10 @@ i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     if (vty < 0) vty = tk_ty_of(v);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
+    // ...and a value NEITHER oracle types is not written raw: it waits for the
+    // one point that can ask (`tk_field_store_judge`), where the same three
+    // steps are taken over the same node.
+    if (vty < 0) return tk_fs_defer(fty, v, line, fl);
     // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,
     // the same way the widening beside it writes the float conversion.
     return tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, v));
@@ -580,6 +643,65 @@ void tk_ty_pass_walk(i64 root, uptr visit) {
     tk_pass_proj = 0 - 1;
     tk_cur_fn_name = 0;
     tk_this_leave_fn();
+}
+
+// ---- ONE point of judgement for a deferred field store ----
+// The walk above is what a deferred store waited for: it enters each function,
+// pushes its parameters and its locals, and reaches the value node wherever
+// the store call put it. It runs as a walk of its OWN, after the one that
+// resolves the tree (`tk_pend_visit`), because both halves of the answer are
+// only there by then -- the implicit `f = e` has had its right-hand side
+// rewritten into the typed load it stands for (`tk_this_ident`, teko_this.tk)
+// and every deferred `.` has become the load or the call it stood for. No pass
+// is registered for it (`mc limits`' `passes` row does not move), exactly as
+// D48's own judgement rides `tk_over_pass`.
+//
+// A value the PASS cannot type either is left alone: `-1` is "not known",
+// never a verdict (D226's own rule, the one every `ety < 0` in this file
+// reads), so a store that reached the run unchecked before still does rather
+// than being refused on a guess.
+void tk_fs_do(i64 i) {
+    if (fst_done_at(i)) return;
+    st64(fst_done + i * 8, 1);
+    i64 n = fst_node_at(i);
+    i64 fty = fst_ty_at(i);
+    i64 vty = tk_ty_of(n);
+    if (vty < 0) return;
+    // the SAME judge every other slot of the language uses -- the two scalar
+    // verdicts and the row one, in one call -- which is what tells an `enum`,
+    // a primitive with members, a raw `uptr` and an unrelated class apart from
+    // a value that really fits a field of reference type.
+    tk_check_compat(fty, vty, n, fst_line_at(i), fst_file_at(i));
+    if (!tk_fs_converts(fty, vty, n)) return;
+    i64 keep = nd_next(n);
+    i64 inner = tk_nd_moved(n);
+    i64 r = tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, inner));
+    node_assign(n, r);
+    set_nd_next(n, keep);
+    // what was built carries the registrations, and what ends up in the TREE
+    // is the node the store already points at (`tk_pend_do`'s own rule, above)
+    if (tk_os_has(r)) tk_os_add(n);
+    tk_xt_move(r, n);
+}
+
+void tk_fs_pend(i64 n) {
+    i64 i = tk_nfs - 1;
+    loop {
+        if (i < 0) break;
+        if (fst_node_at(i) == n) {
+            tk_fs_do(i);
+            return;
+        }
+        i = i - 1;
+    }
+}
+
+// A unit that deferred nothing walks nothing: an empty table has no node to
+// visit, so every program whose field stores were all typed at their own site
+// takes exactly the road it took before.
+void tk_field_store_judge(i64 root) {
+    if (tk_nfs == 0) return;
+    tk_ty_pass_walk(root, &tk_fs_pend);
 }
 
 // ---- the deferred member access ----
@@ -1122,6 +1244,11 @@ i64 tk_typeof_pass(i64 root) {
         tk_ty_pass_walk(root, &tk_pend_visit);
         tk_pend_check();
     }
+    // D50: after the walk above, because a deferred store's value may be the
+    // very node that walk rewrites -- an implicit `total = rate;` reads `rate`
+    // through `tk_this_ident` (teko_this.tk), and a deferred `.` is a load
+    // only once `tk_pend_do` has run.
+    tk_field_store_judge(root);
     tk_da_check(root);                           // Q3: after the `.` above is resolved
     return root;
 }
