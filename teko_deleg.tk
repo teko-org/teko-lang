@@ -1312,7 +1312,24 @@ i64 tk_lam_member(i64 n, uptr name) {
     i64 fi = tk_field_find(tk_body_class, name);
     if (fi >= 0) {
         if (fd_sym_at(fi)) {
-            tk_node_replace(n, tk_ld(fd_ty_at(fi), tk_id(fd_sym_at(fi))));
+            i64 fty = fd_ty_at(fi);
+            tk_node_replace(n, tk_ld(fty, tk_id(fd_sym_at(fi))));
+            // the write door found while closing D70's own write twin
+            // (`tk_lam_member_store`, below): a store built over a READ
+            // this branch resolves -- `sn += y;` lowers to `sn = sn + y;`
+            // (`<teko-loop-prelude>`), whose RHS reads `sn` through here --
+            // needs the type `tk_field_store_val` asks for, exactly as
+            // `tk_this_ident`'s own identical load already tags it. Untagged,
+            // `tk_fs_vty` deferred the store to a later pass that can never
+            // settle it (the raw `ld64`/`st64` this call names is no
+            // declaration `decl_find` or `tk_ty_of`'s own N_CALL arms ever
+            // answer for), and the store died `teko: the type of this value
+            // is not known here` on a program that types clearly at the
+            // point this door already reads it. A plain read with no store
+            // built over it (every other caller before this crumb) never
+            // asked `tk_fs_vty` at all, which is why the gap went unmeasured
+            // until the write door needed the answer.
+            tk_xt_put(n, tk_struct_by_ty(fty), fty, 1, TK_BORROWED);
             return 1;
         }
         tk_lam_not_captured(n);
@@ -1332,6 +1349,88 @@ i64 tk_lam_member(i64 n, uptr name) {
         }
         tk_check_member(mt_cls_at(mi), mt_vis_at(mi), name, nd_line(n), nd_file(n));
         tk_node_replace(n, tk_call(mt_fn_at(mi), 0));
+        // the same tag, for the same reason -- a static GETTER read through
+        // here, inside `sn = SomeProp + 1;`, would defer identically
+        tk_xt_put(n, tk_struct_by_ty(mt_ret_at(mi)), mt_ret_at(mi), 0, TK_OWNED);
+        return 1;
+    }
+    if (tk_method_named_find(tk_body_class, name) >= 0) {
+        tk_lam_not_captured(n);
+        return 1;
+    }
+    return 0;
+}
+
+// D70: the WRITE twin of `tk_lam_member` above -- a bare NAME on the LEFT of
+// `=` inside a lambda, judged through the identical four tables before ever
+// falling through as an ordinary local/global assignment. Measured: `n = x;`
+// inside a lambda `arm()` builds, `n` a field the class declares shadowed by
+// a same-named global, wrote the GLOBAL silently -- the read half of the
+// identical name already answered the FIELD (`tk_lam_member`, above), so one
+// lambda read two different `n`s for the one spelling, one on each side of
+// `=`. This is the exact door D70 opened to close, left open on its own
+// first pass.
+//
+// A STATIC field stores through its own global, the same `tk_field_store_val`
+// gate a plain static store already takes (`tk_static_use`,
+// `tk_fwd_resolve_static_one`, teko_access.tk) -- D33's widening, its
+// narrowing refusal, D43's `null`-only-in-`T?`, D34's reference/number
+// mismatch and Q1b's box wrap all ride along, exactly as they do for
+// `this.f = e` (`tk_this_assign`, teko_this.tk, the PASS-time sibling this
+// mirrors: a lambda's own body is parsed and walked at PARSE time, past
+// `tk_this_fix`'s own reach, the identical timing gap `tk_lam_member` above
+// already crosses for the read side). A member CONST takes no store at all,
+// the one wording a qualified `Type.C = e` already answers with
+// (`tk_const_assign_refuse`, teko_access.tk) -- one string, asked from both
+// doors. A property with a `set`, STATIC, calls it with no receiver, the
+// exact call `tk_prop_static_use` builds for the same shape; one with no
+// `set` is refused there too, by its own existing wording. Every INSTANCE
+// road -- field, property, method -- reads `tk_lam_not_captured`: `this` is
+// never implicitly captured (D11), so there is nothing a lambda can WRITE
+// through an instance member at all.
+//
+// `n += x;`/`n++;` reach here exactly as `n = x;` does: `<teko-loop-prelude>`
+// (teko_loop.tk) lowers both to `n = n + x;` at PARSE time, before this walk
+// ever runs, so the RHS `n + x` is an ordinary expression this function's own
+// caller (`tk_lam_walk`) already walks first -- the READ of `n` inside it
+// resolves through `tk_lam_member` like any other, and only the ASSIGNMENT
+// TARGET is this function's business.
+//
+// 1 when `n` is a member the enclosing class declares at all: the caller's
+// cue that `n`'s own node already decided the outcome, resolved or refused,
+// and the assignment must never fall through to a local or a global once it
+// has.
+i64 tk_lam_member_store(i64 n, uptr name) {
+    if (tk_body_class < 0) return 0;
+    i64 fi = tk_field_find(tk_body_class, name);
+    if (fi >= 0) {
+        if (fd_sym_at(fi)) {
+            if (tk_lam_escapes(nd_a(n)))
+                err_at(nd_file(n), nd_line(n), "teko: a lambda that captures by reference cannot leave its scope");
+            i64 fty = fd_ty_at(fi);
+            i64 line = nd_line(n);
+            uptr fl = nd_file(n);
+            i64 v = tk_field_store_val(fty, nd_a(n), line, fl);
+            i64 st = tk_os_mark(tk_call2(tk_stn(fty), tk_id(fd_sym_at(fi)), v), fty);
+            tk_node_replace(n, tk_stmt(st));
+            return 1;
+        }
+        tk_lam_not_captured(n);
+        return 1;
+    }
+    if (tk_mconst_find(tk_body_class, name) >= 0) {
+        tk_const_assign_refuse(nd_line(n), nd_file(n), name);
+        return 1;
+    }
+    i64 pi = tk_prop_find(tk_body_class, name);
+    if (pi >= 0) {
+        i64 mi = tk_prop_accessor_of(tk_body_class, name, 1, nd_line(n), nd_file(n));
+        if (!mt_static_at(mi)) {
+            tk_lam_not_captured(n);
+            return 1;
+        }
+        tk_check_member(mt_cls_at(mi), mt_vis_at(mi), name, nd_line(n), nd_file(n));
+        tk_node_replace(n, tk_stmt(tk_call(mt_fn_at(mi), nd_a(n))));
         return 1;
     }
     if (tk_method_named_find(tk_body_class, name) >= 0) {
@@ -1435,7 +1534,12 @@ void tk_lam_check_call(i64 n) {
 // `ref`/`out` parameter already derefs with); a by-value capture is already
 // an ordinary local by the time this runs (its own prologue `T name = ...;`
 // is walked like any other declaration), so it needs no rewrite at all --
-// only the check that every OTHER name is a param, a local, or a global.
+// only the check that every OTHER name is a param, a local, or a global. D70:
+// an assignment TARGET that is none of those three either asks
+// `tk_lam_member_store` the same question the target's read half already
+// asks `tk_lam_member` -- a local or a capture answers first (`tk_ty_scope_
+// find`, the identical order `tk_lam_check_name` reads a plain name in), and
+// only a name neither of those own is a member's to judge.
 void tk_lam_walk(i64 n) {
     loop {
         if (n == 0) break;
@@ -1456,6 +1560,12 @@ void tk_lam_walk(i64 n) {
                 set_nd_kind(n, N_EXPRSTMT);
                 set_nd_name(n, 0);
                 set_nd_a(n, store);
+                n = nd_next(n);
+                continue;
+            }
+            if (tk_ty_scope_find(nd_name(n)) < 0) {
+                tk_lam_walk(nd_a(n));
+                tk_lam_member_store(n, nd_name(n));
                 n = nd_next(n);
                 continue;
             }

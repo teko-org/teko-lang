@@ -96,6 +96,12 @@
 //      lambda a STATIC method builds. Its own slot outlives this function's
 //      scope exactly as `St.cb` (item 22) does, so it runs beside
 //      `slot_roads_check`, LAST, rather than beside the other three.
+//  26. `member_write_check` (D70) -- the WRITE twin of item 24: a bare
+//      STATIC field NAME on the LEFT of `=`, `+=` and `++` inside a lambda
+//      a STATIC method builds, beside a same-named global that must stay
+//      untouched. The instance write (`n = x;` on a field a lambda cannot
+//      reach with no `this`) is `tests/refuse/lambda_field_name_write.tk`,
+//      not here.
 //
 // expect-exit: 42
 
@@ -194,6 +200,7 @@ i64 sfield = 111;                     // collides with `D70Member`'s own static 
 i64 SCONST = 222;                     // collides with `D70Member`'s own member CONST
 i64 SProp  = 333;                     // collides with `D70Member`'s own static PROPERTY
 i64 scb    = 444;                     // collides with `D70Member`'s own static delegate FIELD
+i64 wfield = 888;                     // collides with `D70Member`'s own static field, WRITE side (D70)
 
 class D70Member {
     public static i64 sfield;
@@ -202,6 +209,7 @@ class D70Member {
     public static Op scb;                 // D70: a STATIC delegate field -- its own
                                            // slot outlives every scope, exactly as
                                            // `St.cb` (slot_roads_check) already does
+    public static i64 wfield;             // D70: the WRITE twin's own target
     public Op cb;
 
     public static i64 stwice(i64 x) {
@@ -218,6 +226,19 @@ class D70Member {
 
     public void armConstProp() {
         this.cb = new Op((i64 x) => x + SCONST + SProp);
+    }
+
+    // D70: the WRITE twin of `armStatic` above -- a bare STATIC field name on
+    // the LEFT of `=`/`+=`/`++` inside a lambda a STATIC method builds, beside
+    // a global of the identical spelling. No receiver, exactly as the read
+    // side needs none (`tk_lam_member_store`, teko_deleg.tk); `+=` and `++`
+    // are `<teko-loop-prelude>`'s own lowering to `wfield = wfield + x;`, so
+    // the SAME door judges the target both ways.
+    public static void armWrite(i64 v) {
+        Op set = new Op((i64 x) => { wfield = x; return wfield; });
+        set(v);
+        Op bump = new Op((i64 x) => { wfield += x; wfield++; return wfield; });
+        bump(v);
     }
 
     // D70: the STATIC delegate field above, called bare inside a lambda a
@@ -456,6 +477,19 @@ i64 member_check() {
     return 0;
 }
 
+// D70: the WRITE twin of `member_check` above -- `D70Member.armWrite` sets
+// its own STATIC field `wfield` bare (`=`), then bumps it bare (`+=`/`++`),
+// each from inside a lambda the STATIC method builds; the same-named global
+// `wfield` (declared beside the class, line 197) must stay exactly where it
+// started, proving the member won on both statement shapes and the global
+// was never touched at all -- not "wrote the field, and the global too".
+i64 member_write_check() {
+    D70Member.armWrite(3);
+    if (D70Member.wfield != 7) return 1;            // set(3): 3; bump(3): 3+3=6, ++ = 7
+    if (wfield != 888) return 2;                    // the global, untouched
+    return 0;
+}
+
 i64 partial_close_check() {
     Shape s = new Shape();                         // the partial class closes HERE (K6)
     s.w = 3;
@@ -686,6 +720,13 @@ i64 main() {
     bad = member_deleg_check();
     if (bad != 0) return 470 + bad;
     if (rt_live() != 2) return 480;
+
+    // D70: `armWrite`'s own two closures are LOCAL to it, allocated and
+    // released inside the one call -- the floor stays exactly where
+    // `member_deleg_check` left it.
+    bad = member_write_check();
+    if (bad != 0) return 490 + bad;
+    if (rt_live() != 2) return 500;
 
     return 42;
 }
