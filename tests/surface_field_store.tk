@@ -77,7 +77,17 @@
 //                       spot and no pass revisits them, so a SCALAR element
 //                       was tagged with nothing and the store was refused
 //                       for a value the parser had known all along;
-//  16. `rccheck`      -- `rt_live()` back to its floor once every object
+//  17. `fixedstorecheck` -- an element of a FIXED array as the store TARGET,
+//                       global and local: the one road that never entered the
+//                       door at all, so `gf[0] = 1;` wrote the integer's raw
+//                       bits and `gf[0] += 1;` summed a load nobody typed;
+//  18. `copycheck`    -- a global element as the VALUE and as the INDEX of
+//                       another global's write: both are subtrees PARKED in
+//                       the deferred-write table, which the pass that
+//                       rewrites an index does not walk;
+//  19. `pendglobalcheck` -- the same parked subtree on the deferred
+//                       RECEIVER's road (`pd_arg`);
+//  20. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released, the global arrays
 //                       above excepted: those are roots.
 //
@@ -117,6 +127,16 @@ f64 step = 2.5;
 i64[] gl;
 Cell[] gc;
 i64 gx[2];
+
+// the FIXED array's own element STORE (20): `gf[0] = 1;` and `gf[0] += 1;`
+// were built as the raw `stW(addr, v)` -- the door every other store site
+// enters was not on this road at all, so the integer's eight bytes landed in
+// a float element and the compound summed a load nobody had typed. `gdst` is
+// the second global of (21): a global element read as the VALUE of another
+// global's write, a subtree parked in the deferred-write table that no walk
+// reached.
+f64 gf[2];
+i64[] gdst;
 
 enum Color { Red, Green, Blue }
 
@@ -278,6 +298,15 @@ void setinstance(H h, i64 k) {
 void setthrough(H h, i64 k) {
     h.rate = k;
     h.count = k;
+}
+
+// (22) the same deferred receiver, with a global ELEMENT for a value: the
+// value of a deferred store is parked in the table's own row (`pd_arg`) and
+// is not in the tree `tk_array_walk_reads` reads, so the index stood raw
+// inside it and the store was refused, ``teko: `[` needs an array: gl``.
+// Nested, to prove the whole subtree is rewritten and not just its root.
+void setfromglobal(H h) {
+    h.rate = gl[0] + gx[0];
 }
 
 // the two INDIRECT calls, the shapes `tk_callp_ret` (teko_array.tk) leaves
@@ -541,12 +570,59 @@ i64 localcheck() {
     return 0;
 }
 
-// the two global `T[]`s `gloadcheck` fills are ROOTS: a global array is never
+// 20: the element of a FIXED array as a store TARGET, the road that never
+// entered the door: `gf[0] = 1;` wrote the integer's own eight bytes into a
+// float element (read back as 5e-324) and `gf[0] += 1;` summed a load nobody
+// had typed, global and local alike. A `T[]` of heap already passed through
+// it (helper 13), which is what makes the two roads read the same now.
+i64 fixedstorecheck() {
+    gf[0] = 1;                        // the widening the door writes
+    if (gf[0] != 1.0) return 1;
+    gf[0] += 1;                       // the compound, over its own typed load
+    if (gf[0] != 2.0) return 2;
+    f64 a[2];
+    a[0] = 1;                         // the same two, on a LOCAL fixed array
+    if (a[0] != 1.0) return 3;
+    a[0] += 1;
+    if (a[0] != 2.0) return 4;
+    i64 b[2];
+    b[0] = 7;                         // an element whose type ALREADY matched:
+    if (b[0] != 7) return 5;          // the door emits exactly what it emitted
+    return 0;
+}
+
+// 21: a global array element as the VALUE (and as the INDEX) of another
+// global's write. Both are subtrees the parser PARKED in the deferred-write
+// table, and the pass that rewrites an index walks the tree, which they are
+// not in -- so the index survived raw and the write was refused,
+// ``teko: `[` needs an array: gl``, on both kinds of global array.
+i64 copycheck() {
+    gdst = new i64[4];
+    gdst[0] = gl[0];                  // heap element into a heap element
+    if (gdst[0] != 5) return 1;
+    gx[1] = gx[0];                    // fixed element into a fixed element
+    if (gx[1] != 3) return 2;
+    gdst[gx[0]] = 9;                  // ...and the same read in the INDEX
+    if (gdst[3] != 9) return 3;
+    return 0;
+}
+
+// 22: the deferred receiver with a global element for a value (`setfromglobal`
+// above), the third subtree no walk reached.
+i64 pendglobalcheck() {
+    H h = new H(0);
+    setfromglobal(h);
+    if (h.rate != 8.0) return 1;
+    return 0;
+}
+
+// the global `T[]`s the helpers above fill are ROOTS: a global array is never
 // released (surface_array_global.tk's own header), so the floor this counter
-// returns to is those three objects -- the two arrays and the one `Cell` that
-// `gc` holds. `gx` is a FIXED array, static storage the counter never sees.
+// returns to is those four objects -- the three arrays (`gl`, `gc`, `gdst`)
+// and the one `Cell` that `gc` holds. `gx` and `gf` are FIXED arrays, static
+// storage the counter never sees.
 i64 rccheck() {
-    if (rt_live() != 3) return 1;
+    if (rt_live() != 4) return 1;
     return 0;
 }
 
@@ -611,8 +687,17 @@ i64 main() {
     bad = localcheck();
     if (bad != 0) return 200 + bad;
 
-    bad = rccheck();
+    bad = fixedstorecheck();
     if (bad != 0) return 210 + bad;
+
+    bad = copycheck();
+    if (bad != 0) return 220 + bad;
+
+    bad = pendglobalcheck();
+    if (bad != 0) return 230 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 240 + bad;
 
     return 42;
 }
