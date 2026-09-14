@@ -4952,3 +4952,129 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 `mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
 (base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
+
+### D57 · The arguments of an INDIRECT call are judged like a direct call's (2026-09-14)
+An ordinary call names its callee, so the last pass of all looks the symbol up and judges
+every argument against the declaration (`tk_rc_call_args`, teko_rc.tk). A VIRTUAL call, an
+INTERFACE call and the UNQUALIFIED form of either inside a method name none: all three are
+a `callp`, and the only point that knows which method they reach is the site that BUILDS
+them -- `tk_vcall_args_check` (teko_expr.tk), `tk_ifargs_check` (teko_iface.tk) and
+`tk_this_emit` (teko_this.tk), which built the same `callp` and called **no check at all**.
+
+Those sites ask the oracle they have, the parse-time `tk_pty_of` (teko_struct.tk), whose
+N_IDENT arm is `tk_slv_find` -- the parser's own stack of locals -- and which has no N_ADDR
+arm whatever. `tk_check_compat` and `tk_num_widen` both read its -1 as "do nothing", so the
+argument crossed **unjudged and unconverted**. Eight shapes measured on the base
+(`af2fffad`), every one of them compiling, every one of them refused or converted on the
+identical local through the qualified spelling:
+
+- `Box gb; b.take(gb);` on a `take(Point)` -- exit **7**, the callee reading `Box.w` as
+  `Point.x`. The interface twin the same.
+- `f64 gf; b.takei(gf);` on an `i64` parameter -- accepted, the double's bit pattern in an
+  integer slot. The interface twin the same.
+- `i64 gi; b.bump(ref gi);` on a `ref f64` parameter -- exit 42 and `gi` left holding the
+  bits of 2.0. The interface twin the same, and the LOCAL `ref li` too, where the DIRECT
+  call is refused `teko: a value of type i64 does not convert to f64`.
+- `takei(lf)` written unqualified inside a method, with an `f64` LOCAL -- accepted. This is
+  the road on which even a local crossed unread: it is rewritten from a pass, where the
+  parser's stack is long closed, so `tk_pty_of` answers -1 for every name.
+- `takef(2)` written unqualified, on an `f64` parameter -- exit **1** against 25. The
+  CONVERSION went missing with the check, and that half is silently wrong in a program with
+  no global in it at all.
+
+**ROOT: one oracle, asked at the only point that holds the callee, and too early.** The
+answer is not a second oracle at the site -- the pass-time tables (`tk_ty_global`,
+teko_array.tk, filled at pass 5; `tk_ty_scope_or_global`, teko_typeof.tk) do not exist while
+the parser is running, and reading `tk_ty_global` alone would be wrong twice over: a global
+declared BELOW the body works today, and a LOCAL shadowing a global of another type must
+resolve to the local. So the judgement is DEFERRED, which is D48's own discipline for a
+primitive row's argument and D50's for a field store, one slot over: the argument is PARKED
+(`tk_vca_defer`) and judged at the end of `tk_over_pass` (`tk_vcall_arg_judge`,
+teko_typeof.tk), **no pass of its own** -- `passes` stays 15/30 -- at the one point that has
+the lexical scope live at the site (`tk_ty_pass_walk`), every deferred `.` resolved, every
+user operator lowered and every overload pick committed. It matches by node IDENTITY,
+because the argument was spliced into the `callp`'s own list and nothing at the door knows
+which link it is.
+
+**Two rules at the judge, neither of them new.** By value it is `tk_ty_of` then
+`tk_check_compat` -- the two scalar verdicts and the row one in one call -- followed by the
+conversion C# §10.2.3 owes it; `ref`/`out` is `tk_ref_check_pointee_ty` (teko_ref.tk), the
+IDENTITY rule `tk_rc_call_args` and the delegate call already apply, with a pointee no scope
+and no global table names silently skipped there as here. The conversion is D50's own tail,
+factored out of `tk_fs_do` as `tk_fs_convert` and called from both: the node keeps its
+identity and BECOMES the cast or the box, because the slot it crosses into holds no handle
+on it. No behaviour of the field store moved -- the 94 pre-existing dumps prove it.
+
+**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** What a later
+pass adds to a name is the scope, the global table and the load an unqualified field name
+becomes; a local array's element, an indirect `callp` and an address the source built by hand
+are no better known at pass 14 than at the door, so parking them would turn today's silence
+into a refusal of code with nothing wrong with it. Measured unmoved on both builds: an
+argument that is a field of `this`, a local array's element, an `out` argument, a global
+declared below, a local shadowing a global, and `p.same(v)` on a bare parameter
+(`tests/primitives_float.tk`, the one pre-existing fixture that parks anything -- 1 row,
+judged `i64` against `i64`, no node moved). A top-level `const` never reaches the table at
+all: teko_const.tk rebuilds the name into its `N_INT` before any of the three doors reads it,
+so `b.take(K)` into a `take(Point)` was already refused on the base and `b.takei(K)` runs
+here -- probed in both directions.
+
+**`tk_this_emit` calls `tk_vcall_args_check` on its `slot >= 0` branch**, and on that branch
+only: the direct branch names its callee and the last pass of all looks it up. One body, not
+a third copy of the loop.
+
+**The ceiling is D50's, for D50's reason.** `TK_MAXVCA` 4096 over six columns is 192 KB of
+globals, against a measured peak of **26** (`tests/surface_globals_calls.tk`) and 1
+everywhere else in the tree; `mc limits`' `globals` row moves 935 -> 942, six arrays and a
+counter, against 2530 reserved. Over it,
+`teko: too many deferred call arguments`, the one new literal, documented on the
+diagnostics page's Capacity table.
+
+**FIXTURES** (8). Seven refusals, each measured COMPILING on the base before it was written
+down: `tests/refuse/vcall_global_arg.tk`, `vcall_global_arg_scalar.tk`,
+`ifcall_global_arg.tk`, `ifcall_global_arg_scalar.tk`, `vcall_ref_pointee.tk`,
+`ifcall_ref_pointee.tk` and `thiscall_virtual_arg.tk` -- the last being new ground, an `f64`
+LOCAL through the unqualified road. And the positive `tests/surface_globals_calls.tk` (42):
+globals above and below `main` on all three roads and through the written-out `this.m(x)`,
+the widening of an `i64` global onto an `f64` parameter, a `ref` global with the right
+pointee on both roads, a local shadowing a global of another type, a `const`, and a
+`DateOnly`/`TimeSpan` global -- four bytes and eight (D54) -- crossing the `callp`. It exits
+**14** on the base, section 1's fourth check, and 42 here; running the head's `tests/` under
+the BASE compiler reads `68 passed, 26 refused as expected, 8 failed`, the eight being
+exactly these.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `af2fffad`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **69 passed, 33 refused as
+expected, 0 failed** (68/26 on the base); `--dump-ast` of all **94** pre-existing fixtures
+(68 `tests/*.tk` + 26 `tests/refuse/*.tk`), the base compiler's output against this head's:
+**byte-identical, 94 of 94** -- the change only parks, refuses and converts, and no
+pre-existing fixture hands an indirect call an argument that needs a conversion;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (the compiler's own
+sources are mc: no class, no interface, so nothing is ever parked there and stage 2 rebuilds
+itself byte-for-byte); `sh scripts/check-docs.sh` green (`docs ok: 587 links, 389
+diagnostics, 33 refusals, 138 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs -- the `tests/hello.tk` leg has `passes` 15/30, `types` 12, `intrin` 8/16, `alias`
+19 and `syntax` 15 **unmoved**, and `./build/teko limits tests/hello.tk` is byte-identical to
+the base compiler's own output; the compiler leg moves only by the size of the added surface
+code and its tables, `nodes` 155615 -> 155975, `globals` 935 -> 942, `ins` 214500 -> 215007,
+`funcs` 3162 -> 3173, `lowered` 3144 -> 3155; `mc pkg hash .`
+`9b9e6483727e8e0736bfd4dc37db5ef87141bbf76a6f33a729b405b1afd8a8e7` (base
+`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: five listed `.tk`
+modules moved, so the hash moves by design).
+
+**A row of `not-yet.md` is CLOSED by this entry**, not merely amended: "an integer argument
+at a virtual or an interface call, written as a bare parameter name (`a.by(n)` inside
+`g(i64 n)`) -- not converted". Probed both ways: `s.by(n)` on a `virtual f64 by(f64)` and
+`k.take(n)` on an interface `f64 take(f64)`, with an `i64` parameter `n`, read the raw bits
+on the base and read 8.0 here. The `switch`-on-an-enum-parameter row that cited it as a
+sibling limitation is amended to say why it is NOT one: a `switch` subject's hidden local is
+DECLARED at parse time, so there is no later point at which its type could still be chosen.
+
+**Left open, found here and NOT touched** -- a call through a DELEGATE slot does not judge a
+by-value argument. `tk_deleg_check_arg_kinds` (teko_deleg.tk) checks the `ref`/`out` KIND and,
+since D51, the `ref` POINTEE, and nothing else: the by-value column `dg_pty_at` is never
+compared. `delegate i64 Op(i64 a); i64 twice(i64 a) { return a + a; } f64 gf = 1.5;
+i64 main() { Op f = twice; f64 lf = 1.5; i64 a = f(lf); i64 b = f(gf); return 64; }` compiles
+on this head exactly as on the base, local and global alike, where the direct `twice(lf)` is
+refused. It is its own crumb -- the door is a different one, in a different module, and the
+rule it needs is the one this entry just wrote down. Recorded as a row of
+`docs/reference/not-yet.md` § "Numeric conversions".

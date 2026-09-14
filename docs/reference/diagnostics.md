@@ -1175,6 +1175,48 @@ i64 main() {
 }
 ```
 
+A VIRTUAL call, an INTERFACE call and the UNQUALIFIED form of either inside a method are
+`callp`s too, and their arguments take the judgement a direct call's take — by type
+identity, by *derives/implements*, with C# §10.2.3's widening of an integer onto a float
+parameter, and with the `ref`/`out` pointee rule above (D57). The site that builds such a
+call is the only point that knows which method it reaches, and until this rule it judged
+only what the parser could type there: a GLOBAL, a `ref`/`out` pointee, and — on the
+unqualified road, which is rewritten from a pass — a plain local too crossed unjudged and
+unconverted. A `const` is folded into its literal before any of the three reads it, so it
+is judged as a literal and never deferred:
+
+```teko
+// no-run
+class Point { public i64 x; public Point(i64 v) { x = v; } }
+class Box {
+    public i64 w;
+    public Box(i64 v) { w = v; }
+    public virtual i64 take(Point p) { return p.x; }
+    public virtual i64 takei(i64 n) { return n; }
+    public virtual i64 bump(ref f64 d) { d = 2.0; return 42; }
+    public virtual i64 mine() {
+        f64 lf = 1.5;
+        return takei(lf);           // teko: a value of type f64 does not convert to i64
+    }
+}
+Box gb;
+f64 gf;
+i64 gi;
+i64 main() {
+    Box b = new Box(9);
+    b.take(gb);                     // teko: a value of type Box does not convert to Point
+    b.takei(gf);                    // teko: a value of type f64 does not convert to i64
+    b.bump(ref gi);                 // teko: a value of type i64 does not convert to f64
+    return 0;
+}
+```
+
+An interface call refuses each of the three in the same words. A name that reaches the
+judge with no type at all is `"teko: the type of this argument is not known here"`, the
+sentence a primitive row's deferred argument already gets; a `ref`/`out` pointee no scope
+and no table of globals holds a row for stays silently skipped, exactly as it does on the
+direct road.
+
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps
   the C symbol.
@@ -1399,6 +1441,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
 | `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
+| `"teko: too many deferred call arguments"` | 4096 arguments of a VIRTUAL, an INTERFACE or an unqualified virtual call whose type the site that built the `callp` could not read — a global, a `ref`/`out` pointee, a bare name on the unqualified road — waiting for the pass; 26 in `tests/surface_globals_calls.tk`, the busiest fixture, and 1 in `tests/primitives_float.tk` |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |
