@@ -1377,7 +1377,9 @@ the first declaration of that name: with `f64 pick(f64)` declared ahead of `i64 
   not be determined at that site. Bind it to a local of the right type.
 - `"teko: unknown member of "` — completed by the type's name.
 - `"teko: unknown member"` — the same, where the type has no name to print.
-- `"teko: the member is a field, not a method"` — drop the `()`.
+- `"teko: the member is a field, not a method"` — drop the `()`. A field of **delegate**
+  type is the exception: it is callable wherever it is read, on every road a receiver
+  takes ([delegates.md](delegates.md#calling)).
 - `"teko: the member is a method; call it with ()"` — add them.
 - `"teko: a virtual call needs a name or a field on the left"` — a virtual call needs a
   receiver the compiler can name.

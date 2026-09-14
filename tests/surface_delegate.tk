@@ -27,10 +27,21 @@
 //      `1.0 + d(2.0)` is 5.0 and not the 3.0 the untyped `callp` left in the
 //      register; the same by `new Scale(dbl)`, from a class field, and in
 //      `f32`, where the value travels in the single-precision half.
+//   7. `argcheck` -- D59, every argument of an indirect call judged and
+//      widened exactly as a direct call's, over all four roads;
+//   8. `pfcheck` -- D65, a delegate FIELD reached on the roads that had no
+//      call at all: a receiver only the PASS can type (a parameter, and a
+//      field of a field under one), and the BARE name inside a method;
+//   9. `sfcheck` -- the same on the two slots that OUTLIVE the helper: a
+//      STATIC field (`PH.scb(20, 1)`, and its bare name from a static
+//      method) and a GLOBAL receiver (`g_ph.cb(3, 4)`).
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
 // reference, teko_struct.tk's `tk_is_counted` the only line that changed.
+// `sfcheck` is the one exception, and by design -- a static field and a
+// global outlive every scope -- so `main` asserts the exact count it leaves
+// rather than the floor.
 //
 // expect-exit: 42
 
@@ -304,6 +315,71 @@ i64 argcheck() {
     return 0;
 }
 
+// ---- D65: a delegate FIELD is callable on every road it can be READ ----
+// The parse-time road (`fcheck`, above) was the only one with a call. Three
+// had none: a receiver the PARSER cannot type defers to teko_typeof.tk's
+// pass and came out `teko: the member is a field, not a method`; the bare
+// name inside a method reached no rewrite and was left to the core, `call to
+// unknown function`; and `PH.scb(...)` on a STATIC field came out
+// `teko: unknown member`.
+class PH {
+    public Op cb;
+    public static Op scb;
+
+    // the BARE name -- `this.cb(a, b)` written without the receiver
+    public i64 go(i64 a, i64 b) {
+        return cb(a, b);
+    }
+
+    // ...and from a STATIC method, where the field is a global of its own
+    public static i64 sgo(i64 a, i64 b) {
+        return scb(a, b);
+    }
+}
+
+class PA {
+    public PH inner;
+}
+
+PH g_ph;                                          // the GLOBAL receiver road
+
+i64 use_ph(PH h) {                                // a PARAMETER receiver
+    return h.cb(2, 3);
+}
+
+i64 use_pa(PA a) {                                // ...a field of a field under one
+    return a.inner.cb(4, 5);
+}
+
+i64 pfcheck() {
+    PH h = new PH;
+    h.cb = new Op(add);
+
+    if (use_ph(h) != 5) return 1;                 // a receiver only the pass types
+    if (h.go(6, 7) != 13) return 2;               // the bare name inside a method
+
+    PA a = new PA;
+    a.inner = h;
+    if (use_pa(a) != 9) return 3;                 // `a.inner.cb`, root a parameter
+
+    return 0;
+}
+
+// the two slots that OUTLIVE the helper -- a static field and a global -- so
+// the live count after this one is not the floor, and `main` asserts what it
+// is instead
+i64 sfcheck() {
+    PH.scb = new Op(add);
+    if (PH.scb(20, 1) != 21) return 1;            // `Type.field(...)`
+    if (PH.sgo(30, 2) != 32) return 2;            // ...and its bare name
+
+    g_ph = new PH;
+    g_ph.cb = new Op(mul);
+    if (g_ph.cb(3, 4) != 12) return 3;            // a GLOBAL receiver
+
+    return 0;
+}
+
 i64 main() {
     i64 bad = dcheck();
     if (bad != 0) return 10 + bad;
@@ -332,6 +408,15 @@ i64 main() {
     if (bad != 0) return 90 + bad;
     if (rt_live() != 0) return 100;
     if (cell_dtors != 5) return 110 + cell_dtors;
+
+    bad = pfcheck();
+    if (bad != 0) return 170 + bad;
+    if (rt_live() != 0) return 180;               // borrowed by the call, not kept
+
+    bad = sfcheck();
+    if (bad != 0) return 190 + bad;
+    if (rt_live() != 3) return 200;               // the static delegate, the global
+                                                  // object and the delegate it holds
 
     return 42;
 }

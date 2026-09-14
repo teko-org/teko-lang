@@ -53,6 +53,13 @@ i64 main() {
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
 called is a panic with exit 70, never a segfault ([memory.md](memory.md)).
 
+A delegate **field** is called wherever it can be read: through a receiver the parser
+already types (`h.cb(x)` on a local), through one only the pass can type (a parameter, a
+global, a field of either), by its bare name inside a method of the declaring type
+(`cb(x)`, the unqualified spelling of `this.cb(x)`) and, for a `static` one, through the
+type (`H.cb(x)`). A method of the same name still answers first on the bare-name and the
+`Type.` roads, as it does in C#.
+
 Its arguments are judged and converted exactly as a direct call's are — the count, the
 `ref`/`out` kind, the pointee of a `ref`/`out` one, the type of one passed by value, and
 C# §10.2.3's widening of an integer onto a float parameter — on all three roads a delegate
