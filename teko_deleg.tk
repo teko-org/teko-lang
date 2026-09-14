@@ -445,11 +445,26 @@ i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included a
 // `gadd`, named bare inside `namespace geo { ... }`, is not this pass's own
 // call/const rewrite (teko_ns.tk's `tk_ns_pass` ran first and only touches an
 // `N_CALL`/`N_ADDR`/a const `N_IDENT`) -- a plain function reference is left
-// exactly as the source wrote it, so the wrap has to try the DECLARED symbol
-// first and only then the same namespace/`using` search a call already gets
+// exactly as the source wrote it, so the wrap has to run the same
+// namespace/`using` search a call already gets, in the SAME order.
+//
+// That order is `tk_ns_rewrite_call`'s (teko_ns.tk, N3b/N3c, D31.6): the
+// site's own namespace and its prefixes outward FIRST, then a plain top-level
+// declaration of the exact bare name, and only then the `using`s of the file.
+// This function asked `decl_find` first and had the first two steps the wrong
+// way round, so inside `namespace geo` a bare `col` wrapped the flat `col`
+// while `col(2, 3)` one line over called `geo__col` -- the same name, two
+// different functions, silently, with no diagnostic anywhere (D62, the
+// namespace pass; measured on `441be45a` too, where every road that reaches
+// this resolver -- a local initializer, an assignment, `new Op(f)`, a call
+// argument, a `return`, an element of an `Op[]` -- already carried it, so the
+// field road only inherited it). The steps ahead of the namespace one in
+// `tk_ns_rewrite_call` are already answered before this function is reached:
+// a LOCAL, a PARAMETER or a GLOBAL of the name is exactly what
+// `tk_deleg_coerce`'s own guard (`tk_ty_scope_or_global`) refuses to wrap.
 uptr tk_deleg_resolve_fn(uptr fname, i64 line, uptr fl) {
-    if (decl_find(fname) >= 0) return fname;
     i64 d = tk_ns_call_try_prefixes(fname, tk_deleg_cur_ns);
+    if (d < 0 && decl_find(fname) >= 0) return fname;
     if (d < 0) d = tk_ns_call_try_usings(fname, fl, line);
     if (d < 0) return fname;
     return nd_name(d);
@@ -581,6 +596,7 @@ i64  dl_line[TK_MAXDGLATE];
 uptr dl_file[TK_MAXDGLATE];
 i64  dl_done[TK_MAXDGLATE];
 i64  dl_esc[TK_MAXDGLATE];            // ...and whose ESCAPE is unjudged as well
+i64  dl_val[TK_MAXDGLATE];            // 1 = `dl_node` IS the value (a FIELD store's, D62)
 i64  tk_ndglate = 0;
 
 // D51 (eighth pass), the walk's own cost: `tk_deleg_late_pend` runs at EVERY
@@ -639,6 +655,7 @@ i64  dl_line_at(i64 i) { return ld64(dl_line + i * 8); }
 uptr dl_file_at(i64 i) { return ld64(dl_file + i * 8); }
 i64  dl_done_at(i64 i) { return ld64(dl_done + i * 8); }
 i64  dl_esc_at(i64 i)  { return ld64(dl_esc + i * 8); }
+i64  dl_val_at(i64 i)  { return ld64(dl_val + i * 8); }
 
 // ---- a store built where NOTHING can be judged (D51, fourth pass) ----
 // A GLOBAL `T[]`'s own element store is assembled inside `tk_array_pass`
@@ -744,8 +761,73 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
     st64(dl_file + tk_ndglate * 8, fl);
     st64(dl_done + tk_ndglate * 8, 0);
     st64(dl_esc + tk_ndglate * 8, tk_deleg_defer_all);
+    st64(dl_val + tk_ndglate * 8, 0);
     tk_dg_bucket_insert(tk_ndglate, st);
     tk_ndglate = tk_ndglate + 1;
+}
+
+// ---- D62: a bare NAME stored into a FIELD of delegate type ----
+// The one door every field store is built by (`tk_field_store_val`,
+// teko_typeof.tk) hands the value here BEFORE it parks it as "type not known":
+// every caller of that door had the element road's validator missing, so
+// `h.cb = twice;` on an `Op cb` field died `teko: the type of this value is
+// not known here` while `Op cb = twice;` one slot over wraps the function
+// (D51). One detection, one judge, and the door's callers are ALL of them --
+// `p.f = e` and `this.f = e` (`tk_field_use`, teko_expr.tk), the implicit
+// `f = e` of a method or constructor (`tk_this_assign`, teko_this.tk), the
+// two static ones (`tk_static_use` and `tk_fwd_resolve_static_one`,
+// teko_access.tk), an element of an array FIELD (`tk_array_index`,
+// teko_struct.tk) and a store through a receiver typed at pass time
+// (`tk_pend_field`, teko_typeof.tk). Two more callers exist and carry no
+// delegate: a FIXED array's element (`tk_arr_elem_store`, teko_array.tk),
+// whose declaration is refused for a delegate element type, and a `T[]`'s
+// (`tk_ha_store`, teko_heaparr.tk), where a bare name is parked by the
+// element road's own validator and never reaches the door.
+//
+// A bare N_IDENT is the whole of what waits here, and it is exactly what the
+// door cannot type: a free function's name is in no slot table, so
+// `tk_pty_of` answers -1 for it, and so does it for a PARAMETER of delegate
+// type (`tk_pty_of` records declarations, never parameters -- D51's sixth
+// pass measured the same dead end for an element). Everything the door DOES
+// type keeps the verdict it has today, unmoved: a local of delegate type, a
+// `new Op(...)`, a call, a literal. The value is not judged here for the same
+// reason the element road does not judge one either -- `tk_deleg_coerce`
+// reads `tk_ty_scope_or_global`, and at a parse-time door no scope answers
+// for any name at all, not even to be asked (the hazard teko_typeof.tk's own
+// `tk_fs_vty` header spells out in full).
+//
+// What is parked is the VALUE node, never a store call: the door returns the
+// value and its callers build the store around it afterwards, so there is
+// no store node to key on yet. The value node is in the tree all the same --
+// the walk reaches it as the second argument of the store it ends up in --
+// and `tk_deleg_val_do` below rewrites it IN PLACE, the same `tk_node_replace`
+// answer `tk_fs_convert` (teko_typeof.tk) gives a field store's own widening
+// for the same reason: the slot that holds the value keeps no handle anyone
+// here could re-point.
+i64 tk_deleg_field_late(i64 fty, i64 v, i64 line, uptr fl) {
+    if (v == 0) return 0;
+    if (nd_kind(v) != N_IDENT) return 0;
+    i64 si = tk_deleg_row(fty);
+    if (si < 0) return 0;                         // an `Op?` field is a row of its own
+    tk_deleg_store_defer(v, si, line, fl);
+    st64(dl_val + (tk_ndglate - 1) * 8, 1);       // the row it just took
+    return 1;
+}
+
+// D62's own half: the node parked IS the value, and the coercion is written
+// over its identity. Only a WRAP ever comes back different here (a bare name
+// is the only shape parked, and a ternary/`null` never reaches this table
+// from the field door), so the node that ends up in the tree is `v` carrying
+// the wrap's content and the wrap's own registrations -- `tk_xt_put` in
+// `tk_deleg_wrap` tags the row by node id, which is what `tk_xt_move` carries
+// over. The store around it was marked by its own site (`tk_os_mark`), so
+// nothing of the reclaim pass's own bookkeeping is this function's to move.
+void tk_deleg_val_do(i64 i) {
+    i64 v = dl_node_at(i);
+    i64 nv = tk_deleg_coerce(dl_si_at(i), v, dl_line_at(i), dl_file_at(i));
+    if (nv == v) return;
+    tk_node_replace(v, nv);
+    tk_xt_move(nv, v);
 }
 
 // the value is the SECOND argument of the store (`tk_call2`, teko_struct.tk),
@@ -770,6 +852,7 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
 void tk_deleg_late_do(i64 i) {
     if (dl_done_at(i)) return;
     st64(dl_done + i * 8, 1);
+    if (dl_val_at(i)) { tk_deleg_val_do(i); return; }
     i64 a = nd_a(dl_node_at(i));
     if (a == 0) return;
     i64 v = nd_next(a);

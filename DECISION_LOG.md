@@ -5607,6 +5607,167 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
+
+### D62 · A bare FUNCTION name lands in a FIELD of delegate type, judged where names have types (2026-09-14)
+`Op cb = twice;` on a local wraps the function in the thunk every delegate value shares
+(D221 §41), and `h.cb = twice;` on the field beside it answered `teko: the type of this
+value is not known here`. So did `this.cb = twice;` and the implicit `cb = twice;` of a
+constructor, and so did a STATIC field (`H.scb = twice;`); a function whose signature is
+NOT the delegate's gave the same generic sentence, where the local slot names the cause
+(`teko: wrong does not match the delegate Op(i64)`, `tk_deleg_check_sig`). The workaround
+was a local of delegate type held for one line (`Op cb = twice; h.cb = cb;`, what
+`tests/surface_delegate.tk` did) or `new Op(twice)` spelled in full. The ELEMENT of an
+`Op[]` already had the answer (D51) and the field road had none of it: the chain
+`tk_field_use` (teko_expr.tk) -> `tk_field_store_val` (teko_typeof.tk) -> `tk_fs_vty` asks
+`tk_pty_of` for an N_IDENT, a free function's name is in no slot table, -1, `tk_fs_defer`
+parks the value, and `tk_fs_do` at the end of `tk_over_pass` asks `tk_ty_of`, which answers
+-1 for the same reason and refuses. No delegate validator stood anywhere on that road.
+
+**The seat: the DOOR, not its callers.** Two shapes were open. (a) The element road's
+own template (`tk_ha_store`, teko_heaparr.tk) copied at each site that builds a field
+store; (b) the ONE door all of them pass through, `tk_field_store_val`. (b) is what
+landed, for the reason D54 gave the last time this question came up and the reason
+CLAUDE.md's root-cause law gives: a guard in the shared function is a smaller diff than a
+guard in every caller, and it leaves no sibling caller behind -- the constructor and the
+static field are fixed by the same three lines as `h.cb = twice`, and were never
+separately written.
+
+That is not a figure of speech, so the door's callers are named exhaustively rather than
+counted (Copilot on #713, which found the earlier wording -- "the four field-store sites"
+in `diagnostics.md`, "the five sites" in the source -- short of the truth). Every caller
+of `tk_field_store_val`, measured by grep on the final tree: `tk_field_use` (teko_expr.tk,
+`p.f = e` and `this.f = e`), `tk_this_assign` (teko_this.tk, the implicit `f = e` of a
+method or constructor), `tk_static_use` and `tk_fwd_resolve_static_one` (teko_access.tk,
+`H.scb = e` written after and before the type's own declaration), `tk_array_index`
+(teko_struct.tk, an element of an ARRAY FIELD), `tk_pend_field` (teko_typeof.tk, a store
+through a receiver the parser cannot type yet), `tk_arr_elem_store` (teko_array.tk, a
+FIXED array's element) and `tk_ha_store` (teko_heaparr.tk, a `T[]`'s element). The first
+six carry a delegate and all six were measured refusing this store on `441be45a` and
+accepting it here; the last two cannot -- a fixed array of delegate element type is
+refused at its own declaration (``teko: an array of this type is not taught yet``), and a
+bare name at a `T[]` element is parked by the element road's own validator and never
+reaches the door (D51). `tests/surface_delegate.tk`'s `dfcheck2` covers the three that had
+no fixture: the deferred receiver, the array-field element and the forward-referenced
+static store.
+
+**What the door may do there is DETECT, never judge.** `tk_deleg_coerce` reads
+`tk_ty_scope_or_global`, and at a parse-time door no scope answers for any name at all
+(the hazard `tk_fs_vty`'s own header documents in full: a global a parameter or a field
+shadows answered for the shadowing name, measured on #698). So the door asks two questions
+it can answer with no scope -- is the field's type a delegate row (`tk_deleg_row`), and is
+the value a bare `N_IDENT` -- and hands the store to the delegate's own late table
+(`tk_deleg_field_late`, teko_deleg.tk) instead of `tk_fs_defer`. `tk_deleg_pass` judges it
+with the lexical scope of the site live, which is the element road's own answer, and it
+runs BEFORE `tk_ops_pass`/`tk_over_pass`/`tk_rc_pass`, so the four declarations a wrap
+emits are walked by every pass that has to see them -- a delegate with a counted return
+(`rcheck`, `tests/surface_delegate.tk`) is unaffected. `decl_find` is deliberately NOT
+asked as part of the detection: it answers "a function of that name has been read so far",
+which is not the question (a PARAMETER shadows that function and nothing the parser keeps
+records one, D51's sixth pass) and it would miss a namespaced function the walk resolves
+by prefix (`tk_deleg_resolve_fn`).
+
+**One column, no new table.** What waits is the VALUE node, not a store call: the door
+hands the value back and its callers build the store around it afterwards, so there is
+no store node to key on yet. The existing late table takes it with one more column
+(`dl_val`, 1 = "`dl_node` IS the value"), and `tk_deleg_val_do` rewrites the node IN PLACE
+(`tk_node_replace` + `tk_xt_move`) -- the same answer `tk_fs_convert` gives a field store's
+own widening, and for the same reason: the slot holding the value keeps no handle this
+function could re-point. The value node is visited by `tk_deleg_walk` like any other (it
+is the second argument of the store it ends up in), so the bucket that keys the table by
+node id needed nothing new, and no other entry's behaviour moves (`dl_val` is written 0 by
+`tk_deleg_store_defer` for every store-keyed row).
+
+**The namespace order of a bare name, fixed at the shared resolver.** Copilot on #713
+read the field road's own tail and found `tk_deleg_resolve_fn` (teko_deleg.tk) asking
+`decl_find(fname)` BEFORE `tk_ns_call_try_prefixes` -- the opposite of what
+`tk_ns_rewrite_call` (teko_ns.tk) does for a CALL, where the site's own namespace and its
+prefixes outward come first and a flat declaration of the exact name only after. So inside
+`namespace geo`, with a `col` declared both flat and in `geo`, `col(2, 3)` called
+`geo__col` while `Op f = col;` wrapped the flat one: the same name, two different
+functions, silently, with no diagnostic anywhere.
+
+**It is PRE-EXISTING, and it is not the field road's.** Measured on the base `441be45a`,
+with the same source exercising six roads and an exit code carrying one bit per road: the
+local initializer, the assignment, the call argument, the `return` and the `Op[]` element
+ALL wrapped the flat `col` there (mask 63 of 63; the field road could not compile at all on
+that compiler, which is what this entry's first half fixes). On the PR head before the fix
+the seventh road joined them (mask 127 of 127), and after it six of the seven answer the
+namespaced `col` (mask 4). The resolver is shared by every road that wraps a bare name, so
+one line moved fixes all of them:
+
+    i64 d = tk_ns_call_try_prefixes(fname, tk_deleg_cur_ns);
+    if (d < 0 && decl_find(fname) >= 0) return fname;
+
+-- `tk_ns_rewrite_call`'s own order, transcribed. The steps that precede the namespace one
+there (a local, a parameter, a member of the walked function's type) are already answered
+before this function is reached: `tk_deleg_coerce`'s guard, `tk_ty_scope_or_global`, is
+what refuses to wrap a name any slot declares.
+
+The road still out is the seventh, `new Op(col)`, and it is a different seat: that wrap is
+built while the file is still being READ (`tk_new_deleg` -> `tk_deleg_wrap` ->
+`tk_deleg_thunk`), and `tk_ns_scan_decls` mangles declarations in a later pass, so no
+namespaced name exists to resolve at the moment the thunk is emitted -- `new Op(only_geo)`
+inside `geo`, with no flat twin, dies `call to unknown function` at lowering on `441be45a`
+and here alike. Deferring the thunk to `tk_deleg_pass` is a redesign of the explicit form,
+not a patch to a resolver; the row is in `docs/reference/not-yet.md` with the workaround
+(the contextual form, which IS built in the pass and does resolve). `tests/surface_delegate.tk`'s
+`geo.ns_roads` locks the six that work, including the fallback to a flat `add` no `geo__add`
+competes with.
+
+**Scope.** A value the door DOES type keeps the verdict it has today, byte for byte: a
+local of delegate type, a `new Op(...)`, a call, a literal, and every field that is not of
+delegate type. The one wording that moves is a name of another type written into a delegate
+field -- `i64 g_n; h.cb = g_n;` now reads `teko: Op takes a function, another Op, or null`,
+the delegate's own sentence, where the general conversion words answered before; both are
+refusals, and the new one is the element road's, already in
+`docs/reference/diagnostics.md`. An `Op?` field is a `TK_KNULL` row of its own, which
+`tk_deleg_row` answers -1 for, so it declines the detour and keeps the refusal
+`docs/reference/not-yet.md` already records for a bare name into a `T?` delegate slot.
+
+**Out of scope, measured and recorded in `docs/reference/not-yet.md`** (both identical on
+the base compiler, neither introduced here): a LAMBDA written straight into a field
+(`h.cb = (i64 x) => x * 2;`) dies `expected ) in cast` in the core's parser -- the field
+store reads its right-hand side with `parse_expr` alone and has no counterpart to
+`tk_deleg_init_expr`'s lookahead, which is a parse-time hole in the field road, not a
+judging one; and calling a delegate through a STATIC field by its qualified name
+(`H.cb(21)`) dies `teko: unknown member: cb`, because `tk_static_use` (teko_access.tk) has
+no delegate-call branch where `tk_field_use` has one. `Op f = H.cb; f(21);` is taught and
+is what the fixture does.
+
+**Fixtures.** `tests/surface_delegate.tk`: `fcheck`'s workaround is gone -- `h.cb = add;`
+direct, which IS the proof (the base compiler refuses the file at that line) -- and a new
+`dfcheck` covers the constructor (`this.cb = add;`), the implicit form (`made = mul;`), the
+STATIC field (`D62H.scb = add;`, read back through a local and called) and the name that is
+a PARAMETER shadowing a free function `p` of the same name (`setcb(h, mul)`, whose call
+afterwards proves the parameter is what landed). `dfcheck2` covers the three callers of the
+door that had no fixture at all: a receiver typed at pass time (`void set_late(LateH h)`,
+with `LateH` declared BELOW it), an element of an ARRAY FIELD (`h.cbs[0] = mul;`) and the
+forward-referenced static store (`LateH.scb = mul;` written above the class). `geo.ns_roads`
+locks the namespace order over six roads at once, with `col` declared both flat and inside
+`geo` and a flat-only `add` for the fallback. `dfcheck` and `dfcheck2` run near the end of
+`main` and assert `rt_live()` at 1 then 2: a static field outlives every scope, so each
+helper's own delegate is still live, and that count is exactly what must remain.
+`expect-exit: 42` unmoved. One refusal, `tests/refuse/deleg_field_name_sig.tk`: a
+wrong-signature function into the field, the delegate's own sentence at the store's own
+line.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 51 refused as
+expected, 0 failed** (was 73/50, one refusal added and one fixture grown); `--dump-ast`
+byte-identical against the base compiler for all 73 pre-existing `tests/*.tk` with their
+`441be45a` sources -- the 72 the tree still carries verbatim, plus `surface_delegate.tk`'s
+own base source compiled by both binaries; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 611 links, 41 fragments,
+389 diagnostics, 51 refusals, 143 samples`; `mc limits` verdict `ok` with `grow` 0 on every
+row of both legs (macos/aarch64 and linux/x86_64), every counted table exactly where the
+base left it -- `passes` 15, `types` 13, `intrin` 8, `alias` 20, `syntax` 15, `rules` 6,
+`on_stmt` 4 -- and only the size-of-surface-code rows moved (`nodes` 156558 -> 156697,
+`funcs` 3182 -> 3185, `lowered` 3164 -> 3167, `globals` 943 -> 944 for `dl_val`, `symbols`
+6263 -> 6267, `ins` 216018 -> 216226, identical on both legs; `strings` unmoved at 2138);
+`mc pkg hash .`
+`fda769ca698d63e4ccddfbc3a5d2820edfb5b8c3bac24be8b20adc9e55a006dc` (base
+`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
+`teko_typeof.tk` are listed files, so the hash moves by design).
 ### D66 · A contextual lambda is read on every slot of delegate type teko's own parser reaches (2026-09-14)
 `(i64 x) => x * 2` with no `new Op(...)` around it needs a READER that looks ahead before
 mc's core does: `parse_primary` sees `(`, asks `type_of_token` for a cast and otherwise
