@@ -62,6 +62,16 @@
 //      about a bare NAME: a parameter written under a free function of that
 //      name was stored as a wrap of the FUNCTION and called (D51, sixth
 //      pass).
+//   3f. `delegcallcheck` -- a CALL at the element store. The site typed one
+//      through `tk_ty_of`, which asks `decl_find` for the FIRST declaration
+//      of that name and has neither a scope nor the prepared overloads in
+//      front of it: a LOCAL delegate `chooser` shadowing a free function
+//      `chooser` was judged by the FUNCTION's return, and an overload whose
+//      first row is not the one the call picks by the row it is not --
+//      `teko: a value of type Boxed does not convert to Op` on two legal
+//      programs. The mirror image was worse: a first row answering `Op` over
+//      a pick that does not settled the store unchecked. Every call waits for
+//      the walk now (D51, seventh pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -343,6 +353,38 @@ i64 delegternarycheck() {
 
 i64 addAfter(i64 a) { return a + 4; }
 
+// ---- 3f. the CALL at an element store, typed at the WALK and never by the
+// FIRST declaration of its name (D51, seventh pass) ----
+
+class Boxed { public i64 v; }                     // a type no `Op[]` may hold
+
+// a free function of the name a LOCAL delegate below shadows. `tk_ty_of`
+// answers `decl_find`'s first declaration at parse time, with no scope in
+// front of it, so the store below was judged against THIS return type and a
+// legal program was refused, `teko: a value of type Boxed does not convert to
+// Op`.
+Boxed chooser(i64 k) { return new Boxed(); }
+
+// ...and an OVERLOAD whose first declaration is not the one the call picks.
+// The store read `make`'s first row -- `Boxed` -- for a call the matcher
+// resolves to the second, so the legal store below was refused in the same
+// words. (The mirror image is the one that cannot be a fixture: a first row
+// answering `Op` and a pick answering something else was SETTLED at the site
+// and stored unchecked, a segfault on the first call through the element --
+// docs/reference/diagnostics.md carries it.)
+Boxed make(i64 k) { return new Boxed(); }
+Op make(i64 k, i64 j) { return addTwo; }
+
+i64 delegcallcheck() {
+    Chooser chooser = pickOp;                     // the LOCAL shadows the function
+    Op[] ops = new Op[2];
+    ops[0] = chooser(1);                          // the LOCAL delegate's own return
+    ops[1] = make(1, 2);                          // the PICKED overload's return
+    if (ops[0](10) != 12) return 1;
+    if (ops[1](10) != 12) return 2;
+    return 0;
+}
+
 // ---- 4. `params` over a global scalar element ----
 
 i64 sumall(params i64[] xs) {
@@ -487,6 +529,9 @@ i64 main() {
 
     bad = delegternarycheck();
     if (bad != 0) return 110 + bad;
+
+    bad = delegcallcheck();
+    if (bad != 0) return 120 + bad;
 
     bad = paramscheck();
     if (bad != 0) return 40 + bad;

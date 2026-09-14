@@ -693,8 +693,23 @@ And a value the store is written at cannot TYPE waits for the same walk whether 
 is global or local: `ops[0] = chooser(1)`, with `chooser` a local delegate that answers
 `Op`, is judged where `chooser` has a type, never refused at the store (D51, fifth pass).
 A bare NAME is one of those values at every store, because a PARAMETER shadows a function
-of the same name and nothing the parser keeps records a parameter; a ternary is late
-exactly when one of its branches is (D51, sixth pass).
+of the same name and nothing the parser keeps records a parameter (D51, sixth pass). So is
+a CALL, and a ternary of them with it: the store's own oracle reads the FIRST declaration
+of the called name, which is neither the local that shadows it nor the overload the call
+picks (D51, seventh pass). The judgement is the walk's, and the words are the delegate's:
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+i64 addOne(i64 a) { return a + 1; }
+Op make(i64 k) { return addOne; }       // the FIRST declaration of `make`
+i64 make(i64 k, i64 j) { return 7; }    // ...and the one this call picks
+i64 main() {
+    Op[] ops = new Op[1];
+    ops[0] = make(1, 2);                // teko: Op takes a function, another Op, or null
+    return ops[0](1);
+}
+```
 
 The escape reads a ternary branch by branch, at every slot that outlives the capture
 (D51, sixth pass):
@@ -1078,7 +1093,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `ref`/`out` parameters in one unit"`` | 512 |
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |
-| `"teko: too many element stores of unknown type"` | 512 stores into an element of delegate type, in one unit, whose value only the walk can type — the same ceiling the array writes waiting for that pass already have |
+| `"teko: too many element stores of unknown type"` | 512 stores into an element of delegate type, in one unit, whose value only the walk can type. A ceiling of its own: a delegate is a counted type, so every element store of one takes a row of the 128 above first, and a program with 513 of them is refused `"teko: too many stores into a slot of class type"` at the 129th long before this table fills |
 | `"teko: too many captures in one lambda"` | 32, summed across the lambdas being read |
 | `"teko: too many captures by value in one unit"` | 256, summed over every lambda: definite assignment reads each one's own node |
 | `"teko: too many capturing lambdas"` | 64 capturing by reference |

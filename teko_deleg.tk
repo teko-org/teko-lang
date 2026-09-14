@@ -473,12 +473,18 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
 // already answer, a name a `new Op(...)`/lambda/call already types, and a
 // FUNCTION declared ahead of the store are decided where they were written, so
 // no accepted program's tree moves (the 62 dumps of `da33ebd4`).
-// The table is as deep as the write table that feeds it: `TK_MAXGDEF` (512,
-// teko_array.tk) is the ceiling on the element writes of a unit that wait for
-// `tk_array_pass`, and every one of them may need a row here. At 64 a program
-// with 65 perfectly ordinary stores in it was refused
-// `teko: too many element stores of unknown type` -- a ceiling below the one
-// the language already publishes for the same writes (D51, fifth pass).
+// A ceiling of its OWN, and measured rather than derived (D51, seventh pass).
+// The fifth pass raised it from 64 to 512 by reading `TK_MAXGDEF` (512,
+// teko_array.tk), the writes into a possibly-global array that wait for
+// `tk_array_pass` -- but a LOCAL store never passes through that table at all,
+// so the derivation named the wrong feeder. What every row here really costs
+// first is a row of `TK_MAXOS` (128, teko_struct.tk): a delegate is a counted
+// type, so `tk_os_mark` records EVERY element store of one, local or global,
+// in a table that is never reset within a unit. Measured, mc 0.15.23: a
+// program with 513 perfectly ordinary local stores is refused at the 129th,
+// `teko: too many stores into a slot of class type`, and never reaches this
+// table -- 512 is four times the deepest any unit can fill it, and is left
+// where it stands rather than grown for a row nothing can add.
 #define TK_MAXDGLATE 512              // element stores waiting for the pass
 
 i64  dl_node[TK_MAXDGLATE];           // the store call, `stW(tk_arr_at(...), v)`
@@ -542,34 +548,46 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // parameter stands in `tk_ty_scope_var` exactly as a local does, and a name
 // nothing there names is the function to wrap.
 //
-// Every OTHER shape asks `tk_deleg_expr_ty`, which is the oracle the
-// validator itself would ask one line later: a `new Op(...)`, a lambda, an
-// element read and a call to a function declared above all type as the
-// element right where they stand and are settled there, and a value this site
-// cannot type at all -- `ops[0] = chooser(1)` through a LOCAL delegate, whose
-// row only the walk's own lexical scope holds -- waits instead of being
-// refused on the spot (D51, fifth pass). Deferring only what the site types
-// WRONG is also what keeps every accepted program's tree where it was: a wrap
-// that already worked emits four declarations through `tk_top_emit`, and
-// moving the wrap would move them (the 62 dumps of `da33ebd4`).
+// A CALL is the same dead end, for the same reason (D51, seventh pass). The
+// site asked `tk_deleg_expr_ty`, which reads the pass-time scope for a call
+// THROUGH a delegate slot -- empty here -- and then `tk_ty_of`, which asks
+// `decl_find` for the FIRST declaration of that name, with no scope and no
+// overload table in front of it. Both of its answers were wrong and in
+// opposite directions: a LOCAL delegate `chooser` shadowing a function
+// `chooser` was typed by the FUNCTION's return, so `ops[0] = chooser(1)` was
+// refused over a type nothing in the program stores; and an overload whose
+// first declaration answers `Op` while the one the call actually picks
+// answers something else typed as `Op`, was settled here, and the value the
+// pick returns was written into an `Op[]` unchecked -- a call through it
+// segfaults. Neither shape can be told apart from the other WITHOUT the scope
+// and the prepared overloads, which is the walk. So every call waits, the
+// same rule D50's own `tk_fs_vty` takes ("a call whose return only the pass
+// resolves is not this early check's to guess at") and the same one D48 takes
+// for an argument.
 //
-// A ternary is the one value the validator takes APART, one branch at a time,
-// so it is late exactly when a BRANCH is. Settling the whole of it here handed
-// each branch to a site that cannot type it: `ops[0] = c ? chooser(1) :
-// chooser(0)` through a local delegate was refused `teko: Op takes a function,
-// another Op, or null`, and a branch naming a function declared BELOW the
-// store died `teko: unknown function: ...` -- two legal programs (D51, sixth
-// pass).
+// A ternary is an `N_CALL` of `tk_ternary`, so it waits with them -- one line
+// less than the branch-by-branch recursion the sixth pass needed here, and the
+// same verdict, because a bare NAME in a branch is already late at this site
+// (the two slot oracles above are empty until `tk_array_pass` has run). The
+// validator still takes it APART where it is judged; it is the walk that
+// judges it now.
+//
+// Every OTHER shape asks `tk_deleg_expr_ty`, which is the oracle the
+// validator itself would ask one line later: an element read, a literal,
+// arithmetic -- what the node itself types, with no table in between. A
+// `new Op(...)` and a lambda are calls to their own allocator, so they wait
+// with the rest and the walk gives them the same answer this site had (the
+// allocator is a declaration of the unit, and the node carries a `tk_xt_put`
+// row of its own besides). Nothing that waits can be WRAPPED -- only a bare
+// name is -- and a wrap is what moves a tree, four declarations through
+// `tk_top_emit`: which is why no accepted program's dump moves when a call
+// waits (the dumps of `da33ebd4`).
 i64 tk_deleg_store_late(i64 si, i64 v) {
     if (si < 0 || v == 0) return 0;
     if (nd_kind(v) == N_INT && nd_val(v) == 0) return 0;    // `null`, the same answer anywhere
     if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
     if (nd_kind(v) == N_IDENT) return tk_ty_scope_or_global(nd_name(v)) < 0;
-    if (nd_kind(v) == N_CALL && str_eq(nd_name(v), "tk_ternary")) {
-        i64 c = nd_a(v);                          // `c ? a : b`, still the raw placeholder
-        i64 a = nd_next(c);                       // (teko_ternary.tk lowers it later)
-        return tk_deleg_store_late(si, a) || tk_deleg_store_late(si, nd_next(a));
-    }
+    if (nd_kind(v) == N_CALL) return 1;           // a CALL is the pass's own answer, never this site's
     return tk_deleg_expr_ty(v) != sr_ty_at(si);
 }
 
