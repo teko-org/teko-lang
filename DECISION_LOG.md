@@ -4359,7 +4359,171 @@ diagnostics, 130 samples); `mc limits . --config mc.macos.toml` verdict `ok` on
 both legs, the `tests/hello.tk` leg's structural counts unmoved from D50's own
 measurement (`passes` 15/30, `syntax` 15, `alias` 18, `types` 11, `intrin`
 8/16, heap 1114992 of 33554432) and the `tests/surface_datetime.tk` leg at
-`syntax` 16, `alias` 22, `types` 15, heap 3998976 -- the one `alias` row and
-the one `types` row this entry's own code adds, against D50's 21 and 14.
+`syntax` 16, `alias` 22, `types` 15, heap 3998976 -- two rows this entry's own
+code does NOT move. The sentence here used to attribute the `+1` on `alias`
+and the `+1` on `types` to "this entry", against "D50's 21 and 14"; both halves
+were wrong, and three builds say so (the twelfth pass below re-measured them
+back to back, mc 0.15.23, macos/aarch64): `da33ebd4`, the base BEFORE D50,
+reads **21**/**14**; `13b3c38a`, D50 alone, already reads **22**/**15**; this
+crumb's head reads 22/15 too. **D50 is the single cause of both rows**, and the
+21/14 the ninth pass recorded is the figure of a head that predates it.
 `mc pkg hash .` over the rebased tree:
 `433973c4026dd0f10a917dff5e8d53e24624ac09ddd545c3fa80ac7037870ba1`.
+
+**Copilot finding, twelfth pass: a delegate call read the TAG of a `ref`
+argument and never the type behind it, a `?` on a slot hid the escape rule
+from two sites, and the pass-time scope was one table short of the signature
+it holds.** Four findings, each measured on `cdcd8a6d` (the head this fix sits
+on) and on this fix, mc **0.15.23**, macos/aarch64 -- `Mut` is
+`delegate void Mut(ref f64 x)`, `Op` is `delegate i64 Op(i64 a)`, `g` an `i64`
+and `acc` a local a lambda captures by reference:
+
+| probe | `cdcd8a6d` | now |
+|---|---|---|
+| `Mut m = bumpf; i64 g; m(ref g);` on a LOCAL slot | compiles, the `i64` comes back holding a double, **exit 9** | refuses, `teko: a value of type i64 does not convert to f64` |
+| the same through a GLOBAL `Mut` over a global `i64` | compiles, **exit 9** | refuses, the same words |
+| `bumpf(ref g)` written DIRECTLY (the wording it is measured against) | refuses, the same words | unchanged |
+| `m(ref v)` / `mi(ref n)` with the pointee the signature declares | runs | runs |
+| `Op? g; g = new Op((i64 x) use (&acc) => acc + x);` | compiles, the capture outlives `acc` | refuses, `teko: a lambda that captures by reference cannot leave its scope` |
+| the same into a plain `Op` global | refuses, the same words | unchanged |
+| `Op? h;` LOCAL taking that lambda | runs | runs |
+| `xs[0] = new Op(... use (&acc) ...)` on a LOCAL `Op?[]` | compiles | refuses, the same words |
+| the same on a GLOBAL `Op?[]` | compiles | refuses, the same words |
+| the same pair on an `Op[]`/global `Op[]` | refuses | unchanged |
+| `Op?[]` taking `new Op((i64 x) => x + 1)` and `null`, local and global | runs | runs |
+| `Op[] xs; xs[0] = null;` | refuses, `teko: null needs a slot declared Op?` | unchanged |
+| `TK_MAXSLV` locals + 1 parameter in one function | refuses, `teko: too many locals in one function` | the pass is silent; mc's own `frame too large` answers |
+
+1. **A call through a DELEGATE compared the argument's `ref`/`out` TAG and
+   nothing else.** `tk_deleg_check_arg_kinds` (teko_deleg.tk) read `dg_pk_at`
+   -- is this argument tagged the way the signature says? -- and never
+   `dg_pty_at`, the type the callee writes THROUGH that address. Nothing else
+   was going to: the `callp` a delegate call lowers to is built in
+   `tk_deleg_pass` (7), AFTER `tk_ref_pass` (6) whose own call check would
+   have asked, and it names no callee, so `tk_rc_call_args` (teko_rc.tk) has
+   no declaration to read either. That check is the only door the argument
+   passes, and it was open: `Mut m = bumpf; i64 g = 7; m(ref g);` ran
+   `v = v + 1.0` through an integer's address and the integer came back
+   holding 8.0's bit pattern -- a local slot and a global one alike, and the
+   same program written as the DIRECT `bumpf(ref g)` is refused. The rule is
+   the one that already owns pointees, IDENTITY
+   (`tk_ref_check_pointee`, teko_ref.tk, D51's verifier finding): it is split
+   over the pointee TYPE rather than the parameter NODE
+   (`tk_ref_check_pointee_ty`, two lines and one caller rewritten), because a
+   delegate signature keeps its pointees in a flat column and has no N_PARAM
+   to hand over. The oracle underneath is unchanged and shared
+   (`tk_ref_arg_pointee`: the lexical scope live at the site, then the
+   globals), so a delegate LOCAL, PARAMETER or GLOBAL called by name is judged
+   whole -- `tk_deleg_pass` opens that scope with the signature and keeps it
+   live, exactly as `tk_ref_pass` does. **What is NOT closed, measured and
+   stated rather than patched:** the two roads whose `callp` is built at PARSE
+   time, a delegate FIELD (`tk_field_use`, teko_expr.tk) and an `Op[]` ELEMENT
+   (`tk_ha_deleg_call`, teko_heaparr.tk), stand where the pass-time scope is
+   empty and `tk_ty_global` is not filled yet (`tk_hg_collect` runs in
+   `tk_array_pass`, 5), so the pointee answers -1 there and is skipped in
+   silence -- the same answer `tk_ref_check_pointee` gives any pointee no
+   oracle names, and the one sentence its header has carried since the
+   verifier finding. Reaching them needs the store's own device, a row that
+   waits for a walk, and that is a crumb, not a line.
+2. **`tk_deleg_row` answers -1 for `Op?`, and two sites read that -1 as "this
+   slot holds no delegate".** `Op?` is a `TK_KNULL` row of its own
+   (teko_struct.tk), and the guard the escape rule sits behind asked exactly
+   that question: `tk_deleg_assign` (teko_deleg.tk) returned before reaching
+   D221 decision 21's first escape, so `Op? g; g = new Op((i64 x) use (&acc)
+   => acc + x);` and `g = local` parked the ADDRESS of a dead local in a
+   global -- the very write the `Op` beside it is refused for since the fifth
+   pass. `tk_deleg_row_under` peels the `?` and is read at the escape question
+   and nowhere else: a `?` says the slot may hold NOTHING, never that it lives
+   LESS LONG, which is the only thing that rule asks. The coercion keeps
+   reading `tk_deleg_row`, which is what leaves `Op? g = null;` the nullable
+   row's own business and `Op[] xs; xs[0] = null;` refused.
+3. **The element store had the same -1, and its global road had nowhere to ask
+   the question at all.** `tk_ha_index` (teko_heaparr.tk) guards the parse-site
+   escape with the same call, so an `Op?[]` element took the capture too; and a
+   GLOBAL array's store is assembled inside `tk_array_pass`
+   (`tk_hg_resolve_write`, teko_array.tk), where the rule cannot run -- the
+   fourth pass's own finding, whose deferral is reached only when
+   `tk_deleg_store_late` answers 1, which it cannot for a row it reads as -1.
+   The parse site reads `tk_deleg_row_under`, and the global store defers the
+   ESCAPE ALONE, with `dl_si` = -1: `tk_deleg_late_do` takes the escape from
+   the one walk that knows which function owns the store and then returns,
+   because the `null` and the type of that element were already judged by
+   D50's own door where the store was built (`tk_field_store_val`) and
+   `tk_deleg_coerce` would refuse the very `null` an `Op?[]` element is
+   declared to hold. One rule per question, at the site that can answer it.
+4. **`TK_MAXSCOPE` was `TK_MAXSLV`, and the scope holds the PARAMETERS too.**
+   The eleventh pass tied the pass-time scope's ceiling to the parser's own so
+   that "a body the parser accepted always fits"; `tk_ty_scope_params`
+   (teko_typeof.tk) pushes the whole signature into that same table before the
+   body is walked, and no parse-time table counts a parameter (`tk_slv_add`'s
+   own rule, D33). At `TK_MAXSLV` locals exactly the invariant broke: 8192
+   locals is accepted by the parser -- 8193 is its own
+   `teko: too many locals in one unit` -- and one parameter beside them made
+   the pass refuse with a ceiling of its own,
+   `teko: too many locals in one function`. It is `TK_MAXSLV + MAXPARAMS`
+   now, mc's own ABI ceiling on a signature added to the parser's own on
+   locals, 192 bytes of globals for the two columns. **What this does not
+   buy, measured:** mc refuses a function with **510** locals outright,
+   `frame too large` (509 + 1 parameter is the last that compiles), so no
+   program that BUILDS can reach either ceiling -- what the fix removes is a
+   refusal in teko's own voice for a body teko's own parser accepted, and the
+   boundary probe now reaches a high-water of **8193** scope entries with the
+   pass silent. The refusal stays reachable, and only for what it was written
+   for: the temporaries the compiler declares itself (teko_null.tk,
+   teko_ternary.tk), which no source count bounds. A throwaway counter on
+   `tk_ty_scope_add`, printed at the last pass over all 64 fixtures, says the
+   busiest body spends **72** of the 8204 rows (`surface_nullable_ops`).
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config
+mc.macos.toml` clean; **64/64** fixtures at their `expect-exit`, with
+`tests/surface_globals.tk` (exit 42) gaining section 8, `delegrefcheck` -- the
+pointee the signature declares, `ref f64` and `ref i64`, through a delegate
+LOCAL and a delegate GLOBAL -- and section 9, `nulldelegcheck` -- an `Op?`
+global and an `Op?[]` element, global and local, taking a lambda with NO
+capture and the `null` a `?` is declared for, read back through
+`== null`/`!= null`. Both sections are the ACCEPTED side on purpose: every
+refusal of this pass is a refusal, which has no exit code, and the four of
+them are `// no-run` samples in
+[diagnostics.md](docs/reference/diagnostics.md) instead. **No new `teko:`
+string**: the pointee mismatch is the wording a direct call already gives and
+the escape is the sentence five slots already carry. The **141** probes of
+this crumb -- the **83** of passes 1 to 10, the **25** of the eleventh, the
+**11** of the two families D50 ∧ D51 measures and this pass's own **22** --
+run whole on `cdcd8a6d` and on this fix: **135** verdicts identical line for
+line and **6** that move, which are the four findings above and nothing else.
+`--dump-ast` of all **64** fixtures under the compiler of `cdcd8a6d` and under
+this one, over the SAME sources -- **64 byte-identical**, the whole code change
+being refusals and one capacity; against `13b3c38a`, **62** of the 63 fixtures
+that exist on both are byte-identical and `tests/surface_array_heap.tk` is
+exactly as the sixth pass declared it (2439 lines on both, the same multiset
+line for line, one contiguous 88-line block of wrap declarations emitted at a
+different point of the unit), `tests/surface_globals.tk` being this crumb's
+own. Instrumented, `tk_deleg_late_rest` refusing any store that reaches it
+unjudged: the 64 fixtures and all 141 probes pass with **0** survivors, and the
+instrument is not vacuous -- with `tk_deleg_late_pend` disabled it fires on
+`tests/surface_globals.tk:228` at once. `sh scripts/bootstrap.sh --os macos
+--arch aarch64` -> `FIXPOINT OK` (64/64 under the self-hosted `teko1`, 58.5s);
+`sh scripts/check-docs.sh` green (**573** links, **388** diagnostics -- none
+added -- **132** samples, the two `// no-run` blocks this pass writes: the
+delegate `ref` mismatch beside the direct call's own, and the `T?` slot's
+escape beside the plain global's). Two rows join
+[not-yet.md](docs/reference/not-yet.md), both measured here: `??` over a `T?`
+of delegate type is refused `teko: Op takes a function, another Op, or null`,
+and a bare FUNCTION name stored into a `T?` delegate slot is `unknown name`
+from the core at an initializer and `teko: the type of this value is not known
+here` at an element store -- the wrap reads the delegate row, which a `T?`
+answers -1 for, and `new Op(addOne)` is the form that works today.
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, measured back
+to back against `cdcd8a6d` from the same clean `build/`: the `tests/hello.tk`
+leg is BYTE IDENTICAL down to its `heap` (467824 of a 33554432 ceiling;
+`passes` 15/30, `syntax` 15, `alias` 18, `types` 11, `intrin` 8/16) and the
+compiler leg moves by this pass's own source growth (`nodes` used 155312 ->
+155398, `funcs` 3157 -> 3159 -- `tk_ref_check_pointee_ty` and
+`tk_deleg_row_under` -- `globals` 933 unchanged, `ins` 213918 -> 214057,
+`symbols` 6189 -> 6191, used heap 93817520 -> 93957712). The
+`tests/surface_datetime.tk` leg is identical on both heads as well (`syntax`
+16, `alias` 22, `types` 15, heap 3026144), which is the measurement the
+correction to the D50 ∧ D51 paragraph above rests on: `da33ebd4` reads 21/14,
+`13b3c38a` reads 22/15, and this crumb changes neither. `mc pkg hash .` at
+this pass's own code commit:
+`93fab590c5fd29dc2ceaabab56ba296e39d41044b3b6e38bd6ee36861d45ed6e`.
