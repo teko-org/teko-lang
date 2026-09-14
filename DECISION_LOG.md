@@ -6171,6 +6171,7 @@ answered `h.cb(2, 3)` only where the PARSER itself could type the receiver. Meas
 | `i64 f(A a) { return a.b.cb(21); }` — a field of a field under a parameter | the same |
 | `cb(x)` UNQUALIFIED inside a method of `H` | `call to unknown function`, from the core |
 | `H.cb(21)` on a `static Op cb` | `teko: unknown member: cb` |
+| `LateH.scb(1)` on a `static Op scb` of a type declared BELOW the call | the same |
 
 The fourth row broke the refusal law on its own: a diagnostic with no `teko:` prefix, from
 mc's own resolver, for a construct teko taught.
@@ -6392,6 +6393,18 @@ silent-wrong, and the same C# rule D65 wrote out for the field: the class's own 
 answers before anything the namespace declares. It costs no fixture of its own: the row is
 `nsh.cgo()` in `tests/surface_delegate.tk`'s `shadowcheck`, a `const i64 CX = 105` in
 `namespace shd` against `NShad`'s own `public const i64 CX = 6`.
+
+**Copilot on #716, pass 4 — the forward road and the array guard.** `LateH.scb(1)` with
+`LateH` declared below the call goes through `tk_fwd_resolve_static_one` (teko_access.tk),
+whose `TK_STCALL` branch picked methods only and refused `teko: unknown member: scb`. The
+branch now asks `tk_static_deleg_field` first and builds the delegate `callp` with
+`tk_deleg_build` over the arguments the site recorded (`st_arg_at`/`st_na_at`) — no re-parse,
+the same builder the known-type road takes; measured with a LOCAL argument (`go(k)` calling
+`LateH.scb(k, 2)`), the judged `callp` runs. And `tk_ns_deleg_field` (teko_ns.tk) now excludes
+an ARRAY field — `fd_ty_at` carries the element type, so `public Op cb[2]` looked like a
+callable delegate field and stopped the namespace rewrite of a bare `cb(5)` that names the
+namespace's free function; every other delegate-call door already excluded arrays.
+`tests/surface_delegate_fwd.tk` carries both.
 
 ### D66 · A contextual lambda is read on every slot of delegate type teko's own parser reaches (2026-09-14)
 `(i64 x) => x * 2` with no `new Op(...)` around it needs a READER that looks ahead before
