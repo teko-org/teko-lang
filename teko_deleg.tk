@@ -473,7 +473,13 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
 // already answer, a name a `new Op(...)`/lambda/call already types, and a
 // FUNCTION declared ahead of the store are decided where they were written, so
 // no accepted program's tree moves (the 62 dumps of `da33ebd4`).
-#define TK_MAXDGLATE 64               // element stores waiting for the pass
+// The table is as deep as the write table that feeds it: `TK_MAXGDEF` (512,
+// teko_array.tk) is the ceiling on the element writes of a unit that wait for
+// `tk_array_pass`, and every one of them may need a row here. At 64 a program
+// with 65 perfectly ordinary stores in it was refused
+// `teko: too many element stores of unknown type` -- a ceiling below the one
+// the language already publishes for the same writes (D51, fifth pass).
+#define TK_MAXDGLATE 512              // element stores waiting for the pass
 
 i64  dl_node[TK_MAXDGLATE];           // the store call, `stW(tk_arr_at(...), v)`
 i64  dl_si[TK_MAXDGLATE];             // the delegate row the ELEMENT type is
@@ -516,8 +522,13 @@ i64 tk_deleg_defer_all = 0;
 
 void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 
-// "the store's own oracles cannot settle this name". Only two answers are
-// settled where the store is built, and everything else waits:
+// "the store's own oracles cannot settle this value". ONE rule, whatever
+// shape the value has: what the site's own oracles TYPE is judged where it is
+// written, and what they do not type waits for the walk -- the same rule the
+// store built in a pass takes for every value it holds. `null` means the same
+// thing at every site, so it never takes a row of the table.
+//
+// For a bare name that reads:
 //
 //   - the pass-time scope or a global row already names it (both are empty at
 //     parse time and both are live once `tk_array_pass` has run), so the
@@ -531,13 +542,30 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // slot is judged by the type the validator reads from the scope, not by the
 // wrap -- so it waits. So does a name no table here knows at all: it may still
 // be a global, a parameter, or a function declared further down the file.
+//
+// Every OTHER shape asks `tk_deleg_expr_ty`, which is the oracle the
+// validator itself would ask one line later: a `new Op(...)`, a lambda, an
+// element read and a call to a function declared above all type as the
+// element right where they stand and are settled there, and a value this site
+// cannot type at all -- `ops[0] = chooser(1)` through a LOCAL delegate, whose
+// row only the walk's own lexical scope holds -- waits instead of being
+// refused on the spot (D51, fifth pass). Deferring only what the site types
+// WRONG is also what keeps every accepted program's tree where it was: a wrap
+// that already worked emits four declarations through `tk_top_emit`, and
+// moving the wrap would move them (the 62 dumps of `da33ebd4`). A ternary is
+// the one value this validator takes APART, one branch at a time, so it stays
+// here whenever the site is judging at all.
 i64 tk_deleg_store_late(i64 si, i64 v) {
-    if (si < 0) return 0;
+    if (si < 0 || v == 0) return 0;
+    if (nd_kind(v) == N_INT && nd_val(v) == 0) return 0;    // `null`, the same answer anywhere
     if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
-    if (nd_kind(v) != N_IDENT) return 0;
-    if (tk_ty_scope_or_global(nd_name(v)) >= 0) return 0;
-    if (tk_pty_of(v) >= 0) return 1;
-    return decl_find(nd_name(v)) < 0;
+    if (nd_kind(v) == N_IDENT) {
+        if (tk_ty_scope_or_global(nd_name(v)) >= 0) return 0;
+        if (tk_pty_of(v) >= 0) return 1;
+        return decl_find(nd_name(v)) < 0;
+    }
+    if (nd_kind(v) == N_CALL && str_eq(nd_name(v), "tk_ternary")) return 0;
+    return tk_deleg_expr_ty(v) != sr_ty_at(si);
 }
 
 void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
@@ -630,9 +658,22 @@ void tk_deleg_var(i64 n) {
 // `f = add;` on a local/parameter of delegate type -- the assignment form of
 // the initializer above. A qualified target (`h.cb = e;`) is a different
 // node shape entirely (teko_expr.tk's field store), untouched here.
+//
+// A GLOBAL target is the one that OUTLIVES the scope it is written in, so it
+// takes D221 decision 21's first escape exactly as `return` above does:
+// `g_op = local;` with `local` holding a lambda that captured by reference,
+// or `g_op = new Op(... use (&acc) ...)` written straight into the global,
+// parked the ADDRESS of a dead local in a slot that survives the call. The
+// field, the static field and the element of a `T[]` already carry the same
+// verdict; the plain global slot was the one write of a delegate that had
+// none. A LOCAL target keeps the taint PROPAGATION it always had
+// (`tk_lam_taint_stmt` above) and no refusal: `Op local2 = local;` and
+// `local2 = local;` stay inside the scope that owns the capture.
 void tk_deleg_assign(i64 n) {
     i64 si = tk_deleg_row(tk_ty_scope_or_global(nd_name(n)));
     if (si < 0) return;
+    if (tk_ty_scope_find(nd_name(n)) < 0 && tk_lam_escapes(nd_a(n)))
+        err_at(nd_file(n), nd_line(n), "teko: a lambda that captures by reference cannot leave its scope");
     set_nd_a(n, tk_deleg_coerce(si, nd_a(n), nd_line(n), nd_file(n)));
 }
 

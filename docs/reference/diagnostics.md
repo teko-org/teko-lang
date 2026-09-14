@@ -623,8 +623,9 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - `"teko: a capture by reference of a counted type is not taught yet"` — capture the object
   **by value**; the closure then holds a reference of its own.
 - `"teko: a lambda that captures by reference cannot leave its scope"` — such a closure
-  cannot be returned, nor stored in a field, a static field or an ELEMENT of a `T[]`,
-  whether the array is a local or a global.
+  cannot be returned, nor stored in a field, a static field, a GLOBAL of delegate type or
+  an ELEMENT of a `T[]`, whether the array is a local or a global. Handing it to another
+  LOCAL is allowed: the scope that owns the capture is still the one holding it.
 - ``"teko: a delegate declared below `new` is not taught yet"`` — move the `delegate`
   declaration above the `new` that names it.
 - `"teko: an array of this type is not taught yet"` — a fixed array whose element is a type
@@ -668,6 +669,27 @@ i64 main() {
 A local wins over a global of the same name at that store as it does everywhere else, and a
 local of delegate type wins over a free FUNCTION of that name: `Op f = addOne; g_ops[0] = f;`
 stores the local `f`, never a wrap of the function `f`.
+
+A plain GLOBAL of delegate type outlives its writer the same way an element of a global
+array does, so a write into one takes the same verdict (D51, fifth pass):
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+Op g_op;
+i64 f() {
+    i64 acc = 0;
+    Op local = new Op((i64 x) use (&acc) => acc + x);
+    Op copy = local;                // fine: a LOCAL, inside the scope that owns `acc`
+    g_op = local;
+                  // teko: a lambda that captures by reference cannot leave its scope
+    return copy(1);
+}
+```
+
+And a value the store is written at cannot TYPE waits for the same walk whether the array
+is global or local: `ops[0] = chooser(1)`, with `chooser` a local delegate that answers
+`Op`, is judged where `chooser` has a type, never refused at the store (D51, fifth pass).
 
 ## Arrays
 
@@ -1032,7 +1054,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `ref`/`out` parameters in one unit"`` | 512 |
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |
-| `"teko: too many element stores of unknown type"` | 64 stores into an element of delegate type, in one unit, whose value only the pass can name |
+| `"teko: too many element stores of unknown type"` | 512 stores into an element of delegate type, in one unit, whose value only the walk can type — the same ceiling the array writes waiting for that pass already have |
 | `"teko: too many captures in one lambda"` | 32, summed across the lambdas being read |
 | `"teko: too many captures by value in one unit"` | 256, summed over every lambda: definite assignment reads each one's own node |
 | `"teko: too many capturing lambdas"` | 64 capturing by reference |

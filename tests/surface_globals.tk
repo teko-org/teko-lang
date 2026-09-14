@@ -41,6 +41,14 @@
 //      for a call through a local delegate -- and never ran the escape rule
 //      the parse site runs. The whole store waits for the walk now (D51,
 //      fourth pass).
+//   3d. `delegarrlocalcheck` -- the same element store on a LOCAL `Op[]`,
+//      whose value only the walk can type: `ops[0] = chooser(1)` through a
+//      local delegate was refused at the parse site, `teko: Op takes a
+//      function, another Op, or null`, because that site differed a bare NAME
+//      alone. It differs whatever it cannot type now, the rule the global
+//      store already had. The by-reference capture handed to another LOCAL is
+//      the other half: it is accepted, where the global slot of section 3 is
+//      refused (D51, fifth pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -244,6 +252,38 @@ i64 delegarrglobalcheck() {
     return 0;
 }
 
+// ---- 3d. the LOCAL element store, judged by the SAME rule (D51, fifth
+// pass) ----
+
+i64 delegarrlocalcheck() {
+    // a call through a LOCAL delegate, stored into a LOCAL `Op[]`: the parse
+    // site the store is built at has no scope to name `chooser` with, so the
+    // guard used to hand the value straight to the validator and refuse a
+    // legal program, `teko: Op takes a function, another Op, or null` -- the
+    // exact shape the GLOBAL `Op[]` above already waits on. It waits here too
+    // now: a value this site cannot type is judged at the walk, and a value it
+    // types is settled where it stands.
+    Chooser chooser = pickOp;
+    Op[] ops = new Op[2];
+    ops[0] = chooser(1);
+    ops[1] = new Op((i64 a) => a * 4);            // typed right here, as it always was
+    if (ops[0](10) != 12) return 1;
+    if (ops[1](10) != 40) return 2;
+
+    // a lambda that captures by reference may be handed to another LOCAL --
+    // the scope that owns the capture is still the one holding it. Only a
+    // slot that OUTLIVES that scope is refused (a global, a field, a static
+    // field, an element of a `T[]`: docs/reference/diagnostics.md).
+    i64 acc = 40;
+    Op held = new Op((i64 x) use (&acc) => acc + x);
+    Op held2 = held;                              // an initializer
+    Op held3 = addOne;
+    held3 = held;                                 // ...and an assignment
+    if (held2(1) != 41) return 3;
+    if (held3(2) != 42) return 4;
+    return 0;
+}
+
 // ---- 4. `params` over a global scalar element ----
 
 i64 sumall(params i64[] xs) {
@@ -382,6 +422,9 @@ i64 main() {
 
     bad = delegarrglobalcheck();
     if (bad != 0) return 90 + bad;
+
+    bad = delegarrlocalcheck();
+    if (bad != 0) return 100 + bad;
 
     bad = paramscheck();
     if (bad != 0) return 40 + bad;
