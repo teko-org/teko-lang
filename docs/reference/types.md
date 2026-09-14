@@ -423,6 +423,14 @@ struct is never a base class.
 A struct is **not reference-counted** — it has no vtable, hence no release function to
 reach. Its allocation lives for the run ([memory.md](memory.md)).
 
+A struct **global** is the same eight-byte slot a class global is: it converts by the same
+assignment corridor a local's own store takes (D53), and assigning one struct global (or a
+struct-typed local) to another copies the POINTER, not the fields — `gp = p;` makes `gp` and
+`p` the same allocation, so a field written through either name is read through the other
+(D5, D56). It cannot be built at its own declaration: `Point gp = new Point();` at file scope
+is refused by mc's own core, `global initializer must be constant` — `new` is a call, not a
+constant. Declare it bare (`Point gp;`) and build it in a body instead.
+
 ---
 
 ## `class`

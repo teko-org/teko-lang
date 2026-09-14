@@ -1,0 +1,205 @@
+// surface_globals_struct.tk -- a STRUCT global (G-d). This is a REGRESSION
+// net, not a new construct: a struct value is a pointer, eight bytes (D5,
+// docs/reference/types.md § struct), so a struct global IS a class global --
+// D48's slot table already records its row, D53's corridor already judges
+// every store into it, and D55 leaves it out of `rt_store`'s counting through
+// `tk_is_counted` (a struct has no vtable and no count of its own). Every
+// point below was measured green on the base (`e0129ba6`) before this file
+// was written; nothing here required a line of compiler code (D56).
+//
+// What each helper proves, in order:
+//
+//   1. `buildcheck`    -- a struct global cannot be built at its own
+//      declaration: mc's core refuses `new` there (`global initializer must
+//      be constant` -- a `new` is a call, not a constant). `gp` is declared
+//      bare and built inside a body instead, then its fields are stored and
+//      read.
+//   2. `aliascheck`    -- the ALIAS a struct global's own pointer licenses:
+//      `gp = p;` makes `gp` and `p` the SAME allocation, so a field written
+//      through either name is read through the other. C# copies a struct on
+//      assignment; teko does not, because here the "struct" IS the pointer
+//      (D5) -- there is no sixteen-byte value to copy in the first place.
+//   3. `localcopycheck` -- `Point q = gp;` is the same alias one more time,
+//      a struct-typed LOCAL built from the global.
+//   4. `paramscheck`   -- the struct global passed by value (the parameter
+//      is a copy of the POINTER, so a field store through it still lands on
+//      the object `gp` names), by `ref` (the callee reassigns `gp` itself)
+//      and by `out` (same, from a callee that never reads the old value).
+//   5. `methodcheck`   -- a struct METHOD through the implicit `this`,
+//      writing a field of the global receiver.
+//   6. `nestedcheck`   -- a struct field of struct type (`Line.a`), read
+//      and written two levels deep off a global (`gl.a.x`).
+//   7. `countedfieldcheck` -- a struct global whose own field is a CLASS
+//      (`S.c`, a `Cell`): the field store already goes through `rt_store`
+//      because the FIELD's type is counted, not the struct's -- churning two
+//      unrelated `Cell`s after building `gs` does not disturb it, proving the
+//      count lives in the field, not in the struct slot.
+//   8. `staticcheck`   -- a `static` field of struct type (`Holder.sp`),
+//      the same slot a plain global is, reached through a class name instead
+//      of a bare one.
+//   9. `nullablecheck` -- `Point? gp2;` at file scope: a struct is a
+//      REFERENCE (D5), so `T?` over it is a global like any other class
+//      nullable (Q1a) -- no box, the handle IS the pointer. `.HasValue`,
+//      `??` and `.Value` all read as a local's would.
+//  10. `paramshadow`   -- a PARAMETER named `gp`, of a different type,
+//      shadows the struct global: the store inside stays a plain integer
+//      assignment, exactly as D53 already proved for a scalar global shadowed
+//      by a parameter.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+struct Point {
+    public i64 x;
+    public i64 y;
+
+    public void bump(i64 k) {
+        x = x + k;                                 // implicit `this.x`, a field store
+    }
+}
+
+struct Line {
+    public Point a;
+    public i64   len;
+}
+
+class Cell { public i64 v; public Cell(i64 n) { this.v = n; } }
+
+struct S { public Cell c; }
+
+class Holder {
+    public static Point sp;
+}
+
+Point  gp;
+Line   gl;
+S      gs;
+Point? gp2;
+
+i64 buildcheck() {
+    gp = new Point();                              // built in a body, not the declaration
+    gp.x = 1;
+    gp.y = 2;
+    if (gp.x != 1) return 1;
+    if (gp.y != 2) return 2;
+    return 0;
+}
+
+i64 aliascheck() {
+    Point p = new Point();
+    p.x = 10;
+    gp = p;                                        // the whole-struct store: a pointer copy
+    p.x = 42;
+    if (gp.x != 42) return 1;                       // visible through `gp`
+    gp.y = 43;
+    if (p.y != 43) return 2;                        // and back through `p`
+    return 0;
+}
+
+i64 localcopycheck() {
+    Point q = gp;                                   // `q` is the SAME allocation as `gp`
+    q.x = 44;
+    if (gp.x != 44) return 1;
+    return 0;
+}
+
+void takeval(Point p) {
+    p.x = 100;                                      // a copy of the POINTER, not the object
+}
+
+void takeref(ref Point p) {
+    p.y = 200;                                      // still the object `gp` names
+}
+
+void takeout(out Point p) {
+    p = new Point();                                // `out` rebinds the caller's own slot
+    p.x = 300;
+}
+
+i64 paramscheck() {
+    takeval(gp);
+    if (gp.x != 100) return 1;
+    takeref(ref gp);
+    if (gp.y != 200) return 2;
+    takeout(out gp);
+    if (gp.x != 300) return 3;
+    return 0;
+}
+
+i64 methodcheck() {
+    gp.x = 0;
+    gp.bump(7);
+    if (gp.x != 7) return 1;
+    return 0;
+}
+
+i64 nestedcheck() {
+    gl = new Line();
+    gl.a = new Point();
+    gl.a.x = 400;
+    if (gl.a.x != 400) return 1;
+    return 0;
+}
+
+void fillS()  { gs = new S(); gs.c = new Cell(42); }
+void churnS() { Cell a = new Cell(1); Cell b = new Cell(2); }
+
+i64 countedfieldcheck() {
+    fillS();
+    churnS();
+    churnS();
+    if (gs.c.v != 42) return 1;                     // the count lives in the field
+    return 0;
+}
+
+i64 staticcheck() {
+    Holder.sp = new Point();
+    Holder.sp.x = 500;
+    if (Holder.sp.x != 500) return 1;
+    return 0;
+}
+
+i64 nullablecheck() {
+    if (gp2.HasValue) return 1;                     // starts null
+    Point d = gp2 ?? new Point();
+    if (d.x != 0) return 2;
+    Point np = new Point();
+    np.x = 600;
+    gp2 = np;
+    if (!gp2.HasValue) return 3;
+    if (gp2.Value.x != 600) return 4;
+    gp2 = null;
+    if (gp2.HasValue) return 5;
+    return 0;
+}
+
+i64 paramshadow(i64 gp) {                           // the struct global's own name, shadowed
+    gp = 5;
+    if (gp != 5) return 1;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = buildcheck();
+    if (bad != 0) return 10 + bad;
+    bad = aliascheck();
+    if (bad != 0) return 20 + bad;
+    bad = localcopycheck();
+    if (bad != 0) return 30 + bad;
+    bad = paramscheck();
+    if (bad != 0) return 40 + bad;
+    bad = methodcheck();
+    if (bad != 0) return 50 + bad;
+    bad = nestedcheck();
+    if (bad != 0) return 60 + bad;
+    bad = countedfieldcheck();
+    if (bad != 0) return 70 + bad;
+    bad = staticcheck();
+    if (bad != 0) return 80 + bad;
+    bad = nullablecheck();
+    if (bad != 0) return 90 + bad;
+    bad = paramshadow(0);
+    if (bad != 0) return 100 + bad;
+    return 42;
+}
