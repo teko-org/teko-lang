@@ -3147,8 +3147,11 @@ fixture roots **four** objects through **three** global `T[]`s, `gl`/`gc`/`gdst`
 **63/63** fixtures at their `expect-exit`; `--dump-ast` of all **63** fixtures under the
 compiler of `fd05b9b8` and under this one, over the SAME sources — **63 byte-identical**,
 which is the whole of the code change being a refusal and nothing else; the three fixtures
-this pass edits, old source against new under this compiler, differ by ADDITION only (0
-lines removed, sorted diff); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+this pass edits, old source against new under this compiler, differ by addition in two
+(`surface_timespan.tk`, `surface_datetime.tk`: 0 lines removed, sorted diff) and by one
+rewritten line in the third (`surface_timespan_overflow.tk`: the overflow operand is now an
+element, `heap[ei] + TimeSpan.FromTicks(1)`, its comment with it — 2 lines out, the
+verifier's own count); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
 `FIXPOINT OK` (63/63 under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (567
 links, 387 diagnostics, 122 samples — unmoved, the `void` paragraph gaining a sentence and
 no sample); `mc limits . --config mc.macos.toml` verdict `ok` with every table unmoved —
