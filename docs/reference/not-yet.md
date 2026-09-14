@@ -26,7 +26,6 @@ Nothing here is a promise about a later version; what is designed and not built 
 | `type X = ...` | not taught: there is no type alias in the surface |
 | a variant / discriminated union | not taught |
 | `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong` | not taught: ordinary identifiers, because teko registers none of the seven C# alias words — `i8`/`i16` are `type_new` primitives of their own, spelled `mc`'s way, not C#'s ([types.md](types.md#i8-and-i16)) |
-| a **global of class type** assigned from a body (`gc = c;`) | judged like a local, but not COUNTED like one: the store writes the pointer without the reclaim's own `rt_store`, so the object is freed when the local that built it goes away and the global is left pointing at reclaimed memory (measured: a global set to a `Cell` of 42 reads 7 after two unrelated allocations). Hold a counted object in a local, a field or a parameter; a global of class type is safe only while nothing else is freed under it |
 
 Interfaces have no covariance and no contravariance, and a `struct` has no reference count
 of its own ([memory.md](memory.md)).

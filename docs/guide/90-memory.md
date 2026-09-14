@@ -15,7 +15,7 @@ forever.
 | a **local** of counted type | releases at the end of its block, and on the way out of a `break`, `continue` or `return` that leaves it |
 | a **field**, or an element of a `T[]` | released when the holder dies, and when the slot is overwritten |
 | a **capture by value** in a closure | released with the closure |
-| a **global**, a **static field**, a **Singleton** | never: it is a root |
+| a **global**, a **static field**, a **Singleton** | when the slot is overwritten, the old value is released; the value held at program end never is: the slot is a root |
 | a **parameter** of class type | **borrows** — it carries no count, and reassigning it is refused |
 
 A value produced and handed straight to a call, `f(new Cell(1))`, has no owner: it is
