@@ -30,6 +30,41 @@ Anything else is `teko: Op takes a function, another Op, or null`, and a functio
 signature does not match is refused by name. The thunk is generated once per (delegate,
 function) pair.
 
+`Op f = add;` and `Op g = new Op(add);` are the **same** thunk: the contextual form and the
+explicit `new` form share one memoized wrapper per (delegate, function) pair, so the two
+roads accept and refuse exactly the same targets. A parameter the delegate declares
+`ref`/`out` is forwarded through that wrapper **by kind** — it carries the caller's address,
+not a copy — and the signature has to match on the kind as well as on the type: `void
+byval(f64 x)` is `teko: byval does not match the delegate Mut(ref f64)` (D63).
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+delegate void Mut(ref f64 x);
+delegate void Setter(out i64 x);
+
+void bumpf(ref f64 x) { x = x + 1.0; }
+void seti(out i64 x) { x = 7; }
+
+i64 run() {
+    Mut m = new Mut(bumpf);
+    f64 v = 1.0;
+    m(ref v);
+    if (v != 2.0) return 1;
+    Setter s = new Setter(seti);
+    i64 r = 0;
+    s(out r);
+    if (r != 7) return 2;
+    return 0;
+}
+
+i64 main() {
+    if (run() != 0) return 1;
+    return 42;
+}
+```
+
 `Op g;` at top level is a **global** slot, and every form above works on it exactly as it
 does on a local: `g = add;`, `g = new Op(mul);`, and `g(3, 4)` from any function of the
 unit, the declaring one included (D51). It reads the same on the RIGHT of every slot that

@@ -755,8 +755,12 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
   method call lowers to does.
 - `"teko: wrong number of arguments for "` — completed by the name: the call's arity does
   not match.
-- `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
-  delegate `Op(...)`*, *`Op` takes a function, another `Op`, or null*, *`X` is not
+- `"teko: "` — completed by one of the delegate-shaped messages:
+  `" does not match the delegate "` (the target's own name on the left and the delegate's
+  signature on the right, `teko: byval does not match the delegate Mut(ref f64)` — the
+  arity, the return, the parameter types AND the `ref`/`out` kind of each all have to
+  match, on the contextual road and on `new Op(...)` alike, which share one thunk),
+  *`Op` takes a function, another `Op`, or null*, *`X` is not
   captured; add it to use (...)*, and *`X` is used but never declared*.
 
 An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
