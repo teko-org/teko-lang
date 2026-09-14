@@ -665,9 +665,11 @@ are listed in [runtime.md](runtime.md#the-time-library).
   variable, a field or an element.
 - ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
   know to be one. Bind it to a local of the right type first. The name the base spells is
-  appended when it has one, and a LOCAL that shadows a global array is the shape that
+  appended when it has one, and a name that SHADOWS a global array is the shape that
   reads oddest: the global's own index is rewritten by a pass that matches by name alone,
-  so the refusal is raised where the parser still knows the binding is the local's.
+  so the refusal is raised where the parser still knows what the binding really is. A
+  LOCAL and a FIELD of the class being parsed both shadow that way; a field that IS an
+  array is read as the field, index and all.
 
 ```teko
 // no-run
@@ -678,6 +680,20 @@ i64 f() {
     i64 src = 3;              // ...shadowed by a local of another type
     dst[0] = src[0];          // teko: `[` needs an array: src
     return dst[0];
+}
+
+class H {
+    public i64 src;           // ...and shadowed by a FIELD, one scope out
+    public i64[] xs;
+
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+
+    public i64 h() {
+        xs[0] = 8;            // ...while a field that IS an array reads the field
+        return xs[0];
+    }
 }
 ```
 
@@ -1014,6 +1030,24 @@ i64 main() {
   eight bytes in a slot of another type. Bind the value to a local of the right type first,
   the same answer *the type of this argument is not known here* gives one position over.
 
+A **`void` call** reaches the same judgement with a type, and it is no value: the store is
+refused in the wording every mismatched value gets. mc's core already refuses a `void` where
+it can see one (`value of type void`, its own message, the one a local initializer gets),
+but a VIRTUAL or an INTERFACE call is indirect and the core types every indirect call `i64`
+by itself — so the declared return, `void` included, is what the compiler records and what
+the store is judged against.
+
+```teko
+// no-run
+class B { public virtual void M() { } }
+class H {
+    public i64 n;
+    public void go(B b) {
+        this.n = b.M();      // teko: a value of type void does not convert to i64
+    }
+}
+```
+
 ## Capacity
 
 Every table the compiler keeps has a ceiling. Hitting one is a diagnostic, not a silent
@@ -1058,7 +1092,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many expressions whose type is known"` | 4096 expressions the parser typed in one unit — every load of a field, of an array element and of a `T[]`, every box and every indirect return spends one; 239 in `tests/surface_nullable_ops.tk`, the busiest fixture |
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
-| `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 28 in `tests/surface_field_store.tk`, the busiest fixture |
+| `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |

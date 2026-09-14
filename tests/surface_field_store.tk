@@ -96,6 +96,18 @@
 //                       (`gc[gl[1] - 1].v`, where only the outer one was
 //                       rewritten). Each was refused, ``teko: `[` needs an
 //                       array: gl``;
+//  24. `fwdloadcheck` -- the forward-referenced static as the VALUE of a
+//                       store (`this.rate = W3.tally;` on a class declared
+//                       ABOVE it): the load is built by the same pass that
+//                       resolves the write and copied into the tree, which
+//                       left its type on a node nobody reads -- the store
+//                       was REFUSED for a value the compiler had just typed;
+//  25. `mbindexcheck` -- the implicit index on a `T[]` FIELD (`xs[0]`,
+//                       `xs[0] += 1`, `this.rate = xs[0]`) with a global
+//                       array of this file beside it: a bare name the class
+//                       declares is that field at PARSE time, which is what
+//                       keeps the global rewrite -- keyed by name alone --
+//                       off it;
 //  20. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released, the global arrays
 //                       above excepted: those are roots.
@@ -306,6 +318,47 @@ class W {
 
 class H2 {
     public static f64 total;
+}
+
+// the forward-referenced static as the VALUE of a store, the other half of
+// the road helper 9 writes (24): `W3` is declared BELOW this class, so
+// `W3.tally` is a LOAD built by `tk_fwd_resolve_static_one` and copied into
+// the tree with `node_assign` -- which used to leave the element's own type
+// on the node the load was BUILT as, so the store was refused for a value the
+// compiler itself had just typed.
+class FS {
+    public f64 rate;
+    public FS() { rate = 0.0; }
+    public void take() { this.rate = W3.tally; }
+}
+
+class W3 {
+    public static i64 tally;
+}
+
+// a `T[]` of heap as a FIELD, indexed by the IMPLICIT name (25): a bare name
+// the class declares is that field, at parse time, which is what keeps the
+// global-array rewrite -- keyed by name alone -- off it. `gl` is a global
+// `i64[]` of this very file and `xs` is not, so the two names below are the
+// pair the defect needs: a field that IS an array reads the field, and a
+// field that is NOT one refuses the `[` instead of reading the global's
+// storage through the field's own bytes.
+class X {
+    public i64[] xs;
+    public f64 rate;
+
+    public X() {
+        xs = new i64[2];
+        rate = 0.0;
+    }
+
+    public void fill() {
+        xs[0] = 8;                    // the implicit store...
+        xs[0] += 1;                   // ...the implicit compound...
+        this.rate = xs[0];            // ...and the implicit load, widened by the gate
+    }
+
+    public i64 at0() { return xs[0]; }
 }
 
 // a FREE function's own parameter: no member body is being parsed, so nothing
@@ -673,6 +726,37 @@ i64 parkedcheck() {
     return 0;
 }
 
+// the forward static as a VALUE (24): `W3.tally` is an `i64` read into an
+// `f64` field, so the gate has to WIDEN it -- which it can only do over a
+// load that carries its type. Nothing here allocates beyond the one `FS`.
+i64 fwdloadcheck() {
+    W3.tally = 5;
+    FS v = new FS();
+    v.take();
+    if (v.rate != 5.0) return 1;
+    return 0;
+}
+
+// the implicit index on a `T[]` FIELD (25), with the file's own global `gl`
+// standing beside it under a different name: the store, the compound and the
+// load all reach the field, and the `X` this helper allocates -- the object
+// and its array -- is released before it returns, so the floor `rccheck`
+// reads below is unmoved.
+i64 mbindexcheck() {
+    i64 floor = rt_live();
+    i64 seen = 0;
+    {
+        X x = new X();
+        x.fill();
+        if (x.at0() != 9) return 1;
+        if (x.rate != 9.0) return 2;
+        seen = rt_live();
+    }
+    if (seen != floor + 2) return 3;  // the object and the array it holds
+    if (rt_live() != floor) return 4;
+    return 0;
+}
+
 // the global `T[]`s the helpers above fill are ROOTS: a global array is never
 // released (surface_array_global.tk's own header), so the floor this counter
 // returns to is those four objects -- the three arrays (`gl`, `gc`, `gdst`)
@@ -755,6 +839,12 @@ i64 main() {
 
     bad = parkedcheck();
     if (bad != 0) return 240 + bad;
+
+    bad = fwdloadcheck();
+    if (bad != 0) return 243 + bad;
+
+    bad = mbindexcheck();
+    if (bad != 0) return 245 + bad;
 
     bad = rccheck();
     if (bad != 0) return 250 + bad;

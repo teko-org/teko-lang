@@ -2543,8 +2543,8 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in nine passes over
-[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and eight Copilot reviews
+*This entry is the whole of D50 as it stands. It was written in eleven passes over
+[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and ten Copilot reviews
 — and every earlier wording of it, including the `tk_member_fn` push described below, the
 two-oracle door the third pass removed, the silent `-1` the fourth one turned into a
 refusal, the registration the fourth one gave every call alike and every intermediate proof
@@ -2729,7 +2729,7 @@ refused at the 260th on `6a30d158`. Both become **4096**: 5 columns × 4096 × 8
 each, 320 KB in all, against a 33554432-byte reservation whose floor leg (`tests/hello.tk`)
 moves from **467824** to **1114992** bytes used, `mc limits` verdict `ok` with every other
 table unmoved. Measured with a throwaway counter printed at the last pass, the busiest
-fixture spends **239** of `TK_MAXXT` (`surface_nullable_ops`) and **28** of `TK_MAXFS`
+fixture spends **239** of `TK_MAXXT` (`surface_nullable_ops`) and **34** of `TK_MAXFS`
 (`surface_field_store`), so the new ceiling is sixteen times the worst case either table has
 ever seen; the boundary is proved from both sides — 300 reads compile, 4200 are refused with
 the table's own message, the fixed-array road on `TK_MAXXT` and the global one on `TK_MAXFS`.
@@ -2911,7 +2911,68 @@ really has — `null` is silent on it, a reference fits any row — spelled exac
 `tk_check_compat` spells it. No verdict moves: the 63 fixtures and the `null` probes are
 unchanged either way.
 
-**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty-four helpers: the
+**A registration follows the value into the node the tree holds, at the FORWARD static's
+own road too.** `tk_hg_rewrite_index` was one of two functions that build a node and copy it
+into the tree with `node_assign`; the other is `tk_fwd_resolve_static_one` (teko_access.tk),
+which resolves every `T.x` on a type declared BELOW its use — the LOAD, the static call and
+the static property alike — and tagged the node it BUILT. `f64 rate; this.rate = H2.total;`
+with `H2` declared below its reader reached the judge with no type at all and was REFUSED,
+`teko: the type of this value is not known here`, a false refusal over a value this very
+function had just typed (Copilot on #698, pass 11). The registration is MOVED under the
+tree's identity (`tk_xt_move`), the twin of the `tk_os_has(r)` re-mark one line above it and
+the same move `tk_fs_do` and `tk_pend_do` already make. Measured: the store above was
+refused and reads back **5.0**; its mirror (`i64 n; this.n = H2.frate;` on a `static f64`)
+was refused as "not known" and is refused as the NARROWING it is.
+
+**A FIELD of the class being parsed shadows a global array exactly as a local does.** The
+ninth pass closed the LOCAL half of "the rewrite of a global array's reads may not match by
+NAME ALONE"; the same defect lives one scope out. With a global `i64[] src` beside an
+`i64 src` FIELD, `src[0]` in a method was rewritten into a load of the GLOBAL by
+`tk_array_pass`, while the base identifier under that load was rewritten by `tk_this_ident`
+into the FIELD's own load — the array pass runs first (teko.tk's own order) — so the field's
+eight bytes were read as the array's handle: exit **139**, an invalid program that neither
+compiled correctly nor was refused (Copilot on #698, pass 11). The binding is LEXICAL and
+known at PARSE time, so the answer is written where the local's already is, in `tk_bracket`
+(teko_params.tk): inside a member body (`tk_body_class`, teko_this.tk), a bare name the class
+declares is that FIELD — C#'s own rule, and `tk_this_field`'s. A field that IS a `T[]` of
+heap answers there through `tk_ha_index`, exactly as a `T[]` PARAMETER does four lines above,
+so it no longer reads the global by accident and the implicit `xs[0]` has a road even when no
+global of that name exists at all, where it used to be refused; everything else — a scalar,
+an object, a delegate, and an INLINE array field, which is reached through `this.` and
+nowhere else — takes the refusal the local half gives, ``teko: `[` needs an array: src``.
+Measured after: the shadowing program is refused at its own line on the READ, on the WRITE,
+over both kinds of global array and through a parked subtree; the `T[]` field reads the field
+with the global beside it (**7**, as it did) and without it (**7**, where it was refused);
+the same program with no field reads the global (**99**), unmoved. A field declared BELOW the
+method that reads it is NOT closed here and is [not-yet.md](docs/reference/not-yet.md)'s own
+row, measured (exit 139): the parser has not read that field yet, which is the one fact this
+door rests on, and the tables that could answer later are three walks and a parked-row column
+away — the same shape, and the same ruling, the parameter shadow already has.
+
+**A `void` call is no value for a field to take.** An INDIRECT call is a `callp`, which names
+no callee, so mc's core types the node `TY_I64` by itself; the three sites that record the
+declared return (`tk_emit_call`'s vtable branch, `tk_iface_call`, `tk_iface_prop_use`,
+teko_expr.tk) skipped `void` on the grounds that it has "nothing to be asked about" — the
+fourth pass's own wording, above — and that left the core's `TY_I64` standing as the answer
+the oracle gives. `i64 n; this.n = b.M();` on a VIRTUAL `void M()` compiled and stored
+whatever the call had left in the return register (measured: exit **64**), and the INTERFACE
+twin the same. The DIRECT road never had that half — the core refuses `value of type void`
+where it can see one, the very message a local initializer gets — but the judge did not
+refuse it either: `TY_VOID` names no row of the type table, is not a float and is not one of
+`tk_is_int_ty`'s words, so `tk_check_compat` was silent for a field of NUMBER type and only a
+field of REFERENCE type got a verdict. The declared return is registered, `void` included —
+it spends the row a wide scalar return already spends and names no row, exactly as `i64` does
+not — and `tk_fs_do` turns that answer into the refusal, in the wording every mismatched
+value already gets: `teko: a value of type void does not convert to i64`. No new `teko:`
+string. Measured over the six roads of the gate: the virtual and the interface store compiled
+(exit 64 and exit 0, garbage) and are refused; the direct call through `this.`, through a
+deferred receiver, through a `static` field, into an `i64?` box and into an element of a
+`T[]` now carry the same sentence, where four of them used to fall to mc's own wording. What
+this does NOT close is the same `void` reaching another slot: `i64 x = b.M();` on a virtual
+`void M()` still compiles (measured, exit 32) — a local initializer is judged nowhere near
+this gate, and the registration this pass adds is what a crumb of its own would read.
+
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty-six helpers: the
 constructor's explicit `this.rate = k` and the implicit `rate = k`; a method's
 `this.rate = this.rate + 1`; a `static f64` written and read back; a `Cell?` field boxing
 `null` and a live reference; an `enum` field; `this.rate = k + 1` (an N_BINARY); `rate =
@@ -2938,7 +2999,11 @@ global and local, the widening (`f64 gf[2]; gf[0] = 1;`), the compound over its 
 (`gf[0] += 1;`) and an element whose type already matched, which the door has to leave
 exactly as it found it; a global element as the VALUE and as the INDEX of another global's
 write, on both kinds of global array; the same parked subtree on the deferred
-RECEIVER's road (`h.rate = gl[0] + gx[0];` through a parameter); and the three OTHER
+RECEIVER's road (`h.rate = gl[0] + gx[0];` through a parameter); the forward static as the VALUE of a store
+(`this.rate = W3.tally;` on a class declared ABOVE it, whose `i64` widens into the `f64`
+field); the implicit index on a `T[]` FIELD (`xs[0] = 8;`, `xs[0] += 1;` and
+`this.rate = xs[0];`) with this file's own global arrays standing beside it, the object and
+its array released inside the helper so the floor below is unmoved; and the three OTHER
 subtrees that same access parks (helper 23) — the receiver's own index
 (`h.items[gl[1]] = 7;`), the arguments of a member call NESTED in the value
 (`h.rate = 1 + h.mul(gl[1]);`) and an index nested inside the receiver's index
@@ -2963,8 +3028,11 @@ the three parked subtrees it reaches. On `a9e0b0d7` (the eighth head, and the ni
 own "before") it is REFUSED at `h.items[gl[1]] = 7;`, the deferred receiver's own INDEX;
 with that helper neutralised, at the member call NESTED in the value; with that one
 neutralised too, at the index nested inside the receiver's index — the three subtrees of
-helper 23, in the order the file writes them — after which it exits **42**, every other
-verdict of the file unmoved. That every verdict the earlier passes settled is
+helper 23, in the order the file writes them. On `a0b9388c` (the tenth head, and this pass's
+own "before") it is REFUSED at `xs[0] = 8;`, the implicit index on a `T[]` FIELD
+(`teko: not a known array: xs`, helper 25); with that helper neutralised, at
+`this.rate = W3.tally;`, the forward static's LOAD no registration reached (helper 24) —
+after which it exits **42**, every other verdict of the file unmoved. That every verdict the earlier passes settled is
 unmoved is what the 62 byte-identical dumps say, not this file's own exit.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
@@ -2973,7 +3041,8 @@ so helper 3 writes the same shape by hand.
 
 The refusals — narrowing through `this.`, `null` in a non-`T?` field, an `enum` field taking
 a bare integer, a reference/number mismatch through a `static` field and through a parameter
-receiver, and the narrowing a PICK asks for — are `// no-run` samples in
+receiver, the narrowing a PICK asks for, the name that SHADOWS a global array (a local's and
+a field's alike) and the `void` call a field cannot take — are `// no-run` samples in
 [types.md](docs/reference/types.md) and [diagnostics.md](docs/reference/diagnostics.md),
 reusing the wording every mismatched value already gets. Two `teko: ...` strings are new in
 the whole crumb: the deferral table's own ceiling, `teko: too many field stores of unknown
@@ -2983,21 +3052,21 @@ wording every mismatched value already gets.
 
 **Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
 clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of the **62** fixtures that
-predate the crumb, against `da33ebd4` — **62 byte-identical**, re-proved on the ninth head
-against a compiler built from `da33ebd4` itself, since every site this crumb touches only
-changes a program that was previously silently WRONG or wrongly refused;
+predate the crumb, against `da33ebd4` — **62 byte-identical**, re-proved on the ELEVENTH
+head against a compiler built from `da33ebd4` itself, since every site this crumb touches
+only changes a program that was previously silently WRONG or wrongly refused;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (63/63 under the
-self-hosted `teko1`); `sh scripts/check-docs.sh` green (567 links, 387 diagnostics, 121
-samples on the ninth head, the shadowed index being the sample that pass added; the seventh
-pass's own wording said 570 links, over what the script counts on that head and on this one
-alike); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (567 links, 387 diagnostics, 122
+samples on the eleventh head — 121 on the ninth, the `void` store being the sample this pass
+added and the shadowed index the one the ninth did; the seventh pass's own wording said 570
+links, over what the script counts on that head and on this one alike); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
 — `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new
 pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that moves,
 **467824 → 1114992** bytes used against a 33554432-byte reservation (measured in a clean
 `build/`; the floor leg's heap figure follows the state of `build/` and is not a gate — an
 independent run over a used `build/` reads 721776 on both sides), which is the two tables
-raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the ninth pass:
-`a7a71e9d612096bdde88457911dbc05c5e27f857547449cbfb0baf392587c9e3`.
+raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the eleventh pass:
+`d054f989225ce29724ca6bfa3989a5b23deb1c55956f7d9544e8ff5d21b501f1`.
 
 **What the element's own type bought for free.** With every array element load carrying
 its type (`tk_ha_load`, `tk_arr_index_of`, `tk_array_index`, the fixed-global rewrite), the
@@ -3014,7 +3083,10 @@ than a silent store, it also proves that no store is ACCEPTED with `-1`: every f
 compiles and none of them trips the refusal. The `TK_MAXXT` and `TK_MAXFS` figures quoted
 above are a throwaway counter printed at the LAST pass, `tk_rc_pass`, on both of its exits —
 the two tables are per unit and never reset, so their final value is the unit's cost — run
-over all 63 fixtures; the 253-call ceiling of the fifth pass, and the 2000 beside it, are
+over all 63 fixtures, and re-run on the eleventh head: `TK_MAXXT`'s worst is **239**, the
+same fixture and the same figure the fifth pass measured (a `void` indirect return spends a
+row, and the busiest fixture writes none), and `TK_MAXFS`' worst is **34**, up from 28 with
+the two helpers this pass added to `surface_field_store`; the 253-call ceiling of the fifth pass, and the 2000 beside it, are
 bisections, the constant lowered and every fixture recompiled until one trips. Probe matrices
 outside `tests/` (not committed) measured each defect above before its fix and its absence
 after, and the two capacity boundaries from both sides: 300 scalar reads compile, 4200 are
