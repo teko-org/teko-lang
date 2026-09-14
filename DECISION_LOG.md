@@ -6319,7 +6319,7 @@ every counted table exactly where `95e157cb` left it (`passes` 15/30, `syntax` 1
 `014f902503d1510e450ba4422be5b5a5d76bd58c73b678e98ed1b5e843c6106d` on `95e157cb`:
 `teko_expr.tk` is a listed file, so the hash moves by design.
 
-### D69 · Two capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256 (2026-09-14)
+### D69 · Five capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256, `TK_MAXEMIT` 512 -> 4096, `TK_MAXMETHOD` 128 -> 1024 (2026-09-14)
 
 (D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
 takes the next free number, D69.)
@@ -6355,7 +6355,7 @@ table that never shrinks. Raised to 4096.
 `globals` counts DECLARATIONS (one per `i64 x[N];`, whatever `N` is), so raising a
 `#define`'s numeric literal moves it not at all -- the ten arrays above and `os_node` are
 still ten and one top-level globals, respectively, before and after. The real cost is the
-STATIC storage the two ceilings' arrays reserve in `build/teko`'s own BSS, which is what
+STATIC storage the first two ceilings' arrays reserve in `build/teko`'s own BSS, which is what
 `heap`'s `used` column picks up: +30720 B on the compiler's own leg (10 x 8 B x 224 for
 `TK_MAXFWD`'s growth, 1 x 8 B x 3968 for `TK_MAXOS`'s, plus a few bytes of comment text the
 pre-scan counts), +24576 B on the `hello.tk` leg (the SAME arrays, now compiled into the

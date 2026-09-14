@@ -1540,7 +1540,7 @@ truncation; the fix is to split the unit.
 
 | message | limit |
 |---|---|
-| `"teko: too many type declarations"` | 256 structs, classes and interfaces in one source (D69; was 32, raised to match `TK_MAXFWD`) |
+| `"teko: too many type declarations"` | 256 rows of the shared type table in one unit (D69; was 32, raised to match `TK_MAXFWD`): every struct, class, interface, enum and delegate declared takes one, and so does every distinct `T[]` (`tk_ha_row`) and `T?` (`tk_nl_row`) the unit spells, so the ceiling can be reached with fewer than 256 declarations |
 | `"teko: too many fields"` | 256 fields, summed |
 | `"teko: too many methods"` | 1024 methods, summed (D69; was 128) |
 | `"teko: too many virtual slots"` | 128 slots, summed |
