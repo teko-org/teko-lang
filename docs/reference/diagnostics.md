@@ -1035,7 +1035,10 @@ refused in the wording every mismatched value gets. mc's core already refuses a 
 it can see one (`value of type void`, its own message, the one a local initializer gets),
 but a VIRTUAL or an INTERFACE call is indirect and the core types every indirect call `i64`
 by itself — so the declared return, `void` included, is what the compiler records and what
-the store is judged against.
+the store is judged against. The verdict does not depend on WHEN the store learns it: on a
+receiver the parser already types (`B b = d; h.n = b.M();`) the answer is there at the store
+site itself, on a receiver only the pass types it arrives at the judgement, and one function
+answers for both.
 
 ```teko
 // no-run

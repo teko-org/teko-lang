@@ -553,6 +553,28 @@ i64  fst_done_at(i64 i) { return ld64(fst_done + i * 8); }
 // and nothing here knows which link it is.
 i64 tk_nd_moved(i64 n);
 
+// `void` is no value, and a store refuses it wherever it LEARNS it -- at the
+// door below and at the judge further down, which is the whole of the rule.
+// The eleventh pass made the three indirect sites register their declared
+// return, `void` included (teko_expr.tk), so that the judge could refuse it --
+// but a receiver the PARSER types registers that answer at PARSE time, where
+// the door reads it as a type it KNOWS and never defers. `TY_VOID` names no
+// row, is not a float and is not one of `tk_is_int_ty`'s words, so
+// `tk_check_scalar_compat` had no clause to answer with and a field of NUMBER
+// type took the return register's leftovers: measured on `fd05b9b8`,
+// `i64 n; v.n = b.M();` on a VIRTUAL `void M()` through a LOCAL receiver
+// compiled and exited 32, and the INTERFACE twin the same, while the same
+// store on a receiver only the pass types was refused (Copilot on #698, pass
+// 12). One function, called from both, is what makes the two roads one
+// verdict, in the wording every mismatched value already gets.
+void tk_fs_void_check(i64 fty, i64 vty, i64 line, uptr fl) {
+    if (vty != TY_VOID) return;
+    uptr fname = type_name(fty);
+    i64 fi = tk_struct_by_ty(fty);
+    if (fi >= 0) fname = sr_name_at(fi);
+    tk_reject_compat(type_name(TY_VOID), fname, line, fl);
+}
+
 i64 tk_fs_defer(i64 fty, i64 v, i64 line, uptr fl) {
     if (v == 0) return v;
     if (tk_nfs == TK_MAXFS) err_at(fl, line, "teko: too many field stores of unknown type");
@@ -655,6 +677,7 @@ i64 tk_fs_vty(i64 v) {
 i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     i64 vty = tk_fs_vty(v);
     if (vty < 0) return tk_fs_defer(fty, v, line, fl);
+    tk_fs_void_check(fty, vty, line, fl);
     tk_check_scalar_compat(fty, vty, v, line, fl);
     tk_check_field_store(fty, v, line, fl);
     // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,
@@ -753,24 +776,17 @@ void tk_fs_do(i64 i) {
     if (vty < 0)
         err_at(fst_file_at(i), fst_line_at(i), "teko: the type of this value is not known here");
     // ...and a value the pass types `void` is no value at all. The judge below
-    // has no clause for it -- `TY_VOID` names no row, it is not a float and it
-    // is not one of `tk_is_int_ty`'s words, so a field of NUMBER type took it
-    // in silence -- and the core caught only the calls it can see: a DIRECT
-    // `this.rate = v();` is refused by mc's own `value of type void`, while a
-    // VIRTUAL or an INTERFACE one is a `callp` the core types `TY_I64` by
-    // itself, so `i64 n; this.n = b.M();` on a `void M()` compiled and stored
-    // whatever the call had left in the return register (measured: exit 64,
-    // and the interface twin the same; Copilot on #698, pass 11). The three
-    // indirect sites now register their declared return, `void` included
-    // (teko_expr.tk), and this is where that answer becomes the refusal --
-    // in the wording every mismatched value already gets, which a field of
-    // reference type was already getting from `tk_check_compat` below.
-    if (vty == TY_VOID) {
-        uptr fname = type_name(fty);
-        i64 fi2 = tk_struct_by_ty(fty);
-        if (fi2 >= 0) fname = sr_name_at(fi2);
-        tk_reject_compat(type_name(TY_VOID), fname, fst_line_at(i), fst_file_at(i));
-    }
+    // has no clause for it -- and the core catches only the calls it can see: a
+    // DIRECT `this.rate = v();` is refused by mc's own `value of type void`,
+    // while a VIRTUAL or an INTERFACE one is a `callp` the core types `TY_I64`
+    // by itself, so `i64 n; this.n = b.M();` on a `void M()` compiled and
+    // stored whatever the call had left in the return register (measured: exit
+    // 64, and the interface twin the same; Copilot on #698, pass 11). The three
+    // indirect sites register their declared return, `void` included
+    // (teko_expr.tk), and this is one of the two points that turn that answer
+    // into the refusal -- the DOOR is the other (`tk_fs_void_check`, above),
+    // for the same call on a receiver the parser already types.
+    tk_fs_void_check(fty, vty, fst_line_at(i), fst_file_at(i));
     // the SAME judge every other slot of the language uses -- the two scalar
     // verdicts and the row one, in one call -- which is what tells an `enum`,
     // a primitive with members, a raw `uptr` and an unrelated class apart from
