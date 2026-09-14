@@ -10,6 +10,8 @@
 //      free-function overload `apply(Op)` vs `apply(i64)`;
 //   2. `fcheck` -- a class field of delegate type, called where it is read
 //      (`h.cb(2, 3)`), and released along with the object that holds it;
+//      the store is the plain function's own NAME (`h.cb = add;`, D62), the
+//      same wrap the local slot beside it gets;
 //   3. `ncheck` -- `null`, an `N_INT` 0, guarded by an `if`;
 //   4. `geo.use_gop()` -- the same declaration, INSIDE a namespace.
 //   5. `rcheck` -- a delegate whose RETURN is a counted class (`Make`):
@@ -27,10 +29,19 @@
 //      `1.0 + d(2.0)` is 5.0 and not the 3.0 the untyped `callp` left in the
 //      register; the same by `new Scale(dbl)`, from a class field, and in
 //      `f32`, where the value travels in the single-precision half.
+//   7. `dfcheck` -- D62, the three other field-store sites a bare function
+//      name reaches: `this.cb = add;` and the implicit `made = mul;` inside a
+//      CONSTRUCTOR, and a STATIC field (`D62H.scb = add;`). Plus the name that
+//      is NOT a function: `setcb` stores its PARAMETER `p` into the field
+//      while a free function `p` stands right above it, and the call
+//      afterwards proves the parameter is what landed there.
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
 // reference, teko_struct.tk's `tk_is_counted` the only line that changed.
+// `dfcheck` is the one exception and it runs LAST: a STATIC field outlives
+// every scope by definition, so the delegate it holds is still live when the
+// helper returns -- the count is asserted to be exactly that one object.
 //
 // expect-exit: 42
 
@@ -96,11 +107,53 @@ i64 dcheck() {
     return 0;
 }
 
+// D62: the store is the FUNCTION's own name. A local of delegate type held
+// the wrap here (`Op cb = add; h.cb = cb;`) because the field door could not
+// type a bare name at all -- `teko: the type of this value is not known here`
+// on a program the slot one line up accepts.
 i64 fcheck() {
     H h = new H;
-    Op cb = add;
-    h.cb = cb;
+    h.cb = add;
     if (h.cb(2, 3) != 5) return 1;
+    return 0;
+}
+
+// ---- D62: the constructor, the implicit `f = e` and the static field ----
+
+class D62H {
+    public Op cb;
+    public Op made;
+    public static Op scb;
+
+    public D62H() {
+        this.cb = add;                            // teko_this.tk's `tk_this_assign`
+        made = mul;                               // ...and its implicit form
+    }
+}
+
+i64 p(i64 a, i64 b) {                             // a free function named `p`
+    return a + b + 100;
+}
+
+// the name stored here is the PARAMETER `p`, which shadows the function above
+// for the whole body: the judge runs in `tk_deleg_pass`, where the lexical
+// scope answers, and never at the parse-time door, where no table can tell
+// the two apart (D51's own sixth pass, one slot over on an element).
+void setcb(D62H h, Op p) {
+    h.cb = p;
+}
+
+i64 dfcheck() {
+    D62H h = new D62H();
+    if (h.cb(2, 3) != 5) return 1;
+    if (h.made(2, 3) != 6) return 2;
+
+    D62H.scb = add;                               // teko_access.tk's `tk_static_use`
+    Op s = D62H.scb;
+    if (s(2, 3) != 5) return 3;
+
+    setcb(h, mul);
+    if (h.cb(2, 3) != 6) return 4;
     return 0;
 }
 
@@ -228,6 +281,10 @@ i64 main() {
     if (bad != 0) return 90 + bad;
     if (rt_live() != 0) return 100;
     if (cell_dtors != 5) return 110 + cell_dtors;
+
+    bad = dfcheck();
+    if (bad != 0) return 140 + bad;
+    if (rt_live() != 1) return 150;               // the STATIC field's own delegate
 
     return 42;
 }
