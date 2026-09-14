@@ -3038,3 +3038,109 @@ used 154215 -> 154279, `ins` 212326 -> 212446, `funcs` 3137 and `globals` 924 un
 used heap 85187904 -> 85532512 of a 149487616 reserve). `mc pkg hash .` at this pass's own
 code commit:
 `709748245e85b6ca08389ff24e75bbbdf4e13883d59411c484361f08e8d015b1`.
+
+**Copilot finding, sixth pass: the store guessed "function" for a name a PARAMETER
+shadows, kept a ternary at a site that cannot judge its branches, and the escape rule read
+the top of the node and never its arms.** Three findings, each measured on `da33ebd4` (the
+base), on the head of this crumb (`a3a70f66`) and on this fix, mc **0.15.23**,
+macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)`, `Chooser` a `delegate Op Chooser(i64 k)`,
+`held` a local holding a lambda tainted by `use (&acc)` and `other` a plain `Op`:
+
+| probe | `da33ebd4` | `a3a70f66` | now |
+|---|---|---|---|
+| `ops[0] = p` inside `storeParam(Op p)`, under a free `i64 p(i64)` | runs, the FUNCTION's answer | same | runs, the PARAMETER's answer |
+| `ops[0] = c ? chooser(1) : chooser(0)` on a LOCAL `Op[]` | refuses, `teko: Op takes a function, another Op, or null` | same | runs, 42 |
+| `ops[0] = c ? addLater : addOne`, `addLater` declared BELOW | refuses, `teko: unknown function: addLater` | same | runs, 42 |
+| the same ternary on a GLOBAL `Op[]` | runs, 42 (nothing judged it) | runs, 42 | runs, 42 |
+| `g_ops[0] = flag ? held : other` | compiles, the capture outlives `acc` | same | refuses, `teko: a lambda that captures by reference cannot leave its scope` |
+| `g_op = flag ? held : other` | compiles, the same dangling capture | same | refuses, the same words |
+| `return flag ? held : other` from a function answering `Op` | compiles, the same | same | refuses, the same words |
+| `g_op = flag ? new Op(... use (&acc) ...) : other` | compiles, the same | same | refuses, the same words |
+| `Op h = flag ? held : other` (a LOCAL target) | runs, 42 | runs, 42 | runs, 42 |
+
+1. **`decl_find` is not the question a store may ask about a name.** `tk_deleg_store_late`
+   (teko_deleg.tk) settled a bare `N_IDENT` whenever a declaration read SO FAR gave that
+   name a body, and wrapped it as that function. A PARAMETER shadows the function for the
+   whole body, and no table the parser keeps records one: `tk_pty_of` (teko_struct.tk) is a
+   stack of DECLARATIONS, the pass-time scope and the global rows are both empty at parse
+   time, and `decl_find(p_decl_name())` cannot help either -- the enclosing N_FUNC joins the
+   unit only after its own body has been read (`parse_function`, mc's `src/parse.mc`), so
+   its parameter list is unreachable from inside it. `storeParam(Op p) { ops[0] = p; }`
+   written under a free `i64 p(i64)` stored the wrap and called the FUNCTION: not a refusal,
+   a wrong answer, on the base exactly as on the head. The name waits for the walk, where a
+   parameter stands in `tk_ty_scope_var` exactly as a local does. Two lines of guess
+   deleted, and with them the last table in this file that answered about a name from
+   somewhere other than the site.
+2. **A ternary is late exactly when a BRANCH is.** The same guard sent every ternary
+   straight to `tk_deleg_coerce`, which takes it APART -- one coercion per branch, at the
+   parse site, against the two oracles that answer nothing there. A branch calling a LOCAL
+   delegate was refused in the delegate's own mismatch words and a branch naming a function
+   declared BELOW the store died `teko: unknown function: ...`, both legal programs, and
+   both the very shapes the fifth pass had just taught the bare value to wait for. The guard
+   recurses now, so a ternary whose branches the site can type is settled where it stands
+   (the dumps) and one whose branches it cannot waits whole.
+3. **The escape rule owns every shape the validator accepts, and it accepted one it never
+   read.** `tk_lam_escapes` (teko_deleg.tk) answers over a leaf: a call to an allocator
+   whose lambda captured by reference, or a name tainted with one. A ternary is an `N_CALL`
+   named `tk_ternary`, so it asked `tk_lamref_has("tk_ternary")` -- no allocator has that
+   name -- and answered 0 without looking at either arm. EVERY site that reads this rule
+   took the capture unrefused: the global of delegate type (`tk_deleg_assign`), the element
+   of a `T[]` local or global (`tk_ha_index`, `tk_deleg_late_do`), the field and the static
+   field (teko_expr.tk, teko_access.tk) and the `return` (`tk_deleg_return`). One recursion
+   in the one rule fixes all six, which is what makes it the root cause rather than the
+   site the reviewer named; `tk_lam_taint_stmt`'s own propagation follows it for free, so
+   `Op q = c ? held : other;` taints `q` as `Op q = held;` always did. A LOCAL target is
+   still accepted: the scope that owns the capture is the one holding it.
+
+**The suppressed comment is a LIMIT, not a defect, and it is written down instead of
+patched.** `void sink(Op p) { g_op = p; }` called `sink(held)` retains the capture in a
+global after the caller returns, and nothing refuses it. The escape is an intra-function
+taint (D42): the caller's site is an ordinary argument pass, which is how a delegate is
+used at all -- `forEach(xs, new Op((i64 x) use (&sum) => ...))` has the identical shape, and
+a rule that refused the argument would refuse `register(Op cb)` with it. Carrying the
+verdict into the callee needs a qualifier on the parameter's own TYPE, a design and not a
+patch, so it is a row of [not-yet.md](docs/reference/not-yet.md): a by-reference capture
+handed to a parameter that a callee stores in an outliving slot is not caught, the taint
+does not cross a call.
+
+**One dump moves, and it is this pass's own cost, named and measured.**
+`tests/surface_array_heap.tk` writes `ops[0] = add; ops[1] = mul;` into an `Op[]`, the one
+shape in the 62 fixtures of `da33ebd4` that the parse site used to settle and now defers
+(finding 1: nothing at that site can know whether `add` is the function or a parameter).
+The unit has the same **2439** lines and the same multiset of them, and `diff` is a single
+pair of hunks: one contiguous **88**-line block, the eight declarations of the two wraps
+(`Op__thunk_add`, `Op__vt_add`, `Op__release_add`, `Op__new_add`, and `mul`'s four), moves
+from the middle of the unit to its end -- which is where every wrap the store defers has
+been emitted since the third pass (`ops[3] = addLater`, a function declared below, already
+took that path). The fixture is at its `expect-exit` on both sides. The other **61**
+fixtures that existed at `da33ebd4` are byte-identical to that base. The alternative --
+asking, at the parse site, whether the name is a parameter of the enclosing declaration --
+has no table to ask: teko's own parameter readers (`tk_default_param`, teko_default.tk, and
+`tk_params`, teko_class.tk) know each name as they read it, but the one table they fill
+(`tk_hp_*`, teko_struct.tk) keeps `T[]` parameters alone and is reset by the next parameter
+list a LAMBDA in the body opens. Judging where names have types is this crumb's whole rule;
+the moved block is what it costs here.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the nine probes above on the three
+builds, plus the twenty probes of the third, fourth and fifth passes re-run on this build --
+every one at the verdict its own table records; **63/63** fixtures at their `expect-exit`,
+with `tests/surface_globals.tk` (exit 42) gaining section 3e, `delegternarycheck` (the
+ternary at a LOCAL and at a GLOBAL element store, an arm naming a function declared below,
+and the by-reference capture another LOCAL may still hold) and `storeParam` gaining the free
+function `p` its own parameter shadows -- the head of this crumb refuses that section at its
+first store, the base refuses the fixture earlier still. The `--dump-ast` of **61** of the
+62 fixtures that existed at `da33ebd4` byte-identical to that base, the 62nd relocated as
+described above; instrumented, `tk_deleg_late_rest` refusing any store that reaches it
+unjudged, the whole suite and all twenty-nine probes pass -- no deferred store survives the
+walk (and the instrument is not vacuous: with `tk_deleg_late_pend` disabled it fires on
+`tests/surface_globals.tk:183` at once); `sh scripts/bootstrap.sh --os macos --arch aarch64`
+-> `FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green (568 links, 385
+diagnostics -- none added, the escape's own entry now names the ternary -- **122** samples,
+one added); `mc limits . --config mc.macos.toml` measured back-to-back against `a3a70f66`
+from the same clean state, verdict identical on both legs (the compiler leg `ok`, the
+`tests/hello.tk` leg `grew` on the head exactly as here, its heap estimate 16318 against
+464272 used of a 33554432 ceiling): that second leg is BYTE IDENTICAL down to its `heap`,
+and the compiler leg moves by this pass's own source growth (`nodes` used 154279 -> 154307,
+`ins` 212446 -> 212503, `funcs` 3137 and `globals` 924 unchanged, used heap 85532512 ->
+85578928 of a 149553152 reserve). `mc pkg hash .` at this pass's own code commit:
+`eab5530bc2fadc4462fa2b1146a9411a34a85492a053d1d142805fcad0660d0c`.
