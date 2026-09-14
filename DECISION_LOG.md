@@ -4696,7 +4696,16 @@ release; it is its own crumb. Recorded for the user in
 clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **65 passed, 21 refused as
 expected, 0 failed** (was 64/15: `tests/surface_globals_slot.tk` and six under
 `tests/refuse/`, each one measured compiling on the base before it was written down, and the
-surface fixture exiting **11** there -- the first `f64` global read -- against 42 here);
+surface fixture exiting **11** there -- the first `f64` global read -- against 42 here). The
+verifier caught the measurement short on three of the six: a refuse fixture that declares a
+`class` and carries no `#include "../../lib/rt.tk"` never reaches the pass-time refusal on a
+build where it does not fire -- the core answers `call to unknown function` at line 1 for
+the runtime the class needs -- so "accepted on the base" was not actually observed. Every
+refuse fixture that declares a class (eleven, the eight pre-existing ones included) now
+carries the include, its `// expect-refuse-line` moved by one, and the base measurement was
+redone: the six new ones compile there, the fifteen old ones refuse at their new lines
+(`64 passed, 15 refused as expected, 6 failed` with the head's `tests/refuse/` over the base
+build);
 `./build/teko --dump-ast` byte-identical against the base build for every one of the 64
 pre-existing `tests/*.tk`; `sh scripts/bootstrap.sh --os macos --arch aarch64` →
 `FIXPOINT OK`, the judge running over the compiler's own global slots with the new check in
