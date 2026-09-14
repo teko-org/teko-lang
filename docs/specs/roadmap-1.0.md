@@ -55,7 +55,7 @@ Nothing that blocks a 1.0. The list this section used to carry has closed or mov
 | **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool; until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
 | **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | superseded: mc 0.16.0 (M52) shipped the library as `lib/mc/v<ver>/` beside the binary, no `stdlib` package and no include line to change; the release ships that tree with the taught compiler (D64) |
 | the hook API | **stable**: `mc` no longer changes it and works on real core defects only (the owner, 2026-09-08). teko treats the API pinned since 0.15.18 as the surface it builds on, proves every pin raise by the whole recipe (D29, D35, D37), and reports a core defect with a pure-mc reproducer — never a feature request |
-| a minimum `mc` a package declares (`[package].mc`) | landed on mc's side: `mc.toml` declares `mc = "0.16.1"`, a bare minimum (D64) |
+| a minimum `mc` a package declares (`[package].mc`) | landed on mc's side: `mc.toml` declares `mc = "0.17.0"`, a bare minimum that follows the pin (D64, D72) |
 
 Everything teko is, is hooks: fifteen passes, fourteen `syntax` registrations, a
 `source_claim`, an `on_source`, a `syntax_param`, a `syntax_type`. That is why a pin is
