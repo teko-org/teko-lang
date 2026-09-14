@@ -3296,3 +3296,15 @@ line, then the whole diagnostic of one refuse fixture were each corrupted in tur
 alongside — the third mutation (swapping the `teko:` refusal for an unrelated core error,
 `unknown name`) is the harness proving it does not accept ANY build failure as a pass, only
 one whose stderr carries the named diagnostic.
+
+**The second direction, one step later.** `scripts/check-docs.sh` step 4 proves every
+`"teko: …"` literal in the sources is on the diagnostics page; step 4b now proves every
+`// expect-refuse:` message under `tests/refuse/` is composed from a documented literal — the
+longest string literal of the compiler (10+ characters) found inside the message has to be
+on the page, so a fixture whose message drifted from the sources, or a refusal the page never
+names, fails the `docs` gate. The literals are read from `teko*.tk` as whole string tokens,
+never by a length-bounded pattern: a pattern such as `"[^"]{10,}"` skips a short literal and
+then pairs its closing quote with the next literal's opening one, and the composed message
+`"teko: " + name + " is used before it is assigned"` was exactly the case that exposed it.
+Drill: replacing one fixture's message tail with an undocumented word fails the check;
+restored, `docs ok: 569 links, 387 diagnostics, 15 refusals, 122 samples`.

@@ -12,7 +12,8 @@ and the compiler exits 1. A failure at **run time** is a panic with exit 70 and 
 
 The list below is checked against the sources by
 [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh): a message that exists and is
-not documented here fails the `docs` gate. Some messages end mid-sentence in this page
+not documented here fails the `docs` gate, and so does a `// expect-refuse:` message under
+`tests/refuse/` whose fixed text this page does not carry (the check goes both ways). Some messages end mid-sentence in this page
 because the compiler appends a name to them — the quoted part is the fixed text, and the
 entry says what completes it.
 

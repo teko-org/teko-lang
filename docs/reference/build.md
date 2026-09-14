@@ -180,4 +180,4 @@ produced unproven.
 |---|---|
 | the five native legs | each `(os, arch)` pair builds the taught compiler on its own runner, runs every `tests/*.tk` fixture there and refuses every `tests/refuse/*.tk` |
 | the five `fixpoint` legs | the ladder above closes on the same five pairs |
-| `docs` | [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh): links resolve, every `teko` example on this site is compiled **and run**, every `teko: …` message the sources carry is documented in [diagnostics.md](diagnostics.md) |
+| `docs` | [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh): links resolve, every `teko` example on this site is compiled **and run**, every `teko: …` message the sources carry is documented in [diagnostics.md](diagnostics.md) and every `tests/refuse/` message is one of them |
