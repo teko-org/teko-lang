@@ -4839,9 +4839,12 @@ S { Cell c; } S gs;`) survives two unrelated `Cell` allocations still reading it
 struct's, so the reclaim serves it with no line of its own either; a `static` field of struct
 type; `Point? gp2;` at file scope (a struct is a REFERENCE, Q1a, so `T?` over it is a global
 like any other class nullable -- no box); a parameter shadowing the global's name. No refuse
-fixture: `tests/refuse/global_row_mismatch.tk` already fixes the wording for the
-struct-to-struct case (`tk_check_compat` reads the ROW, and a struct row is judged the
-identical way a class row is), so there is no new refusal to add.
+fixture: `tests/refuse/global_row_mismatch.tk` is a class-to-class mismatch (`Cell` into a
+`Box` slot), and it fixes the wording of the ROW case; the struct-to-struct form was measured
+to refuse with the identical message (`teko: a value of type Box does not convert to Point`,
+global and local alike) because `tk_check_compat` reads the row and judges a struct row the
+way it judges a class row -- so a struct-specific refuse fixture would prove nothing the
+class one does not, and none is added.
 
 **Docs.** `docs/reference/types.md` § struct: one paragraph beside the struct-vs-class
 boundary, naming the alias rule explicitly and the initializer refusal (build it in a body).
