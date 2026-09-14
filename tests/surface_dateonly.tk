@@ -1,0 +1,205 @@
+// surface_dateonly.tk -- `DateOnly` as C# spells it
+// (docs/specs/datetime-extras.md, crumb N4a): FOUR bytes holding the day
+// number since 0001-01-01, with the calendar of `lib/time.tk` between the
+// number and every component --
+//
+//   new DateOnly(2024, 2, 29)          the calendar constructor, checked
+//   DateOnly.MinValue / MaxValue       0001-01-01 and 9999-12-31
+//   DateOnly.FromDayNumber(n)          ...and the round trip back, `.DayNumber`
+//   DateOnly.FromDateTime(d)           the date half of a `DateTime`
+//   d.Year d.Month d.Day               the civil components
+//   d.DayOfWeek d.DayOfYear            ...and the two derived ones
+//   d.AddDays d.AddMonths d.AddYears   the three C# has, clamping included
+//   d.CompareTo(e) d.Equals(e)         the two methods
+//   a < b  a == b  ...                 the six comparisons, and NO arithmetic
+//
+// THE FOUR BYTES ARE THE POINT. Every other primitive with members is eight
+// bytes wide, where the compiler's own `(i64) d` and `(DateOnly) r` are no
+// instruction at all; here they are a sign extension and a narrowing store,
+// so the value is walked through EVERY slot it can live in -- a local, a
+// parameter, a return, a field, a global, a fixed array element, a `T[]`
+// element and a closure's captured copy. A width the core got wrong in any one
+// of them reads back as a wrong date here, not as a crash somewhere else.
+//
+// Every number is exact and most only come out right with the real calendar:
+// 2024-02-29 is day 738944, a Thursday, the 60th day of its year; 2024-01-31
+// plus one month is 2024-02-29 (C#'s clamp); 2000-02-29 plus one year is
+// 2001-02-28; and 9999-12-31 is day 3652058.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+class Booking {
+    public DateOnly day;
+    public Booking() { day = DateOnly.MinValue; }
+}
+
+DateOnly g_day;                                     // a global of primitive type
+
+delegate DateOnly DOp();
+
+// the receiver the PARSER cannot type: a parameter, deferred to the oracle's
+// own pass and lowered there against the very same table
+i64 year_of(DateOnly d) { return d.Year; }
+i64 num_of(DateOnly d) { return d.DayNumber; }
+DateOnly tomorrow(DateOnly d) { return d.AddDays(1); }
+void shift(ref DateOnly d, i64 days) { d = d.AddDays(days); }
+void first_of(out DateOnly d, DateOnly src) { d = src.AddDays(0 - src.Day + 1); }
+DateOnly later(DateOnly a, DateOnly b) { return a > b ? a : b; }
+
+i64 main() {
+    // ---- the calendar constructor, exact to the day ----
+    DateOnly leap = new DateOnly(2024, 2, 29);
+    if (leap.DayNumber != 738944) return 1;
+    if (leap.Year != 2024) return 2;
+    if (leap.Month != 2) return 3;
+    if (leap.Day != 29) return 4;
+    if (leap.DayOfWeek != 4) return 5;               // a Thursday, 0 is Sunday
+    if (leap.DayOfYear != 60) return 6;              // 31 + 29
+
+    // ---- the day number round trip ----
+    DateOnly same = DateOnly.FromDayNumber(leap.DayNumber);
+    if (same.DayNumber != 738944) return 7;
+    if (same != leap) return 8;
+    if (DateOnly.FromDayNumber(0).Year != 1) return 9;
+    if (DateOnly.FromDayNumber(0).Day != 1) return 10;
+
+    // ---- the date half of a `DateTime`, time of day and `Kind` dropped ----
+    DateTime moment = new DateTime(2024, 2, 29, 13, 45, 30);
+    DateOnly cut = DateOnly.FromDateTime(moment);
+    if (cut != leap) return 11;
+    DateTime utc = new DateTime(638447616000000000, DateTimeKind.Utc);
+    if (DateOnly.FromDateTime(utc) != leap) return 12;
+
+    // ---- AddDays, across a month and across a year ----
+    DateOnly march = leap.AddDays(1);
+    if (march.Month != 3 || march.Day != 1) return 13;
+    if (march.DayOfYear != 61) return 14;
+    DateOnly newyear = new DateOnly(2023, 12, 31).AddDays(1);
+    if (newyear.Year != 2024 || newyear.Month != 1 || newyear.Day != 1) return 15;
+    if (newyear.DayOfYear != 1) return 16;
+    if (leap.AddDays(0 - 1).Day != 28) return 17;
+    if (leap.AddDays(0).DayNumber != 738944) return 18;
+
+    // ---- AddMonths, with C#'s own clamp, and AddYears ----
+    DateOnly jan31 = new DateOnly(2024, 1, 31);
+    if (jan31.AddMonths(1).Month != 2) return 19;
+    if (jan31.AddMonths(1).Day != 29) return 20;     // clamped, not 31 February
+    if (jan31.AddMonths(12).Year != 2025) return 21;
+    if (jan31.AddMonths(0 - 1).Month != 12) return 22;
+    if (jan31.AddMonths(0 - 1).Year != 2023) return 23;
+    DateOnly feb29 = new DateOnly(2000, 2, 29);
+    if (feb29.AddYears(1).Day != 28) return 24;      // 2001 is no leap year
+    if (feb29.AddYears(1).Month != 2) return 25;
+    if (feb29.AddYears(4).Day != 29) return 26;      // 2004 is
+
+    // ---- the two ends of the range ----
+    DateOnly min = DateOnly.MinValue;
+    DateOnly max = DateOnly.MaxValue;
+    if (min.DayNumber != 0) return 27;
+    if (max.DayNumber != 3652058) return 28;
+    if (min.Year != 1 || min.Month != 1 || min.Day != 1) return 29;
+    if (max.Year != 9999 || max.Month != 12 || max.Day != 31) return 30;
+    if (max.DayNumber - min.DayNumber != 3652058) return 31;   // the C# form
+
+    // ---- the six comparisons, and the two methods ----
+    if (!(leap < march)) return 32;
+    if (!(march > leap)) return 33;
+    if (!(leap <= same)) return 34;
+    if (!(leap >= same)) return 35;
+    if (!(leap == same)) return 36;
+    if (!(leap != march)) return 37;
+    if (leap.CompareTo(march) != 0 - 1) return 38;
+    if (march.CompareTo(leap) != 1) return 39;
+    if (leap.CompareTo(same) != 0) return 40;
+    if (leap.Equals(same) != 1) return 41;
+    if (leap.Equals(march) != 0) return 42;
+
+    // ---- every slot the four bytes travel through ----
+    if (year_of(leap) != 2024) return 43;
+    if (num_of(leap) != 738944) return 44;
+    if (tomorrow(leap).Month != 3) return 45;
+
+    Booking b = new Booking();
+    if (b.day.DayNumber != 0) return 46;
+    b.day = leap;
+    DateOnly fromfield = b.day;
+    if (fromfield.DayNumber != 738944) return 47;
+    if (fromfield.Day != 29) return 48;
+    if (b.day != leap) return 49;
+
+    g_day = leap;
+    DateOnly fromglobal = g_day;
+    if (fromglobal.DayNumber != 738944) return 50;
+    if (fromglobal.Year != 2024) return 51;
+
+    DateOnly table[3];
+    table[0] = leap;
+    table[1] = march;
+    table[2] = max;
+    i64 i = 0;
+    DateOnly e0 = table[i];
+    if (e0.DayNumber != 738944) return 52;
+    if (table[i + 2].DayNumber != 3652058) return 53;
+    if (!(table[i] < table[i + 1])) return 54;
+    if (table[i + 1].DayNumber - table[i].DayNumber != 1) return 55;
+    DateOnly[] heap = new DateOnly[2];
+    heap[0] = leap;
+    heap[1] = max;
+    if (heap[i].Day != 29) return 56;
+    if (heap[i + 1].Year != 9999) return 57;
+    if (!(heap[i] < heap[i + 1])) return 58;
+    if (heap[i].DayNumber != 738944) return 59;
+
+    // ---- `ref`/`out` pointees and the ternary's hidden local ----
+    DateOnly moved = leap;
+    shift(ref moved, 1);
+    if (moved.Month != 3 || moved.Day != 1) return 60;
+    DateOnly first;
+    first_of(out first, leap);
+    if (first.Day != 1 || first.Month != 2) return 61;
+    if (later(leap, march).DayNumber != march.DayNumber) return 62;
+    DateOnly pick = moved > leap ? moved : leap;
+    if (pick.Day != 1) return 63;
+
+    // ---- a loop, one day at a time across the end of a month ----
+    DateOnly walk = new DateOnly(2024, 2, 27);
+    i64 k = 0;
+    while (k < 3) {
+        walk = walk.AddDays(1);
+        k = k + 1;
+    }
+    if (walk.Month != 3 || walk.Day != 1) return 64;
+
+    // ---- a lambda's by-value capture of the four bytes ----
+    DateOnly cap_src = new DateOnly(2024, 2, 29);
+    DOp cap_f = () use (cap_src) => cap_src.AddDays(1);
+    DateOnly cap_r = cap_f();
+    if (cap_r.Month != 3 || cap_r.Day != 1) return 65;
+    if (cap_r.DayNumber != 738945) return 66;
+    cap_src = new DateOnly(2000, 1, 1);              // the copy is frozen
+    cap_r = cap_f();
+    if (cap_r.DayNumber != 738945) return 67;
+
+    // ---- the biggest day number, through every slot that could truncate it
+    DateOnly big = DateOnly.MaxValue;
+    b.day = big;
+    g_day = big;
+    table[0] = big;
+    heap[0] = big;
+    DateOnly cap_big = big;
+    DOp big_f = () use (cap_big) => cap_big;
+    if (b.day.DayNumber != 3652058) return 68;
+    if (g_day.DayNumber != 3652058) return 69;
+    if (table[i].DayNumber != 3652058) return 70;
+    if (heap[i].DayNumber != 3652058) return 71;
+    DateOnly cap_max = big_f();                  // a local: the `.` on a CALL's
+    if (cap_max.DayNumber != 3652058) return 72; // own result is not resolved yet
+                                                 // for ANY primitive (measured on
+                                                 // `DateTime` too, N4a's report)
+    if (num_of(big) != 3652058) return 73;
+    if (later(big, leap).Year != 9999) return 74;
+
+    return 42;
+}
