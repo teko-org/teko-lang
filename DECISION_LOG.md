@@ -5535,6 +5535,6 @@ refusals, 142 samples`; `mc limits` verdict `ok` with `grow` 0 on every row of b
 only the size-of-surface-code rows moved (`nodes` 156558 -> 156693, `funcs` 3182 -> 3185,
 `lowered` 3164 -> 3167, `globals` 943 -> 944 for `dl_val`, `symbols` 6263 -> 6267, `ins`
 216018 -> 216215, identical on both legs; `strings` unmoved at 2138); `mc pkg hash .`
-`3bc7244d46c4a393a4256269b72fbbb3b72bcc8e1fbb2b1636a6c654509ef60d` (base
+`2882e8a61ad6810d07830a0650bb0241a0f20c4132f49937a7dacabdc2bc482c` (base
 `571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
 `teko_typeof.tk` are listed files, so the hash moves by design).

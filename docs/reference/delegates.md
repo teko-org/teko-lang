@@ -100,6 +100,8 @@ i64 main() {
     H h = new H;
     h.cb = f;
     if (h.cb(2, 3) != 5) return 6;               // called where it is read
+    h.cb = mul;                                  // a bare function name into a field (D62)
+    if (h.cb(2, 3) != 6) return 8;
 
     Op? maybe = null;
     if (maybe != null) return 7;
