@@ -19,6 +19,7 @@ looking up a construct must never find a plan described as if it worked.
 | [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation over the `$` token `mc` 0.15.25 lets a module claim |
 | [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **all of it is built** ([nullable.md](../reference/nullable.md), D43/D44/D45/D46); what is left of the page is the lifted `==` (Q4a) |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
+| [tekoc-tool.md](tekoc-tool.md) | `tekoc` — the taught compiler as an installable `mc` tool: two packages, the manifest, the library tree the install stages, the permission set, and the crumbs that land it |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
 ## The order the type work lands in
