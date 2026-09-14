@@ -30,6 +30,46 @@ Anything else is `teko: Op takes a function, another Op, or null`, and a functio
 signature does not match is refused by name. The thunk is generated once per (delegate,
 function) pair.
 
+`Op f = add;` and `Op g = new Op(add);` are the **same** thunk: the contextual form and the
+explicit `new` form share one memoized wrapper per (delegate, function) pair, so the two
+roads accept and refuse exactly the same targets. A parameter the delegate declares
+`ref`/`out` travels through that wrapper as **the caller's own address**, not a copy, and the
+signature has to match on the kind as well as on the type — which is checked once, on the
+target, before any wrapper exists: `void byval(f64 x)` is `teko: byval does not match the
+delegate Mut(ref f64)` (D63). The pointee is any type at all — a scalar, a class, a struct or
+a primitive such as `DateOnly` — and the target may write through the reference (`b.v = 3`) or
+rebind the caller's own slot (`b = new Box(7)`), exactly as a direct call does; a target whose
+pointee is a DIFFERENT type is refused by the same signature check, `teko: fillc does not
+match the delegate Fill(ref Box)`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+delegate void Mut(ref f64 x);
+delegate void Setter(out i64 x);
+
+void bumpf(ref f64 x) { x = x + 1.0; }
+void seti(out i64 x) { x = 7; }
+
+i64 run() {
+    Mut m = new Mut(bumpf);
+    f64 v = 1.0;
+    m(ref v);
+    if (v != 2.0) return 1;
+    Setter s = new Setter(seti);
+    i64 r = 0;
+    s(out r);
+    if (r != 7) return 2;
+    return 0;
+}
+
+i64 main() {
+    if (run() != 0) return 1;
+    return 42;
+}
+```
+
 ### Which function a bare name names
 
 A bare name on a delegate slot is resolved exactly as a **call** to that name would be
@@ -93,6 +133,11 @@ i64 main() {
 
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
 called is a panic with exit 70, never a segfault ([memory.md](memory.md)).
+
+The call's **result carries the delegate's own return type wherever it is read** — an
+initializer, an operand, an argument, and a `.` on it: `DOp f = mk; f().DayNumber` reads
+`DateOnly`'s member, on a local, a parameter, a global slot, a field and a lambda bound to
+a slot alike.
 
 Its arguments are judged and converted exactly as a direct call's are — the count, the
 `ref`/`out` kind, the pointee of a `ref`/`out` one, the type of one passed by value, and
