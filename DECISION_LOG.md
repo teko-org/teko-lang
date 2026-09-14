@@ -7438,3 +7438,162 @@ Two facts recorded for the next raise. The registry refused teko 0.12.4 while it
 move together. And `mc tool install` exists since mc 0.15.21 (M48 C3): `tekoc` as an
 installable tool (`[project] kind = "exe"`, `[package].bin`, `[[permission]]`) is a crumb of its
 own, the last row of `docs/specs/roadmap-1.0.md` § What teko owes.
+
+### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
+> A type teko registers with `type_new` carries whatever its representation needs to **move**: a
+> derived machine table per instruction set, deriving from the table in effect and delegating
+> everything else through a pristine copy. That is not an intrinsic and not a fork of `mc`'s core
+> — `git diff src/` for it is empty, which is the criterion
+> [`mc`'s own guide](https://github.com/minicompiler/mc/blob/main/docs/guide/96-a-new-primitive.md)
+> sets — and the "zero new intrinsics" law does not veto it. What the law still forbids is
+> unchanged and is the whole of it: **no operation of the language surface may be an intrinsic.**
+> Addition, rounding, formatting, parsing and every conversion have surface code in `lib/`, and
+> `mc limits`' `intrin` row does not move. A primitive that cannot be moved without a **new
+> instruction encoding** is still allowed — the encoding is the module's, beside the table — and
+> a primitive that cannot be expressed without changing `mc`'s core is a fork and halts, as D2 says.
+
+That is `docs/specs/decimal.md` § 14, proposed when the page was written and entering the log
+here, with C3 built on it. `docs/specs/surface.md` § "What is 'magic'" carries the amendment;
+D21's own sentence is untouched, and the measurement below is what makes the claim checkable.
+
+**D73 is reserved** by `docs/specs/tekoc-tool.md`'s draft, merged on `main` in #725; this entry
+is D74 so the two do not collide.
+
+#### The five rulings this crumb was dispatched with, and what each became
+
+1. **teko writes its OWN `teko_wide.tk`, keyed by an id SET.** Modelled on `mc`'s bundled
+   `lib/i128.mc` but never on `t == ty_decimal`: `tk_wide_add(ty, ldsym, stsym)` and
+   `tk_wide_is(ty)` are the shape of `iw_is` widened from two ids to a set of four
+   (`TK_MAXWIDE`, `teko: too many wide types`). N3's `Guid`, N5's `DateTimeOffset` and N6's
+   `i128` register their ids into it and get the whole machine with **no machine work at all**.
+   `<i128>` is deliberately NOT included: it reserves the words `i128`/`u128` program-wide,
+   which is N6's surface ahead of N6's crumb.
+
+   The file split that fell out: the machine is `teko_wide.tk` and is generic; `decimal` is
+   `teko_decimal.tk` and is its first client. One file would have been ~560 lines and would have
+   mixed "how sixteen bytes move" with "what a decimal is", and the second module is what makes
+   the next three crumbs one line each.
+
+2. **Movement is BY ADDRESS**, as § 1 mandates, and the justification was re-measured rather
+   than inherited: `mc`'s own `lib/i128.mc` proves a register pair IS writable from outside
+   `src/`, on all three tables, so the choice is not forced. It is made anyway, because a
+   register pair is three ABI implementations (SysV's `rax:rdx`, Win64's hidden reference,
+   AAPCS64's even-numbered pair) and an address is **one rule every machine already
+   implements**. Every handler either delegates in full or rewrites one depth into a pointer and
+   then delegates in full, so the argument counting, the stack area, the shadow space and the
+   float/integer split all stay where `mc` and `<float>` wrote them. teko writes no ABI, and the
+   five-leg matrix is what proves it (`ngen` and `fixpoint`, all five, green on the first push).
+
+3. **The `mc limits` gate.** `mc limits . --config mc.macos.toml`, tolerance 1.0, the high-water
+   column, base `9ded80ec` → this crumb: `intrin` **8 → 8 (unmoved, the law's own row)**,
+   `passes` **15 → 15 (unmoved)**, `syntax` **15 → 15 (unmoved** — `syntax_lit` is not counted
+   there, and no `syntax_expr("decimal")`/`syntax_stmt("decimal")` is registered: those are what
+   a RECEIVER form needs and C5 is where they are spent**)**, `types` **13 → 14 (+1, the
+   `decimal` row)**, `alias` **20 → 21 (+1**, a side effect of `type_new` reserving the word,
+   not a second registration**)**. Verdict `ok` on both sides; **no new `grew` row**. The three
+   derived tables add **no row at all** — a derived table shadows the name it registers and
+   consumes no `machines` slot. `docs/specs/decimal.md` § 10 carries the same table; the `heap`
+   column is not read (D-entries do not quote it).
+
+4. **The field and the array-element roads.** The ruling allowed them to stay explicit
+   (`tk_dec_ld`/`tk_dec_st`) unless they fell out of the machine handlers for free, and asked
+   for a measurement. **They did not fall out, and leaving them would have been a silent wrong
+   answer.** Measured on this branch before the fix: `decimal arr[3]; arr[1] = 1.5m;` compiled
+   and emitted `str x10, [x9]` — teko lowers **every** indirect access to a raw `ldW`/`stW`
+   picked by WIDTH (`tk_ldn`/`tk_stn`, `teko_struct.tk`, the one table a field, an array
+   element, a `ref`/`out` pointee, a closure capture and a property all go through), and sixteen
+   is a width no machine has, so eight bytes of the literal's ADDRESS were written where sixteen
+   bytes of its value belonged.
+
+   The root cause is that one table, so that is where it is fixed: a wide type carries its own
+   two lowering symbols in the set and `tk_ldn`/`tk_stn` answer with them. `MTASK_LOAD` and
+   `MTASK_STORE` are registered as well, as the backstop for any road that reaches the machine
+   directly. Measured after: a fixed global array, a fixed local array, a `decimal[]` of heap, a
+   `class` field and a `struct` field all move sixteen bytes and leave their neighbour fields
+   intact. `&a[i]` is refused for every element type in teko and always was, which is why the
+   explicit helpers stay in `lib/decimal.tk` and are what the fixture uses over a raw `ptr`.
+
+5. **This entry is D74**, after D72, with D73 reserved (above).
+
+#### What is built
+
+`teko_wide.tk` — the wide id set, one sixteen-byte frame slot per wide depth, and three tables
+derived over `arm64`, `x86_64` and `x86_64-win` (Windows on aarch64 uses the `arm64` table, so
+three cover all five legs), copied from `machine_tab(...)` **after** `tk_float_init()` has run so
+a float operation still reaches `<float>`'s handler through the pristine copy. Seventeen slots:
+`PROLOGUE`, `PARAM`, `PARAM_REG`, `LOAD`, `STORE`, `LOCAL_LOAD`, `LOCAL_STORE`, `GLOBAL_LOAD`,
+`GLOBAL_STORE`, `CALL`, `CALLP`, `RET`, and the five guards `BIN`/`CMP`/`UN`/`CAST`/`CONST`.
+**No `MTASK_ENCODE`, no `INS_SIZE`, no `DUMP`, no `RELOC_KIND`**: this module emits no opcode the
+base machine did not already encode, and `--dump-asm` needs no new mnemonic.
+
+The per-instruction-set part is **four answers**, written by each prologue: the pristine table in
+force, the frame base register, the transfer and address scratch registers, and how one word is
+loaded and stored. Every handler is written once over them. The address of a frame slot is
+`MTASK_LOCAL_ADDR`'s and the address of a global is `MTASK_SYM_ADDR`'s, both delegated, so no
+`adrp`, no `lea [rip + disp32]` and no relocation shape appears in this module.
+
+The return buffer is `tk_dec_retbuf`, a global of the **program**, declared in `lib/decimal.tk`.
+It could not be a module-private global of the compiler (a machine emits code for the program,
+not for itself) and it could not be a frame slot of the returning function (gone at the
+epilogue; reading it after the return is a red-zone read this compiler is not entitled to on
+AArch64 or on Win64). The machine finds it with `global_find` + `glb_sym`, and a program that
+returns a `decimal` without the include is told so by name. One buffer is safe under recursion
+and under nesting because the call site copies out **immediately** after the branch, before any
+other instruction the handler emits — a rule of one handler, in one place, with a recursive
+fixture and a two-wide-returns-in-one-expression fixture as its oracles.
+
+`teko_decimal.tk` — `type_new("decimal", 16, 16, TK_WIDE)`, `tk_wide_add`, and the literal
+`<digits>[.<digits>][e[+|-]<digits>](m|M)` through `syntax_lit`, becoming a module-private
+global with an `N_BLOB` initializer and an `N_IDENT` naming it (the `$tk_dec_N` gensym carries a
+`$` the lexer never forms into an identifier). The digits go into four 32-bit limbs most
+significant first; a carry out of the top limb is remembered, so `1e40m` is refused rather than
+wrapped. Two refusals of its own: `teko: decimal literal out of range` and
+`teko: a decimal carries at most 28 decimal places`.
+
+**The registration order is load-bearing, in both directions**, and `teko_init()` says so at
+both call sites: `tk_dec_init()` runs **before** `tk_float_init()`, because `syntax_lit` handlers
+run in registration order and the first non-zero node wins — registered the other way round,
+`<float>`'s `fl_lit` reads `1.5` and stops before the `m`, and `1.5m` silently becomes an `f64`
+followed by a stray identifier. `tk_wide_init()` runs **after** it, because a derived table has
+to copy the table `<float>` left in place and not the one underneath it.
+`tests/primitives_decimal_order.tk` puts `0.5m` and `0.5` in one program and is the oracle for
+the first; the five-leg matrix is the oracle for the second. One consequence worth recording:
+`decimal` now takes the type id `f64` used to have, and every id after it shifts by one. Nothing
+in this repository keys on an id's numeric value, and all 169 fixtures agree.
+
+#### What refuses, and why almost nothing new was written
+
+`decimal` is registered with `tk_prim_type` — the primitive-member mechanism `TimeSpan` and
+`DateTime` already ride — with an **empty** member table. A primitive with no rows converts to
+nothing but itself, claims no operator and answers every member by name, so one registration
+buys the whole of § 4 with wordings this compiler already had: `` no operator `+` takes these
+operands `` for the arithmetic and the six comparisons, `a value of type decimal does not
+convert to i64` and its mirror, `unknown member of decimal` and its static twin,
+`const requires a constant expression` for `const decimal`, and
+`a case label must be a constant expression` for a `decimal` `case`.
+
+**Two refusals are new.** `teko: a decimal does not cast yet` — `tk_prim_cast_check` names the
+type's reader and its constructor, and `decimal` has neither yet, so a primitive registered with
+a null reader gets the short form instead of a message pointing at members that do not exist.
+`` teko: an `extern` takes no decimal `` — refused at the DECLARATION (`tk_ov_extern_wide`,
+`teko_over.tk`, on the top-level walk that already visits every `N_EXTERN`), because the
+sixteen-byte convention is teko's own and no C ABI shares it: without this the call would
+compile, link and hand libc an address where sixteen bytes were expected.
+
+**Five more are guards on the machine** and are unreachable from the surface —
+`arithmetic`/`a comparison`/`a unary operator`/`a cast`/`a constant`
+`is not defined on a sixteen-byte value yet`, plus
+`teko: a sixteen-byte value in an allocatable register` for `MTASK_PARAM_REG` under `--opt=1`.
+They exist so that a hole in the reasoning above is a message rather than eight bytes moved
+where sixteen were meant. All of them are in `docs/reference/diagnostics.md`.
+
+#### The gate, as run
+
+`mc build . --config mc.macos.toml` clean on mc 0.17.0;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **78 passed, 91 refused as expected,
+0 failed** (76 + 2 and 84 + 7);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → **FIXPOINT OK** (`--dump-asm` diff empty
+over 234592 lines); `sh scripts/check-docs.sh` → `docs ok`;
+`mc limits` per ruling 3. `--dump-ast` of all **169** fixtures against a compiler built from
+`origin/main` (`9ded80ec`): **160 byte-identical, 9 differing, and the 9 are this crumb's own
+new fixtures** — which the base compiler cannot compile at all, since it has no `decimal`.

@@ -1,8 +1,11 @@
 # `decimal`
 
-**Designed, not built.** Nothing on this page compiles today; every sample carries
-`// no-run` for that reason. What runs is [the type reference](../reference/types.md), and
-this page is kept apart from it on purpose ([the specs index](README.md)).
+**C3 is built (D74); the rest is designed, not built.** The sixteen-byte value, its
+literal and its movement compile today and are documented where a reader looks for them,
+[the type reference](../reference/types.md#decimal); everything past § 4 — the
+arithmetic, the conversions, the members and the text — does not, and the
+samples below carry `// no-run` for that reason ([the specs index](README.md),
+[not-yet.md](../reference/not-yet.md)).
 
 `decimal` is C#'s, exactly ([the surface policy](surface.md), rule 1): 128 bits, a 96-bit
 mantissa, a scale of 0 to 28, a sign, **exact base-ten arithmetic**, and an overflow that
@@ -44,8 +47,7 @@ and never a `cmp`.
 allocation** ([types.md](../reference/types.md) § `struct`): a `decimal` field would be a
 reference to sixteen bytes on the arena, copied by aliasing rather than by value, and every
 `decimal` in a loop would be a block to reclaim. C# gives it value semantics and no heap,
-`type_new` is the mechanism that gives exactly that, and the decision § 14 proposes — a proposal until it enters the log — would be the ruling that
-lets teko use it.
+`type_new` is the mechanism that gives exactly that, and D74 (§ 14) is the ruling that lets teko use it.
 
 ### How sixteen bytes travel
 
@@ -57,8 +59,8 @@ legs:
 |---|---|
 | a local, a global, a parameter | sixteen bytes of frame or of `__data`, sized by the registry from `type_width`; the machine copies them two words at a time |
 | an argument | the caller materialises the address of the value's slot into the argument's depth and lets the **underlying machine's own ABI** place that pointer, exactly as it places any `uptr` |
-| a return | the callee copies its sixteen bytes into one module-private global and returns **its address**; the call site copies them out into the call depth's slot before anything else runs |
-| a field, an array element | two `ld64`/`st64` pairs, written in ordinary teko: `tk_dec_ld(ptr)` and `tk_dec_st(ptr, decimal)` in `lib/decimal.tk` |
+| a return | the callee copies its sixteen bytes into one global and returns **its address**; the call site copies them out into the call depth's slot before anything else runs. **As built** that global is `tk_dec_retbuf` in `lib/decimal.tk` and belongs to the PROGRAM, not to the module: a machine emits code for the program, and a frame slot of the returning function is gone the moment its epilogue runs |
+| a field, an array element | two `ld64`/`st64` pairs, written in ordinary teko: `tk_dec_ld(ptr)` and `tk_dec_st(ptr, decimal)` in `lib/decimal.tk`. **As built** they are also what `tk_ldn`/`tk_stn` (`teko_struct.tk`) lower every INDIRECT access of a wide type to, so `a[i] = d`, `p.f = d` and their reads move all sixteen bytes with nothing written at the surface — teko picks a raw `ldW`/`stW` by width everywhere else, and sixteen is a width no machine has |
 
 The consequences are worth naming, because they are why this shape was chosen over the
 register pair `<i128>` uses:
@@ -96,12 +98,21 @@ and no `MTASK_RELOC_KIND`, and `--dump-asm` needs no new mnemonic.
 | `MTASK_PARAM` | delegate the incoming pointer as a `uptr` into a scratch slot, then copy sixteen bytes from it into the parameter's slot | delegate |
 | `MTASK_CALL` | for each wide argument depth, materialise its slot address into that depth's register; delegate; if the result is wide, copy sixteen bytes from the returned pointer into the depth's slot | delegate |
 | `MTASK_RET` | copy the depth's sixteen bytes into `$tk_wide_ret`, put its address in the depth, delegate | delegate |
-| `MTASK_BIN`, `CMP`, `UN`, `CAST`, `CONST` | unreachable: teko lowers every one of them to a call before codegen. A guard that `die`s names the teko refusal it should have been | delegate |
+| `MTASK_LOAD` / `STORE` | copy sixteen bytes through the address the core computed — a field, an array element (**as built**) | delegate |
+| `MTASK_CALLP` | the same argument rewrite as `MTASK_CALL`; no cast names a wide type, so an indirect call never RETURNS one (**as built**) | delegate |
+| `MTASK_PARAM_REG` | `die`: a sixteen-byte value is never allocated to a register. Owed because `MTASK_PARAM` is overridden, contract version 5 (**as built**) | delegate |
+| `MTASK_BIN`, `CMP`, `UN`, `CAST`, `CONST` | unreachable: teko refuses every one of them at the surface, with a line and a name. A guard that `die`s names the teko refusal it should have been | delegate |
 
-The per-instruction-set part is two functions — "copy sixteen bytes from `base+off` to
-`base2+off2`" — `I_LDR`/`I_STR` on AArch64 and `X_LD64`/`X_ST64` on x86-64, both already
-defined by the bundled machines this compiler links (`<mc/core_machines>`), the way
-`lib/machine_x86_64_float.mc` reaches `X_LD64` and `XR_RBP` today. **The x86-64 encoding
+The per-instruction-set part is **four answers**, and every handler above is written once
+over them (as built): which pristine table is in force, which register is the frame base,
+which two are free as scratch, and how ONE word is loaded and stored —
+`I_LDR`/`I_STR` on AArch64 and `X_LD64`/`X_ST64` on x86-64, both already defined by the
+bundled machines this compiler links, the way `lib/machine_x86_64_float.mc` reaches
+`X_LD64` and `XR_RBP` today. Each of the three prologues writes the four, exactly as
+`<i128>`'s `xw_cur` is written by its own two. Everything else is asked of the machine
+itself — `MTASK_LOCAL_ADDR` for the address of a slot, `MTASK_SYM_ADDR` for the
+address of a global — so no `adrp`, no `lea [rip + disp32]` and no relocation
+shape appears in this module at all. **The x86-64 encoding
 list this design needs is empty.** The list the optional accelerator would need is in
 § 11.
 
@@ -300,19 +311,25 @@ About 900 lines of ordinary teko, all of it listed in
 
 ## 10. What it costs in `mc limits`
 
-Measured on `6b868f0c` with `mc limits . --config teko.toml` (tolerance 1.0):
-`types 7/14`, `intrin 8/16`, `passes 15/30`, `syntax 14/28`, verdict `ok`.
+**Measured for C3**, `mc limits . --config mc.macos.toml` on the crumb's own base
+(`9ded80ec`) and on the crumb, tolerance 1.0. The column read is the high-water usage; the
+verdict is `ok` on both sides.
 
-| row | today | after | why |
+| row | before | after | why |
 |---|---|---|---|
-| `types` | 7 | **10** | with the two of [datetime.md](datetime.md); `decimal` is one of them |
-| `intrin` | 8 | **8** | teko still registers none: the halves are reached with `&`, `ld64` and `st64` |
-| `passes` | 15 | **15** | the operator and member lowerings ride passes that exist |
-| `syntax` | 14 | **17** | one `syntax_expr` per type word, `decimal` included |
-| `nodes`, `funcs`, `globals`, `heap` | — | up | about 900 lines of library and 400 of module; every `decimal` literal in a program is one more global |
+| `types` | 13 | **14** | the `decimal` row of the registry |
+| `alias` | 20 | **21** | `type_new` reserves the word, which is one alias row — a side effect of the registration and not a second registration |
+| `syntax` | 15 | **15** | **unmoved**: `syntax_lit` is not counted here, and C3 registers no `syntax_expr("decimal")` and no `syntax_stmt("decimal")` — those are what a RECEIVER (`decimal.Round(d)`) needs, and C5 is where they are spent |
+| `intrin` | 8 | **8** | **unmoved**, and the law's own row: the halves are reached with `&`, `ld64` and `st64`, all three already on the closed list |
+| `passes` | 15 | **15** | **unmoved**: the refusals ride `teko_ops.tk`'s and `teko_typeof.tk`'s existing passes |
+| every other row | — | unmoved | |
+
+What C4 and C5 add on top of this is still an estimate: `syntax` +2 for the receiver form,
+and `nodes`/`funcs`/`globals` up by about 900 lines of library. Every `decimal` literal in a
+program is one more global.
 
 The machine module adds **no** row: a derived table shadows the name it registers and does
-not consume a `machines` slot.
+not consume a `machines` slot. Three tables, zero rows.
 
 ## 11. Fixtures
 
@@ -332,19 +349,32 @@ not consume a `machines` slot.
 They follow [datetime.md](datetime.md)'s C1 and C2, because C1 carries the primitive-member
 mechanism all of these read.
 
-### C3 — the sixteen-byte value (M)
+### C3 — the sixteen-byte value (M) — **LANDED, D74**
 
-`teko_wide.tk` (the three derived tables), `type_new("decimal", 16, 16, TK_WIDE)`, the
-literal, and the two copy helpers. **No arithmetic**: the fixture moves values and reads
-their bytes.
+`teko_wide.tk` (the three derived tables and the wide id SET), `teko_decimal.tk`
+(`type_new("decimal", 16, 16, TK_WIDE)` and the literal) and `lib/decimal.tk` (the two copy
+helpers and the return buffer). **No arithmetic**: the fixtures move values and read their
+bytes.
 
-**Gate:** `tests/primitives_decimal_value.tk` at `42` **on all five legs** — this is the
-one crumb whose CI matrix is the proof, because three machine tables are being derived —
-the other fixtures unchanged with `--dump-ast` byte-identical, `FIXPOINT OK`, `mc limits`
-verdict `ok` with `intrin` and `passes` unmoved. **Owes:** a `decimal` section in
-[types.md](../reference/types.md), the literal in the lexical part of the guide, the new
-module in [modules.md](../internals/modules.md), and the amendment § 14 proposes to
-[surface.md](surface.md) § "What is 'magic'".
+Three things the design did not foresee, all recorded in D74:
+
+- the module is **two** files, not one — the machine is generic over a wide id
+  SET and `decimal` is its first client, so `Guid`, `DateTimeOffset` and `i128` cost one
+  line each and no machine work;
+- `MTASK_LOAD`/`MTASK_STORE` and `tk_ldn`/`tk_stn` were needed for the field and array
+  roads: teko lowers every indirect access to a raw `ldW`/`stW` picked by WIDTH, which for
+  sixteen bytes moves half the value in silence. It is fixed at that one table, so a fixed
+  array, a heap array, a class field and a struct field are all correct;
+- `` teko: an `extern` takes no decimal `` is refused at the DECLARATION (§ 4's row),
+  because the sixteen-byte convention is teko's own and the two sides would otherwise
+  disagree at run time rather than at compile time.
+
+**Gate, as run:** `tests/primitives_decimal_value.tk` and
+`tests/primitives_decimal_order.tk` at `42` and seven refusal fixtures, **on all five
+legs** — this is the one crumb whose CI matrix is the proof, because three
+machine tables are derived — every other fixture unchanged with `--dump-ast`
+byte-identical (160 of 169, the nine that differ being this crumb's own), `FIXPOINT OK`,
+`mc limits` verdict `ok` with `intrin`, `passes` and `syntax` unmoved.
 
 ### C4 — the arithmetic (L)
 
@@ -380,14 +410,14 @@ first row of § 13.
 | tension | recommended resolution |
 |---|---|
 | **The owner's ruling anticipated an `i128` on x86-64 as a dependency.** `mc`'s `<i128>` is AArch64 only, so teko would carry its own. | **The dependency dissolves.** With the arithmetic written in surface teko over 32-bit limbs (§ 8) and the value moved by address (§ 1), nothing in this design needs a 128-bit instruction on any leg — correctness lands on all five legs at once, and the native instructions become C7, a measurable speed crumb. The ruling stands where it matters: a primitive **may** use the ISA, and § 14 records it. Whether the accelerator is teko's own module or a contribution of an x86-64 half to `mc`'s `<i128>` is a question for the `mc` channel and blocks nothing. |
-| **"Zero new intrinsics" against a machine primitive.** [surface.md](surface.md) states that teko registers no intrinsic and that the closed list is exactly what `mc` gives. | **§ 14**, below, and an amendment to that page in C3. The list stays closed as written: this design registers **no intrinsic at all** — the halves are read with `&`, `ld64` and `st64`, which are already on the list. What § 14 adds is narrower and needs saying anyway: a type registered with `type_new` carries a **machine module for its own value movement**, and a machine table is not an intrinsic and not backend magic — it is where the sixteen bytes of a load are decided, and there is no surface code that could decide them instead. |
+| **"Zero new intrinsics" against a machine primitive.** [surface.md](surface.md) states that teko registers no intrinsic and that the closed list is exactly what `mc` gives. | **D74** (§ 14), and the amendment C3 made to that page. The list stays closed as written: this design registers **no intrinsic at all** — the halves are read with `&`, `ld64` and `st64`, which are already on the list. What § 14 adds is narrower and needs saying anyway: a type registered with `type_new` carries a **machine module for its own value movement**, and a machine table is not an intrinsic and not backend magic — it is where the sixteen bytes of a load are decided, and there is no surface code that could decide them instead. |
 | **Three derived tables are three chances to be wrong on one leg only.** A wrong `MTASK_PARAM` on Win64 is a wrong answer, not a diagnostic. | C3 is gated on the **five-leg matrix**, not on the local recipe, and its fixture reads the raw bytes back through `&` rather than trusting an arithmetic result. `lib/machine_probe.mc`'s trick — a derived machine that asserts the depth-type contract and changes no instruction — is worth one probe in P0. |
 | **The return buffer is one global.** Recursion and nesting depend on the call site copying out immediately. | It is a rule of one handler, in one place, with the recursive fixture as its oracle. The alternative — a return in a register pair — is three ABIs and was rejected for that reason. |
 | **The literal ordering.** If `tk_dec_init()` is ever registered after `tk_float_init()`, `1.5m` silently becomes an `f64` followed by an identifier. | The registration order is asserted by a fixture that puts `0.5m` and `0.5` in the same program and compares neither to the other, and by a comment at the call site in `teko.tk`. |
 | **Rounding rules are two, not one.** The operators round half away from zero; `Round` rounds half to even. | That is C#, and both are fixtures with values that only pass under the right rule (`Round(2.5m) == 2m` for the one, `1m/3m*3m` for the other). If an implementation diverges, the fixture is the oracle and C# is the reference. |
 | **`decimal` has no folded form**, so `const decimal RATE = 0.07m;` cannot work. | Refuse it by name and record the row in [not-yet.md](../reference/not-yet.md). A folded `TK_WIDE` constant would need the core's folder, which is `mc`'s and frozen. |
 
-## 14. The decision this design proposes (numbered when it enters the log)
+## 14. The decision this design proposed, and the log entry it became — **D74**
 
 > **A primitive may be a machine type; the closed list stays closed.**
 > A type teko registers with `type_new` carries whatever its representation needs to

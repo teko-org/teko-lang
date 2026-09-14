@@ -53,6 +53,25 @@ gives**, and teko adds nothing to it:
 **Teko registers no intrinsic of its own.** A feature that seems to need one is a fork: it is
 recorded and asked, never implemented quietly.
 
+**D74 amends this section in exactly one way, and narrows nothing else.** A type teko
+registers with `type_new` may carry a **machine module for its own value movement** — a
+table derived per instruction set, deriving from the table in effect and delegating
+everything else through a pristine copy. `decimal` is the first
+([decimal.md](decimal.md) § 1, [`teko_wide.tk`](../../teko_wide.tk)): sixteen bytes are
+wider than a register, no `ldW`/`stW` moves them, and there is **no surface code that could
+decide a load's width** — that is the one thing a machine table is for. It is not an
+intrinsic and not a fork of `mc`'s core (`git diff src/` for it is empty, which is the
+criterion [`mc`'s own guide](https://github.com/minicompiler/mc/blob/main/docs/guide/96-a-new-primitive.md)
+sets), and the `intrin` row does not move: it is still 8, and all eight are still
+`<float>`'s.
+
+What the law forbids is unchanged and is the whole of it: **no operation of the language
+surface may be an intrinsic.** Addition, rounding, formatting, parsing and every conversion
+have surface code in `lib/`. A primitive that cannot be moved without a **new instruction
+encoding** is still allowed — the encoding is the module's, beside the table — and a
+primitive that cannot be expressed without changing `mc`'s core is a fork and halts, as D2
+says.
+
 The rest — the arena, reference counting, the interface dispatch, the array guard, the
 delegate call, the closure captures, `str` and the `f64` bit pattern — is ordinary teko in
 [`lib/rt.tk`](../../lib/rt.tk), which is why

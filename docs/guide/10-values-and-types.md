@@ -32,6 +32,28 @@ unsigned words and **sign** for `i32`. Every type word is reserved program-wide,
 literals (`2.0`, `0.5f`). A cast between a float and an integer converts the **value**;
 the bit pattern is reached through `tk_f64_bits`/`tk_f64_from_bits`.
 
+## `decimal`
+
+`decimal` is C#'s money type: 128 bits, a 96-bit mantissa, a scale of 0 to 28 and a sign,
+behind an include of its own.
+
+```
+#include "decimal.tk"
+```
+
+Its **literal** is a run of digits with an optional fraction and exponent and an `m` or `M`
+at the end — `1m`, `0.1m`, `19.99M`, `1.5e3m`, `15e-2m` — and the suffix is what tells it
+apart from a float: `0.5` is an `f64` and `0.5m` is a `decimal`, in the same program and
+even in the same expression list. More than 96 bits of mantissa or more than 28 decimal
+places is refused at the literal.
+
+**Today it only moves.** A `decimal` travels through a local, a parameter, a return, a
+global, a field and an array element, and `&d` reads its two halves — and nothing else:
+`a + b`, `a < b`, `(i64) d`, `decimal d = 5;` and `decimal.Round(d)` are all refused by
+name, because the arithmetic, the conversions and the members are the crumbs after this one
+([what is not there yet](99-what-is-not-there-yet.md),
+[the type reference](../reference/types.md#decimal)).
+
 ## Strings and pointers
 
 `str` is a pointer to bytes ending in a NUL — there is no string object and no length

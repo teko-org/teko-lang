@@ -779,6 +779,87 @@ yet.
 
 ---
 
+## `decimal`
+
+Sixteen bytes, sixteen-byte aligned, behind `#include "decimal.tk"`. It is C#'s type, and
+it exists because `0.1 + 0.2 == 0.3` is false in an `f64` and true in a `decimal` — but
+**today it only moves**: C3 ([the specification](../specs/decimal.md) § 12) carries the
+value and its literal, and the arithmetic, the comparisons, the conversions and the members
+are C4 and C5 ([not-yet.md](not-yet.md)).
+
+```teko
+// expect-exit: 42
+#include "decimal.tk"
+
+decimal rate;
+
+decimal echo(decimal d) { return d; }
+
+i64 main() {
+    decimal price = 19.99m;                       // C#'s suffix, `M` too
+    rate = 0.07m;
+    decimal copy = echo(price);                   // a parameter, and a return
+    decimal cells[2];
+    cells[1] = copy;                              // an element, sixteen bytes of it
+    decimal back = cells[1];
+    ptr p = &back;                                // `&` on a local of decimal type
+    if (ld64(p) != 1999) return 1;                // the low 64 bits of the mantissa
+    if (((ld64(p + 8) >> 32) & 0xff) != 2) return 2;   // the scale
+    if (ld64(&rate) != 7) return 3;               // `&` reaches a global's sixteen bytes too
+    return 42;
+}
+```
+
+**The literal** is `<digits>[.<digits>][e[+|-]<digits>]m`, case-insensitive in the suffix:
+`1m`, `0.1m`, `19.99M`, `1.5e3m`, `15e-2m`. It is refused where it is written when the
+mantissa needs more than 96 bits (`teko: decimal literal out of range`) or the scale passes
+28 (`teko: a decimal carries at most 28 decimal places`). The **unary minus** is an
+operator, not part of the literal, so `-3.25m` is refused with the rest of the arithmetic.
+
+**The layout**, which `&d` reads back with two `ld64`s:
+
+| offset | bits | holds |
+|---|---|---|
+| `+0` | 0..63 | the low 64 bits of the 96-bit mantissa |
+| `+8` | 0..31 | the high 32 bits of the mantissa |
+| `+8` | 32..39 | the scale, `0..28` |
+| `+8` | 40..62 | zero |
+| `+8` | 63 | the sign, `1` negative |
+
+The value is `(-1)^sign * mantissa / 10^scale`, so `0m`, `0.00m` and `-0m` are three
+distinct bit patterns that are all equal — C#'s rule, and the reason equality will be a call
+and never a `cmp`.
+
+**It moves by address.** A local, a global, a parameter, a field and an array element are
+all sixteen bytes copied two words at a time; an argument travels as the ADDRESS of the
+value's slot, placed by the underlying machine's own ABI exactly as it places any `uptr`;
+a return goes through one buffer the program declares (`tk_dec_retbuf`, in `decimal.tk`) and
+is copied out at the call site before anything else runs, which is what makes a recursive
+`decimal` function safe. Three derived machines do it — `arm64`, `x86_64`, `x86_64-win` —
+and none of them adds an instruction the base machine did not already encode
+([`teko_wide.tk`](../../teko_wide.tk), D74).
+
+**It is a primitive and not a `struct`**, because a teko `struct` value is a pointer to an
+allocation (§ `struct` above): a `decimal` field would be a reference to sixteen bytes on the
+arena, copied by aliasing rather than by value, and every `decimal` in a loop would be a
+block to reclaim. C# gives it value semantics and no heap.
+
+**What C3 refuses**, every one of them by name and at the line it was written:
+
+| written | message |
+|---|---|
+| `a + b`, `a - b`, `a * b`, `-a`, the six comparisons | ``teko: no operator `+` takes these operands`` |
+| `i64 n = d;` | `teko: a value of type decimal does not convert to i64` |
+| `decimal d = 5;`, `decimal d = 1.5;` | `teko: a value of type i64 does not convert to decimal` |
+| `(i64) d`, `(decimal) x` | `teko: a decimal does not cast yet` |
+| `d.Anything`, `decimal.Anything` | `teko: unknown member of decimal` and its static twin |
+| `const decimal R = 1m;` | `teko: const requires a constant expression` |
+| `case 1m:` | `teko: a case label must be a constant expression` |
+| `extern i64 f(decimal d);` | ``teko: an `extern` takes no decimal`` |
+| `ref decimal` / `out decimal` | `teko: a value of type decimal does not convert to uptr` |
+
+---
+
 ## Members
 
 The same member grammar serves a struct and a class.
