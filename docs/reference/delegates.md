@@ -33,9 +33,10 @@ function) pair.
 `Op f = add;` and `Op g = new Op(add);` are the **same** thunk: the contextual form and the
 explicit `new` form share one memoized wrapper per (delegate, function) pair, so the two
 roads accept and refuse exactly the same targets. A parameter the delegate declares
-`ref`/`out` is forwarded through that wrapper **by kind** — it carries the caller's address,
-not a copy — and the signature has to match on the kind as well as on the type: `void
-byval(f64 x)` is `teko: byval does not match the delegate Mut(ref f64)` (D63).
+`ref`/`out` travels through that wrapper as **the caller's own address**, not a copy, and the
+signature has to match on the kind as well as on the type — which is checked once, on the
+target, before any wrapper exists: `void byval(f64 x)` is `teko: byval does not match the
+delegate Mut(ref f64)` (D63).
 
 ```teko
 // expect-exit: 42

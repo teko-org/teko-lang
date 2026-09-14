@@ -5436,7 +5436,7 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
-### D63 · `new Op(f)` and `Op f = ...` are one thunk, and it forwards `ref`/`out` by kind (2026-09-14)
+### D63 · `new Op(f)` and `Op f = ...` are one thunk, and the `ref` pass does not judge the compiler's own forwarding (2026-09-14)
 `delegate void Mut(ref f64 x); void bumpf(ref f64 x) { x = x + 1.0; }` was accepted through
 `Mut m = bumpf;` and refused through `Mut m = new Mut(bumpf);`, at the `new` line, with
 ``teko: argument 1 needs `ref` at the call site`` — the same for `out`. A FALSE refusal, not
@@ -5452,9 +5452,10 @@ saying it is one, and `tk_ref_check_kind` (`teko_ref.tk`) refuses exactly that. 
 `new` road refused because `new` builds its thunk during the PARSE, so `tk_ref_pass`
 (`teko.tk`, pass 12) walks it; the contextual road builds the identical thunk inside
 `tk_deleg_pass`, which runs AFTER that walk, and nothing looked at it. One road checked, one
-road not — the fix has to make the checked one pass honestly, never make the check skip it.
+road not — and the check being asked of a body no program wrote is itself the defect, which
+is where the second pass below lands.
 
-**Two gates the forwarded argument has to satisfy.** (1) `tk_ref_check_kind` reads the
+**Two gates the forwarded argument has to satisfy, if it is to be judged at all.** (1) `tk_ref_check_kind` reads the
 argument's TAG (`tk_rfarg_kind`), so the argument must be tagged with the delegate's own
 kind. (2) `tk_ref_check_pointee_ty` reads `tk_ref_arg_pointee`, which for an `N_IDENT`
 PREFERS the lexical scope — the right rule for a `ref x` the source wrote, where the tag is
@@ -5462,60 +5463,107 @@ the parser's guess (`tk_slv_find`) and the scope is the truth (higiene 3, item A
 scope holds `a0` under the `uptr` it is declared at, there being no `tk_rp_*` row for it:
 `uptr` against `f64` would be refused in the other words.
 
-**The three seats, measured.**
+**The four seats, measured** (the first three on the first pass, the fourth on the second).
 
 | seat | what it costs | verdict |
 |---|---|---|
-| (i) tag the argument and wrap the name in `(uptr)`, so it is not an `N_IDENT` and the pointee oracle falls to the tag | 12 lines, `teko_deleg.tk` alone | **taken** |
+| (i) tag the argument and wrap the name in `(uptr)`, so it is not an `N_IDENT` and the pointee oracle falls to the tag | 12 lines, `teko_deleg.tk` alone — and one row of `TK_MAXRFARG` per forwarded `ref`/`out` parameter, out of the budget the SOURCE's own arguments draw on | taken on the first pass, **rejected** on the second |
 | (ii) `tk_rp_add` on the thunk's own parameter, so the SCOPE answers the pointee | `tk_ref_walk` then rewrites `a0` into `ld64(a0)` and breaks the forward — needs a guard there — and an `out` thunk trips `tk_ref_check_out_assigned` unless it is also marked seen: two files, three new branches | rejected |
 | (iii) `tk_addr("a0")` — `&a0` | the thunk's OWN slot, not the caller's; the repass road that rewrites `&x` into `x` (`tk_ref_walk`'s `N_ADDR` branch) never fires here, since `a0` carries no `ref` row | rejected, wrong code |
+| (iv) do not judge the thunk at all: `tk_ref_pass` skips a function the delegate table itself names as a forwarder | one column on the memo table `tk_deleg_thunk` already keeps, one predicate, one `&&` in the pass loop — and the forwarded argument goes back to the bare `tk_id(pn)` it always was | **taken**, second pass |
 
-Seat (i) is `tk_deleg_thunk_arg`: a by-value parameter stays the bare name, and a `ref`/`out`
-one becomes `tk_cast(TY_UPTR, tk_id(pn))` tagged `tk_rfarg_tag(a, dg_pk_at, dg_pty_at)`. The
+Seat (i) was `tk_deleg_thunk_arg`: a by-value parameter stayed the bare name, and a `ref`/`out`
+one became `tk_cast(TY_UPTR, tk_id(pn))` tagged `tk_rfarg_tag(a, dg_pk_at, dg_pty_at)`. The
 tag is the DELEGATE's, which is the callee's by then — `tk_deleg_check_sig` has already proved
 kind and type identical parameter by parameter before any thunk exists, which is also why the
-mismatch (`void byval(f64 x)` on a `Mut`) is still refused, at the `new` line, by name.
+mismatch (`void byval(f64 x)` on a `Mut`) is refused, at the `new` line, by name, under every
+seat in the table.
 
-**Is a compiler-written `(uptr)` a cast the program did not write?** D54's own-cast machinery
-(`tk_prim_own_cast`, `teko_prim.tk`) exists for a cast over a PRIMITIVE WITH MEMBERS, the one
-`tk_prim_cast_check` refuses when the source writes it. `uptr` is not one: `tk_prim_is(TY_UPTR)`
-answers 0, so `tk_cast` does not register the node and `tk_prim_cast_check` returns before
-reading it. It is inert downstream too — `tk_rc_call_args` (`teko_rc.tk`) now types the
-argument by the parameter's own POINTEE, which is what `tk_decl_param_ty` already answers, so
-its compatibility check becomes `f64` against `f64` where it used to be `f64` against `uptr`;
-and the tag is what the overload matcher (`tk_ov_match`, `teko_over.tk`) compares, which the
-bare name could never have matched. Eight bytes cast to eight bytes is no instruction: the
-emitted assembly is BYTE-IDENTICAL (below).
+**Copilot finding, second pass: the tag is spent out of the program's own budget.** The
+`rf_*` table (`teko_ref.tk`, `TK_MAXRFARG` 512) is unit-wide and holds one row per `ref`/`out`
+ARGUMENT. Seat (i) put the compiler's own forwarding in it: one row per forwarded parameter,
+`TK_MAXDGI` (64) wrapper pairs × the delegate's arity, against the same 512 rows every
+argument the SOURCE writes draws on. Measured, one generated unit, 30 delegate types of 8
+`ref i64` parameters each (one target function per type, so 30 wrappers = 240 forwarded
+parameters) plus N `src(ref x)` calls, the same text compiled by the base compiler
+(`441be45a`) and by seat (i) (`cd844c2a`):
+
+| N source `ref` arguments | base `441be45a` | seat (i) `cd844c2a` | seat (iv) |
+|---|---|---|---|
+| 272 | accepted | accepted | accepted |
+| 273 | accepted | **refused** | accepted |
+| 500 | accepted | refused | accepted |
+| 512 | accepted | refused | accepted |
+| 513 | refused (the table's real ceiling) | refused | refused |
+
+Seat (i) cost the unit 240 of its 512 rows — code no one wrote — and a legitimate 273rd
+source `ref` argument then died where the base compiler takes 512. Seat (iv) puts the whole
+budget back: 512 on both roads, `new` and contextual alike, which is more than the base
+manages, since the base cannot compile the `new` road at all (that is this decision's own
+bug).
+
+**Why seat (iv) is the root and not a hole punched in a check.** A thunk is not a body the
+program wrote and then had exempted; it is a body the COMPILER wrote, argument by argument,
+out of `dg_pk_at`/`dg_pty_at`, over a target `tk_deleg_check_sig` has already proved identical
+to the delegate parameter by parameter. Correct BY CONSTRUCTION, so there is nothing in it for
+`tk_ref_pass` to verify — and nothing for it to rewrite either: the thunk's own parameters
+carry no `tk_rp_*` row, so both rewriting branches of `tk_ref_walk` were already inert there,
+and `tk_ref_fn_has_refout` is already 0, so the `out` prologue and the never-assigned check
+were already skipped. The walk's ONLY effect inside a thunk was `tk_ref_check_call` asking a
+question about a call the compiler itself had just written, and answering ``argument 1 needs
+`ref` at the call site``. D63's rule, restated: **the `ref` pass does not judge the compiler's
+own forwarding.**
+
+The mark is an IDENTITY, never a name pattern. `tk_deleg_thunk`'s memo table already holds one
+row per (delegate row, function) pair; the forwarder's `N_FUNC` node becomes that row's fourth
+column (`dgi_thunk`), and `tk_deleg_is_thunk(f)` is the one question `tk_ref_pass` asks. D48's
+`tk_emit_owns`/`tk_emit_is` registry could not carry this: it records every GENERATED
+declaration, and a lambda body is generated too while holding the code the program wrote —
+that body keeps every check the same code written inline would get. Reserving the spelling
+`Op__thunk_add` is teko_over.tk's job and a different question.
+
+**A second defect the probe surfaced, fixed here.** `tk_rfarg_tag`'s own overflow guard read
+`err_at(tk_line, tk_file, …)` — the two arguments the wrong way round, where `tk_rp_add`
+fifty lines above spells `err_at(tk_file, tk_line, …)`. A unit that exhausted `TK_MAXRFARG`
+therefore read an integer line number as a file POINTER and died of a segmentation fault
+instead of refusing: measured on the base compiler too (`441be45a`, 513 source `ref`
+arguments, exit 139), so it is older than this decision and reachable from pure source. It now
+refuses, with the file and the line: ``teko: too many `ref`/`out` arguments in one unit``.
+No new message, no new fixture — a 519-line generated fixture would pin the ceiling's exact
+value rather than the guard, and would have to be rewritten the day the table grows.
 
 **Fixtures.** `tests/surface_globals.tk`'s `delegrefcheck` grows four rows: `new Mut(bumpf)`
 and `new MutI(bumpi)` (the two pointees the contextual rows already prove, now on the `new`
 road) and a `Setter`/`seti` pair — `delegate void Setter(out i64 x)`, the first `out` delegate
 any fixture has — on BOTH roads, `return 5` through `return 8`, `expect-exit: 42` unmoved. One
-refusal, `tests/refuse/deleg_new_kind.tk`: `new Mut(byval)` over `void byval(f64 x)` must stay
-refused, `teko: byval does not match the delegate Mut(ref f64)` at the `new` line.
+refusal, `tests/refuse/deleg_new_kind.tk`: `new Mut(byval)` over `void byval(f64 x)` stays
+refused by `tk_deleg_check_sig`, `teko: byval does not match the delegate Mut(ref f64)` at the
+`new` line — untouched by the second pass, which changes nothing about what a target has to
+match.
 
 **Docs.** `docs/reference/delegates.md` states that the contextual form and `new Op(...)` are
-the same memoized thunk and that a `ref`/`out` parameter travels through it by kind, with a
+the same memoized thunk, that a `ref`/`out` parameter travels through it as the caller's own
+address, and that the kind is matched once on the TARGET before any wrapper exists, with a
 runnable sample of `ref` and `out` over `new`. `docs/reference/diagnostics.md`'s delegate-shaped
-bullet now carries `" does not match the delegate "` as a literal on one line (the check-docs
+bullet carries `" does not match the delegate "` as a literal on one line (the check-docs
 refusal gate matches the compiler's own string, and the phrase was split across a line wrap),
-naming the kind as part of what has to match. No new `teko: …` refusal was added.
+naming the kind as part of what has to match. No new `teko: …` refusal was added by either
+pass.
 
 **Proof** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
 clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **73 passed, 51 refused as
 expected, 0 failed** (was 73/50); `--dump-ast` byte-identical against the base compiler for
-**72 of the 73** pre-existing `tests/*.tk`, the one that moves being `tests/surface_globals.tk`
-— the only pre-existing fixture declaring a `ref`/`out` delegate — where the whole diff is
-`CAST type=uptr` above the forwarded `IDENT name=a0` of `Mut__thunk_bumpf` and of
-`MutI__thunk_bumpi`, two hunks, nothing else; `--dump-asm` of that same fixture, base compiler
-against this one, **identical**, which is the cast costing no instruction; `sh
-scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` →
-598 links, 41 fragments, 389 diagnostics, 51 refusals, 142 samples, all green; `mc build .
---config mc.macos.toml --limits` verdict `ok`, every counted table where the base left it
-except the size-of-surface-code rows the one new function moves (`funcs`/`lowered` 3816 →
-3817, `symbols` 7756 → 7757, `nodes` 178817 → 178986 on the compiler leg); `./build/teko
-limits tests/hello.tk` and `./build/teko limits tests/surface_delegate.tk` both byte-identical
-to the base compiler's; `mc pkg hash .`
-`b4a4066c04034e19d357e09d78242edc0c0fbd97564b594cdbf2f9125bdfaebe` (base
-`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` is a
-listed file, so the hash moves by design).
+**all 73** pre-existing `tests/*.tk` — `tests/surface_globals.tk` included, the two
+`CAST type=uptr` hunks seat (i) put above the forwarded `IDENT name=a0` of `Mut__thunk_bumpf`
+and `MutI__thunk_bumpi` being gone, and there is no `CAST` left anywhere in that dump; `sh
+scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (81.9s); `sh
+scripts/check-docs.sh` → 598 links, 41 fragments, 389 diagnostics, 51 refusals, 142 samples,
+all green; `mc build . --config mc.macos.toml --limits` verdict `ok`, every COUNTED table
+exactly where the base left it — `passes` 15/30, `syntax` 15/30, `alias` 20/40, `types` 13/26,
+`intrin` 8/16 — and only the size-of-surface-code rows moved (`funcs`/`lowered` 3816 → 3819,
+`globals` 1272 → 1273, `symbols` 7756 → 7760, `nodes` 178817 → 179140, `ins` 216018 → 216116
+on the compiler leg); `./build/teko limits tests/hello.tk` and `./build/teko limits
+tests/surface_delegate.tk` both byte-identical to the base compiler's; `mc pkg hash .`
+`b3b40c5aa0985d1205838560f11107624da2f78471934ea5afec518185e5dbad` (base
+`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
+`teko_ref.tk` are listed files, so the hash moves by design).
