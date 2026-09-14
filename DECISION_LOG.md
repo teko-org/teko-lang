@@ -3238,3 +3238,76 @@ recursion cost (`nodes` used 154307 -> 154284, `ins` 212503 -> 212458, `funcs` 3
 `globals` 924, `strings` 2096 and `symbols` 6157 unchanged, used heap 85578928 -> 85637664 of
 a 149684224 reserve). `mc pkg hash .` at this pass's own code commit:
 `8f5a5276b4a1544adf52fc42f9e63c19aa9e0db51ae1b9efd5788421cef8155f`.
+
+**Copilot finding, eighth pass: the store's own `null` check answered `yes` for a plain
+`0`, and the walk's own lookup cost a table scan per NODE it visited.** Two findings,
+measured on `da33ebd4` (the base), on the head of this crumb (`fa596667`) and on this fix,
+mc **0.15.23**, macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)`:
+
+| probe | `da33ebd4` | `fa596667` | now |
+|---|---|---|---|
+| `ops[0] = 0;` on a LOCAL `Op[]`, then `ops[0](1)` | `call to unknown function` | `call to unknown function` | refuses, `teko: Op takes a function, another Op, or null` |
+| `ops[0] = null;` on a LOCAL `Op[]` (unaffected) | refuses, `teko: null needs a slot declared Op?` | the same | the same |
+| `g_ops[0] = 0;` on a GLOBAL `Op[]`, no call | `call to unknown function` | `call to unknown function` | refuses, the delegate's own words |
+| `g_op = addOne; g_op = 0;` on a plain GLOBAL `Op` | `unknown name` | `call to unknown function` | refuses, the delegate's own words |
+
+1. **`nd_kind(v) == N_INT && nd_val(v) == 0` is not `null`.** `tk_deleg_store_late` and
+   `tk_deleg_coerce` (teko_deleg.tk) both asked that predicate for "is this value `null`",
+   and an ordinary `i64` literal `0` answers it exactly as `tk_type.tk`'s own `tk_null` does
+   -- the two differ only in `nd_type`, `TY_I64` against the `TY_UPTR` only `tk_null`
+   carries, which neither check read. `ops[0] = 0;` slipped past `tk_deleg_store_late`'s
+   null branch as if it were `null` (so the store was never deferred to the walk) and then
+   past `tk_deleg_coerce`'s twin in `tk_check_field_store` (`ety` a delegate is never
+   nullable, so a plain scalar there types nothing and the check falls through in silence,
+   `tk_check_field_store`'s own `ei < 0` branch) -- a raw `0` reached codegen where a
+   two-word delegate object belongs, and every probe above died at a MC CORE error with no
+   `teko:` prefix at all (D20), not the silent numeric store the citation named but a
+   diagnostic this project does not own. `tk_is_null_lit` (teko_struct.tk), which checks the
+   `TY_UPTR` type, is what both sites ask now -- the SAME helper `tk_check_field_store`
+   itself already reads for the identical question at every other slot a store passes
+   through, so the fix is a call already in scope, not a new one. `null` is unaffected
+   everywhere it was already accepted (`ops[0] = null` still needs the element declared
+   `Op?`, `Op? h = null;` still passes, both probed).
+2. **`tk_deleg_late_pend`, the check `tk_deleg_walk` runs at EVERY node it visits while a
+   store still waits, scanned the WHOLE table -- up to `TK_MAXDGLATE` (512) entries -- per
+   node, not per store.** This compiler's own source visits on the order of 150K nodes
+   there (`mc limits`' own `nodes` row, below), so the table lookup this crumb's earlier
+   passes added is, worst case, a comparison for every (node, waiting store) pair at once --
+   most of them a store some earlier or later FUNCTION owns and the node being visited can
+   never be. The fix keys each entry by the node id it waits on: `dl_bucket`/`dl_chain`
+   (teko_deleg.tk), a fixed 1024-bucket table chained through the existing 512-row store
+   (`tk_dg_bucket_insert`), turns "does any waiting store name this node" into the one or
+   two comparisons its own chain holds -- node ids are a dense, always-positive sequence
+   (`node_new`, mc's own `ast.mc`), so a plain `n % TK_DGBUCKETS` spreads them evenly
+   whatever the source looks like. `tk_deleg_late_move` (the one caller that re-points an
+   entry at a NEW node id, a global array's own store) inserts into the entry's new bucket
+   rather than unlinking the old one -- the stale slot never matches again, because
+   `dl_node` itself changed, and is left as one harmless dead link rather than taught how to
+   remove itself from a chain shared with live entries; `tk_deleg_late_rest`, the one full
+   sweep of the table (once, at the end of the pass, never per node), is untouched.
+   Measured: `sh scripts/bootstrap.sh` end to end, three back-to-back runs each, `fa596667`
+   (39.446s, 39.519s) against this fix (38.701s) -- inside the run-to-run noise of a build
+   that also links, diffs 215K lines of assembly and runs 63 fixtures, so the wall clock does
+   not prove the complexity claim by itself; `mc limits` does, on the compiler leg (the one
+   the bucket table changes, `tests/hello.tk`'s own leg is a 38-node program the old scan
+   never had to cross): `nodes` 154284 -> 154332 (+48, the bucket table and its one helper),
+   `funcs` 3137 -> 3138 (+1, `tk_dg_bucket_insert`), `globals` 924 -> 926 (+2, `dl_bucket`
+   and `dl_chain`), both legs still `ok` against their own ceiling.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the four probes above on the three
+builds, plus the 36 probes of passes 1 to 7 re-run on this build -- every one at the verdict
+its own table (or narrative) records; **63/63** fixtures at their `expect-exit`, with
+`tests/surface_globals.tk` (exit 42) gaining a comment (section 3g) that names the fixed
+predicate and points at the `// no-run` case this refusal cannot be a fixture of
+([diagnostics.md](docs/reference/diagnostics.md)) -- no new code path in the fixture itself,
+because every store it already makes is a real function and the validator's null branch is
+exercised, correctly, by the ones already there (`storeParam`, `h = ops[1]`, and so on). The
+`--dump-ast` of all **63** fixtures: byte-identical to `fa596667` at every one -- neither
+finding moves an accepted program's tree, the first because no fixture ever wrote a literal
+`0` where a delegate is expected, the second because the bucket table answers the exact same
+membership question the linear scan did, only faster. `sh scripts/bootstrap.sh --os macos
+--arch aarch64` -> `FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green (569
+links, 385 diagnostics -- one no-run sample added and documented in the same paragraph, 124
+samples); `mc limits --config mc.macos.toml` verdict `ok` on both legs, deltas in finding 2
+above. `mc pkg hash .` at this pass's own code commit:
+`5fa74991ce956317f690c012c26789d1b0fab809cd724956e8aca950ddf83d95`.

@@ -423,7 +423,11 @@ uptr tk_deleg_mismatch_msg(i64 si) {
 // that segfaults the first time the slot is called
 i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
     if (e == 0) return e;
-    if (nd_kind(e) == N_INT && nd_val(e) == 0) return e;             // `null`
+    // `null` -- and only `null` (D51, eighth pass): `tk_is_null_lit`
+    // (teko_struct.tk) asks the TY_UPTR type `tk_null` alone carries, so a
+    // plain `i64` literal `0` (same N_INT kind, same zero value) falls
+    // through to the mismatch check below instead of passing as null.
+    if (tk_is_null_lit(e)) return e;
     if (nd_kind(e) == N_CALL && str_eq(nd_name(e), "tk_ternary")) {
         i64 c = nd_a(e);                          // K4c item 3: `c ? a : b`, still the
         i64 a = nd_next(c);                       // raw placeholder here (this pass runs
@@ -494,6 +498,32 @@ uptr dl_file[TK_MAXDGLATE];
 i64  dl_done[TK_MAXDGLATE];
 i64  dl_esc[TK_MAXDGLATE];            // ...and whose ESCAPE is unjudged as well
 i64  tk_ndglate = 0;
+
+// D51 (eighth pass), the walk's own cost: `tk_deleg_late_pend` runs at EVERY
+// node the walk visits while a store still waits, `tk_deleg_walk`'s own
+// `tk_deleg_visit` call at the top of the loop -- a program the size of this
+// compiler's own source visits on the order of 150K nodes there, and a linear
+// scan of the table at each one (the loop this replaces) is a table lookup
+// PER NODE, not a lookup per store: 512 comparisons apiece, most of them a
+// store some earlier or later FUNCTION owns and this node can never be. A
+// bucket keyed by the node id itself turns "does any waiting store name this
+// node" into the one or two comparisons its own chain holds, node ids being a
+// dense, always-positive sequence (`node_new`, mc's ast.mc) that spreads
+// evenly over a fixed table of buckets no matter how the source is shaped.
+#define TK_DGBUCKETS 1024
+
+i64  dl_bucket[TK_DGBUCKETS];         // 0 = empty; else 1 + the newest entry here
+i64  dl_chain[TK_MAXDGLATE];          // 0 = chain ends; else 1 + the next entry sharing it
+
+// `tk_deleg_late_move` (below) re-points an entry at a NEW node id without
+// unlinking the old bucket slot: the stale one never matches again (`dl_node`
+// itself changed), so it is left as a single harmless dead link rather than
+// taught how to remove itself from a chain it shares with live entries.
+void tk_dg_bucket_insert(i64 i, i64 n) {
+    i64 b = n % TK_DGBUCKETS;
+    st64(dl_chain + i * 8, ld64(dl_bucket + b * 8));
+    st64(dl_bucket + b * 8, i + 1);
+}
 
 i64  dl_node_at(i64 i) { return ld64(dl_node + i * 8); }
 i64  dl_si_at(i64 i)   { return ld64(dl_si + i * 8); }
@@ -584,7 +614,13 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // waits (the dumps of `da33ebd4`).
 i64 tk_deleg_store_late(i64 si, i64 v) {
     if (si < 0 || v == 0) return 0;
-    if (nd_kind(v) == N_INT && nd_val(v) == 0) return 0;    // `null`, the same answer anywhere
+    // `null`, the same answer anywhere -- and ONLY `null`: `nd_kind(v) ==
+    // N_INT && nd_val(v) == 0` also matches an ordinary `i64` literal `0`
+    // (TY_I64), so `tk_is_null_lit` (teko_struct.tk), which checks the
+    // TY_UPTR type `tk_null` alone carries, is what this site has to ask
+    // (D51, eighth pass) -- `ops[0] = 0;` waited here unjudged and stored a
+    // bare zero where a wrong-width copy segfaults the first call.
+    if (tk_is_null_lit(v)) return 0;
     if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
     if (nd_kind(v) == N_IDENT) return tk_ty_scope_or_global(nd_name(v)) < 0;
     if (nd_kind(v) == N_CALL) return 1;           // a CALL is the pass's own answer, never this site's
@@ -600,6 +636,7 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
     st64(dl_file + tk_ndglate * 8, fl);
     st64(dl_done + tk_ndglate * 8, 0);
     st64(dl_esc + tk_ndglate * 8, tk_deleg_defer_all);
+    tk_dg_bucket_insert(tk_ndglate, st);
     tk_ndglate = tk_ndglate + 1;
 }
 
@@ -641,17 +678,24 @@ void tk_deleg_late_move(i64 from, i64 to) {
     i64 i = tk_ndglate - 1;
     loop {
         if (i < 0) break;
-        if (dl_node_at(i) == from) st64(dl_node + i * 8, to);
+        if (dl_node_at(i) == from) {
+            st64(dl_node + i * 8, to);
+            tk_dg_bucket_insert(i, to);   // the OLD bucket slot is left dangling (harmless,
+        }                                 // `dl_node` no longer answers `from`) -- see above
         i = i - 1;
     }
 }
 
+// the hot path of the whole walk (D51, eighth pass): the chain this node's
+// own bucket holds, never the full table -- see the bucket's own header for
+// the cost this replaces.
 void tk_deleg_late_pend(i64 n) {
-    i64 i = tk_ndglate - 1;
+    i64 h = ld64(dl_bucket + (n % TK_DGBUCKETS) * 8);
     loop {
-        if (i < 0) break;
+        if (h == 0) break;
+        i64 i = h - 1;
         if (dl_node_at(i) == n) tk_deleg_late_do(i);
-        i = i - 1;
+        h = ld64(dl_chain + i * 8);
     }
 }
 
