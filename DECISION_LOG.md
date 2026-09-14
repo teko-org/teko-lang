@@ -4309,3 +4309,57 @@ and not the table's size: `TK_MAXSCOPE` at 1024 and at 8192 both measure
 1114992, which is D35's own precedent read back. `mc pkg hash .` at this pass's
 own code commit:
 `71ec8182830b155bb163a17ff0c52631011f15f168c776e22622d5a06e219602`.
+
+**D50 ∧ D51, rebased onto `13b3c38a`.** This entry was written against
+`da33ebd4`; D50 ([#698](https://github.com/teko-org/teko-lang/pull/698)) landed
+first, as the fourth finding above said it would, and the two meet at exactly
+one body, `tk_ha_store` (teko_heaparr.tk). D50 made every element store ONE
+call to the door `tk_field_store_val` (teko_typeof.tk) -- the deferral, the two
+scalar verdicts, the row one and Q1b's box; the seventh pass of this entry made
+a store the site cannot settle the DELEGATE validator's alone, because the
+generic row check types a name and a call from the same parse-time tables the
+`late` guard just refused to trust. Both rules stand, in this order: the
+coercion runs first for a value the site CAN name, and the door is asked only
+when the store does not wait --
+`if (dsi >= 0 && !late) v = tk_deleg_coerce(...); if (!late) v =
+tk_field_store_val(...);`. A waiting store keeps its single judgement at
+`tk_deleg_late_do` (`tk_deleg_pass`, 7), which runs BEFORE the door's own judge
+(`tk_field_store_judge`, at the end of `tk_over_pass`, 14), so the wrap the
+walk splices in is what the tree holds either way and no deferred row is left
+pointing at a node a later pass replaced. `tk_hg_resolve_write` (teko_array.tk)
+keeps this entry's `tk_os_move`/`tk_deleg_late_move` over D50's `tk_os_add`
+re-mark -- the rows the built store owns are MOVED onto the node the tree
+keeps, one rule for both tables -- and a global element store of any type that
+is NOT a delegate still goes through D50's door whole, since
+`tk_deleg_store_late` answers 0 for `si < 0`. That is what makes the fourth
+finding run: `i64?[] xs; xs[0] = g;` with `g` a global reads **42** on the
+rebased head, on a GLOBAL `i64?[]` and on a LOCAL one alike (it segfaults, 139,
+on `dd489bbe`) -- #698's door and this entry's write, cooperating.
+
+Proof on the new base, mc **0.15.23** (`MC_VERSION`), macos/aarch64. The
+eleven key probes of the two families, each at its verdict: (D51) the global
+`i64?[]`/local `i64?[]` store above, an `f64 x` shadowing a `ref i64 x`
+parameter, a global `Op` into a global `Op[]`, `ops[0] = chooser(1)` through a
+local delegate, `ops[0] = make(chooser(1))` and `Op h = make(chooser(1))` over
+two overloads -- 42 each -- and a by-reference lambda into a global `Op[]`
+refused `teko: a lambda that captures by reference cannot leave its scope`;
+(D50) `this.rate = k` on a widened `f64` field, `h.count = k` into an `i64?`
+field through a receiver the parser cannot type, `xs[0] = rick(1, 2)` picking
+the second declaration of an overloaded name into a `Cell[]`,
+`h.items[gl[0]] = 9` reading a global element inside a store, and
+`dst[0] = src[0]` under a local shadowing a global `T[]` -- 42 each. **64/64**
+fixtures at their `expect-exit` (the 63 of `13b3c38a` plus
+`tests/surface_globals.tk`); `--dump-ast` of those 63 against `13b3c38a`: **62
+byte-identical**, and `tests/surface_array_heap.tk` exactly as the sixth pass
+declared it -- 2439 lines on both builds, the same multiset line for line, the
+four declarations of a wrap emitted at a different point of the unit.
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (64/64
+under `teko1`, 39.5s); `sh scripts/check-docs.sh` green (572 links, 388
+diagnostics, 130 samples); `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs, the `tests/hello.tk` leg's structural counts unmoved from D50's own
+measurement (`passes` 15/30, `syntax` 15, `alias` 18, `types` 11, `intrin`
+8/16, heap 1114992 of 33554432) and the `tests/surface_datetime.tk` leg at
+`syntax` 16, `alias` 22, `types` 15, heap 3998976 -- the one `alias` row and
+the one `types` row this entry's own code adds, against D50's 21 and 14.
+`mc pkg hash .` over the rebased tree:
+`433973c4026dd0f10a917dff5e8d53e24624ac09ddd545c3fa80ac7037870ba1`.
