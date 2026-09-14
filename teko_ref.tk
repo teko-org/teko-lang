@@ -85,6 +85,7 @@ i64 tk_ref_root = 0;                   // the unit, for the same decl-count guar
 i64 tk_ref_cur_fn = 0;                 // the N_FUNC this pass is walking right now
 
 i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
+i64 tk_deleg_is_thunk(i64 f);                     // teko_deleg.tk, included after this file
 
 // teko_typeof.tk, included after this file -- but this pass RUNS after that
 // one (`teko.tk`: `tk_typeof_pass`, then `tk_ref_pass`), so the oracle's own
@@ -172,7 +173,11 @@ void set_rf_kind_at(i64 i, i64 v) { st64(rf_kind + i * 8, v); }
 void set_rf_ty_at(i64 i, i64 v)   { st64(rf_ty + i * 8, v); }
 
 void tk_rfarg_tag(i64 n, i64 kind, i64 ty) {
-    if (tk_nrf == TK_MAXRFARG) err_at(tk_line, tk_file, "teko: too many `ref`/`out` arguments in one unit");
+    // the two arguments were the wrong way round -- `err_at(file, line)`, as
+    // `tk_rp_add` above already spells it -- so the unit that exhausted this
+    // budget read `tk_line` as a file POINTER and died of a segmentation
+    // fault instead of the refusal below (Copilot on #712, second pass)
+    if (tk_nrf == TK_MAXRFARG) err_at(tk_file, tk_line, "teko: too many `ref`/`out` arguments in one unit");
     set_rf_node_at(tk_nrf, n);
     set_rf_kind_at(tk_nrf, kind);
     set_rf_ty_at(tk_nrf, ty);
@@ -661,13 +666,29 @@ void tk_ref_fn(i64 f) {
     tk_ref_cur_fn = 0;
 }
 
+// Every function but ONE: a delegate thunk (`tk_deleg_is_thunk`,
+// teko_deleg.tk) is the COMPILER's own forwarder, and this pass has nothing
+// to do inside it. Its parameters carry no row of the table above -- the walk
+// rewrites nothing there -- and the single call in its body forwards each
+// `ref`/`out` parameter as the ADDRESS its `uptr` slot already holds, over a
+// target `tk_deleg_check_sig` has proved identical to the delegate parameter
+// by parameter: correct by construction, so `tk_ref_check_call` has no
+// question left to ask and the answer it used to get was ``argument 1 needs
+// `ref` at the call site`` on the compiler's own code (D63).
+//
+// Saying so HERE, once, is what keeps a thunk out of the `rf_*` budget as
+// well: tagging the forwarded arguments instead spent one row of TK_MAXRFARG
+// per forwarded `ref`/`out` parameter, against the same table every argument
+// the SOURCE writes draws on, so a unit of 30 delegate wrappers of 8 `ref`
+// parameters each lost 240 of its 512 rows to code no one wrote (Copilot on
+// #712, second pass).
 i64 tk_ref_pass(i64 root) {
     if (tk_nrp == 0 && tk_nrf == 0) return root;   // no `ref`/`out` parameter AND no `ref`/`out` argument
     tk_ref_root = root;
     i64 f = root;
     loop {
         if (f == 0) break;
-        if (nd_kind(f) == N_FUNC) tk_ref_fn(f);
+        if (nd_kind(f) == N_FUNC && !tk_deleg_is_thunk(f)) tk_ref_fn(f);
         f = nd_next(f);
     }
     return root;

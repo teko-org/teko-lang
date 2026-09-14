@@ -198,11 +198,50 @@ i64 tk_args(uptr pn) {
     return head;
 }
 
-// `tk_args`, but each position checked against the callee's OWN declared
-// parameter type first (K4b, D221/§41): a delegate one may spell either
-// lambda grafia, the same lookahead `tk_deleg_init_expr` (teko_deleg.tk)
-// reads for a declaration's own initializer.
-i64 tk_args_typed(uptr pn, i64 d, i64 recv_off) {
+// the delegate row EVERY method `si` reaches under `name` declares at
+// argument position `pos`, or -1 (K4b, D221/§41; D66, Copilot on #719).
+// Which signature an OVERLOADED name picks is decided by the argument COUNT,
+// which the parser does not have while it is still reading position `pos` --
+// but where every signature that could take an argument there spells the SAME
+// delegate, which one wins does not change how that argument is READ. The
+// chain is walked exactly as `tk_method_pick` walks it, one level at a time:
+// a class's own declaration hides the base's overloads of the name, so the
+// candidates are the level that declares it and no other. A signature too
+// short to reach `pos` cannot take this call at all and is skipped. The row
+// comes with the `?` peeled off (`tk_deleg_row_under`), so an `Op?` parameter
+// reads a lambda exactly as an `Op` one does -- the coercion below still sees
+// the nullable parameter type and boxes for it.
+i64 tk_method_param_deleg(i64 ci, uptr name, i64 pos) {
+    loop {
+        if (ci < 0) return 0 - 1;
+        if (tk_method_name_count(ci, name) > 0) break;
+        ci = sr_base_at(ci);
+    }
+    i64 row = 0 - 1;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nmethod) break;
+        if (mt_cls_at(i) == ci && str_eq(mt_name_at(i), name) && mt_np_at(i) > pos) {
+            i64 d = decl_find(mt_fn_at(i));
+            if (d < 0) return 0 - 1;
+            i64 dsi = tk_deleg_row_under(tk_decl_param_ty(d, pos + 1));
+            if (dsi < 0) return 0 - 1;
+            if (row >= 0 && row != dsi) return 0 - 1;
+            row = dsi;
+        }
+        i = i + 1;
+    }
+    return row;
+}
+
+// `p.m(...)`'s own arguments, each position checked against the callee's OWN
+// declared parameter type first (K4b): a delegate one may spell either lambda
+// grafia, the same lookahead `tk_deleg_init_expr` (teko_deleg.tk) reads for a
+// declaration's own initializer. Every other position is `parse_expr(0)`,
+// byte for byte what `tk_args` reads. `left` occupies parameter 0 of the
+// mangled function `mt_fn_at` compiles to, hence the `+1` inside the reader
+// above.
+i64 tk_call_method_args(i64 si, uptr m, uptr pn) {
     p_expect(K_LPAR, "expected ( in the method call");
     i64 head = 0;
     i64 n = 0;
@@ -210,7 +249,7 @@ i64 tk_args_typed(uptr pn, i64 d, i64 recv_off) {
         if (p_id() == K_RPAR) break;
         i64 line = p_line();
         uptr fl = p_file();
-        i64 dsi = tk_deleg_row(tk_decl_param_ty(d, n + recv_off));
+        i64 dsi = tk_method_param_deleg(si, m, n);
         i64 a;
         if (dsi >= 0) a = tk_deleg_init_expr(dsi, line, fl);
         else          a = parse_expr(0);
@@ -221,20 +260,6 @@ i64 tk_args_typed(uptr pn, i64 d, i64 recv_off) {
     p_expect(K_RPAR, "expected ) after the arguments");
     st64(pn, n);
     return head;
-}
-
-// `p.m(...)`'s own arguments, with the callee's parameter types in hand when
-// `m` names exactly one signature on `si` (K4b) -- an overloaded name falls
-// back to the plain, untyped `tk_args`: which signature applies is not known
-// until the argument COUNT is, and a lambda's own comma-separated parameters
-// would throw a blind count off. `left` occupies parameter 0 of the mangled
-// function `mt_fn_at` compiles to, hence the `+1` offset into it.
-i64 tk_call_method_args(i64 si, uptr m, uptr pn) {
-    if (tk_method_name_count(si, m) != 1) return tk_args(pn);
-    i64 mi = tk_method_named_find(si, m);
-    i64 d = decl_find(mt_fn_at(mi));
-    if (d < 0) return tk_args(pn);
-    return tk_args_typed(pn, d, 1);
 }
 
 // the arguments a call left out, taken from the callee's own defaults. Each
@@ -272,7 +297,7 @@ i64 tk_field_use(i64 left, i64 fi, i64 line, uptr fl) {
     i64 addr = tk_bin(K_ADD, left, tk_int(fd_off_at(fi)));
     if (fd_nel_at(fi) > 0) return tk_array_of(addr, fi, line, fl);
     if (p_accept(K_ASSIGN)) {
-        i64 v = parse_expr(0);
+        i64 v = tk_deleg_rhs(fty, line, fl);     // D66: `h.cb = (i64 x) => ...`
         tk_line = line;
         tk_file = fl;
         if (tk_lam_escapes(v))
@@ -349,9 +374,10 @@ i64 tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl) {
         tk_ref_check_kind(tk_rp_kind(tk_decl_param_node(d, i)), a, i, line, fl);
         // D57: an argument this oracle cannot answer for is PARKED, not
         // skipped -- a global, a `ref`/`out` pointee, a call to an overloaded
-        // name, and, on the unqualified road that calls this from a pass,
-        // every local and parameter too. Judged where the scope is live, at
-        // the end of `tk_over_pass` (teko_typeof.tk's
+        // name, a composite expression (D59's second pass), and, on the
+        // unqualified road that calls this from a pass, every local and
+        // parameter too. Judged where the scope is live, at the end of
+        // `tk_over_pass` (teko_typeof.tk's
         // `tk_vca_park`/`tk_vcall_arg_judge`), and -1 back is "not known here"
         // for the check and the conversion alike.
         i64 at = tk_vca_park(pt, a, tk_pty_of(a), line, fl);
@@ -582,6 +608,30 @@ i64 tk_dot(i64 left) {
         i64 pty = tk_hp_find(nd_name(left));      // a `T[]` PARAMETER (K3): known at parse time too
         if (pty >= 0) return tk_member_of(left, tk_struct_by_ty(pty), m, line, fl);
     }
+    // D61: a CALL whose type the node does not already carry is not typed
+    // here at all. Both oracles this door used to ask answer it the same wrong
+    // way -- `decl_ret(decl_find(name))`, the FIRST declaration of the name,
+    // the guess D49 took out of the pass-time oracle and left standing here:
+    // `tk_pty_of` (teko_struct.tk) for a primitive row, and `tk_struct_of_expr`
+    // (same file, its own N_CALL arm) for a class, a struct or an enum. With
+    // `DateTime pick(i64)` declared ahead of `DateOnly pick(i64, i64)`,
+    // `pick(1, 2).Day` read a DateOnly through the DateTime row and answered
+    // 1 instead of 29, and in the other order (`TimeSpan pick(i64)` first) a
+    // legal program was refused `teko: unknown member of TimeSpan: Day`; with
+    // `Cell pick(i64)` ahead of `Box pick(i64, i64)`, `pick(1, 2).w` read the
+    // Box through Cell's row -- a field at the wrong OFFSET where both declare
+    // the name, `teko: unknown member of Cell: w` on a legal program where
+    // only one does, and the wrong enum's name table for `.ToString()`. So the
+    // check stands AHEAD of both (Copilot on #718): the deferred road answers
+    // every one of them -- `tk_prim_pend` (teko_prim.tk) is `tk_prim_dot`'s
+    // twin and `tk_pend_do` (teko_typeof.tk) is `tk_member_of`'s, both at
+    // `atpass`, where the oracle is `tk_ty_of` -- `tk_ov_pick` for an
+    // overloaded name, the delegate table for a call through a slot. A call the
+    // node DOES type (`new DateOnly(...)`, `new Box()`, a static or an instance
+    // row the parser already emitted, all `tk_xt_put`) keeps the parse-time
+    // road it always had.
+    if (nd_kind(left) == N_CALL && tk_xt_ty(left) < 0)
+        return tk_defer_member(left, m, line, fl);
     i64 si = tk_struct_of_expr(left);
     if (si >= 0 && sr_part_at(si) == TK_PFWD) return tk_defer_member(left, m, line, fl);
     if (si >= 0) return tk_member_of(left, si, m, line, fl);

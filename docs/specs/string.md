@@ -283,7 +283,7 @@ digit or `$`), the lexer falls through to the punctuation matcher, so a module t
 registered `syntax_expr("$", …)` owns the token and reads the string literal after it with
 `p_cp()`/`p_take_lit`; the three `#rule` forms are untouched, nothing in `mc`'s core changed.
 N10 waited for one thing only: teko's pin reaching 0.15.25 (a `MC_VERSION` crumb proved by
-the whole recipe, D29/D35/D37). **D64 raised the pin to 0.16.0, so that wait is over** —
+the whole recipe, D29/D35/D37). **D64 raised the pin to 0.16.1, so that wait is over** —
 N10 is now blocked by nothing but its own crumb, and this page's refusal (`teko: string
 interpolation is not taught yet`) is reachable the day the module claims `$`. The
 measurement above is kept as the record of what the 0.15.23 lexer did.

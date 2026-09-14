@@ -5087,7 +5087,13 @@ factored out of `tk_fs_do` as `tk_fs_convert` and called from both: the node kee
 identity and BECOMES the cast or the box, because the slot it crosses into holds no handle
 on it. No behaviour of the field store moved -- the 94 pre-existing dumps prove it.
 
-**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** What a later
+**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** *(Superseded
+in part by D59's second pass: the rule below refused nothing, but it let every COMPOSITE
+expression -- a binary, a ternary, a negation -- cross unjudged and unwidened on all three
+roads, which the skip this entry documented is exactly the record of. Every by-value
+argument is parked now, and the false-refusal risk this paragraph names is answered at the
+judge instead: a parked row the pass still cannot type is refused only when it is a bare
+name.)* What a later
 pass adds to a name is the scope, the global table and the load an unqualified field name
 becomes; a local array's element, an indirect `callp` and an address the source built by hand
 are no better known at pass 14 than at the door, so parking them would turn today's silence
@@ -5367,6 +5373,171 @@ cost: nothing" section. `docs/specs/README.md` row 9b marked landed.
   heading's own slug shifted with the new name), one new `teko: …` literal
   (`a time of day is out of range`), documented.
 - `mc pkg hash .` → `246d6defa97f3a76094ddf1469e8512c0a815d4d45269f3bb3565fc219c757d3`.
+### D59 · A delegate call's arguments are judged and widened like a direct call's (2026-09-14)
+D57 taught the vtable road, the itab road and the unqualified form of either. The DELEGATE
+road was the fourth `callp` in the tree and it kept the whole gap: its own door
+(`tk_deleg_check_arg_kinds`, teko_deleg.tk) read the `ref`/`out` TAG and, since D57, the
+`ref` POINTEE -- and nothing about a value. Measured on `f660795d`, for
+`delegate i64 Op(i64)` and `delegate f64 F(f64)`:
+
+| road | narrowing `f64` -> `i64` parameter | widening `i64` -> `f64` parameter |
+|---|---|---|
+| direct call (the control) | refused `teko: a value of type f64 does not convert to i64` | widened, exit 25 |
+| delegate LOCAL, `f(lf)` | accepted, exit 64 | not widened, the raw integer crossed |
+| delegate GLOBAL, `gop(gf)` | accepted, exit 96 | -- |
+| delegate PARAMETER, `apply(Op f) { f(lf) }` | accepted, exit 64 | not widened |
+| delegate FIELD, `h.cb(lf)` | accepted, exit 128 | not widened |
+| `Op[]` ELEMENT, `ops[0](lf)` | accepted, exit 0 (the double's bits truncated to a byte) | not widened |
+
+The missing widening is not an exotic shape: `F f = half; f(5);` passed the LITERAL 5 as an
+integer where `half(5)` reads 25, and `f64? x` on the parameter made it worse -- the raw
+integer was handed to a callee that dereferences it as a box, and the program SIGSEGV'd
+(exit 139, measured). The `ref` gap D57 left open was the two roads that build their `callp`
+while the file is still being parsed: `class H { public Mut cb; }` with
+`delegate void Mut(ref f64 x); i64 g = 0; h.cb(ref g);` compiled and let the callee write
+1.0's bit pattern through the `i64`'s own slot, where the bare-name road refuses it.
+
+**ROOT: one choke point, and it was asking one question out of three.** All three roads go
+through `tk_deleg_build` (teko_deleg.tk), the single builder of a delegate `callp` -- the
+bare name rewritten at pass 8 (`tk_deleg_call`), a FIELD through `tk_field_use`
+(teko_expr.tk) and an `Op[]` ELEMENT through `tk_ha_deleg_call` (teko_heaparr.tk) -- and it
+calls `tk_deleg_check_arg_kinds` for every one of them. That function's whole judgement was
+`if (pk != TK_RP_NONE) tk_ref_check_pointee_ty(dg_pty_at(si, i), a, line, fl);` beside an
+inlined copy of the kind check. The signature was in hand all along: `dg_pty_at(si, i)` is
+the parameter's own type, per position.
+
+**The fix is D57's own two-line shape, reused, with nothing new invented.** Per argument
+position: the `ref`/`out` TAG first, through `tk_ref_check_kind` (teko_ref.tk) -- the direct
+call's own words, which the door had been repeating verbatim rather than calling; then the
+type, through `tk_vca_park` (teko_typeof.tk). A by-value argument is offered the parse-time
+oracle's answer (`tk_pty_of`, teko_struct.tk) and a `ref`/`out` one is offered none at all,
+because no oracle at this door types what an address points at. What the park keeps is
+judged at the end of `tk_over_pass` (pass 14, `tk_vcall_arg_judge`) by the two rules it
+already carries -- `tk_ty_of` + `tk_check_compat` + `tk_fs_convert` by value,
+`tk_ref_check_pointee_ty` for a pointee -- and what it hands back is judged inline, with the
+conversion written IN PLACE by `tk_fs_convert`: this walk is over `nd_next` and holds no
+handle to relink with, so the node keeps its identity and BECOMES the cast, rather than
+`tk_vcall_args_check`'s splice. **No pass of its own** and **no table of its own**: `passes`
+stays 15/30 and `globals` 942.
+
+**Which arguments park, and why that is the same rule and not a wider one.** `tk_pty_of`
+answers a literal, a cast and an xt-tagged node on EVERY road, and a bare name only while
+the parser's own stack is live -- so on the two parse-time roads a local is typed inline and
+on the pass-8 road every identifier parks, which is exactly D57's own finding for the
+unqualified road. A call to an OVERLOADED name parks on all three (`tk_vca_ov_call`:
+`tk_pty_of` would answer the FIRST declaration's return, not the pick's), and
+`f(pick(2))` with `f64 pick(f64)` declared ahead of `i64 pick(i64)` is the fixture row for
+it. A `ref`/`out` argument parks always, which is what carries the pointee rule onto the
+FIELD and ELEMENT roads for the first time. Nothing else changed hands: the whole battery of
+legal shapes was measured identical on both builds -- a class reference, a struct, an
+interface value, an `str`, a `bool`, an `enum`, a global of each, a local array's element, a
+direct call, an arithmetic expression, a delegate LOCAL passed as an argument, a lambda
+wrapped in `new Op(...)`, an unqualified field inside a method, and `T?` parameters boxed
+from a literal and from a name.
+
+**One shape's diagnostic moved, and it was already refused.** A bare FUNCTION name as an
+argument at a delegate call whose parameter is itself a delegate type (`r(twice)` on
+`delegate i64 Runner(Op f)`) came out of the core as `unknown name` and now comes out as
+`teko: the type of this argument is not known here` at the same line -- the wrap that turns
+a function name into a delegate object is written at a call that NAMES its callee, and an
+indirect call names none. `r(new Op(twice))` is typed where it stands and runs. That row
+replaces, in `docs/reference/not-yet.md`, the by-value row D57 added and this entry closes.
+
+**Fixtures.** Nine refusals, `tests/refuse/deleg_*`: `deleg_arg_narrow.tk`,
+`deleg_arg_narrow_global.tk` and `deleg_arg_narrow_param.tk` (the three bare-name slots),
+`deleg_field_arg_narrow.tk` and `deleg_elem_arg_narrow.tk` (the two parse-time roads),
+`deleg_field_ref_pointee.tk` (the pointee on the FIELD road, which had none) and
+`deleg_arg_ref_pointee.tk` (the same on the bare-name road, which D59 moved from pass 8 onto
+the shared park -- the refusal and its line stand where D57 left them), plus
+`deleg_arg_ref_missing.tk` and `deleg_arg_ref_extra.tk` for the two kind diagnostics now
+given by `tk_ref_check_kind` rather than by a copy of it. One positive:
+`tests/surface_delegate.tk` grows `argcheck()`, eleven rows over the LOCAL, PARAMETER, FIELD
+and ELEMENT roads -- an integer literal and an integer name widened, a global integer, a
+right-typed global, a call to an overloaded name, and a `ref` global with the RIGHT pointee
+through a field slot. Nine of those eleven are WRONG on the base (measured as a bitmask,
+`1015`); the two that stand are the two that ask for no conversion at all. `expect-exit: 42`
+unmoved.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `f660795d`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **71 passed, 54 refused as
+expected, 0 failed** (was 71/45); `--dump-ast` byte-identical against the base compiler for
+**70 of the 71** pre-existing `tests/*.tk`, the one that moves being the fixture this crumb
+grew, whose diff is exactly nine added `CAST type=f64` lines and nothing else;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 587 links, 32 fragments, 389 diagnostics, 54
+refusals, 138 samples` (no new literal: every message this door gives was already
+documented); `mc limits . --config mc.macos.toml` verdict `ok` on both legs, every counted
+row of the `tests/hello.tk` leg exactly where the base left it (`passes` 15/30, `types` 12,
+`intrin` 8/16, `alias` 19, `syntax` 15) and the compiler leg moving DOWN by the inlined
+error construction this crumb deleted -- `nodes` 156214 -> 156205, `ins` 215408 -> 215350,
+`funcs` 3178, `lowered` 3160, `symbols` 6240, `strings` 2120 and `globals` **942** all
+unmoved; `mc pkg hash .`
+`64615adc8c576867df94b79f1193d40dbe96f3ea3cf0a197921ffe870d9be6be` (base
+`14b54b7d0a7175813638eb7fb8bbeacf8c9f4be1fa9b912ce29d6b2cdcfbc73f`: `teko_deleg.tk` is a
+listed file, so the hash moves by design).
+
+**Copilot finding, second pass: the park read two shapes, and every other one crossed
+raw.** `delegate f64 F(f64); F f = half; f(1 + 2);` compiled and the integer 3 never
+reached the parameter at all -- `tk_pty_of` answers -1 for a BINARY, `tk_vca_park` parked
+only an `N_IDENT` and a call to an overloaded name, so the door took its `at < 0` path,
+converted nothing, and the callee read the FP register instead of the integer one. The
+direct `half(1 + 2)` widens. The same gate stood on D57's three roads, where D57's own
+second pass had DOCUMENTED it as a silent skip -- "a by-value argument that is neither a
+bare name nor an overloaded call" -- and a silent wrong result is worse than a refusal.
+Measured on `9b6c4180`, one shape at a time, each on six roads (direct, delegate, vtable,
+itab, unqualified, `this.`), the argument's value 3 onto an `f64` parameter:
+
+| argument shape | direct | the five indirect roads |
+|---|---|---|
+| `1 + 2` | widened | **all five wrong** |
+| `x + 2` | widened | **all five wrong** |
+| `x > 0 ? 3 : 4` | widened | **all five wrong** |
+| `0 - (x - 4)` | widened | **all five wrong** |
+| `arr[0]`, `h.n` | widened | right (the xt table tags an element load and a field load) |
+| `(i64) y` | widened | right (`tk_pty_of` has an `N_CAST` arm) |
+
+...and the narrowing mirror, `f(lf * 2.0)` into a `delegate i64 Op(i64)` and
+`b.takei(lf * 2.0)` into a `virtual i64 takei(i64)`: both compiled, exits 64 and 16, where
+the direct call is refused.
+
+**ROOT: the restriction was at the wrong end.** D57's reason for parking only a name was a
+FALSE REFUSAL -- a shape the pass cannot type either would turn today's silence into a
+refusal of code with nothing wrong with it -- and that is a question for the JUDGE, which
+knows the answer, not for the door, which does not. So `tk_vca_defer` now parks EVERY
+by-value argument the parse-time oracle could not type, and `tk_vca_do` decides on what
+`tk_ty_of` gives back: a type means `tk_check_compat` + `tk_fs_convert`, exactly as before;
+-1 is refused for the shapes D57 parked (a bare NAME, where the scope, the global table and
+the field load are precisely what this walk has, so a name still unanswered is a name
+nothing declares -- D57's invariant, unmoved) and skipped SILENTLY for the rest, which is
+what the door itself did before. The three-way distinction is the column that used to be a
+`ref`/`out` flag (`TK_VCA_VAL`/`TK_VCA_REF`/`TK_VCA_NAME`): no new array, `globals`
+**943** unmoved.
+
+**FIXTURES** (2 refusals, 2 positives grown). `tests/refuse/deleg_arg_expr_narrow.tk` and
+`vcall_arg_expr_narrow.tk`, both measured COMPILING on `9b6c4180`. `tests/surface_delegate.tk`
+`argcheck()` grows seven rows -- a binary over two literals, a binary over a name, a ternary
+and a negation on the LOCAL road, then the FIELD, ELEMENT and PARAMETER roads -- and exits
+**152** on that head (row 12, the first of them). `tests/surface_globals_calls.tk` gains
+section 9, `exprcheck()`, the same four shapes on the vtable, itab, unqualified and `this.`
+roads, each road first passing 2.0 so that a row which crossed RAW reads that 2.0 back
+instead of its own 3.0: **102** on that head, 42 here.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `9b6c4180`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 61 refused as
+expected, 0 failed** (73/59 on the base); `--dump-ast` against the base compiler for all 73
+pre-existing `tests/*.tk` -- **byte-identical on 71**, and the two this crumb grew move by
+exactly 7 and 12 inserted `CAST type=f64` lines and nothing else (both dumps compare equal
+once those lines and the indentation they add are removed), every one of them on a call that
+computed the wrong bits before; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 598 links, 41 fragments, 389
+diagnostics, 61 refusals, 141 samples`; `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs, the `tests/hello.tk` leg byte-identical to the base's (`passes` 15/30, `types` 13,
+`intrin` 8/16, `alias` 20, `syntax` 15) and the compiler leg moving only by the added surface
+code -- `nodes` 156549 -> 156565, `ins` 215960 -> 215968, with `globals` 943, `funcs` 3182,
+`lowered` 3164, `strings` 2138 and `symbols` 6263 all unmoved; `mc pkg hash .`
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e` (base
+`f2a456cbe8da2786a861d66ae62c2587a90c95812c80b4c3e5b09a8545ba88f8`: `teko_typeof.tk`, `teko_expr.tk` and `teko_deleg.tk` are
+listed files, so the hash moves by design).
 ### D60 · A type word already taught refuses a second `class`/`struct`/`interface`/`delegate` under the same name (2026-09-14)
 `class TimeSpan { public i64 v; }` (a teko primitive, `teko_time.tk`), `class f64 { ... }`
 (mc's own core word, its bundled `<float>` module) and `class usize { ... }` (one of the
@@ -5437,38 +5608,590 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
 
+### D61 · A call is typed by the pick and by the slot, at the `.` door too (2026-09-14)
+*(The number D61 was reserved when this crumb was cut; the entry is appended here, after
+D60, which is where it belongs chronologically.)*
 
-### D64 · The pin rises to 0.16.0 (2026-09-14)
-`MC_VERSION` moves from `0.15.23` to `0.16.0` — twenty-one `minicompiler/mc` commits, of
-which one changes the SHAPE of what a build produces here. **M52: the standard library
-left the binary.** Up to 0.15.23 `<sys>`, `<prelude>`, `<io>`, `<float>` and the two float
-machines were a blob inside `mc`; in 0.16.0 they are 41 files on disk under
-`lib/mc/v0.16.0/`, which `mc` resolves next to its own binary (by realpath, so a symlinked
-`mc` still finds it) and one directory up. `mc build` **stages that tree beside a
-`[compiler]` product**, so `build/lib/mc/v0.16.0/` now travels with `build/teko`, and the
-child resolves its own roots — teko passes **no `--libs-dir` anywhere**, and none was
-added. The rest of the range is invisible from here: the x86-64/Win64 register allocator
-and peephole (M49 D2), the arm64 peephole, loop-invariant hoisting, the reproducible bench
-cell (M50), `mc --exe` for Windows PE, version constraints for `[deps]`/`[tools]`,
-`[package].mc`, the registry index snapshot, `$` as a claimable surface token, and
-`i128`/`u128` on x86-64 (SysV and Win64).
+Two defects met on ONE door -- the `.` whose RECEIVER is a CALL, over a primitive with
+members (`DateOnly`, `DateTime`, `TimeSpan`, `TimeOnly`) or an enum. Measured on
+`d028a7a0`:
 
-**`mc.toml` and `teko.toml` stay BARE.** 0.16.0 accepts `=`, `~`, `^`, `*` and `>=` ranges
-and a `[package].mc` minimum, and this repository writes none of them: the registry's
-validator still pins 0.15.20 until the owner redeploys it, and a manifest it cannot parse
-is a manifest it cannot publish. There is also no `[deps] stdlib` to declare —
-`docs/specs/packages.md` predicted the library would become a *package* reached through the
-lock; what shipped moved it to a *directory*, leaving the include names, the closure rule
-and `[deps]` untouched. That section is rewritten to what landed.
+| written | before | after |
+|---|---|---|
+| `DOp f = mk; f().DayNumber` (`delegate DateOnly DOp()`) | refused `teko: unknown member: DayNumber` | 738944 |
+| the same through a parameter, a global slot, a lambda bound to a slot | refused, identically | reads the member |
+| `DateTime pick(i64)` ahead of `DateOnly pick(i64, i64)`, `pick(1, 2).Day` | **exit 1** -- the DateOnly value lowered through the DateTime row | 29 |
+| the mirror order, `TimeSpan pick(i64)` first, `pick(1, 2).Day` | refused `teko: unknown member of TimeSpan: Day` on a legal program | 29 |
+
+A LOCAL in between (`DateOnly d = f(); d.DayNumber`) always worked, and so did a delegate
+FIELD call (`h.cb().Day`) and every call the parser itself writes -- direct, static,
+method, virtual, interface, constructor.
+
+**ROOT A: the pass-time oracle had no arm for a call through a slot.** `tk_typeof_pass`
+(pass 6, teko.tk) resolves the deferred `.`; `tk_deleg_pass` (pass 8) is what rewrites
+`f()` into a `callp`. Until it runs, the call's name is the SLOT's, no declaration owns
+it, and `tk_ty_of`'s N_CALL arm (teko_typeof.tk) asked `tk_ov_find`/`decl_find` only --
+both -1 -- so the member was resolved by its own name and refused. The lookup already
+existed one file over, `tk_deleg_expr_ty` (teko_deleg.tk), written for `tk_ov_arg_ty` for
+exactly this reason. Reordering the passes is not the fix and is rejected: the delegate
+pass reads types the typeof pass writes (teko.tk's own note on the order).
+
+**FIX A:** the two lines move INTO `tk_ty_of`'s N_CALL branch, ahead of the overload
+table, with `tk_deleg_row`/`dg_ret_at` forward-declared as `tk_nl_pend` already is. Every
+consumer of the oracle -- the operator pass, the ternary, `??`, a primitive row's
+argument, the deferred `.` -- gets the one answer. `tk_deleg_expr_ty` then read
+`return tk_ty_of(e)` and is DELETED, its three call sites (`tk_deleg_coerce`,
+`tk_deleg_store_late`, `tk_ov_arg_ty`) asking the oracle directly.
+
+**ROOT B: `tk_dot` still typed a call receiver by the FIRST declaration.** D49 took
+`decl_ret(decl_find(name))` out of the pass-time oracle and left it standing at the parse
+door: `tk_dot` (teko_expr.tk) asked `tk_pty_of` (teko_struct.tk), whose N_CALL arm is
+exactly that guess, and handed the answer to `tk_prim_dot`. On an overloaded callee the
+guess is wrong in both directions -- a silently wrong RESULT in one order, a refusal of a
+legal program in the other.
+
+**FIX B:** a call receiver carrying no `tk_xt_ty` tag of its own is DEFERRED
+(`tk_defer_member`) instead of typed here, so `tk_prim_pend` -- `tk_prim_dot`'s twin, at
+`atpass` -- answers with the pass-time oracle, which is `tk_ov_pick` for an overloaded
+name and, since fix A, the delegate table for a call through a slot. A call the node DOES
+type (`new DateOnly(...)`, a static or an instance row the parser already emitted, all
+`tk_xt_put`) keeps the parse-time road unchanged.
+
+**The choice inside fix B, measured rather than assumed.** `atpass` also flips the oracle
+a row's ARGUMENT is checked with (`tk_prim_ty_of`, teko_prim.tk), so the deferral could
+have moved an accepted tree; the narrow alternative was to defer only receivers whose
+callee name carries more than one declaration. The BROAD form was measured first and kept:
+`--dump-ast` is byte-identical against the base compiler for all 73 pre-existing
+`tests/*.tk`, `tomorrow(leap).Month` (surface_datetime.tk) among them, and for a probe of
+the shape at risk, `tomorrow(leap).AddTicks(k).Day` with `k` a parameter -- identical tree
+and identical exit on both compilers. A narrowing nothing measures is complexity, so it
+was not written.
+
+**Fixtures.** `tests/surface_prim_call_member.tk` (`expect-exit: 42`, 33 checks): the
+delegate LOCAL reading `.DayNumber`, `.Year`, `.Month` and the chain `.AddDays(1).Day`;
+the delegate PARAMETER; the GLOBAL slot; a lambda bound to a slot; `TimeSpan.Ticks`,
+`DateTime.Day`/`.Hour`/`.Date.Day` and `DateTimeKind.ToString()` through a slot; both
+overload orders; and the seven receiver shapes that already worked, anchored because the
+fix moves every call receiver onto the deferred road. `tests/refuse/deleg_call_member.tk`:
+`f().Nope` is now refused `teko: unknown member of DateOnly: Nope` -- the TYPE named,
+where the same line used to be refused by the member's name alone.
+
+**Docs.** `docs/reference/delegates.md` says a call through a slot carries the delegate's
+return type wherever it is read; `docs/reference/diagnostics.md` records that a CALL
+receiver is among the receivers `teko: unknown member of <type>: <name>` now names;
+`docs/reference/not-yet.md` gains the row no page owned -- two METHOD overloads of one
+arity are refused `teko: ambiguous overload; two signatures take this many arguments`,
+the method road picking by argument COUNT alone (the ruling in
+`tests/surface_overload_method.tk`) -- and its `switch`-subject row now lists the `.` on a
+call result among the sites a PASS types.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d028a7a0`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **74 passed,
+62 refused as expected, 0 failed** (was 73/61); `--dump-ast` byte-identical against the
+base compiler for every one of the 73 pre-existing `tests/*.tk`; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 598
+links, 41 fragments, 389 diagnostics, 62 refusals, 141 samples`; `./build/teko limits
+tests/hello.tk` byte-identical to the base compiler's own output -- `passes` 15, `syntax`
+15, `alias` 20, `types` 13, `intrin` 8, no registration of any kind added -- and `mc
+limits . --config mc.macos.toml` `ok` on both legs with only the size-of-surface-code rows
+moving (`nodes` 179091 → 179246, `ins` 215968 → 215980, and `funcs`/`symbols` DOWN by two,
+the deleted helper); `mc pkg hash .`
+`c71e2f944b688166f76bad309b374fa2ab32add347cec1d0c92666258451c8af` (base
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: three hook modules and
+two fixtures are listed files, so the hash moves by design).
+
+**Verifier finding, first pass (the ceiling the broad form reaches).** Every untagged call
+receiver now waits in the `pd_*` table, which the deferred `.` road shared at `TK_MAXPEND`
+128 — a function holding 129 reads such as `s = s + mkday().Day;`, a single non-overloaded
+callee, compiled on the base at any count tried (1000) and refused on this branch's first
+head with `teko: too many member accesses on a value of unknown type`. The table is now
+4096 (nine arrays of that many words), the same size `TK_MAXXT`, `TK_MAXFS` and the argument
+park use; measured: 600 such reads in one function compile and run (exit 248 = 600·29 mod
+256), `mc limits` verdict `ok` with `globals` 943/2544 unmoved and `grow` 0 on every row.
+The ceiling is a fact of the shared table, not a fixture: a refuse fixture that pins it
+would break the day it grows.
+
+**Copilot findings on #718 (two, both at the root).**
+
+*1. The deferral guard stood one lookup too late.* Fix B's check
+(`nd_kind(left) == N_CALL && tk_xt_ty(left) < 0`) was written BELOW
+`i64 si = tk_struct_of_expr(left)` in `tk_dot` (teko_expr.tk), and that lookup carries an
+N_CALL arm of its own -- `tk_struct_by_ty(decl_ret(decl_find(name)))`, the same
+first-declaration guess, for a receiver whose type is a ROW. So a call whose FIRST
+declaration returns a class, a struct or an enum never reached the deferral at all: it went
+through `tk_member_of` with the wrong row. Measured on this branch's own head
+(`3546684c`), one probe per shape:
+
+| written | before | after |
+|---|---|---|
+| `Cell cpick(i64)` ahead of `Box cpick(i64, i64)`, `cpick(1, 2).w` (both declare `w`, at 8 and at 0) | **exit 0** -- the Box read at Cell's offset | 7 |
+| the same pair, `cpick(1, 2).v` (only Box declares `v`) | refused `teko: unknown member of Cell: v` on a legal program | 9 |
+| the mirror order, `cmirror(1, 2).pad` (only Cell declares `pad`) | refused `teko: unknown member of Box: pad` | 100 |
+| the struct pair, `spick(1, 2).w` (`SPad`/`SBare`) | **exit 0** | 7 |
+| two enums, `epick(1, 2).ToString()` / the mirror order | the other enum's name table | `Wild` / `Green` |
+
+The fix is the move: the untagged-call check now stands ahead of BOTH oracles, since both
+answer a call the same wrong way. The BROAD form is kept a second time, and measured the
+same way: `--dump-ast` is byte-identical against `59652293`'s compiler for all **73**
+pre-existing `tests/*.tk` with that commit's own sources. One dump DOES move, on a shape no
+fixture had before -- a program that reads `.ToString()` off a call returning an ENUM emits
+`Hue__names`/`Hue__vals` at the END of the unit instead of ahead of `main`, because
+`tk_enum_ensure` (teko_enum.tk) now runs from the pass rather than from the parse: the two
+globals are byte-identical in content, only their position in the dump moved, and the
+values they answer are the fixture's own rows 46-49. Everything else in that probe --
+`mk().w`, `mk().in.v`, `mk().bump()`, `mks().b`, a 200-iteration loop over `mk().w` -- dumps
+byte-identical on both compilers. No narrowing to overloaded callees was written: nothing
+measures a reason for it.
+
+*2. The diagnostics table still quoted the old ceiling.* `docs/reference/diagnostics.md`
+read `128 waiting for the pass` for `teko: too many member accesses on a value of unknown
+type` after `TK_MAXPEND` became 4096; the row now names the new ceiling, what spends a slot
+in it (a receiver the parser cannot type, and since D61 any untagged call receiver) and
+what the 128 used to cover. `TK_MAXPEND` and that sentence are quoted nowhere else in
+`docs/` -- grepped over `docs/internals/` and `docs/reference/` -- so the one row is the
+whole fix.
+
+**Fixtures.** `tests/surface_prim_call_member.tk` keeps its name (a rename would only churn
+what D61 and `docs/reference/diagnostics.md` already cite; its header names the widened
+reach) and grows to **52 checks**: rows 34-41 and 43-45 are the class and struct pairs in both
+orders (42 is the fixture's own success code and is no row), rows 46-49 the two enums in
+both orders, rows 50-53 the same three returns with NO
+overload anywhere -- the shapes the moved check carries from the parse road onto the
+deferred one. `tests/refuse/call_member_unknown.tk` is new: `cpick(1, 2).pad` is refused
+`teko: unknown member of Box: pad`, where before the move the same line COMPILED and exited
+7, reading Box's own `w` through `Cell.pad`'s offset.
+
+**Proof** (mc 0.15.23, macos/aarch64, pre-fix head `3546684c` merged with `origin/main`
+at `111559fb`): `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **74 passed, 64
+refused as expected, 0 failed** (was 74/63); `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 611 links, 41 fragments,
+389 diagnostics, 64 refusals, 143 samples`; `mc limits . --config mc.macos.toml` verdict
+`ok`, `grow` 0 on every row, and every counted row identical to the pre-fix head's --
+`nodes` used 156713, `ins` 216188, `funcs` 3184, `lowered` 3166, `globals` 944, `symbols`
+6266, `strings` 2138, `passes` 15, `syntax` 15, `alias` 20, `types` 13, `intrin` 8, `rules`
+6, `on_stmt` 4 -- only the `nodes` ESTIMATE moving (179815 → 179872, the comment this crumb
+writes); the linux/x86_64 config gives the same compiler-leg table and the same `ok`
+verdict; `./build/teko limits tests/hello.tk` identical to the pre-fix compiler's own output
+on every table. `mc pkg hash .`
+`aa4a07da80f7336a739d3aa37cdc40e8a06da9bc7e38ec24c396bffbaf9c9731` (pre-fix head
+`23c318e282b1019fd7eb7aa294e2aac069aa67a90e4fcb2c9579e1e5a2e6c9a4`: `teko_expr.tk` is a
+listed file, so the hash moves by design).
+
+### D62 · A bare FUNCTION name lands in a FIELD of delegate type, judged where names have types (2026-09-14)
+`Op cb = twice;` on a local wraps the function in the thunk every delegate value shares
+(D221 §41), and `h.cb = twice;` on the field beside it answered `teko: the type of this
+value is not known here`. So did `this.cb = twice;` and the implicit `cb = twice;` of a
+constructor, and so did a STATIC field (`H.scb = twice;`); a function whose signature is
+NOT the delegate's gave the same generic sentence, where the local slot names the cause
+(`teko: wrong does not match the delegate Op(i64)`, `tk_deleg_check_sig`). The workaround
+was a local of delegate type held for one line (`Op cb = twice; h.cb = cb;`, what
+`tests/surface_delegate.tk` did) or `new Op(twice)` spelled in full. The ELEMENT of an
+`Op[]` already had the answer (D51) and the field road had none of it: the chain
+`tk_field_use` (teko_expr.tk) -> `tk_field_store_val` (teko_typeof.tk) -> `tk_fs_vty` asks
+`tk_pty_of` for an N_IDENT, a free function's name is in no slot table, -1, `tk_fs_defer`
+parks the value, and `tk_fs_do` at the end of `tk_over_pass` asks `tk_ty_of`, which answers
+-1 for the same reason and refuses. No delegate validator stood anywhere on that road.
+
+**The seat: the DOOR, not its callers.** Two shapes were open. (a) The element road's
+own template (`tk_ha_store`, teko_heaparr.tk) copied at each site that builds a field
+store; (b) the ONE door all of them pass through, `tk_field_store_val`. (b) is what
+landed, for the reason D54 gave the last time this question came up and the reason
+CLAUDE.md's root-cause law gives: a guard in the shared function is a smaller diff than a
+guard in every caller, and it leaves no sibling caller behind -- the constructor and the
+static field are fixed by the same three lines as `h.cb = twice`, and were never
+separately written.
+
+That is not a figure of speech, so the door's callers are named exhaustively rather than
+counted (Copilot on #713, which found the earlier wording -- "the four field-store sites"
+in `diagnostics.md`, "the five sites" in the source -- short of the truth). Every caller
+of `tk_field_store_val`, measured by grep on the final tree: `tk_field_use` (teko_expr.tk,
+`p.f = e` and `this.f = e`), `tk_this_assign` (teko_this.tk, the implicit `f = e` of a
+method or constructor), `tk_static_use` and `tk_fwd_resolve_static_one` (teko_access.tk,
+`H.scb = e` written after and before the type's own declaration), `tk_array_index`
+(teko_struct.tk, an element of an ARRAY FIELD), `tk_pend_field` (teko_typeof.tk, a store
+through a receiver the parser cannot type yet), `tk_arr_elem_store` (teko_array.tk, a
+FIXED array's element) and `tk_ha_store` (teko_heaparr.tk, a `T[]`'s element). The first
+six carry a delegate and all six were measured refusing this store on `441be45a` and
+accepting it here; the last two cannot -- a fixed array of delegate element type is
+refused at its own declaration (``teko: an array of this type is not taught yet``), and a
+bare name at a `T[]` element is parked by the element road's own validator and never
+reaches the door (D51). `tests/surface_delegate.tk`'s `dfcheck2` covers the three that had
+no fixture: the deferred receiver, the array-field element and the forward-referenced
+static store.
+
+**What the door may do there is DETECT, never judge.** `tk_deleg_coerce` reads
+`tk_ty_scope_or_global`, and at a parse-time door no scope answers for any name at all
+(the hazard `tk_fs_vty`'s own header documents in full: a global a parameter or a field
+shadows answered for the shadowing name, measured on #698). So the door asks two questions
+it can answer with no scope -- is the field's type a delegate row (`tk_deleg_row`), and is
+the value a bare `N_IDENT` -- and hands the store to the delegate's own late table
+(`tk_deleg_field_late`, teko_deleg.tk) instead of `tk_fs_defer`. `tk_deleg_pass` judges it
+with the lexical scope of the site live, which is the element road's own answer, and it
+runs BEFORE `tk_ops_pass`/`tk_over_pass`/`tk_rc_pass`, so the four declarations a wrap
+emits are walked by every pass that has to see them -- a delegate with a counted return
+(`rcheck`, `tests/surface_delegate.tk`) is unaffected. `decl_find` is deliberately NOT
+asked as part of the detection: it answers "a function of that name has been read so far",
+which is not the question (a PARAMETER shadows that function and nothing the parser keeps
+records one, D51's sixth pass) and it would miss a namespaced function the walk resolves
+by prefix (`tk_deleg_resolve_fn`).
+
+**One column, no new table.** What waits is the VALUE node, not a store call: the door
+hands the value back and its callers build the store around it afterwards, so there is
+no store node to key on yet. The existing late table takes it with one more column
+(`dl_val`, 1 = "`dl_node` IS the value"), and `tk_deleg_val_do` rewrites the node IN PLACE
+(`tk_node_replace` + `tk_xt_move`) -- the same answer `tk_fs_convert` gives a field store's
+own widening, and for the same reason: the slot holding the value keeps no handle this
+function could re-point. The value node is visited by `tk_deleg_walk` like any other (it
+is the second argument of the store it ends up in), so the bucket that keys the table by
+node id needed nothing new, and no other entry's behaviour moves (`dl_val` is written 0 by
+`tk_deleg_store_defer` for every store-keyed row).
+
+**The namespace order of a bare name, fixed at the shared resolver.** Copilot on #713
+read the field road's own tail and found `tk_deleg_resolve_fn` (teko_deleg.tk) asking
+`decl_find(fname)` BEFORE `tk_ns_call_try_prefixes` -- the opposite of what
+`tk_ns_rewrite_call` (teko_ns.tk) does for a CALL, where the site's own namespace and its
+prefixes outward come first and a flat declaration of the exact name only after. So inside
+`namespace geo`, with a `col` declared both flat and in `geo`, `col(2, 3)` called
+`geo__col` while `Op f = col;` wrapped the flat one: the same name, two different
+functions, silently, with no diagnostic anywhere.
+
+**It is PRE-EXISTING, and it is not the field road's.** Measured on the base `441be45a`,
+with the same source exercising six roads and an exit code carrying one bit per road: the
+local initializer, the assignment, the call argument, the `return` and the `Op[]` element
+ALL wrapped the flat `col` there (mask 63 of 63; the field road could not compile at all on
+that compiler, which is what this entry's first half fixes). On the PR head before the fix
+the seventh road joined them (mask 127 of 127), and after it six of the seven answer the
+namespaced `col` (mask 4). The resolver is shared by every road that wraps a bare name, so
+one line moved fixes all of them:
+
+    i64 d = tk_ns_call_try_prefixes(fname, tk_deleg_cur_ns);
+    if (d < 0 && decl_find(fname) >= 0) return fname;
+
+-- `tk_ns_rewrite_call`'s own order, transcribed. The steps that precede the namespace one
+there (a local, a parameter, a member of the walked function's type) are already answered
+before this function is reached: `tk_deleg_coerce`'s guard, `tk_ty_scope_or_global`, is
+what refuses to wrap a name any slot declares.
+
+The road still out is the seventh, `new Op(col)`, and it is a different seat: that wrap is
+built while the file is still being READ (`tk_new_deleg` -> `tk_deleg_wrap` ->
+`tk_deleg_thunk`), and `tk_ns_scan_decls` mangles declarations in a later pass, so no
+namespaced name exists to resolve at the moment the thunk is emitted -- `new Op(only_geo)`
+inside `geo`, with no flat twin, dies `call to unknown function` at lowering on `441be45a`
+and here alike. Deferring the thunk to `tk_deleg_pass` is a redesign of the explicit form,
+not a patch to a resolver; the row is in `docs/reference/not-yet.md` with the workaround
+(the contextual form, which IS built in the pass and does resolve). `tests/surface_delegate.tk`'s
+`geo.ns_roads` locks the six that work, including the fallback to a flat `add` no `geo__add`
+competes with.
+
+**Scope.** A value the door DOES type keeps the verdict it has today, byte for byte: a
+local of delegate type, a `new Op(...)`, a call, a literal, and every field that is not of
+delegate type. The one wording that moves is a name of another type written into a delegate
+field -- `i64 g_n; h.cb = g_n;` now reads `teko: Op takes a function, another Op, or null`,
+the delegate's own sentence, where the general conversion words answered before; both are
+refusals, and the new one is the element road's, already in
+`docs/reference/diagnostics.md`. An `Op?` field is a `TK_KNULL` row of its own, which
+`tk_deleg_row` answers -1 for, so it declines the detour and keeps the refusal
+`docs/reference/not-yet.md` already records for a bare name into a `T?` delegate slot.
+
+**Out of scope, measured and recorded in `docs/reference/not-yet.md`** (both identical on
+the base compiler, neither introduced here): a LAMBDA written straight into a field
+(`h.cb = (i64 x) => x * 2;`) dies `expected ) in cast` in the core's parser -- the field
+store reads its right-hand side with `parse_expr` alone and has no counterpart to
+`tk_deleg_init_expr`'s lookahead, which is a parse-time hole in the field road, not a
+judging one; and calling a delegate through a STATIC field by its qualified name
+(`H.cb(21)`) dies `teko: unknown member: cb`, because `tk_static_use` (teko_access.tk) has
+no delegate-call branch where `tk_field_use` has one. `Op f = H.cb; f(21);` is taught and
+is what the fixture does.
+
+**Fixtures.** `tests/surface_delegate.tk`: `fcheck`'s workaround is gone -- `h.cb = add;`
+direct, which IS the proof (the base compiler refuses the file at that line) -- and a new
+`dfcheck` covers the constructor (`this.cb = add;`), the implicit form (`made = mul;`), the
+STATIC field (`D62H.scb = add;`, read back through a local and called) and the name that is
+a PARAMETER shadowing a free function `p` of the same name (`setcb(h, mul)`, whose call
+afterwards proves the parameter is what landed). `dfcheck2` covers the three callers of the
+door that had no fixture at all: a receiver typed at pass time (`void set_late(LateH h)`,
+with `LateH` declared BELOW it), an element of an ARRAY FIELD (`h.cbs[0] = mul;`) and the
+forward-referenced static store (`LateH.scb = mul;` written above the class). `geo.ns_roads`
+locks the namespace order over six roads at once, with `col` declared both flat and inside
+`geo` and a flat-only `add` for the fallback. `dfcheck` and `dfcheck2` run near the end of
+`main` and assert `rt_live()` at 1 then 2: a static field outlives every scope, so each
+helper's own delegate is still live, and that count is exactly what must remain.
+`expect-exit: 42` unmoved. One refusal, `tests/refuse/deleg_field_name_sig.tk`: a
+wrong-signature function into the field, the delegate's own sentence at the store's own
+line.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 51 refused as
+expected, 0 failed** (was 73/50, one refusal added and one fixture grown); `--dump-ast`
+byte-identical against the base compiler for all 73 pre-existing `tests/*.tk` with their
+`441be45a` sources -- the 72 the tree still carries verbatim, plus `surface_delegate.tk`'s
+own base source compiled by both binaries; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 611 links, 41 fragments,
+389 diagnostics, 51 refusals, 143 samples`; `mc limits` verdict `ok` with `grow` 0 on every
+row of both legs (macos/aarch64 and linux/x86_64), every counted table exactly where the
+base left it -- `passes` 15, `types` 13, `intrin` 8, `alias` 20, `syntax` 15, `rules` 6,
+`on_stmt` 4 -- and only the size-of-surface-code rows moved (`nodes` 156558 -> 156697,
+`funcs` 3182 -> 3185, `lowered` 3164 -> 3167, `globals` 943 -> 944 for `dl_val`, `symbols`
+6263 -> 6267, `ins` 216018 -> 216226, identical on both legs; `strings` unmoved at 2138);
+`mc pkg hash .`
+`fda769ca698d63e4ccddfbc3a5d2820edfb5b8c3bac24be8b20adc9e55a006dc` (base
+`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
+`teko_typeof.tk` are listed files, so the hash moves by design).
+
+### D63 · `new Op(f)` and `Op f = ...` are one thunk, and the `ref` pass does not judge the compiler's own forwarding (2026-09-14)
+`delegate void Mut(ref f64 x); void bumpf(ref f64 x) { x = x + 1.0; }` was accepted through
+`Mut m = bumpf;` and refused through `Mut m = new Mut(bumpf);`, at the `new` line, with
+``teko: argument 1 needs `ref` at the call site`` — the same for `out`. A FALSE refusal, not
+wrong codegen: the machine code both roads produce was already correct, and the contextual
+road was running a `tests/surface_globals.tk` row (`delegrefcheck`) the whole time.
+
+**The root cause.** Both roads build the SAME wrapper — `tk_deleg_thunk` memoizes one per
+(delegate row, function), so there is exactly one `Mut__thunk_bumpf` whichever spelling asks
+for it — and that wrapper (`tk_deleg_thunk_fn`, `teko_deleg.tk`) forwarded every parameter as
+a bare `tk_id("a0")`, typed by `dg_pslot_at` (`TY_UPTR` for a `ref`/`out` one, K2w) and never
+reading `dg_pk_at`, the KIND column beside it. `bumpf(a0)` is an address passed with nothing
+saying it is one, and `tk_ref_check_kind` (`teko_ref.tk`) refuses exactly that. Only the
+`new` road refused because `new` builds its thunk during the PARSE, so `tk_ref_pass`
+(`teko.tk`, pass 12) walks it; the contextual road builds the identical thunk inside
+`tk_deleg_pass`, which runs AFTER that walk, and nothing looked at it. One road checked, one
+road not — and the check being asked of a body no program wrote is itself the defect, which
+is where the second pass below lands.
+
+**Two gates the forwarded argument has to satisfy, if it is to be judged at all.** (1) `tk_ref_check_kind` reads the
+argument's TAG (`tk_rfarg_kind`), so the argument must be tagged with the delegate's own
+kind. (2) `tk_ref_check_pointee_ty` reads `tk_ref_arg_pointee`, which for an `N_IDENT`
+PREFERS the lexical scope — the right rule for a `ref x` the source wrote, where the tag is
+the parser's guess (`tk_slv_find`) and the scope is the truth (higiene 3, item A) — and the
+scope holds `a0` under the `uptr` it is declared at, there being no `tk_rp_*` row for it:
+`uptr` against `f64` would be refused in the other words.
+
+**The four seats, measured** (the first three on the first pass, the fourth on the second).
+
+| seat | what it costs | verdict |
+|---|---|---|
+| (i) tag the argument and wrap the name in `(uptr)`, so it is not an `N_IDENT` and the pointee oracle falls to the tag | 12 lines, `teko_deleg.tk` alone — and one row of `TK_MAXRFARG` per forwarded `ref`/`out` parameter, out of the budget the SOURCE's own arguments draw on | taken on the first pass, **rejected** on the second |
+| (ii) `tk_rp_add` on the thunk's own parameter, so the SCOPE answers the pointee | `tk_ref_walk` then rewrites `a0` into `ld64(a0)` and breaks the forward — needs a guard there — and an `out` thunk trips `tk_ref_check_out_assigned` unless it is also marked seen: two files, three new branches | rejected |
+| (iii) `tk_addr("a0")` — `&a0` | the thunk's OWN slot, not the caller's; the repass road that rewrites `&x` into `x` (`tk_ref_walk`'s `N_ADDR` branch) never fires here, since `a0` carries no `ref` row | rejected, wrong code |
+| (iv) do not judge the thunk at all: `tk_ref_pass` skips a function the delegate table itself names as a forwarder | one column on the memo table `tk_deleg_thunk` already keeps, one predicate, one `&&` in the pass loop — and the forwarded argument goes back to the bare `tk_id(pn)` it always was | **taken**, second pass |
+
+Seat (i) was `tk_deleg_thunk_arg`: a by-value parameter stayed the bare name, and a `ref`/`out`
+one became `tk_cast(TY_UPTR, tk_id(pn))` tagged `tk_rfarg_tag(a, dg_pk_at, dg_pty_at)`. The
+tag is the DELEGATE's, which is the callee's by then — `tk_deleg_check_sig` has already proved
+kind and type identical parameter by parameter before any thunk exists, which is also why the
+mismatch (`void byval(f64 x)` on a `Mut`) is refused, at the `new` line, by name, under every
+seat in the table.
+
+**Copilot finding, second pass: the tag is spent out of the program's own budget.** The
+`rf_*` table (`teko_ref.tk`, `TK_MAXRFARG` 512) is unit-wide and holds one row per `ref`/`out`
+ARGUMENT. Seat (i) put the compiler's own forwarding in it: one row per forwarded parameter,
+`TK_MAXDGI` (64) wrapper pairs × the delegate's arity, against the same 512 rows every
+argument the SOURCE writes draws on. Measured, one generated unit, 30 delegate types of 8
+`ref i64` parameters each (one target function per type, so 30 wrappers = 240 forwarded
+parameters) plus N `src(ref x)` calls, the same text compiled by the base compiler
+(`441be45a`) and by seat (i) (`cd844c2a`):
+
+| N source `ref` arguments | base `441be45a` | seat (i) `cd844c2a` | seat (iv) `0ef92adc` |
+|---|---|---|---|
+| 272 | accepted | accepted | accepted |
+| 273 | accepted | **segfault (139)** | accepted |
+| 500 | accepted | segfault (139) | accepted |
+| 512 | accepted | segfault (139) | accepted |
+| 513 | segfault (139) | segfault (139) | refused (the table's real ceiling) |
+
+The overflow is a SEGMENTATION FAULT everywhere the guard below is still the swapped
+`err_at`, which is every column but the last: exhausting `TK_MAXRFARG` crashed the compiler,
+it did not refuse. The word "refused" belongs to seat (iv)'s tree alone, where the same
+overflow finally speaks — ``teko: too many `ref`/`out` arguments in one unit``, with the file
+and the line (re-measured on the third pass, mc 0.15.23, macos/aarch64; the probe is
+regenerated per N and no row is quoted from an earlier run).
+
+Seat (i) cost the unit 240 of its 512 rows — code no one wrote — and a legitimate 273rd
+source `ref` argument then crashed the compiler where the base compiler takes 512. Seat (iv)
+puts the whole budget back: 512 on both roads, `new` and contextual alike, which is more than
+the base manages, since the base cannot compile the `new` road at all (that is this
+decision's own bug).
+
+**Why seat (iv) is the root and not a hole punched in a check.** A thunk is not a body the
+program wrote and then had exempted; it is a body the COMPILER wrote, argument by argument,
+out of `dg_pk_at`/`dg_pty_at`, over a target `tk_deleg_check_sig` has already proved identical
+to the delegate parameter by parameter. Correct BY CONSTRUCTION, so there is nothing in it for
+`tk_ref_pass` to verify — and nothing for it to rewrite either: the thunk's own parameters
+carry no `tk_rp_*` row, so both rewriting branches of `tk_ref_walk` were already inert there,
+and `tk_ref_fn_has_refout` is already 0, so the `out` prologue and the never-assigned check
+were already skipped. The walk's ONLY effect inside a thunk was `tk_ref_check_call` asking a
+question about a call the compiler itself had just written, and answering ``argument 1 needs
+`ref` at the call site``. D63's rule, restated: **the `ref` pass does not judge the compiler's
+own forwarding.**
+
+The mark is an IDENTITY, never a name pattern. `tk_deleg_thunk`'s memo table already holds one
+row per (delegate row, function) pair; the forwarder's `N_FUNC` node becomes that row's fourth
+column (`dgi_thunk`), and `tk_deleg_is_thunk(f)` is the one question `tk_ref_pass` asks. D48's
+`tk_emit_owns`/`tk_emit_is` registry could not carry this: it records every GENERATED
+declaration, and a lambda body is generated too while holding the code the program wrote —
+that body keeps every check the same code written inline would get. Reserving the spelling
+`Op__thunk_add` is teko_over.tk's job and a different question.
+
+**A second defect the probe surfaced, fixed here.** `tk_rfarg_tag`'s own overflow guard read
+`err_at(tk_line, tk_file, …)` — the two arguments the wrong way round, where `tk_rp_add`
+fifty lines above spells `err_at(tk_file, tk_line, …)`. A unit that exhausted `TK_MAXRFARG`
+therefore read an integer line number as a file POINTER and died of a segmentation fault
+instead of refusing: measured on the base compiler too (`441be45a`, 513 source `ref`
+arguments, exit 139), so it is older than this decision and reachable from pure source. It now
+refuses, with the file and the line: ``teko: too many `ref`/`out` arguments in one unit``.
+No new message, no new fixture — a 519-line generated fixture would pin the ceiling's exact
+value rather than the guard, and would have to be rewritten the day the table grows.
+
+**Fixtures.** `tests/surface_globals.tk`'s `delegrefcheck` grows four rows: `new Mut(bumpf)`
+and `new MutI(bumpi)` (the two pointees the contextual rows already prove, now on the `new`
+road) and a `Setter`/`seti` pair — `delegate void Setter(out i64 x)`, the first `out` delegate
+any fixture has — on BOTH roads, `return 5` through `return 8`, `expect-exit: 42` unmoved. One
+refusal, `tests/refuse/deleg_new_kind.tk`: `new Mut(byval)` over `void byval(f64 x)` stays
+refused by `tk_deleg_check_sig`, `teko: byval does not match the delegate Mut(ref f64)` at the
+`new` line — untouched by the second pass, which changes nothing about what a target has to
+match.
+
+**Docs.** `docs/reference/delegates.md` states that the contextual form and `new Op(...)` are
+the same memoized thunk, that a `ref`/`out` parameter travels through it as the caller's own
+address, and that the kind is matched once on the TARGET before any wrapper exists, with a
+runnable sample of `ref` and `out` over `new`. `docs/reference/diagnostics.md`'s delegate-shaped
+bullet carries `" does not match the delegate "` as a literal on one line (the check-docs
+refusal gate matches the compiler's own string, and the phrase was split across a line wrap),
+naming the kind as part of what has to match. No new `teko: …` refusal was added by either
+pass.
+
+**Proof, second pass** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **73 passed, 51 refused as
+expected, 0 failed** (was 73/50); `--dump-ast` byte-identical against the base compiler for
+**all 73** pre-existing `tests/*.tk` — `tests/surface_globals.tk` included, the two
+`CAST type=uptr` hunks seat (i) put above the forwarded `IDENT name=a0` of `Mut__thunk_bumpf`
+and `MutI__thunk_bumpi` being gone, and there is no `CAST` left anywhere in that dump; `sh
+scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (81.9s); `sh
+scripts/check-docs.sh` → 598 links, 41 fragments, 389 diagnostics, 51 refusals, 142 samples,
+all green; `mc build . --config mc.macos.toml --limits` verdict `ok`, every COUNTED table
+exactly where the base left it — `passes` 15/30, `syntax` 15/30, `alias` 20/40, `types` 13/26,
+`intrin` 8/16 — and only the size-of-surface-code rows moved (`funcs`/`lowered` 3816 → 3819,
+`globals` 1272 → 1273, `symbols` 7756 → 7760, `nodes` 178817 → 179140, `ins` 216018 → 216116
+on the compiler leg); `./build/teko limits tests/hello.tk` and `./build/teko limits
+tests/surface_delegate.tk` both byte-identical to the base compiler's; `mc pkg hash .`
+`b3b40c5aa0985d1205838560f11107624da2f78471934ea5afec518185e5dbad` (base
+`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
+`teko_ref.tk` are listed files, so the hash moves by design).
+
+**Third pass, verifier finding: the RECLAIM's argument check judged the same forwarding.**
+The `ref` pass was not the only pass asking a question about the thunk's body. `tk_rc_call_args`
+(`teko_rc.tk`, D226's compat crumb) checks every `N_CALL`'s arguments against the callee's
+declared parameter types, and it routes a `ref`/`out` parameter to the rule that owns pointees
+(`tk_ref_check_pointee`) only when the ARGUMENT node is an `N_ADDR` — the shape `f(ref x)` has
+at the surface. A thunk forwards the caller's address as the bare name of a slot declared
+`uptr` (`tk_id(pn)` over `dg_pslot_at`, K2w), which is not an `N_ADDR`, so the argument fell to
+the ordinary `tk_check_compat(pt, at)` with `pt` = the POINTEE and `at` = `uptr`. Permissive
+for a scalar pointee — `uptr` against `f64` or `i64` has no row to fit and passes — and a hard
+row-fit refusal for a class or a struct one:
+
+```teko
+class Box { public i64 v; public Box(i64 x) { v = x; } }
+delegate void Fill(ref Box b);
+void fill(ref Box b) { b.v = 3; }
+
+i64 main() {
+    Box b = new Box(1);
+    Fill f = fill;                                // ...and `new Fill(fill)` alike
+    f(ref b);
+    return b.v;
+}
+```
+
+``teko: a value of type uptr does not convert to Box``, at the line of the delegate's own
+declaration, on BOTH roads — measured on the base compiler (`441be45a`) and on the second
+pass (`7aae5261`), for `ref Box`, `ref DateOnly` (a four-byte primitive), a `ref` struct and
+`out Cell`, eight programs in all. Not a regression against `main`: the base refuses the same
+eight, six of them in these very words and the two `new` ones with the ``argument 1 needs
+`ref` at the call site`` this decision's first pass removed. It IS a regression inside the
+branch — seat (i) (`cd844c2a`) compiled all eight, by accident: the `(uptr)` cast it wrapped
+the forwarded name in made the node something `tk_ty_of` answered with the TAG's pointee, so
+the compat question came out right for the wrong reason. The budget probe killed that seat,
+and the accident with it.
+
+**The fix is the rule already in force, applied to the second pass that breaks it.**
+`tk_rc_call_args` returns at once when the function it is walking is a thunk
+(`tk_deleg_is_thunk(tk_rc_cur_fn)` — the pass already keeps the enclosing `N_FUNC` in
+`tk_rc_cur_fn` for K2's own `ref`/`out` exception, and it is the same identity `tk_ref_pass`
+skips under). One line, one file. There is nothing there to judge — `tk_deleg_check_sig`
+proves the target identical to the delegate parameter by parameter, type AND kind, before any
+thunk exists — and nothing to rewrite: with `pt` equal to `at` at every by-value position, the
+widen (`tk_num_widen`) and the box (`tk_nl_wrap`) the walk also performs are no-ops inside a
+thunk, which is why no dump of a thunk body moves. The reclaim's own work is untouched: this
+is one call's argument check, not the pass, and a `ref` argument carries no count in the first
+place (the park, the own and the releases all live in `tk_rc_walk`/`tk_rc_store`, which still
+walk the thunk exactly as before — `Mut__thunk_bumpf`'s dump is byte-identical). D63's rule,
+restated once more and now pass-agnostic: **no pass judges the compiler's own forwarding.**
+
+**Fixtures, third pass.** `tests/surface_delegate.tk` grows `pcheck`, the seventh helper:
+`delegate void Fill(ref Box b)` over a class, `delegate void Move(ref Pt p)` over a struct and
+`delegate void Mk(out Cell c)` over a counted class, each on BOTH roads, with the target both
+WRITING through the reference (`b.v = 3`) and REBINDING the caller's slot (`b = new Box(7)`,
+the prior reference released), `expect-exit: 42` unmoved. `rt_live()` is 1 rather than 0 after
+it: the one `Pt` a struct allocates carries no count and is live for the run, `lib/rt.tk`'s own
+declared debt — and `cell_dtors` reaches 8, the two `out` rebinds plus the slot itself, which
+is what says the thunk road neither leaks nor double-frees. `tests/surface_dateonly.tk` carries
+the four-byte pointee (`delegate void SetDay(ref DateOnly d)`, `nextday` through both roads,
+`return 84` through `return 87`), where `lib/time.tk` is already in scope. One refusal,
+`tests/refuse/deleg_new_ref_pointee.tk`: `new Fill(fillc)` over `void fillc(ref Cell c)` is
+refused by `tk_deleg_check_sig` for the POINTEE, `teko: fillc does not match the delegate
+Fill(ref Box)`. No new `teko: …` message on this pass either — both fixtures' before-states
+are existing refusals.
+
+**Proof, third pass** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **73 passed, 52
+refused as expected, 0 failed** (was 73/51); the eight programs above compile and run to 0 on
+both roads and refuse on `441be45a` and on `7aae5261` alike; `--dump-ast` byte-identical
+against the base compiler for **all 73** pre-existing `tests/*.tk` with their original
+sources, `tests/surface_globals.tk` and its two thunks included — the skip removes no node,
+because the check it skips wrote none; `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK` (133.3s); `sh scripts/check-docs.sh` → 598 links, 41 fragments, 389 diagnostics,
+52 refusals, 142 samples, all green; `mc build . --config mc.macos.toml --limits` verdict
+`ok`, every COUNTED table where the second pass left it — `passes` 15/30, `syntax` 15/30,
+`alias` 20/40, `types` 13/26, `intrin` 8/16 — with `funcs`/`lowered` 3819, `globals` 1273 and
+`symbols` 7760 unmoved and only `nodes` 179140 → 179259 and `ins` 216116 → 216125 on the
+compiler leg; `./build/teko limits tests/hello.tk` byte-identical to the base compiler's; `mc
+pkg hash .` `c9f8692f8bfdba896b329d634fa10357cff0f936e1195111549082d66799501b` (`teko_rc.tk`
+is a listed file, so the hash moves by design).
+
+### D64 · The pin rises to 0.16.1 (2026-09-14)
+`MC_VERSION` moves from `0.15.23` to `0.16.1` — twenty-five `minicompiler/mc` commits, of
+which one changes the SHAPE of what a build produces here and two more close a blocker this
+same entry once recorded open. **M52: the standard library left the binary.** Up to 0.15.23
+`<sys>`, `<prelude>`, `<io>`, `<float>` and the two float machines were a blob inside `mc`;
+since 0.16.0 they are 44 files (41 at 0.16.0) on disk under `lib/mc/v<version>/`, which `mc` resolves next to
+its own binary (by realpath, so a symlinked `mc` still finds it) and one directory up. `mc
+build` **stages that tree beside a `[compiler]` product**, so `build/lib/mc/v0.16.1/` now
+travels with `build/teko`, and the child resolves its own roots — teko passes **no
+`--libs-dir` anywhere**, and none was added. The rest of the range is invisible from here:
+the x86-64/Win64 register allocator and peephole (M49 D2), the arm64 peephole,
+loop-invariant hoisting, the reproducible bench cell (M50), `mc --exe` for Windows PE,
+version constraints for `[deps]`/`[tools]`, `[package].mc`, the registry index snapshot,
+`$` as a claimable surface token, `i128`/`u128` on x86-64 (SysV and Win64), and M53's own
+release canary machinery, which is the mechanism that unblocked this entry below.
+
+**`mc.toml` gains `[package].mc = "0.16.1"`, a bare MINIMUM (not a cap).** R2, the
+registry's own validator, moved off its 0.15.20 pin once 0.16.0 shipped and now reads
+version constraints, so the manifest can finally say which mc a build of this package
+needs — `docs/reference/packages.md § The minimum mc version` is mc's own prescription: a
+bare/`>=` value is the normal form, a `^`/`~`/`=` CAPS the compiler and is written only
+against a future break already known, which this package has none of. `teko.toml` stays
+bare — it is a build config, not a manifest, and carries no `[package]` table to begin
+with. There is still no `[deps] stdlib` to declare — `docs/specs/packages.md` predicted the
+library would become a *package* reached through the lock; what shipped moved it to a
+*directory*, leaving the include names, the closure rule and `[deps]` untouched.
 
 **One change beyond the version string, and it is not cosmetic.**
-`.github/actions/package-teko` staged `teko` and `lib/rt.tk` into the release archive and
-nothing else. `lib/rt.tk` includes `<sys>`; under 0.16.0 a `teko` binary with no
+`.github/actions/package-teko` used to stage `teko` and `lib/rt.tk` into the release
+archive and nothing else. `lib/rt.tk` includes `<sys>`; under 0.16.x a `teko` binary with no
 `lib/mc/` beside it answers `lib/rt.tk:40: unknown bundled include: sys` and cannot compile
 a single program — measured, by copying `build/teko` out of `build/` and running it, and
 measured again on a full staged archive, which compiles `#include "lib/rt.tk"` to
 `exit 42` with the tree and refuses with that line the moment `lib/mc/` is removed. (`mc`
-itself, whose driver resolves the same names, says `not in this compiler and mc 0.16.0's
+itself, whose driver resolves the same names, says `not in this compiler and mc 0.16.1's
 library tree was not found`; the taught compiler is built on `<mc/core_min>` and keeps the
 core's shorter wording.) The action now copies the tree `mc build` staged beside the
 binary into the archive's own `lib/mc/`, and fails loudly if it is not there; the archive's
@@ -5479,72 +6202,798 @@ by installing `mc` into a `bin/` + `lib/` pair and into a bare directory: the fi
 compiles `#include <sys>`, the second refuses with that exact message.
 `.github/actions/setup-mc` needed nothing — it already untars the WHOLE asset into
 `.mc-toolchain/mc-<version>-<os>-<asset>/` and addresses the binary inside it, so
-`lib/mc/v0.16.0/` lands beside it by construction.
+`lib/mc/v0.16.1/` lands beside it by construction.
 `.github/actions/windows-sysroot`'s `kernel32.def` needed nothing either: mc's own
-`scripts/sysroot-windows.sh` at `v0.16.0` lists the same nineteen names, compared verbatim.
+`scripts/sysroot-windows.sh` at `v0.16.1` still lists the same nineteen names, compared
+verbatim.
 
-Proof, macos/aarch64, with the pinned `~/.local/mc/mc-0.16.0-macos-arm64/mc`: `mc build .
---config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml`
-**73 passed, 50 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
+**The windows/x86_64 blocker this entry recorded open is CLOSED, by `mc` 0.16.1, not by
+anything here.** mc 0.16.0 added a direct PE executable backend for windows/x86_64 (M42
+step 2), and `drv_teach` took that host's exe slot unconditionally, ignoring a declared
+`[linker]` and writing `build/teko.exe` with mc's own PE writer — an image that the loader
+refused the moment the program imported anything from `kernel32`, so `build/teko.exe`
+exited 127 on every invocation and `mc build` reported it as a silent `return 1`, with no
+diagnostic. That was reported to `minicompiler/mc` with the two-line pure-`mc` reproducer
+this entry's earlier draft carried, and never worked around here (D2). `minicompiler/mc`
+PR #84 (commit `718bd82`) makes a declared `[linker]` win over the host's direct exe
+backend for the taught compiler too — the same precedence `drv_entry` already gave the
+entry — so `mc build` on windows/x86_64 links `teko.exe` with the leg's own `lld-link`
+exactly as it did at 0.15.23, and the direct PE writer never enters the road at all; a
+companion finding, PR #83 (commit `166c9f1`), separately showed the loader's refusal on the
+DIRECT road was never a layout defect but an unresolvable `kernel32` import (`write`, which
+`kernel32.dll` does not export), orthogonal to teko once fix 1 takes the linked road.
+Teko's own release canary (`.github/workflows/mc-canary.yml`, M53's mechanism) judged
+0.16.1 `ok` on every leg — `https://raw.githubusercontent.com/teko-org/teko-lang/canary/0.16.1.json`,
+run `https://github.com/teko-org/teko-lang/actions/runs/34877983682` — windows/x86_64 and
+`teko_std` included, which is the measurement this entry stands on rather than a second
+reproducer written here: the fix is on mc's side and mc's own release process is what
+proves it, per D2.
+
+Proof, macos/aarch64, with the pinned `~/.local/mc/mc-0.16.1-macos-arm64/mc`: `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**75 passed, 74 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
 aarch64` → `FIXPOINT OK` (`teko2.o == teko3.o`, fixed point on the FIRST turn —
-`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 227935 lines);
-`sh scripts/check-docs.sh <mc>` green (597 links, 41 fragments, 389 diagnostics, 50
-refusals, 141 samples). `mc pkg hash .` is
-`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75` on both releases: it
-digests `mc.toml`'s bytes and this pin touches none of them, so the tree hash does not move
-with the compiler that reads it.
+`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 229127 lines);
+`sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments, 389 diagnostics, 74
+refusals, 144 samples`. `mc pkg hash .` is
+`87462ab0fda41429aadb57e5fa97dbdbf27a72d4792348cea2907804d11f7870` (base, `origin/main`
+`bcee28f2` under 0.15.23,
+`2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: the tree hash now moves
+with this pin, because `[package].mc` is new bytes in `mc.toml`, which the previous 0.16.0
+draft of this entry did not carry).
 
-`mc limits . --config mc.macos.toml` keeps verdict `ok` on every row of both tables, and
-no table appeared, disappeared or changed its ceiling. The rows that MOVED, `build/teko.mc`
-first (estimate / used, 0.15.23 → 0.16.0): `includes` 78/78 → 79/79, `nodes` 178817/156558
-→ 186217/164041, `defines` 1246/1198 → 1331/1281, `funcs` 3816/3182 → 3961/3265, `lowered`
-3816/3164 → 3961/3246, `globals` 1272/943 → 1320/944, `strings` 2668/2138 → 2726/2172,
-`ins` 216018 → 224999, `symbols` 7756/6263 → 8007/6381, `undef` 18 → 19, `backends` 8 → 9.
-On `tests/hello.tk` exactly one row moves: `backends` 8 → 9. Every one of them is the same
-cause read twice — the library is now SOURCE the build reads (one more include) instead of
-a blob, and 0.16.0 registers one more backend (`mc --exe` for Windows PE) — and none of
-them is near its reserve.
+`mc limits . --config mc.macos.toml` keeps verdict `ok` on every row of both tables, and no
+table appeared, disappeared or changed its ceiling. The rows that MOVED, `build/teko.mc`
+first (estimate / used, 0.15.23 → 0.16.1): `includes` 78/78 → 79/79, `nodes`
+181369/157320 → 188941/164854, `defines` 1249/1201 → 1334/1284, `funcs` 3833/3193 →
+3980/3277, `lowered` 3833/3175 → 3980/3258, `globals` 1277/945 → 1326/946, `strings`
+2667/2138 → 2727/2174, `ins` 217118 → 226179, `symbols` 7777/6276 → 8033/6397, `undef`
+18 → 0, `backends` 8 → 9. On `tests/hello.tk` exactly one row moves: `backends` 8 → 9
+(the `heap` column is not a proof figure — it reflects the state of `build/` at the time
+of the run, D55's lesson). Every row's motion is the same handful of causes read twice —
+D69's own capacity raise (already on `main`, unrelated to this pin), the library now
+SOURCE the build reads (one more include) instead of a blob, and 0.16.x registers one more
+backend (`mc --exe` for Windows PE) — and none of them is near its reserve.
 
-`--dump-ast` of all **123** fixtures (73 under `tests/`, 50 under `tests/refuse/`, the
+`--dump-ast` of all **149** fixtures (75 under `tests/`, 74 under `tests/refuse/`, the
 refusals compared on their stderr since they produce no tree), taken with the compiler
-built by 0.15.23 and with the compiler built by 0.16.0 over the same unmodified tree, is
-**byte-identical on every one**. The taught compiler's own output does not depend on the
-host `mc`; what moved underneath it is codegen and library location, not grammar. The first
-run of that comparison failed on all 123 for a reason worth recording: the 0.16.0-built
-`teko` had been COPIED out of `build/`, away from the staged `lib/mc/v0.16.0/`, and every
-fixture refused at `lib/rt.tk:40: unknown bundled include: sys`. That failure is the
-measurement the packaging fix above is built on, not an mc defect.
+built by 0.15.23 (`origin/main` `bcee28f2`) and with the compiler built by 0.16.1 over the
+same unmodified tree, is **byte-identical on every one**. The taught compiler's own output
+does not depend on the host `mc`; what moved underneath it is codegen, one more capacity
+ceiling (D69) and library location, not grammar.
 
-**BLOCKED on `minicompiler/mc`, and this entry does not take force until it is unblocked.**
-The local recipe above is green; CI's `windows/x86_64` leg is not, and the cause is on mc's
-side. mc 0.16.0 added a **direct PE executable backend for windows/x86_64** (M42 step 2),
-so `drv_teach` now takes the `tgt_exe_at(ht) != 0` branch on that host and writes
-`build/teko.exe` with mc's own PE writer, ignoring the `[linker]` (lld-link) the leg
-declares — a road that did not exist at 0.15.23, where Windows had no direct executable and
-the product was always linked. The PE that writer produces **is not loadable** as soon as
-the program imports anything from `kernel32`, so `build/teko.exe` exits 127 on every
-invocation, and `mc build` reports it as `driver.mc:862`'s silent `return 1`: the leg prints
-`compiler build/teko.mc -> build/teko.exe` and dies with no diagnostic.
+### D65 · A delegate FIELD is callable on every road it can be read (2026-09-14)
+D59 closed the argument gap on the four `callp` roads that HAD a call. This entry is about
+the roads that had none. `class H { public Op cb; }` with `delegate i64 Op(i64 a, i64 b)`
+answered `h.cb(2, 3)` only where the PARSER itself could type the receiver. Measured on
+`d028a7a0`:
 
-The reproducer is two lines of pure `mc`, measured on `windows-latest` with
-`mc-0.16.0-windows-x86_64`:
+| the site | before |
+|---|---|
+| `h.cb(21)` on a LOCAL, `this.cb(x)`, `hs[0].cb(21)`, `mk().cb(21)`, `Op f = h.cb; f(21)` | ran |
+| `i64 f(H h) { return h.cb(21); }` — a PARAMETER receiver | `teko: the member is a field, not a method: cb` |
+| `H gh; ... gh.cb(21)` — a GLOBAL receiver | the same |
+| `i64 f(A a) { return a.b.cb(21); }` — a field of a field under a parameter | the same |
+| `cb(x)` UNQUALIFIED inside a method of `H` | `call to unknown function`, from the core |
+| `H.cb(21)` on a `static Op cb` | `teko: unknown member: cb` |
+| `LateH.scb(1)` on a `static Op scb` of a type declared BELOW the call | the same |
 
-| source | road | result |
+The fourth row broke the refusal law on its own: a diagnostic with no `teko:` prefix, from
+mc's own resolver, for a construct teko taught.
+
+**ROOT: one rule, written at one door out of five.** `tk_field_use` (teko_expr.tk) reads
+`tk_deleg_row(fty)` and, on a `(`, hands the field's load to `tk_field_deleg_call` ->
+`tk_deleg_build`, the single builder of a delegate `callp`. The four other doors a field
+is reached through never asked the question:
+
+  - `tk_pend_field` (teko_typeof.tk) is `tk_field_use`'s PASS-TIME twin — the emitter for
+    every receiver the parser cannot type, which is a parameter, a global, a `TK_PFWD`
+    type and a field of any of them (teko_expr.tk's `tk_dot` defers all four). Its first
+    statement was `if (form == TK_PCALL) err_at2(..., "teko: the member is a field, not a
+    method", m);`. It now asks `tk_deleg_row` first, exactly as its parse-time twin does,
+    and reports the return through `pty`/`ppure`/`pown` rather than through `tk_xt_put` —
+    the node that ends up in the TREE is `tk_pend_do`'s placeholder, not what was built
+    for it, which is the split `tk_deleg_build`'s own contract leaves to its caller.
+  - `tk_this_call` (teko_this.tk) rewrites `area(2)` into `this.area(2)` when the class
+    declares a METHOD of that name, and leaves the node alone otherwise — so a free
+    function of that name still answers, which is the rule that stays. A FIELD of delegate
+    type was never one of its cases, so the bare name reached no rewrite at all.
+    `tk_this_deleg_call` is the new one: the field of `this` under that name
+    (`tk_this_field`, which lets a local or a parameter answer first, C#'s own rule), its
+    row, and `tk_deleg_build` over `tk_ld(fty, tk_this_field_addr(fi))` — the very load
+    `this.cb` builds, and the static field's own global when the field is `static`.
+  - `tk_static_member` (teko_access.tk) decided on `(` BEFORE it ever looked at the field
+    table: `if (p_id() == K_LPAR) return tk_static_call(si, m, line, fl);`, whose
+    `tk_method_pick` answered -1 and gave `unknown member`. It now asks
+    `tk_static_deleg_field` first — a field of that name, `static`, not an array, of a type
+    that names a delegate row — and takes `tk_field_deleg_call` with the field's own global
+    as the address. The lookup is deliberately NOT `tk_static_field_of`: that one refuses an
+    INSTANCE member in words of its own, and `H.n(1)` on an instance field is a mistake
+    whose report belongs where it already was (measured unmoved).
+  - `tk_ns_rewrite_call` (teko_ns.tk), the fifth door, found by the second verifier: inside
+    a NAMESPACE a bare call is rewritten to the namespace's own free function by pass 2,
+    BEFORE `tk_this_call`/`tk_this_deleg_call` ever read the node, and the member guard it
+    stopped on was `tk_method_named_find(cls, name)` alone — so `namespace geo { i64 cb(i64);
+    class H { public Op1 cb; i64 go(i64 x) { return cb(x); } } }` compiled to a direct call
+    to `geo__cb` (`--dump-ast`: `FUNC geo__h_go` -> `CALL geo__cb`) and answered 105 where
+    the same program outside a namespace answers 6. It now also stops on a FIELD whose type
+    names a delegate row (`tk_field_find` + `tk_deleg_row`), which is exactly what
+    `tk_this_deleg_call` then builds — and only on a delegate one, and only for an `N_CALL`:
+    a bare `n(1)` on an `i64` field keeps the fork below, and `&cb` keeps naming the free
+    function it names outside a namespace. Its twin `tk_ns_rewrite_ident` already asked
+    `tk_field_find`.
+    The same door carried a second defect of its own: `tk_ns_call_cls` was filled with
+    `tk_method_of_fn(...)`, a METHOD row number, and read by both rewrites as a STRUCT row
+    number — so the member guard answered for whatever type happened to sit at that index
+    and held only where the two numbers coincided (one class, its methods declared first).
+    With three classes ahead of it, even the METHOD half failed: a namespaced free `tag`
+    won over the class's own `tag`, 105 on `d028a7a0`. `tk_ns_cls_of_fn` reads `mt_cls_at`
+    off the row, the same pair `teko_this.tk` reads for its own `tk_pass_class`.
+
+**What does NOT move, and it is the larger half.** A method named `cb` still answers ahead
+of the field on both the bare-name road and the `Type.` road, as it does in C#. A
+non-delegate field keeps every wording it had: `h.n(1)` through a parameter receiver is
+still `teko: the member is a field, not a method: n`, `H.n(1)` on a `static i64` is still
+`teko: unknown member: n`, and an instance field reached through its type is still the
+instance-member refusal. An ARRAY field is excluded at both new doors (`fd_nel_at > 0`),
+so the two `p.items[i]` forms are untouched. And `n(1)` on an `i64` field by its bare name
+is STILL `call to unknown function` — a surface fork left alone, recorded in
+`docs/reference/not-yet.md`: a bare name becomes a call only where it can become one, and
+widening that into a teko refusal would have to decide what `n(1)` means for every
+non-callable member, which is a design and not this crumb.
+
+**D59's judge rides along, unasked.** All three new roads go through `tk_deleg_build`, so
+`tk_deleg_check_arg_kinds` fires on them from the first day: the count, the `ref`/`out`
+kind, the pointee, the by-value type and C# §10.2.3's widening. The deferred road parks
+what it cannot type at PASS 6 (`tk_typeof_pass`) and the park is judged at the end of
+`tk_over_pass`, pass 14 — later, so nothing is read before it is written. `tests/refuse/
+deleg_pend_arg_narrow.tk` is the row for it. **No pass of its own and no table of its own**:
+`passes` stays 15/30 and `globals` 943.
+
+**Fixtures** (3 refusals, 1 positive grown). `tests/refuse/deleg_pend_not_deleg.tk` and
+`deleg_static_not_deleg.tk` hold the two wordings that must NOT move;
+`deleg_pend_arg_narrow.tk` is an `f64` local through a deferred `Op(i64)` field call.
+`tests/surface_delegate.tk` grows `pfcheck` — a parameter receiver, a field of a field under
+one, and the bare name inside a method, with `rt_live()` back to its floor, the delegate
+being borrowed by the call and not kept — and `sfcheck`, the two slots that OUTLIVE the
+helper: a `static Op` reached as `PH.scb(20, 1)` and by its bare name from a static method,
+and a GLOBAL receiver. `main` asserts `rt_live() == 3` after that one rather than the floor,
+which is what a static field and a global holding an object holding a delegate come to.
+`expect-exit: 42` unmoved; the grown fixture is refused by the base compiler at `PH.scb`.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d028a7a0`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64 refused as
+expected, 0 failed** (73/61 on the base); `--dump-ast` against the base compiler for **all
+73** pre-existing `tests/*.tk` with their ORIGINAL sources — **byte-identical on all 73**,
+every new branch being reached only where the program did not compile before;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 600 links, 43 fragments, 389 diagnostics, 64
+refusals, 141 samples` (no new literal: every message these three doors give was already
+documented); `mc limits . --config mc.macos.toml` verdict `ok` on both legs, the
+`tests/hello.tk` leg unmoved on every counted row (`passes` 15/30, `types` 13, `intrin`
+8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0) and the compiler leg
+moving only by the added surface code — `nodes` 156565 -> 156854, `ins` 215968 -> 216382,
+`funcs` 3182 -> 3185, `lowered` 3164 -> 3167, `symbols` 6263 -> 6266, with `globals` **943**
+and `strings` **2138** both unmoved; `mc pkg hash .` `e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe` (base
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: `teko_typeof.tk`,
+`teko_this.tk` and `teko_access.tk` are listed files, so the hash moves by design).
+
+**The precedence is written out, because this crumb moved it.** A verifier measured a
+shape the entry above did not name: a FREE function and a delegate FIELD sharing a name,
+the bare name called inside a method.
+
+```teko
+delegate i64 Op1(i64 a);
+i64 add1(i64 a) { return a + 1; }
+i64 cb(i64 a) { return a + 100; }         // a FREE function named `cb`
+class H {
+    public Op1 cb;                        // ...and a delegate FIELD named `cb`
+    public i64 go(i64 x) { return cb(x); }
+}
+i64 main() { H h = new H; h.cb = new Op1(add1); return h.go(5); }
+```
+
+`d028a7a0` exits **105** — the free function — and this crumb exits **6**, the field, with
+no diagnostic either way. The twin with a METHOD instead of a field (a free `i64 m(i64)`
+returning `a + 100`, a method `m` returning `a + 1`, `m(x)` inside a sibling method) exits
+**6 on the base as well**: `tk_this_call` (teko_this.tk:414) asks
+`tk_method_named_find(tk_pass_class, m)` FIRST and rewrites the site into `this.m(...)`,
+so a member has shadowed a free function of its name since long before D65.
+
+**The rule, and it is C#'s.** A bare name inside a method resolves to the class's own
+member — method, then field — before any free function of that name. C# has no free
+functions; its nearest forms, a static method of the enclosing (or a static) class and a
+top-level local function, are both shadowed by a same-named member of the class whose body
+reads the name, silently. teko already did that for the method half, so the head's
+behaviour is the consistent one and the base's was the outlier: the field half simply had
+no door (the name reached no rewrite and fell through to the core's resolver, which knows
+only the free function). A program that read a free function through a same-named delegate
+field changed meaning with this crumb, **deliberately**. From outside the class nothing
+moves — `cb(5)` in `main` is still 105 — and a local or a parameter of that name still
+answers before the member, which is `tk_this_field`'s own rule.
+
+**The honest alternative was measured and rejected.** A REFUSAL at the collision —
+`teko: cb is both a field of H and a function; write this.cb(...) or H's own name` — reads
+well, but it refuses what C# accepts, and it would have to refuse the METHOD twin too, or
+teko would refuse the field collision while silently shadowing the method one. Widening it
+to both halves breaks working programs for a shape C# has never complained about. Member
+wins, no refusal.
+
+`tests/surface_delegate.tk` grows `shadowcheck` for it: a free `cb` and a free `tag`, a
+class `Shad` with a delegate field `cb` and a method `tag`, `cb(5)` and `tag(5)` inside its
+methods both answering **6** (the members), `sh.cb(5)` = 6 through the receiver, and
+`main` reading both free functions at **105**. `docs/reference/delegates.md` (the
+precedence sentence) and `docs/reference/classes.md` ("The receiver is not written") carry
+the rule.
+
+**Proof, second pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`, only `tests/` and
+`docs/` moved — no module of the compiler changed in this pass):
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64 refused as
+expected, 0 failed**, `tests/surface_delegate.tk` still `expect-exit: 42` with
+`shadowcheck` inside it and still refused by the base compiler (at `PH.scb`, line 429);
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **72 byte-identical**, `tests/surface_delegate.tk` a pure INSERTION (the
+base's dump plus `shadowcheck`'s own nodes, nothing else moved), unchanged from the first
+pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (the link and the fragment are `classes.md` -> `delegates.md#calling`;
+no new diagnostic, because the ruling is that nothing is refused); `mc limits . --config
+mc.macos.toml` verdict `ok` on both legs with every counted row unmoved from the first pass
+— compiler leg `nodes` 156854, `ins` 216382, `funcs` 3185, `lowered` 3167, `symbols` 6266,
+`globals` 943, `strings` 2138, and the `tests/hello.tk` leg `passes` 15/30, `types` 13,
+`intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0; `mc pkg hash .`
+`e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe`, unmoved — a fixture,
+the log and two reference pages are not listed files.
+
+**The fifth door, measured** (mc 0.15.23, macos/aarch64, base `d028a7a0`). Every shape is
+written inside `namespace geo` except the fourth, where the namespace holds only the free
+function and the class is top level under a `using geo;`; `delegate i64 Op1(i64 a);` and
+`i64 add1(i64 a)` are top level throughout, and the exit code is what `main` returns:
+
+| the shape | base | head |
 |---|---|---|
-| `i64 main() { return 42; }` | `mc --exe` | runs, **42** |
-| `#include <sys>` + the same `main` | `mc --exe` | **127** — the loader refuses the image |
-| `#include <sys>` + the same `main` | `--backend=coff-obj-x86_64` + `lld-link` | runs, **42** |
+| a delegate FIELD `cb` vs the namespace's free `cb`, bare `cb(x)` in a method | 105 | **6** |
+| a METHOD `tag` vs the namespace's free `tag`, bare `tag(x)` in a sibling method | 6 | 6 |
+| the namespace's free `lone` with NO member of that name, `lone(x)` in a method | 105 | 105 |
+| a `using`-imported free `cb` vs a delegate field of a top-level class | 105 | **6** |
+| `cb(5)` in a namespace FUNCTION, outside the class | 105 | 105 |
+| the METHOD twin with three classes declared ahead of it (the index defect) | 105 | **6** |
 
-The object is sound on both roads; only the image mc's own writer lays out is refused. The
-same contrast holds at scale: `build/teko.mc` compiled to a COFF object and linked by hand
-with lld-link gives a `teko.exe` whose `--version` and `--entry-only` both exit 0, while the
-one `mc build` wrote with `--exe` exits 127. `windows/aarch64` is unaffected — it has no
-direct executable backend, so it still links and still passes. `llvm-readobj` on the refused
-image: `SectionCount 4`, `SizeOfImage 0x5000`, `ImportTableRVA 0x4000`, `IATRVA 0x4068`,
-`AddressOfEntryPoint 0x3000` against `BaseOfCode 0x1000`/`SizeOfCode 1536`,
-`IMAGE_FILE_RELOCS_STRIPPED`.
+Row 2 held on the base only by the coincidence row 6 breaks: `tk_ns_call_cls` carried a
+method row number where a struct row number was read.
 
-This is reported to `minicompiler/mc` and never worked around here (D2): there is no flag
-that makes `mc build` prefer the declared `[linker]` over the direct backend, and inventing
-one in this tree would be exactly the patch D2 forbids. The pin lands when a released `mc`
-builds a loadable PE on windows/x86_64.
+**Proof, third pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **73 passed, 64 refused as expected, 0 failed**, `tests/surface_delegate.tk`
+still `expect-exit: 42` with `shadowcheck` grown by the namespaced pair (`shd.NShad`) and
+exiting **214** on the pre-fix compiler — row 210 + 4, the field shape;
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **byte-identical on all 73**, and byte-identical on all 73 of the branch's
+own sources as they stood before this pass grew the fixture, compiler `cc43ad53` against the
+fixed one: this door fires only for a class that declares a delegate field named like a free
+function reachable from its namespace, and no fixture had one before this pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (no new literal: the ruling is still that nothing is refused);
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, the `tests/hello.tk` leg
+unmoved (`passes` 15/30, `types` 13, `intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4,
+`on_stmt` 4, `globals` 0) and the compiler leg moving only by the added surface code —
+`nodes` 156854 -> 156917, `ins` 216382 -> 216486, `funcs` 3185 -> 3187, `lowered` 3167 ->
+3169, `symbols` 6266 -> 6268, with `globals` **943** and `strings` **2138** both unmoved;
+`mc pkg hash .`
+`a0ef8936de1773c578ee8c9800524caef98a9837499b16f6e50b74f40af0e221` (`teko_ns.tk` is a
+listed file, so the hash moves by design).
+
+**A silent-wrong repaired as a side effect: the CONST road.** The third-pass verifier owes
+this entry a paragraph it did not have. `tk_ns_cls_of_fn`'s index fix is read by BOTH
+rewrites of teko_ns.tk, and the second one is `tk_ns_rewrite_ident`, whose member guard is
+`tk_field_find || tk_mconst_find || tk_method_named_find` on that same class index. So a
+namespaced `const X` standing beside a MEMBER `const X`, the bare `X` read inside a method
+of that class, answered the NAMESPACE const wherever the two row numbers did not coincide.
+Measured on `409bc8c0` with three classes declaring methods ahead of the one under test,
+`namespace nsc { const i64 X = 7; ... class NC { public const i64 X = 1; i64 go() { return
+X; } } }`: the base exits **7**, the head exits **1**. No diagnostic either way — a
+silent-wrong, and the same C# rule D65 wrote out for the field: the class's own member
+answers before anything the namespace declares. It costs no fixture of its own: the row is
+`nsh.cgo()` in `tests/surface_delegate.tk`'s `shadowcheck`, a `const i64 CX = 105` in
+`namespace shd` against `NShad`'s own `public const i64 CX = 6`.
+
+**Copilot on #716, pass 4 — the forward road and the array guard.** `LateH.scb(1)` with
+`LateH` declared below the call goes through `tk_fwd_resolve_static_one` (teko_access.tk),
+whose `TK_STCALL` branch picked methods only and refused `teko: unknown member: scb`. The
+branch now asks `tk_static_deleg_field` first and builds the delegate `callp` with
+`tk_deleg_build` over the arguments the site recorded (`st_arg_at`/`st_na_at`) — no re-parse,
+the same builder the known-type road takes; measured with a LOCAL argument (`go(k)` calling
+`LateH.scb(k, 2)`), the judged `callp` runs. And `tk_ns_deleg_field` (teko_ns.tk) now excludes
+an ARRAY field — `fd_ty_at` carries the element type, so `public Op cb[2]` looked like a
+callable delegate field and stopped the namespace rewrite of a bare `cb(5)` that names the
+namespace's free function; every other delegate-call door already excluded arrays.
+`tests/surface_delegate_fwd.tk` carries both.
+
+### D66 · A contextual lambda is read on every slot of delegate type teko's own parser reaches (2026-09-14)
+`(i64 x) => x * 2` with no `new Op(...)` around it needs a READER that looks ahead before
+mc's core does: `parse_primary` sees `(`, asks `type_of_token` for a cast and otherwise
+parses a group, and neither branch has a fallback -- `expected ) in cast` is what a lambda
+gets there. teko's own lookahead for it (`tk_paren_lambda_follows`, non-consuming, counting
+bytes from `p_cp()` to the matching `)` and testing for `=>`/`use`) was reached from exactly
+TWO places: a delegate variable declaration (`tk_deleg_var_stmt`) and a METHOD-call argument
+(`tk_args_typed`). Every other right-hand side of delegate type died in the core, so the
+surface said "a lambda goes wherever a delegate value goes" and the compiler said otherwise
+at six sites.
+
+**Measured on `d028a7a0`** (mc 0.15.23, macos/aarch64), seven roads, all seven
+`expected ) in cast`:
+
+| road | written | before | after |
+|---|---|---|---|
+| instance field | `h.cb = (i64 x) => x * 2;` | `expected ) in cast` | **accepted** |
+| constructor | `this.cb = (i64 x) => x * 2;` | `expected ) in cast` | **accepted** |
+| static field | `H.cb = (i64 x) => x * 2;` | `expected ) in cast` | **accepted** |
+| `T[]` element | `fs[0] = (i64 x) => x * 2;` | `expected ) in cast` | **accepted** |
+| `return` | `return (i64 x) => x * 2;` | `expected ) in cast` | unchanged, and why below |
+| free-function argument | `apply((i64 x) => x * 2, 21)` | `expected ) in cast` | unchanged |
+| bare-name assignment | `g = (i64 x) => x * 2;` (a global, or a field written without `this.`) | `expected ) in cast` | unchanged |
+
+**ONE helper, three call sites, four roads.** `tk_deleg_rhs(ty, line, fl)` (teko_deleg.tk)
+answers "the value of a slot of type `ty`": `tk_deleg_row_under(ty)` -- the delegate row with
+the `?` peeled off -- hands it to `tk_deleg_init_expr`, the reader the declaration road
+already had, and every other type is `parse_expr(0)`, byte for byte what each site read
+before. `tk_field_use` (teko_expr.tk), `tk_static_use` (teko_access.tk, a forward
+declaration away, the module being included four files earlier) and `tk_ha_index`
+(teko_heaparr.tk) call it in place of their own `parse_expr(0)`. The CONSTRUCTOR road costs
+nothing: `this` is an ordinary receiver by the time `.` is read, so `this.cb = ...` reaches
+`tk_field_use` like any other `h.cb = ...`. The `?` is peeled for the same reason the
+element road's own escape check already peeled it (D51, twelfth pass): an `Op?` slot holds
+a lambda exactly as an `Op` slot does, and the declaration road has read `Op? f = (i64 x)
+=> ...;` since Q1a.
+
+**Three roads stay closed, and the reason is not teko's to fix.** They are the three parse
+positions mc's core owns outright, with no registration reaching them (`src/parse.mc`, read
+only, D2): `syntax_stmt` refuses a core keyword, so no handler may stand at `return`;
+`parse_call` reads a free call's arguments itself, so the six word registrations never see
+one (a METHOD call is teko's own `tk_call_method_args`, which is why that road works);
+and a bare-name assignment falls to `parse_expr` at the bottom of `parse_stmt_core`, below
+`syntax_stmt_find`. The one door that WOULD reach all three is `syntax_expr("(")` -- the
+head of `parse_primary` tests `syntax_expr_find` before the `K_LPAR` branch -- which would
+claim every parenthesised expression and every cast in every program and make teko
+re-implement both. That is a fork, not a patch (D21). `new Op((i64 x) => ...)` is what those
+three positions take, and `docs/reference/not-yet.md` carries them with this reason.
+
+**The escape rule did not move.** Each of the three sites already called `tk_lam_escapes`
+over the value it parsed, so `h.cb = (i64 x) use (&acc) => ...;` is refused `teko: a lambda
+that captures by reference cannot leave its scope` at the store's own line on every road
+just opened -- the same sentence the seven existing escape sites carry, no site missing it,
+none added.
+
+**FIXTURES** (1 grown, 5 refusals). `tests/surface_lambda.tk` grows item 22,
+`slot_roads_check`: the field road in all three grafias (explicit parameters, short, and a
+capture by value), the static field, a constructor's `this.cb`, and two `Op[]` elements --
+plus three rows that write a CAST (`(i64) 3.5`) and a GROUP (`(k + 1) * 2`, `(fs[1])`)
+through the very same three readers, so the lookahead is measured not to have claimed a `(`
+that opens neither. It is the LAST helper `main` calls and the only one whose `rt_live()`
+floor is 1: `St.cb` is a static, and the closure it holds outlives every scope. Its own
+`method_check` drops the `new Op(...)` the field road used to force. The five refusals --
+`tests/refuse/deleg_{field,static,this,elem,nullfield}_lam_escape.tk` -- carry the escape
+sentence at the store line of each opened road; the `Op?` one is what pins
+`tk_deleg_row_under`, since with the `?` unpeeled that store would fall to `parse_expr(0)`
+and die in the core instead.
+
+**Docs.** `docs/reference/delegates.md` replaces the sentence that promised a lambda
+"wherever a value of its delegate type is expected" with the table of roads that take one
+and the three that still need `new Op(...)`. `docs/reference/not-yet.md` widens its
+`return (i64 x) => e;` row into the three closed positions with the parser reason.
+`docs/reference/diagnostics.md` is unmoved: no refusal is new here.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d028a7a0`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 66 refused as
+expected, 0 failed** (73/61 on the base: five refusals added, one positive grown);
+`--dump-ast` **byte-identical on all 73** pre-existing `tests/*.tk` with their ORIGINAL
+sources, base compiler against this one, before the fixture was grown -- a lookahead that
+fires only where the core parser refused today cannot move an accepted program, and the
+cast and group rows measure the other half; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 598 links, 41 fragments,
+389 diagnostics, 66 refusals, 141 samples`; `mc limits . --config mc.macos.toml` verdict
+`ok` on both legs, every counted table exactly where the base left it (`passes` 15/30,
+`syntax` 15/30, `types` 13, `intrin` 8/16, `alias` 20/40, `on_stmt` 4, `syntax_type` 2,
+`globals` 943) and only the size-of-surface-code rows moving with the one function added
+(`nodes` 156565 -> 156598, `ins` 215968 -> 216017, `funcs` 3182 -> 3183, `lowered` 3164 ->
+3165, `symbols` 6263 -> 6264); `mc pkg hash .`
+`aaca0aa1374363ee36b04626da0a0fac8c0f1eefd947d29c8097fc650dbc00c1`, with
+`origin/main` merged in at `111559fb` (base
+`0f04c593b5aad2ad3bbf45d97ba6427d56a05fe3620bf3f1ca73d4fb7256d6eb`: `teko_deleg.tk`,
+`teko_expr.tk`, `teko_access.tk` and `teko_heaparr.tk` are listed files, so the hash moves
+by design).
+
+**Copilot on #719, four roads measured again on `95e157cb`.** Each of the four was
+reproduced first, and each answer is the same question asked once: does a READER of teko's
+own hold the slot's TYPE at the moment the value is parsed?
+
+| road | measured on `95e157cb` | became |
+|---|---|---|
+| `H.cb = (i64 x) => e;` with `class H` declared BELOW | `expected ) in cast` | a documented limit |
+| `h.take_q((i64 x) => e, 42)` on a `void take_q(Op? f, i64 k)` | `expected ) in cast` | **opened** |
+| `Op[] g; g[0] = (i64 x) => e;` (a GLOBAL array) | `expected ) in cast` | a documented limit |
+| `h.pick((i64 x) => e, 21)` on an OVERLOADED `pick` | `expected ) in cast` | **opened** |
+
+**Two opened, one reader.** Both are the same site: `tk_call_method_args` (teko_expr.tk)
+asked the callee's SINGLE declaration for the parameter's type, through `tk_deleg_row` and
+a `tk_method_name_count(si, m) != 1` guard, so an `Op?` parameter answered -1 and an
+overloaded name never asked at all. It asks per POSITION now --
+`tk_method_param_deleg(si, m, n)`: the level of the chain that declares the name (the one
+`tk_method_pick` picks from, a class's own declarations hiding the base's overloads), every
+signature there long enough to reach position `n`, the row taken with the `?` peeled off
+(`tk_deleg_row_under`), and -1 the moment two candidates disagree or one is not a delegate
+there. `tk_args_typed` folded into that loop, which is why `funcs` does not move. Three
+roads came with it, measured: the `Op?` parameter (the coercion still sees the nullable
+type and boxes for it -- READING one back inside the callee is untaught, `call to unknown
+function`, and the fixture only proves the parse), an overloaded name at either arity, and
+a method INHERITED from a base, whose name the derived class declares zero times and which
+the old `!= 1` guard sent to the untyped `tk_args`. An overload whose candidates DISAGREE
+at that position (`mix(Op)` beside `mix(i64)`) still needs `new Op(...)`: which signature
+applies is decided by the argument COUNT, which the parser does not have yet.
+
+**Two documented, and the reason is the same one.** The value is parsed BEFORE the slot's
+type exists, so there is no row to read a lambda against and no later pass can re-read
+what the parser already refused. A static field of a type declared below the write goes
+through `tk_fwd_defer_static` (teko_access.tk): the forward pre-scan reserves the type's
+WORD -- `type_new` plus the syntax registrations -- and never a row of the type table,
+because materializing rows at scan time would reorder every interface's vtable slot
+(teko_fwd.tk's own header), so the field has no declared type at that point;
+`tk_fwd_resolve_static_one` learns it one pass too late. A global `T[]` element goes
+through `tk_arr_defer_write` (teko_array.tk), deferred because a global array may be
+declared BELOW its own write -- measured, and accepted today -- so the element type is only
+collected by `tk_hg_collect` in pass 5. Reading the lambda against a row materialized on
+the spot would mean replaying a whole declaration from inside an expression
+(`tk_fwd_materialize` is a source push written for the `:` list) and moving row indices the
+`--dump-ast` gate pins; opening only the declared-above half would make the guarantee
+depend on declaration order, which is the same limit in a fuzzier shape. So the claim is
+narrowed instead: `docs/reference/delegates.md` qualifies the static-field row to a type
+declared ABOVE and the element row to a LOCAL or field `T[]`, and
+`docs/reference/not-yet.md` carries both -- plus the disagreeing overload -- with the
+reason. Its stale D62 row ("a LAMBDA written straight into a FIELD ... `expected ) in
+cast`") is deleted: D66 opened that road and the row was measured false; the row for
+calling an `Op?` says "local or PARAMETER" now, the new road's own untaught half.
+
+**Proof of this pass** (mc 0.15.23, macos/aarch64, head `95e157cb`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed,
+67 refused as expected, 0 failed** (`tests/surface_lambda.tk` grows item 23,
+`arg_roads_check`: the `Op?` parameter, an overloaded name at both arities, a method of the
+base, and a GROUP at a delegate argument with a CAST at the position beside it, so the
+per-position reader is measured not to have claimed a `(` that opens neither; no refusal
+added, no diagnostic new); `--dump-ast` **byte-identical on all 73** pre-existing
+`tests/*.tk` with their ORIGINAL sources (4715223 bytes of dump), `59652293`'s compiler
+against this one; `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 612 links, 41 fragments, 389 diagnostics, 67
+refusals, 143 samples`; `mc limits . --config mc.macos.toml` verdict `ok` on both legs,
+every counted table exactly where `95e157cb` left it (`passes` 15/30, `syntax` 15/30,
+`types` 13, `intrin` 8/16, `alias` 20/40, `on_stmt` 4, `syntax_type` 2, `globals` 944,
+`funcs` 3186, `lowered` 3168, `symbols` 6268) and only the size-of-surface-code rows moving
+(`nodes` 156737 -> 156807, `ins` 216225 -> 216334); `mc pkg hash .`
+`cc220d3c617a15396d75a872947ca825f19bc6c0ec0f71c70cccf5a86bb2969e`, against
+`014f902503d1510e450ba4422be5b5a5d76bd58c73b678e98ed1b5e843c6106d` on `95e157cb`:
+`teko_expr.tk` is a listed file, so the hash moves by design.
+
+### D69 · Five capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256, `TK_MAXEMIT` 512 -> 4096, `TK_MAXMETHOD` 128 -> 1024 (2026-09-14)
+
+(D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
+takes the next free number, D69.)
+
+Two verifiers hit two separate ceilings this week, both sized in the crumb's early days and
+never re-measured against a program with more than a handful of types or stores.
+
+**`TK_MAXFWD` (teko_fwd.tk), the lexical pre-scan's own table** (`fw_name`/`fw_ty`/
+`fw_kind`/`fw_vis`/`fw_proj`/`fw_span`/`fw_spanlen`/`fw_multi`/`fw_mat`, plus `fl_name` --
+ten `uptr`/`i64` arrays, 8 B a column): a `class`/`struct`/`interface`/`delegate` keyword the
+byte-level pre-scan finds ANYWHERE in the reachable source (the whole file, not just a
+forward reference) takes one row, for the whole build, never released. The 32nd was fine;
+the 33rd refused `teko: too many forward-declared types` at `?:0:` (no file/line: the scan
+runs before any real parsing). Raised to 256.
+
+**`TK_MAXOS` (teko_struct.tk), one array, `os_node[TK_MAXOS]`** (one `i64` column): a store
+this module emits into a slot of counted type (a field, an inline array element, an
+auto-property's backing) takes one row, keyed to the STORE SITE in the source (a store
+inside a loop body is one row no matter how many times the loop runs). D51's eleventh pass
+already fixed the double-counting that had silently halved this ceiling for a global array
+(128 declared, 64 delivered); this entry raises the declared number itself, matching
+`TK_MAXXT`/`TK_MAXFS`, both already 4096 for the same reason -- one row per site, a unit-wide
+table that never shrinks. Raised to 4096.
+
+**Cost, measured, not assumed.** `mc limits . --config mc.macos.toml`, both legs, mc
+**0.15.23**, macos/aarch64, base `59652293`:
+
+| leg | `globals` before | `globals` after | `heap` used before | `heap` used after | verdict |
+|---|---|---|---|---|---|
+| compiler (`build/teko`) | 944 / 2546 reserved | 944 / 2546 reserved (unmoved) | 95084208 | 95115648 | `ok`, `grow` 0 |
+| `tests/hello.tk` (compiled BY `build/teko`) | 0 / 32 reserved | 0 / 32 reserved (unmoved) | 468016 | 492592 | `ok`, `grow` 0 |
+
+`globals` counts DECLARATIONS (one per `i64 x[N];`, whatever `N` is), so raising a
+`#define`'s numeric literal moves it not at all -- the ten arrays above and `os_node` are
+still ten and one top-level globals, respectively, before and after. The real cost is the
+STATIC storage the first two ceilings' arrays reserve in `build/teko`'s own BSS, which is what
+`heap`'s `used` column picks up: +30720 B on the compiler's own leg (10 x 8 B x 224 for
+`TK_MAXFWD`'s growth, 1 x 8 B x 3968 for `TK_MAXOS`'s, plus a few bytes of comment text the
+pre-scan counts), +24576 B on the `hello.tk` leg (the SAME arrays, now compiled into the
+teko compiler that leg measures, `os_node`'s own share of it). Both legs stay `ok` with
+`grow` 0 by a wide margin (`heap` reserved is 223739904 / 33554432), so 256 and 4096 are the
+numbers taken, not a smaller compromise.
+
+**Proof, throwaway probes in scratch (not fixtures -- a refuse fixture pinning a ceiling
+breaks the day it grows, D63's lesson), each run on the base build (`59652293`, ceilings 32
+and 128) and on this crumb's build (256 and 4096), mc 0.15.23, macos/aarch64:**
+
+| probe | shape | base (`59652293`) | this crumb |
+|---|---|---|---|
+| 33 distinct classes (`class C0 { public i64 v; }` x33, `#include "lib/rt.tk"`) | one keyword occurrence per class, scanned once each | refused `teko: too many forward-declared types` at `?:0:` (scan time, no line) | refused `teko: too many type declarations` at line 34 (a SEPARATE ceiling, `TK_MAXSTRUCT`, see below) -- proves `TK_MAXFWD`'s OWN ceiling cleared: the SAME 33 classes no longer trip the scan |
+| 257 distinct classes | same shape, 257 of them | refused `teko: too many forward-declared types` at `?:0:` | refused `teko: too many forward-declared types` at `?:0:`, unchanged wording -- the new ceiling (256) is honored and reported the same way |
+| 129 stores into elements of a LOCAL `Probe[]` (one class, one instance stored 129 times by literal index -- `TK_MAXOS` counts SITES, not runtime iterations, so a loop proves nothing here) | 129 store statements | refused `teko: too many stores into a slot of class type` at the 129th | compiles, runs 42 |
+| 4096 of the same | 4096 store statements | (not run; already known refused past 128) | compiles, runs 42 |
+| 4097 of the same | 4097 store statements | (not run) | refused `teko: too many stores into a slot of class type` at the 4097th |
+| 512 / 513 deferred delegate-element stores (`ops[i] = pick();`, `pick()` a CALL, so `tk_deleg_store_late` defers every one to `TK_MAXDGLATE`, teko_deleg.tk, a SEPARATE 512-row table -- each also takes a row of `TK_MAXOS` first, since a delegate is a counted type) | 512 / 513 stores | (base already refuses at the 65th on a GLOBAL array, D51 -- this probe uses a LOCAL one, unaffected) | 512 compiles, runs 42; 513 refuses `teko: too many element stores of unknown type` (`TK_MAXDGLATE`'s own wording, not `TK_MAXOS`'s -- `TK_MAXOS` no longer fills first now that it is 4096) |
+
+The last row is why `docs/reference/diagnostics.md`'s note under `"teko: too many element
+stores of unknown type"` needed a wording change, not just a number: it used to say a
+program with 513 such stores never reaches this table's own ceiling because `TK_MAXOS`
+(128) fills first, at the 129th; with `TK_MAXOS` at 4096 that is no longer true, and the
+513th now answers with THIS table's own message.
+
+**Adjacent finding, not fixed here: `TK_MAXSTRUCT` (teko_struct.tk, still 32, "structs,
+classes and interfaces declared in one source") is coupled to `TK_MAXFWD` in lockstep for
+any plain, non-generic program, and raising `TK_MAXFWD` alone does not let one declare more
+than 32 distinct types.** `tk_type_row_new`, the ONE function that appends a row to the
+shared type table `TK_MAXSTRUCT` bounds, is called both by a real declaration
+(`tk_type_add`, every `class`/`struct`/`interface`/`delegate` alike -- `teko_deleg.tk:285`
+calls it too, so the comment naming only three of the four kinds is stale) and by
+`tk_fwd_row`/`tk_fwd_row_by_ty` materializing a forward-scanned placeholder. A `partial`
+class's SECOND and later parts do NOT take a second row of EITHER table (`tk_fwd_try_decl`:
+`if (seen >= 0) { set_fw_multi_at(fi, 1); return p; }`, no second `tk_fwd_add`; the real
+parser adopts the existing row too), so there is no way, in the language as taught today,
+for `tk_nfwd` to exceed `tk_nstruct` for a program with no generics: every scanned keyword
+becomes exactly one real declaration, and the pre-scan (a single pass over the WHOLE
+reachable source, run before any parsing) always finishes counting all of them before the
+parser reaches declaration 1. Measured: the 33-classes probe above, run on THIS crumb's
+build, no longer trips `TK_MAXFWD` (which now allows up to 256) but trips `TK_MAXSTRUCT`
+(still 32) one parse-time step later, at the exact same count -- the wording changes, the
+practical ceiling does not. `docs/specs/nullable.md` already names this ceiling and its
+cost ("a raise costs BSS in `globals`... measure before raising it"), so this is a known,
+tracked tension, not a new one; whether it needs raising too is a separate crumb's call
+(possibly D67 or D68, reserved and not yet in this log at write time) -- out of scope here,
+since the task named these two ceilings only.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `59652293`: `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 62
+refused as expected, 0 failed**, identical count to the base; `--dump-ast` byte-identical
+against the base build for all 73 `tests/*.tk` and all 62 `tests/refuse/*.tk` -- neither
+ceiling changes any accepted or refused program already in the tree; `sh scripts/
+bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (73/73, 196.7s); `sh scripts/
+check-docs.sh` -> `docs ok: 611 links, 41 fragments, 389 diagnostics, 62 refusals, 143
+samples`; `mc limits` verdict `ok` with `grow` 0 on both legs, `globals` unmoved on both (see
+table above); `mc pkg hash .`
+`f7ef6013d75a654878e132765963b6bd288ca718575a5b10481d623a36298f30` (base
+`5c0738020efa4533cdf6442d5fa6e7cc593c6c8776d9974e30450f0e9c299cce`: `teko_fwd.tk`,
+`teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
+design).
+
+**Follow-up (same day): `TK_MAXSTRUCT` (teko_struct.tk, 32) raised to 256, closing the gap
+this entry already named as an adjacent finding.** The lockstep argument above holds for any
+plain, non-generic, non-partial source: `tk_type_row_new` is the ONE function that appends a
+row to the shared type table, called both by a real declaration and by a forward placeholder's
+adoption, so `tk_nstruct` never exceeds `tk_nfwd` for such a program. Raising `TK_MAXFWD`
+alone therefore bought nothing past the 32nd type: a 33rd class cleared the (now 256-deep)
+scan and refused one parse-time step later, at the identical count, under `TK_MAXSTRUCT`'s own
+message. Measured, `mc` **0.15.23**, macos/aarch64, this crumb's own build (`teko_struct.tk`
+edited, everything else as `85379111` left it) against base `59652293`:
+
+| probe | shape | at `TK_MAXSTRUCT` 32 (`59652293`/`85379111`, unmoved by D69's own FWD/OS raise) | at `TK_MAXSTRUCT` 256 (this follow-up) |
+|---|---|---|---|
+| 33 classes, one field each, `#include "lib/rt.tk"` | one keyword per class | refused `teko: too many type declarations` at line 34 | compiles, runs 42 |
+| 64 classes, 2 fields + 1 method each | 64 classes, 128 fields, 64 methods, all under `TK_MAXFIELD`/`TK_MAXMETHOD` | (not reached: the 33rd already refused) | compiles, runs 42 |
+| 33 interfaces, 2 methods each | one keyword per interface -- interfaces share this same table (`teko_iface.tk`'s declaration road also calls `tk_type_add`) | (not reached, same refusal as the classes probe, at the 33rd) | compiles, runs 42 |
+| 40 interfaces, 2 methods each | 80 interface methods, well under `TK_MAXIFMETH` (128) | (not reached) | compiles, runs 42 |
+| 40 delegates | one keyword per delegate -- `teko_deleg.tk:285` calls `tk_type_row_new` too, so a delegate spends a row of this table exactly like a class does | (not reached) | compiles, runs 42 |
+| 257 classes, one field each (`TK_MAXSTRUCT`+1) | -- | refused `teko: too many forward-declared types` at `?:0:` (scan time) |
+
+The last row is the coupling working as designed, not a gap: `TK_MAXSTRUCT` was raised to
+**match** `TK_MAXFWD` (both 256), and the pre-scan (`teko_fwd.tk`) always runs to completion
+BEFORE any real parsing, over the WHOLE reachable source. For any plain program, `tk_nstruct`
+can never exceed `tk_nfwd`, so once the two ceilings are equal, the fwd-scan ceiling is
+always the one a 257th type hits FIRST -- `TK_MAXSTRUCT`'s own message becomes unreachable
+from plain (non-generic, non-partial) source, exactly as it was when both ceilings stood at
+32 together, before D69's own FWD raise briefly exposed the mismatch. Setting `TK_MAXSTRUCT`
+any higher than `TK_MAXFWD` would only waste BSS (the fwd scan caps every plain program at
+`TK_MAXFWD` regardless); setting it any lower reproduces the exact bug this follow-up closes.
+256 is therefore not a compromise -- it is the only value that lets a program actually use the
+room D69's `TK_MAXFWD` raise already bought it.
+
+**Cost, measured directly from the source (not `mc limits`' `heap` column, which the task
+asked not to cite here).** Every array this module -- and the two others that also key a row
+by counted-type identity -- sizes by `TK_MAXSTRUCT`:
+
+| file | arrays | shape | columns | bytes/row |
+|---|---|---|---|---|
+| `teko_struct.tk` | `sr_name`, `sr_ty`, `sr_size`, `sr_base`, `sr_form`, `sr_nv`, `sr_m0`, `sr_mn`, `sr_ni`, `sr_vis`, `sr_proj`, `sr_abst`, `sr_part`, `sr_off`, `sr_hline`, `sr_hfile`, `ha_ety`, `nl_of` | 18 x `[TK_MAXSTRUCT]` | 1 | 144 B |
+| `teko_deleg.tk` | `dg_ret`, `dg_np` | 2 x `[TK_MAXSTRUCT]` | 1 | 16 B |
+| `teko_deleg.tk` | `dg_pty`, `dg_pk` | 2 x `[TK_MAXSTRUCT * TK_DGMAX]` (`TK_DGMAX` = `MAXPARAMS` - 2 = 10) | 10 | 160 B |
+| `teko_heaparr.tk` | `ha_gen`, `ha_put` | 2 x `[TK_MAXSTRUCT]` | 1 | 16 B |
+
+336 B per `TK_MAXSTRUCT` row (22 one-column `i64`/`uptr` arrays at 8 B, plus two ten-column
+arrays at 80 B each), all `i64`/`uptr`, 8 B on both macos/aarch64 and linux/x86_64. Total BSS
+this table alone reserves: 32 x 336 B = 10752 B before, 256 x 336 B = 86016 B after -- a
++75264 B (73.5 KB) delta, far under the "a few MB" budget the task set, and `TK_MAXFIELD`
+(already 256, unmoved by this follow-up) shows the codebase already accepts that order of
+magnitude for a sibling table of the same shape.
+
+**Sibling ceilings a 33+-type program hits next, probed the same way (mc 0.15.23,
+macos/aarch64, this crumb's build):**
+
+| ceiling | value | probed shape | fires at |
+|---|---|---|---|
+| `TK_MAXEMIT` (`"teko: too many generated declarations in one unit"`) | 512 (unmoved) | N plain classes, ONE field, no methods, no interface -- a real class still emits ~4 top-level declarations (constructor, release, alloc, and one more) even with no virtual/interface surface | the 129th class (128 compile and run 42; 129 refuses at line 129) -- THIS is the practical ceiling for "how many plain classes fit in one source", well before `TK_MAXSTRUCT`'s own 256 |
+| `TK_MAXMETHOD` (`"teko: too many methods"`) | 128 (unmoved) | 64 classes, 2 fields + 2 own methods each, each implementing one shared interface (1 method) -- 3 methods/class, 192 class methods total | the 43rd class (line 44 of the combined-shape probe, ~128th method total) |
+| `TK_MAXFIELD` (`"teko: too many fields"`) | 256 (unmoved, already raised past 32 in an earlier crumb) | not the bottleneck at 64 classes x 2-3 fields (128-192 fields, under 256) | not reached in any probe above |
+| `TK_MAXIFMETH` (`"teko: too many interface methods"`) | 128 (unmoved) | 40 interfaces x 2 methods = 80 | not reached (well under) |
+| `TK_MAXIMPL` (`(class, interface)` pairs, `"teko: too many implemented interfaces"`) | 64 (unmoved) | 64 classes x 1 interface each = 64 pairs | not reached in the probes above (`TK_MAXMETHOD` fires first, at class 43, before the 64th pair is registered) |
+
+No `TK_MAXIFACE` or `TK_MAXVT` constant exists in this codebase: an interface's own count is
+`TK_MAXSTRUCT` (the shared type table, D69's own finding above), its methods are
+`TK_MAXIFMETH`, and a virtual slot is `TK_MAXVSLOT` (128, unmoved, not probed here -- no
+probe above declared a `virtual` method). `TK_MAXEMIT` was the most pressing of these at write
+time: a program of plain classes alone -- no fields beyond one, no methods, no interfaces --
+already needed a raise past 128 classes to grow further, a considerably lower ceiling than
+`TK_MAXSTRUCT`'s new 256. It was probed and recorded here but out of scope for THIS pass (the
+task named `TK_MAXSTRUCT` only); the second follow-up below closes it, together with the
+`TK_MAXMETHOD` row in the table above.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `59652293`: `sh scripts/
+fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 62 refused as expected, 0 failed**,
+identical count to D69's own gate; `--dump-ast` of every one of the 73 `tests/*.tk` and 62
+`tests/refuse/*.tk` (135 files) byte-identical against a `build/teko` built from base
+`59652293` in a separate worktree -- `TK_MAXSTRUCT`'s raise changes no accepted or refused
+program already in the tree; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (73/73, 162.8s, `teko1.o == teko2.o` on the first turn, `--dump-asm` of
+`teko2`/`teko3` empty diff over 219047 lines); `sh scripts/check-docs.sh` -> `docs ok: 611
+links, 41 fragments, 389 diagnostics, 62 refusals, 143 samples`, unmoved; `mc build . --config
+mc.macos.toml --limits` verdict `ok` with `grow` 0 on both legs, `globals` unmoved on both
+(compiler leg 944/2546 reserved, `hello.tk`-by-`build/teko` leg 0/32 reserved -- identical to
+D69's own table, confirming the `TK_MAXSTRUCT` arrays cost `globals` nothing: a `#define`'s
+numeric literal moves no DECLARATION count, only the reserved bytes behind each one); `mc pkg
+hash .` `ac4870f1846bf46d66f7a76a80b7d7904a6f46a94325d55ff5d2f2e7107f8304` (base, `85379111`:
+`f7ef6013d75a654878e132765963b6bd288ca718575a5b10481d623a36298f30` -- `teko_struct.tk` is a
+listed file, so the hash moves by design; `DECISION_LOG.md` and the two docs edits are not
+listed files and move the hash not at all).
+
+**Second follow-up (merged forward past D61/D62/D63/D66/D71): `TK_MAXMETHOD` (teko_class.tk,
+128) raised to 1024 and `TK_MAXEMIT` (teko_struct.tk, 512) raised to 4096, closing the two
+sibling ceilings the table above named and left out of scope.** Every array either constant
+sizes is a plain `[TK_MAXMETHOD]` or `[TK_MAXEMIT]` literal, so raising the `#define` grows
+every one of them without a second edit: `grep -n TK_MAXMETHOD teko*.tk lib/*.tk` finds 13
+one-column arrays, all in `teko_class.tk` (`mt_name` through `mt_abst`), no other module;
+`grep -n TK_MAXEMIT teko*.tk lib/*.tk` finds 2, both in `teko_struct.tk` (`tk_emit_name`,
+`tk_emit_node`), no other module. Every loop that walks either table bounds itself by the
+RUNNING count (`i >= tk_nmethod`, `i >= tk_nemit`), never by a hardcoded literal, so no
+secondary table can fall out of step with either cap: `grep -rn tk_nmethod teko*.tk lib/*.tk`
+and `grep -rn tk_nemit teko*.tk lib/*.tk` show every read site is one of those two guards, a
+constructor-time count snapshot (`tk_own_methods = tk_nmethod`, a trait's own copy,
+unaffected), or a `!= 0` used-at-all test.
+
+**Cost, from the source, never from `mc limits`' `heap` column.** Both tables are all-`i64`/
+`uptr` columns, 8 B each, on both macos/aarch64 and linux/x86_64:
+
+| table | file | arrays | columns | bytes/row | before (rows) | after (rows) | delta (rows) | delta (bytes) |
+|---|---|---|---|---|---|---|---|---|
+| `TK_MAXMETHOD` | `teko_class.tk` | `mt_name`, `mt_cls`, `mt_sig`, `mt_fn`, `mt_np`, `mt_nreq`, `mt_d0`, `mt_ret`, `mt_slot`, `mt_vis`, `mt_static`, `mt_prop`, `mt_abst` (13) | 1 | 104 B | 128 | 1024 | 896 | +93184 B |
+| `TK_MAXEMIT` | `teko_struct.tk` | `tk_emit_name`, `tk_emit_node` (2) | 1 | 16 B | 512 | 4096 | 3584 | +57344 B |
+
+Combined: **+150528 B (147 KB)**, far under the "a few MB" this codebase already spent on
+`TK_MAXSTRUCT`'s own raise a paragraph up, and on `TK_MAXFIELD` before it.
+
+**Proof, throwaway probes in scratch (not fixtures, same reasoning as D69's own first
+paragraph), each run on the base compiler (`origin/main` `409bc8c0`, caps 128/512) and on
+this crumb's build (1024/4096), mc 0.15.23, macos/aarch64:**
+
+| probe | shape | base (`409bc8c0`) | this crumb |
+|---|---|---|---|
+| 129 methods, one class, no fields, no interface (`class C { public i64 m0() {...} ... m128() {...} }`) | one row per method, the SAME table whether the class is one or many | refused `teko: too many methods` at the 129th declaration (line 132) | compiles, runs 42 |
+| 1025 methods, same shape | 1025 rows | (not run; already known refused past 128) | refused `teko: too many methods` at the 1025th declaration (line 1028) — the new ceiling (1024) is honored, exact boundary: methods 1..1024 all land, the 1025th trips |
+| 129 lambda literals stored into one instance field (`delegate i64 Op(i64 x); class H { public Op cb; } … h.cb = (i64 x) => x + N;`, D66's field road, 129 times) — each lambda literal is 4 fresh `tk_top_emit` calls (the function, its vtable, its release, its allocator; `H`'s own declaration spends 4 more, measured directly against the boundary below) | 4 emits/lambda + 4 for `H` itself | refused `teko: too many generated declarations in one unit` at the 129th store (line 136): 4 (H) + 127×4 = 512 exactly, the 128th store (0-indexed 127) is the one that would spend row 513 | compiles, runs 42 |
+| 1025 of the same | 4 emits/lambda + 4 for `H` | (not run) | refused `teko: too many generated declarations in one unit` at the 1025th store (line 1032): 4 (H) + 1023×4 = 4096 exactly, the 1024th store (0-indexed 1023) is the one that would spend row 4097 — the new ceiling (4096) is honored at the identical arithmetic boundary |
+
+The two `129` rows share the shape of D69's own "Sibling ceilings" probes above (methods
+count is class-count-agnostic). The emit probe stores LAMBDA LITERALS, not `new Op(fn)`
+thunks: a literal is never memoized, so each written occurrence is its own fresh
+`tk_top_emit_as` quartet, where a named function forwarded through D63's thunk table would
+have undercounted (one thunk serves every caller). The store also has to be a FIELD, not a
+bare local reassigned by name — `Op f; f = (i64 x) => ...;` repeated is one of D66's own
+CLOSED roads (bare-name assignment still needs `new Op(...)`) — so the probe declares one
+field (`H.cb`) and stores a fresh lambda into it repeatedly, exactly the road D66 opened.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `origin/main` `409bc8c0` (this
+crumb also carries D61/D62/D63/D66/D71, merged forward before this pass): `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **74
+passed, 71 refused as expected, 0 failed**, identical count to the merged base; `--dump-ast`
+byte-identical against a `build/teko` built from base `409bc8c0` in a separate worktree for
+**all 145** `tests/*.tk` (74) and `tests/refuse/*.tk` (71) — 4937127 bytes of dump, neither
+ceiling moves any accepted or refused program already in the tree; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` -> `FIXPOINT OK` (74/74, 90.1s, `teko1.o == teko2.o` on the first
+turn, `--dump-asm` of `teko2`/`teko3` empty diff over 219327 lines); `sh scripts/
+check-docs.sh` -> `docs ok: 614 links, 42 fragments, 389 diagnostics, 71 refusals, 144
+samples`; `mc build . --config mc.macos.toml --limits` verdict `ok` with `grow` 0 on both
+legs, `globals` unmoved and identical to the base build on both (compiler leg 945/2548
+reserved, `hello.tk`-by-`build/teko` leg 0/32 reserved) — the two `#define`s move no
+DECLARATION count, only the reserved bytes behind each one, confirmed directly against a
+`409bc8c0` build rather than assumed; `mc pkg hash .`
+`d614aa95490bf97ab93959b31e4a9761ce02d5301acc41418e9668b3387e7460` (base `409bc8c0`:
+`6252f75a4f9f261365d651c6b318d6a1985cf4330c9605c8fcb4d1aee95dd1a6` — `teko_class.tk`,
+`teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
+design).
+
+### D71 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
+mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one
+thing of the language it compiles: **that a release be proved by teko before it is a release
+at all.** The constraint the direction set is "no credential" in either direction — mc cannot
+dispatch a workflow here (that needs a PAT) and this repository does not get mc's `release`
+webhook (a foreign repository never does), so both halves PULL and the only thing that crosses
+the boundary is a URL each side reads anonymously. This is teko's half.
+
+**The protocol.** mc publishes every tag as a GitHub **pre-release**, assets and checksums
+complete and identical to a release's — the flag is the one property of a published release a
+later job can flip. `.github/workflows/mc-canary.yml` polls
+`repos/minicompiler/mc/releases` every 15 minutes (mc's own number: its `promote` budgets a
+quarter of an hour for this schedule to notice inside a 90-minute poll), takes the newest
+pre-release with no verdict yet, runs the recipe against that toolchain, and commits with its
+own `GITHUB_TOKEN`, at the ROOT of this repository's `canary` branch:
+
+```
+https://raw.githubusercontent.com/teko-org/teko-lang/canary/<version>.json
+{"version":"0.17.0","status":"ok","run":"<the actions run>","utc":"2026-09-15T12:34:56Z"}
+```
+
+**Those four fields are the contract**, and nothing else is in the file: no commit sha (a
+verdict is about an *mc version*, not a teko commit — that is also why it is a file and not a
+commit status, whose subject would have to be a teko commit and the mapping invented), no
+date beside `utc`, and `version` BARE, without its leading `v`. mc's `promote` polls that URL
+with `curl` and no token, every 60 s for 90 minutes: `ok` runs `gh release edit --prerelease=false`,
+`fail` leaves the pre-release standing, and a file that never appears is **neither** — a
+timeout, advisory until mc 1.0.0 so a teko outage cannot hold an mc patch. `publish-to-registry`
+is `needs: promote` on mc's side, so a pre-release never becomes the registry's newest row.
+
+**The recipe is called, not copied.** `ngen.yml` gains ONE input, `mc_version`, which its
+three `setup-mc` uses take instead of `MC_VERSION`; empty — a push, a pull request,
+`release.yml` — is the pin, so nothing about the twelve jobs changes for anyone else. The
+canary calls it with the candidate. What a candidate mc must pass is therefore exactly what a
+merge into `main` must pass, by construction: five native legs, five fixpoint legs, `docs` and
+the aggregator. The one part of the recipe `ngen.yml` does not hold is the standard library,
+which mc counts in, so a `std` job runs `teko-org/teko-std`'s own linux/x86_64 leg against the
+same candidate — the vendored `deps/teko` its `mc.lock` pins (never `mc pkg sync`: a canary
+must not depend on the registry being up, and `mc build` rehashes the vendored tree against the
+lock either way), then `scripts/fixtures.sh` over its fixtures. Nothing there writes to the
+registry.
+
+**`ok` needs every needed job green.** The `verdict` job is `if: always()` — a canary that goes
+quiet on a red leg times mc out instead of answering it — and `cancelled` and `skipped` count
+as `fail`, because neither is evidence that the candidate compiles teko and `promote` must not
+read silence as consent. The branch **accumulates**, one file per mc version, and is never
+force-pushed the way `site` is (D36): mc polls one file for up to 90 minutes and a file must
+not vanish under a reader. One `concurrency` group for the whole workflow, uncancellable, is
+what keeps two runs from racing the same push, and a `workflow_dispatch` naming a `version`
+explicitly rewrites a verdict already on the branch — that is how a re-run corrects itself.
+
+**What this asks of the repository, once:** `refs/heads/canary` in the `All Green` ruleset's
+exclude list, beside `refs/heads/site`, which is there for the same reason — the ruleset covers
+`~ALL` and requires a pull request, and `GITHUB_TOKEN` has no bypass. Without it the `verdict`
+job's push is refused and every candidate times out into mc's advisory promotion, which is
+exactly the pipeline mc has today.
+
+**Proof.** `actionlint` clean beyond the `SC2016` information `ngen.yml`'s own summary step
+already reports (a `printf` format in single quotes, which is what a format string is);
+`sh scripts/check-docs.sh` → `docs ok: 599 links, 42 fragments, 389 diagnostics, 50 refusals,
+141 samples`. No `.tk`, `.mc` or `teko.toml` byte moves in this crumb, so `--dump-ast` is
+unchanged by inspection: nothing the parser reads was touched. **What is NOT yet proved, and
+why:** the round trip. `workflow_dispatch` refuses a workflow that is not on the default branch
+(`HTTP 404: workflow mc-canary.yml not found on the default branch`), so the proof dispatch —
+`gh workflow run mc-canary.yml -f version=0.16.0`, a real release whose `ok` is a true statement
+— is the first step after this lands; and `refs/heads/canary` is not yet on the `All Green`
+ruleset's exclude list (the ruleset PUT is an owner action the session could not take), so
+until it is, `verdict`'s push is refused and every candidate falls through to mc's advisory
+timeout. Both are recorded here so the entry does not claim a run that has not happened; the
+verifier of this crumb caught the first draft of this paragraph claiming exactly that.
