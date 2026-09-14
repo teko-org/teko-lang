@@ -194,7 +194,7 @@ grep -E '\.(md|tk|mc|sh|yml|yaml|toml|cff)$|^\.git(ignore|attributes)$' "$tmp/al
 # outside a UTF-8 locale a bracket class matches single BYTES, and the continuation bytes
 # of `a` are also the continuation bytes of an em dash, a checkmark and a curly quote.
 pt_accents='á|à|â|ã|é|ê|í|ó|ô|õ|ú|ü|ç|Á|À|Â|Ã|É|Ê|Í|Ó|Ô|Õ|Ú|Ü|Ç'
-pt_words='nao|entao|sao|voce|esta|estao|tambem|atraves|divida|dono|dona|arquivo|arquivos|ficheiro|entrega|entregas|escada|primitivas|superficie|nivel|codigo|funcao|porque|quando|isso|dele|dela'
+pt_words='nao|entao|mesmo|mesma|reabertura|sao|voce|esta|estao|tambem|atraves|divida|dono|dona|arquivo|arquivos|ficheiro|entrega|entregas|escada|primitivas|superficie|nivel|codigo|funcao|porque|quando|isso|dele|dela'
 : > "$tmp/pt"
 while read -r f; do
     [ -f "$f" ] || continue

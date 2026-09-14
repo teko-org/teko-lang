@@ -124,7 +124,7 @@ first compiles and runs the samples, the second checks the pages they end up on.
 ## The mc canary
 
 `mc-canary.yml` is teko's half of mc's freeze-and-canary protocol (mc `docs/specs/M53.md`
-§ 6, [D65](../../DECISION_LOG.md)). mc publishes **every** tag as a GitHub *pre-release* with
+§ 6, [D71](../../DECISION_LOG.md)). mc publishes **every** tag as a GitHub *pre-release* with
 its assets complete; a pre-release becomes a release only after this repository says the
 compiler still teaches teko.
 
