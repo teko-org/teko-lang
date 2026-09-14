@@ -7,7 +7,7 @@ Five workflows and three composite actions. Everything a change has to pass runs
 
 | job | count | proves |
 |---|---|---|
-| `ngen (<os>/<arch>)` | 5 | the taught compiler builds on that pair, and all 51 fixtures compile **and run** there with the right exit code |
+| `ngen (<os>/<arch>)` | 5 | the taught compiler builds on that pair, `tests/*.tk` compiles **and runs** there with the right exit code, and `tests/refuse/*.tk` is refused with the right message and line (`scripts/fixtures.sh`, D52) |
 | `fixpoint (<os>/<arch>)` | 5 | the ladder closes on the same five pairs ([bootstrap.md](bootstrap.md)) |
 | `docs` | 1 | `sh scripts/check-docs.sh`, on one pair — it proves a documentation tree, not a platform |
 | `mc build ngen && run` | 1 | the aggregator: green only when every one of the five legs is |
@@ -47,6 +47,27 @@ macOS appends nothing: with no `[linker]` the built-in Mach-O executable backend
 signs the binary itself, which is the only shape that works there. Linux fills the same slot
 with mc's own ELF writer. Windows has neither, so both Windows jobs link with `lld-link`
 against a sysroot the workflow builds first.
+
+## The two fixture kinds, one corridor
+
+`scripts/fixtures.sh <compiler> <config-base> [exe-suffix]` (D52) is what a leg, the
+`fixpoint` ladder ([bootstrap.md](bootstrap.md)) and a local checkout all call — the per-leg
+config swap above, written once instead of copied at four sites.
+
+`tests/*.tk` is the first kind: a program that compiles and runs, judged by its own
+`// expect-exit: N`. `tests/refuse/*.tk` is the second: a program that must FAIL to
+compile, judged by a two-line header —
+
+```
+// expect-refuse: teko: <the exact message>
+// expect-refuse-line: <the exact line>
+```
+
+— checked against the compiler's own stderr, CR-stripped, with `grep -F` (`:<line>: teko:
+<message>` has to appear literally; a refusal with the right words on the wrong line is as
+wrong as one with the wrong words). A `.tk` under either directory missing its header(s)
+fails the run instead of being silently skipped. `docs/reference/diagnostics.md` lists every
+message either kind can hit; D33 first named the gap a refusal fixture had no harness for.
 
 ## The composite actions
 
@@ -133,7 +154,7 @@ package has to be registered once by hand before it can be announced; until the 
 `MC_VERSION` is one line, without a leading `v`, and it is the answer to "which mc does CI
 use". Raising it is its own change, in this order:
 
-1. download the new release and run the whole local recipe against it — 51/51 fixtures;
+1. download the new release and run the whole local recipe against it — every fixture and every refusal;
 2. `sh scripts/bootstrap.sh` against the new release has to print `FIXPOINT OK`;
 3. **only then** write the new version into `MC_VERSION`.
 

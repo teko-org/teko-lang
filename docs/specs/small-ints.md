@@ -348,11 +348,11 @@ reaches.
 | `tests/primitives_i128_divzero.tk` | `(i128) 1 / (i128) 0` | `70` |
 | `tests/primitives_i128_parse_bad.tk` | `i128.Parse("x")` | `70` |
 
-The constant-range crumb adds no fixture of its own: a refusal has no harness
+The constant-range crumb adds no fixture of its own: a refusal had no harness at the time
 (D33's own closing note), so `teko: the constant 300 does not fit u8` is documented with a
 `// no-run` fence in [diagnostics.md](../reference/diagnostics.md) and
 [types.md](../reference/types.md), and the crumb's oracle is that all existing fixtures
-still pass.
+still pass — landed, D52.
 
 ## 12. The crumbs
 

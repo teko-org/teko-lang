@@ -8,7 +8,7 @@
 #   teko3 = teko2 ...                                         over mc_teko.tk
 #   cmp build/teko2.o build/teko3.o          <- the criterion, on the OBJECTS
 #   diff of `--dump-asm` between teko2 and teko3   <- the same, in readable form
-#   the 45 fixtures compiled by teko1               <- and it is a compiler
+#   scripts/fixtures.sh, run by teko1                <- and it is a compiler
 #
 # `teko1.o` vs `teko2.o` is NOT the criterion (they come from two different
 # compilers -- the stock mc's codegen and teko1's own), exactly as `mc1.o` vs
@@ -305,34 +305,19 @@ if ! diff "$asm2" "$asm3" > "$out"; then
 fi
 echo "  ok: $(wc -l < "$asm2" | tr -d ' ') lines, diff empty"
 
-echo "-- criterion 3: teko1 compiles the fixtures --"
-pass=0
-fail=0
-for src in tests/*.tk; do
-    n=$(basename "$src" .tk)
-    want=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
-    derive "$cfgf" "tests/$n.tk" "build/$n$exe"
-    if "$teko1" build . --config "$cfgf" --entry-only >"$out" 2>"$err"; then
-        "build/$n$exe"
-        got=$?
-    else
-        got="build-fail"
-    fi
-    if [ "$got" = "$want" ]; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "  FAIL $n: exit $got, want $want" >&2
-        head -3 "$out" "$err" >&2
-    fi
-done
-echo "  fixtures: $pass passed, $fail failed"
+echo "-- criterion 3: teko1 compiles the fixtures (D52: exit and refusal, one corridor) --"
+derive "$cfgf" "tests/hello.tk" "build/boot-unused$exe"
+if ! sh scripts/fixtures.sh "$teko1" "$cfgf" "$exe"; then
+    fail=1
+else
+    fail=0
+fi
 
 t_total1=$(now)
 echo "=== total: $(dt "$t_total0" "$t_total1")s ==="
 
 if [ "$fail" -ne 0 ]; then
-    echo "FAIL: teko1 does not compile every fixture" >&2
+    echo "FAIL: teko1 does not compile every fixture at its own oracle" >&2
     exit 1
 fi
 echo "FIXPOINT OK"

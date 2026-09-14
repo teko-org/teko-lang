@@ -12,9 +12,16 @@ and the compiler exits 1. A failure at **run time** is a panic with exit 70 and 
 
 The list below is checked against the sources by
 [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh): a message that exists and is
-not documented here fails the `docs` gate. Some messages end mid-sentence in this page
+not documented here fails the `docs` gate, and so does a `// expect-refuse:` message under
+`tests/refuse/` whose fixed text this page does not carry (the check goes both ways). Some messages end mid-sentence in this page
 because the compiler appends a name to them — the quoted part is the fixed text, and the
 entry says what completes it.
+
+A refusal has its own harness: [`tests/refuse/`](https://github.com/teko-org/teko-lang/tree/main/tests/refuse), run by
+[`scripts/fixtures.sh`](../../scripts/fixtures.sh) beside `tests/*.tk`. Each fixture there
+carries a two-line header naming the exact message and the exact line —
+`// expect-refuse: teko: <message>` / `// expect-refuse-line: N` — and the build has to fail
+with that line in its stderr (D52).
 
 ---
 

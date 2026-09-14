@@ -24,14 +24,9 @@ sed -e 's/^os   = .*/os   = "linux"/' -e 's/^arch = .*/arch = "x86_64"/' \
 # Build the taught compiler
 mc build . --config mc.host.toml
 
-# Run the fixtures (every program under tests/, each with its // expect-exit: N oracle)
-for src in tests/*.tk; do
-  n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
-  sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
-      mc.host.toml >"mc.$n.toml"
-  ./build/teko build . --config "mc.$n.toml" --entry-only && "./build/$n"
-  echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
-done
+# Run the fixtures: every tests/*.tk program (its // expect-exit: N is the oracle)
+# and every refusal under tests/refuse/ (its two-line // expect-refuse: / // expect-refuse-line:)
+sh scripts/fixtures.sh ./build/teko mc.host.toml
 ```
 
 ## Fixpoint (self-hosting proof)
@@ -42,7 +37,7 @@ The fixed point proves the taught compiler reproduces itself:
 sh scripts/bootstrap.sh --os linux --arch x86_64
 # Output: teko0 (mc stock) → teko1 → teko2 → teko3 over mc_teko.tk
 # Green means: teko2.o ≡ teko3.o (byte-identical), --dump-asm identical,
-#              teko1 compiles and runs every fixture under tests/ with its own exit code.
+#              teko1 runs every tests/*.tk fixture at its exit code and refuses every tests/refuse/*.tk.
 ```
 
 Runs on five native legs in CI (`ngen.yml`, `fixpoint` job).
@@ -79,11 +74,13 @@ the rest.
 
 ## What a PR must contain
 
-- **Green `mc build ngen && run`**: every fixture under `tests/` compiles and exits as its `// expect-exit` header says
+- **Green `mc build ngen && run`**: every `tests/*.tk` fixture compiles and exits as its `// expect-exit` header says, and every `tests/refuse/*.tk` is refused at the message and line its headers name
   on your platform.
 - **Fixpoint closure** (if touching modules in `mc_teko.tk`): `teko1 == teko2 == teko3` byte-identical
   objects, matching `--dump-asm`.
 - **Fixtures with `// expect-exit: N`**: every new test carries its oracle. No test runs without one.
+- **A refusal that belongs under `tests/refuse/` carries its two-line oracle**:
+  `// expect-refuse: teko: <message>` and `// expect-refuse-line: N` (D52).
 - **Docs gate green** (if touching `docs/**`, `README.md` or `CONTRIBUTING.md`): `sh scripts/check-docs.sh`.
 - **No changes to mc's core** (`minicompiler/mc src/`). Teko only teaches new modules; the base
   grammar, lexer, and type system of mc are off-limits.
@@ -122,7 +119,7 @@ If `mc` itself has a bug or limitation affecting teko's port:
 
 ## CI and workflows
 
-- **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen` and every fixture under `tests/`.
+- **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen`, every `tests/*.tk` fixture and every `tests/refuse/*.tk` refusal.
 - **`fixpoint` job**: teko0→teko1→teko2→teko3, object comparison and ASM diff, every fixture via teko1.
 - **`docs` job**: `sh scripts/check-docs.sh` against `docs/**`.
 - **`site.yml`**: builds `mcsite` from the pinned mc tag and renders `docs/` into the

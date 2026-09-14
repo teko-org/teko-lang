@@ -106,7 +106,7 @@ sh scripts/bootstrap.sh
 
 `teko0` (built by the stock `mc`) compiles the unit into `teko1`, `teko1` into `teko2`,
 `teko2` into `teko3`. Three criteria: `teko2.o` and `teko3.o` byte-identical, the two
-`--dump-asm` dumps equal, and `teko1` compiling and running all 45 fixtures. It prints
+`--dump-asm` dumps equal, and `teko1` compiling and running every `tests/*.tk` fixture and refusing every `tests/refuse/*.tk`. It prints
 `FIXPOINT OK`, and it runs on five native pairs in CI.
 
 ## Where to go next

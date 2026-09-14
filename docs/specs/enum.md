@@ -367,8 +367,9 @@ An `enum` costs a program exactly what a `class` costs it — one `type_new` and
 | `tests/surface_datetime_kind_panic.tk` | N2c: `new DateTime(t, (DateTimeKind) 7)` — the explicit cast is the one road left to an out-of-range `Kind`, and the constructor's own guard still panics on it | `70` |
 | `tests/surface_datetime_kind.tk` | N2c: `DateTimeKind k = d.Kind;`; the three members as `switch` labels; both explicit casts; `new DateTime(t, k)` from a variable and from another date's own `.Kind`; `.ToString()` on a member, a property and a value outside the set; `Parse`/`TryParse`/`IsDefined`; a ternary over two enum arms; a by-value capture | `42` |
 
-The refusals of § 3 have no harness (D33's own note) and are documented with a `// no-run`
-fence in [diagnostics.md](../reference/diagnostics.md) and this page.
+The refusals of § 3 had no harness at the time (D33's own note) and were documented with a
+`// no-run` fence in [diagnostics.md](../reference/diagnostics.md) and this page — landed,
+D52.
 
 ## 12. The crumbs
 

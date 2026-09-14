@@ -18,6 +18,8 @@
 #                    own sources) appears in docs/reference/diagnostics.md. The list is
 #                    extracted from source, never written down here, so a new diagnostic
 #                    fails this check until it is documented.
+#   4b. refusals     every `// expect-refuse:` message under tests/refuse/ contains a
+#                    documented compiler literal (10+ characters) -- the other direction.
 #   5. samples      every fenced ```teko block under docs/ carries `// expect-exit: N`
 #                    (built with the taught compiler and RUN, exit code compared) or
 #                    `// no-run` (an illustrative fragment, left uncompiled); anything
@@ -156,6 +158,33 @@ else
     echo "ok diagnostics: $ndiag teko: strings documented in docs/reference/diagnostics.md"
 fi
 
+# ---------------------------------------------------------- 4b. refusals
+# The other direction: every `// expect-refuse:` message under tests/refuse/ is
+# composed from the compiler's own string literals; the longest literal (10+
+# characters) found inside the message is the diagnostic it exercises, and that
+# literal has to be documented. A fixture whose message drifted from the sources,
+# or a refusal the page never names, fails here.
+grep -ohE '"([^"\\]|\\.)*"' teko*.tk | awk 'length >= 12 { print length, substr($0, 2, length - 2) }' | sort -rn | cut -d' ' -f2- > "$tmp/lits"
+: > "$tmp/refuse_missing"
+nrefuse=0
+for f in tests/refuse/*.tk; do
+    msg=$(grep -m1 '^// expect-refuse:' "$f" | sed 's#^// expect-refuse: *##')
+    [ -n "$msg" ] || continue
+    nrefuse=$((nrefuse + 1))
+    hit=""
+    while IFS= read -r lit; do
+        case "$msg" in *"$lit"*) hit="$lit"; break ;; esac
+    done < "$tmp/lits"
+    if [ -z "$hit" ] || ! grep -qF -- "$hit" docs/reference/diagnostics.md; then
+        echo "$f: $msg" >> "$tmp/refuse_missing"
+    fi
+done
+if [ -s "$tmp/refuse_missing" ]; then
+    fail "refusal fixtures whose message is not documented in docs/reference/diagnostics.md" "$(cat "$tmp/refuse_missing")"
+else
+    echo "ok refusals: $nrefuse tests/refuse/ messages documented in docs/reference/diagnostics.md"
+fi
+
 # ------------------------------------------------------------------ 5. samples
 : > "$tmp/manifest"
 fno=0
@@ -263,7 +292,7 @@ echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
 # ------------------------------------------------------------------- verdict
 if [ "$fails" -eq 0 ]; then
-    echo "docs ok: $nlinks links, $ndiag diagnostics, $nblocks samples"
+    echo "docs ok: $nlinks links, $ndiag diagnostics, $nrefuse refusals, $nblocks samples"
     exit 0
 fi
 echo "$fails documentation check(s) failed"

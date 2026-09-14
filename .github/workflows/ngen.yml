@@ -263,59 +263,20 @@ jobs:
           fi
           echo "build/teko-hello$EXE exited 42, as expected"
 
-      - name: run the primitives, types and surface fixtures
+      - name: run the fixtures (exit and refusal, one corridor)
         # `mc --exe` always emits a Mach-O (`minicompiler/mc` src/main.mc:227
         # hardcodes `bname = "macho-exe"`, ignoring host and [target]), so
         # compiling a fixture with `teko --exe` produced an unrunnable
         # binary off macOS (ENOEXEC, exit 126). The only path that honours
         # `[target]` and `[linker]` is the one `mc build .` itself used for
         # tests/hello.tk (docs/build.md `mc build DIR --config FILE`): a
-        # `[project]` naming the fixture. Each fixture gets its own config,
-        # generated here from the LEG config by swapping only
-        # `[project].entry`/`out` -- so it cannot drift from the leg's own
-        # `[target]`/`[linker]` -- and is fed to the already-built taught
-        # compiler with `--entry-only` (docs/build.md § [compiler]), which
-        # reuses it instead of re-teaching it once per fixture. Each fixture's
-        # own `// expect-exit: N` header is the oracle, the same convention
-        # `mc`'s own tests/*.mc use.
-        #
-        # The runner's default shell already runs with `-e` (bash -e {0}), so
-        # a bare `set -u` here let the FIRST fixture that failed `exit 1` the
-        # whole step immediately -- the loop's own `status=1; continue`
-        # accumulation never got to run past it. `set +e` below is what lets
-        # every fixture in the loop actually run and be reported.
-        run: |
-          set +e -u
-          status=0
-          for src in tests/primitives_*.tk tests/types_*.tk tests/surface_*.tk; do
-            name=$(basename "$src" .tk)
-            want=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
-            if [ -z "$want" ]; then
-              echo "::error::$src has no // expect-exit: N header" >&2
-              status=1
-              continue
-            fi
-            cfg="mc.$name.toml"
-            sed -e "s#^entry = .*#entry = \"tests/$name.tk\"#" \
-                -e "s#^out   = .*#out   = \"build/$name$EXE\"#" \
-                mc.ci.toml >"$cfg"
-            if ! "build/teko$EXE" build . --config "$cfg" --entry-only; then
-              echo "::error::$src failed to compile" >&2
-              status=1
-              rm -f "$cfg"
-              continue
-            fi
-            rm -f "$cfg"
-            "build/$name$EXE"
-            rc=$?
-            if [ "$rc" -ne "$want" ]; then
-              echo "::error::$src exited $rc, expected $want" >&2
-              status=1
-              continue
-            fi
-            echo "$src exited $rc, as expected"
-          done
-          exit $status
+        # `[project]` naming the fixture. `scripts/fixtures.sh` (D52) does
+        # this once for every leg, this script and CONTRIBUTING.md's own
+        # recipe alike: `tests/*.tk` builds --entry-only and runs, judged by
+        # `// expect-exit: N`; `tests/refuse/*.tk` must FAIL to build, judged
+        # by its two-line `// expect-refuse:` / `// expect-refuse-line:`
+        # header against the compiler's own stderr.
+        run: sh scripts/fixtures.sh "build/teko$EXE" mc.ci.toml "$EXE"
 
       # R1: only when a release is calling. The binary packaged here is the one
       # the fixtures above have just run against -- the release PROMOTES what
