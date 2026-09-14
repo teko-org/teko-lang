@@ -61,6 +61,16 @@
 //      class or struct one. The target mutates through the ref (`b.v = 3`)
 //      and rebinds the caller's slot (`b = new Box(7)`, the prior reference
 //      released), and the caller sees both.
+//  14. D67: `new Op(f)` resolves `f` LATE now, the same walk the contextual
+//      road already resolves at, so three roads the parse-time thunk got
+//      wrong or refused are open -- `ovcheck` (an OVERLOADED target: `decl_
+//      find` answered about whichever signature came first, wrong or no
+//      match either way), `belowcheck` (a target declared BELOW the `new`,
+//      `teko: unknown function` on the base) and `geo.ns_roads`'s own eighth
+//      road (`new Op(col)` from INSIDE `geo`, `call to unknown function` --
+//      no `teko:` at all -- on the base, the seventh road D62 measured and
+//      left open). `usingcheck` is the fourth: a namespaced-only target
+//      (`geo.gadd`, no flat twin) reached through `using geo;` alone.
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
@@ -314,8 +324,49 @@ namespace geo {
         h.cb = col;                               // a FIELD -- D62's own road
         if (h.cb(2, 3) != 6) return 7;
 
+        Op d = new Op(col);                       // D67: the EXPLICIT thunk, the
+        if (d(2, 3) != 6) return 8;               // seventh road D62 left open
+
         return 0;
     }
+}
+
+using geo;                                        // D67: `usingcheck`'s own road
+
+// ---- D67: `new Op(f)` resolves `f` LATE, at the same walk the contextual
+// road already resolves at ----
+
+i64 ov700(i64 a) {                                // declared FIRST -- `decl_find`'s
+    return a + 700;                               // own pick, on the base
+}
+
+i64 ov700(i64 a, i64 b) {                         // arity 2, the ONE that matches `Op`
+    return a + b + 700;
+}
+
+i64 ovcheck() {
+    Op f = new Op(ov700);
+    if (f(2, 3) != 705) return 1;
+    return 0;
+}
+
+i64 belowcheck() {
+    Op f = new Op(laterfn);                       // `laterfn` is declared BELOW
+    if (f(2, 3) != 805) return 1;
+    return 0;
+}
+
+i64 laterfn(i64 a, i64 b) {
+    return a + b + 800;
+}
+
+// `geo.gadd` has no flat twin: `using geo;` above is the ONLY road that
+// answers for its bare name here, outside the namespace and with no
+// enclosing one of its own to try first.
+i64 usingcheck() {
+    Op f = new Op(gadd);
+    if (f(2, 3) != 5) return 1;
+    return 0;
 }
 
 i64 cell_dtors = 0;
@@ -784,7 +835,7 @@ i64 main() {
 
     bad = geo.ns_roads();
     if (bad != 0) return 189 + bad;
-    if (rt_live() != 2) return 197;
+    if (rt_live() != 2) return 198;
 
     bad = sfcheck();
     if (bad != 0) return 198 + bad;
@@ -796,6 +847,18 @@ i64 main() {
     if (bad != 0) return 203 + bad;
     if (rt_live() != 6) return 212;                // ...plus the one `Pt`
     if (cell_dtors != 8) return 213 + cell_dtors;  // the two `out` rebinds, then the slot
+
+    bad = ovcheck();                               // D67: an OVERLOADED target
+    if (bad != 0) return 220 + bad;
+    if (rt_live() != 6) return 225;                // purely local, the floor unmoved
+
+    bad = belowcheck();                            // D67: a target declared BELOW
+    if (bad != 0) return 226 + bad;
+    if (rt_live() != 6) return 231;
+
+    bad = usingcheck();                            // D67: a namespaced target through `using`
+    if (bad != 0) return 232 + bad;
+    if (rt_live() != 6) return 237;
 
     return 42;
 }
