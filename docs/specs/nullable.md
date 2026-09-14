@@ -575,7 +575,7 @@ Measured against D42's own baseline (`types` 11, `alias` 19, `syntax` 15, `passe
 | `intrin` | **not at all** | every function has surface code: three in `lib/rt.tk`, and the loads and stores are `tk_ld`/`tk_stn`, which are the core's own fixed intrinsics already in use |
 | `nodes`, `funcs`, `globals` | up | one module of roughly 600 lines, and one vtable global |
 | a **compiled program**'s `types` | **+1 per distinct `T?` spelled** | exactly what `T[]` costs, and the registry doubles rather than dies |
-| `TK_MAXSTRUCT` (teko's own, 32) | one row per distinct `T?` | shared with every class, struct, interface, delegate and `T[]`; the ceiling is the existing `teko: too many type declarations`. **Measure before raising it** — a raise costs BSS in `globals` and no fixture on this page needs more than four |
+| `TK_MAXSTRUCT` (teko's own, 256 since D69; was 32 at write time) | one row per distinct `T?` | shared with every class, struct, interface, delegate and `T[]`; the ceiling is the existing `teko: too many type declarations`. **Measure before raising it** — a raise costs BSS in `globals` and no fixture on this page needs more than four |
 
 ---
 

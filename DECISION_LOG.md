@@ -5769,7 +5769,7 @@ base left it -- `passes` 15, `types` 13, `intrin` 8, `alias` 20, `syntax` 15, `r
 `571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
 `teko_typeof.tk` are listed files, so the hash moves by design).
 
-### D69 · Two capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096 (2026-09-14)
+### D69 · Two capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256 (2026-09-14)
 
 (D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
 takes the next free number, D69.)
@@ -5868,3 +5868,91 @@ table above); `mc pkg hash .`
 `5c0738020efa4533cdf6442d5fa6e7cc593c6c8776d9974e30450f0e9c299cce`: `teko_fwd.tk`,
 `teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
 design).
+
+**Follow-up (same day): `TK_MAXSTRUCT` (teko_struct.tk, 32) raised to 256, closing the gap
+this entry already named as an adjacent finding.** The lockstep argument above holds for any
+plain, non-generic, non-partial source: `tk_type_row_new` is the ONE function that appends a
+row to the shared type table, called both by a real declaration and by a forward placeholder's
+adoption, so `tk_nstruct` never exceeds `tk_nfwd` for such a program. Raising `TK_MAXFWD`
+alone therefore bought nothing past the 32nd type: a 33rd class cleared the (now 256-deep)
+scan and refused one parse-time step later, at the identical count, under `TK_MAXSTRUCT`'s own
+message. Measured, `mc` **0.15.23**, macos/aarch64, this crumb's own build (`teko_struct.tk`
+edited, everything else as `85379111` left it) against base `59652293`:
+
+| probe | shape | at `TK_MAXSTRUCT` 32 (`59652293`/`85379111`, unmoved by D69's own FWD/OS raise) | at `TK_MAXSTRUCT` 256 (this follow-up) |
+|---|---|---|---|
+| 33 classes, one field each, `#include "lib/rt.tk"` | one keyword per class | refused `teko: too many type declarations` at line 34 | compiles, runs 42 |
+| 64 classes, 2 fields + 1 method each | 64 classes, 128 fields, 64 methods, all under `TK_MAXFIELD`/`TK_MAXMETHOD` | (not reached: the 33rd already refused) | compiles, runs 42 |
+| 33 interfaces, 2 methods each | one keyword per interface -- interfaces share this same table (`teko_iface.tk`'s declaration road also calls `tk_type_add`) | (not reached, same refusal as the classes probe, at the 33rd) | compiles, runs 42 |
+| 40 interfaces, 2 methods each | 80 interface methods, well under `TK_MAXIFMETH` (128) | (not reached) | compiles, runs 42 |
+| 40 delegates | one keyword per delegate -- `teko_deleg.tk:285` calls `tk_type_row_new` too, so a delegate spends a row of this table exactly like a class does | (not reached) | compiles, runs 42 |
+| 257 classes, one field each (`TK_MAXSTRUCT`+1) | -- | refused `teko: too many forward-declared types` at `?:0:` (scan time) |
+
+The last row is the coupling working as designed, not a gap: `TK_MAXSTRUCT` was raised to
+**match** `TK_MAXFWD` (both 256), and the pre-scan (`teko_fwd.tk`) always runs to completion
+BEFORE any real parsing, over the WHOLE reachable source. For any plain program, `tk_nstruct`
+can never exceed `tk_nfwd`, so once the two ceilings are equal, the fwd-scan ceiling is
+always the one a 257th type hits FIRST -- `TK_MAXSTRUCT`'s own message becomes unreachable
+from plain (non-generic, non-partial) source, exactly as it was when both ceilings stood at
+32 together, before D69's own FWD raise briefly exposed the mismatch. Setting `TK_MAXSTRUCT`
+any higher than `TK_MAXFWD` would only waste BSS (the fwd scan caps every plain program at
+`TK_MAXFWD` regardless); setting it any lower reproduces the exact bug this follow-up closes.
+256 is therefore not a compromise -- it is the only value that lets a program actually use the
+room D69's `TK_MAXFWD` raise already bought it.
+
+**Cost, measured directly from the source (not `mc limits`' `heap` column, which the task
+asked not to cite here).** Every array this module -- and the two others that also key a row
+by counted-type identity -- sizes by `TK_MAXSTRUCT`:
+
+| file | arrays | shape | columns | bytes/row |
+|---|---|---|---|---|
+| `teko_struct.tk` | `sr_name`, `sr_ty`, `sr_size`, `sr_base`, `sr_form`, `sr_nv`, `sr_m0`, `sr_mn`, `sr_ni`, `sr_vis`, `sr_proj`, `sr_abst`, `sr_part`, `sr_off`, `sr_hline`, `sr_hfile`, `ha_ety`, `nl_of` | 18 x `[TK_MAXSTRUCT]` | 1 | 144 B |
+| `teko_deleg.tk` | `dg_ret`, `dg_np` | 2 x `[TK_MAXSTRUCT]` | 1 | 16 B |
+| `teko_deleg.tk` | `dg_pty`, `dg_pk` | 2 x `[TK_MAXSTRUCT * TK_DGMAX]` (`TK_DGMAX` = `MAXPARAMS` - 2 = 10) | 10 | 160 B |
+| `teko_heaparr.tk` | `ha_gen`, `ha_put` | 2 x `[TK_MAXSTRUCT]` | 1 | 16 B |
+
+336 B per `TK_MAXSTRUCT` row (22 one-column `i64`/`uptr` arrays at 8 B, plus two ten-column
+arrays at 80 B each), all `i64`/`uptr`, 8 B on both macos/aarch64 and linux/x86_64. Total BSS
+this table alone reserves: 32 x 336 B = 10752 B before, 256 x 336 B = 86016 B after -- a
++75264 B (73.5 KB) delta, far under the "a few MB" budget the task set, and `TK_MAXFIELD`
+(already 256, unmoved by this follow-up) shows the codebase already accepts that order of
+magnitude for a sibling table of the same shape.
+
+**Sibling ceilings a 33+-type program hits next, probed the same way (mc 0.15.23,
+macos/aarch64, this crumb's build):**
+
+| ceiling | value | probed shape | fires at |
+|---|---|---|---|
+| `TK_MAXEMIT` (`"teko: too many generated declarations in one unit"`) | 512 (unmoved) | N plain classes, ONE field, no methods, no interface -- a real class still emits ~4 top-level declarations (constructor, release, alloc, and one more) even with no virtual/interface surface | the 129th class (128 compile and run 42; 129 refuses at line 129) -- THIS is the practical ceiling for "how many plain classes fit in one source", well before `TK_MAXSTRUCT`'s own 256 |
+| `TK_MAXMETHOD` (`"teko: too many methods"`) | 128 (unmoved) | 64 classes, 2 fields + 2 own methods each, each implementing one shared interface (1 method) -- 3 methods/class, 192 class methods total | the 43rd class (line 44 of the combined-shape probe, ~128th method total) |
+| `TK_MAXFIELD` (`"teko: too many fields"`) | 256 (unmoved, already raised past 32 in an earlier crumb) | not the bottleneck at 64 classes x 2-3 fields (128-192 fields, under 256) | not reached in any probe above |
+| `TK_MAXIFMETH` (`"teko: too many interface methods"`) | 128 (unmoved) | 40 interfaces x 2 methods = 80 | not reached (well under) |
+| `TK_MAXIMPL` (`(class, interface)` pairs, `"teko: too many implemented interfaces"`) | 64 (unmoved) | 64 classes x 1 interface each = 64 pairs | not reached in the probes above (`TK_MAXMETHOD` fires first, at class 43, before the 64th pair is registered) |
+
+No `TK_MAXIFACE` or `TK_MAXVT` constant exists in this codebase: an interface's own count is
+`TK_MAXSTRUCT` (the shared type table, D69's own finding above), its methods are
+`TK_MAXIFMETH`, and a virtual slot is `TK_MAXVSLOT` (128, unmoved, not probed here -- no
+probe above declared a `virtual` method). `TK_MAXEMIT` is the most pressing of these: a
+program of plain classes alone -- no fields beyond one, no methods, no interfaces -- already
+needs a raise past 128 classes to grow further, a considerably lower ceiling than
+`TK_MAXSTRUCT`'s new 256. Out of scope here (the task named `TK_MAXSTRUCT` only): the next
+crumb to raise capacity for "many classes" should measure `TK_MAXEMIT` first, not
+`TK_MAXSTRUCT` again.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `59652293`: `sh scripts/
+fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 62 refused as expected, 0 failed**,
+identical count to D69's own gate; `--dump-ast` of every one of the 73 `tests/*.tk` and 62
+`tests/refuse/*.tk` (135 files) byte-identical against a `build/teko` built from base
+`59652293` in a separate worktree -- `TK_MAXSTRUCT`'s raise changes no accepted or refused
+program already in the tree; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (73/73, 162.8s, `teko1.o == teko2.o` on the first turn, `--dump-asm` of
+`teko2`/`teko3` empty diff over 219047 lines); `sh scripts/check-docs.sh` -> `docs ok: 611
+links, 41 fragments, 389 diagnostics, 62 refusals, 143 samples`, unmoved; `mc build . --config
+mc.macos.toml --limits` verdict `ok` with `grow` 0 on both legs, `globals` unmoved on both
+(compiler leg 944/2546 reserved, `hello.tk`-by-`build/teko` leg 0/32 reserved -- identical to
+D69's own table, confirming the `TK_MAXSTRUCT` arrays cost `globals` nothing: a `#define`'s
+numeric literal moves no DECLARATION count, only the reserved bytes behind each one); `mc pkg
+hash .` `ac4870f1846bf46d66f7a76a80b7d7904a6f46a94325d55ff5d2f2e7107f8304` (base, `85379111`:
+`f7ef6013d75a654878e132765963b6bd288ca718575a5b10481d623a36298f30` -- `teko_struct.tk` is a
+listed file, so the hash moves by design; `DECISION_LOG.md` and the two docs edits are not
+listed files and move the hash not at all).

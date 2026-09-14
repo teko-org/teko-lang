@@ -1527,7 +1527,7 @@ truncation; the fix is to split the unit.
 
 | message | limit |
 |---|---|
-| `"teko: too many type declarations"` | 32 structs, classes and interfaces in one source |
+| `"teko: too many type declarations"` | 256 structs, classes and interfaces in one source (D69; was 32, raised to match `TK_MAXFWD`) |
 | `"teko: too many fields"` | 256 fields, summed |
 | `"teko: too many methods"` | 128 methods, summed |
 | `"teko: too many virtual slots"` | 128 slots, summed |
