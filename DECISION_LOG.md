@@ -3144,3 +3144,97 @@ and the compiler leg moves by this pass's own source growth (`nodes` used 154279
 `ins` 212446 -> 212503, `funcs` 3137 and `globals` 924 unchanged, used heap 85532512 ->
 85578928 of a 149553152 reserve). `mc pkg hash .` at this pass's own code commit:
 `eab5530bc2fadc4462fa2b1146a9411a34a85492a053d1d142805fcad0660d0c`.
+
+**Copilot finding, seventh pass: a CALL was settled by the FIRST declaration of its name,
+and the store that waits was judged twice.** Three findings, each measured on `da33ebd4`
+(the base), on the head of this crumb (`82fa6aa9`) and on this fix, mc **0.15.23**,
+macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)`, `Chooser` a `delegate Op Chooser(i64 k)`,
+`Boxed` a class and `make` an overloaded name:
+
+| probe | `da33ebd4` | `82fa6aa9` | now |
+|---|---|---|---|
+| `ops[0] = chooser(1)`, a LOCAL `Chooser` shadowing a `Boxed chooser(i64)` | refuses, `teko: Op takes a function, another Op, or null` | refuses, `teko: a value of type Boxed does not convert to Op` | runs, 42 |
+| `ops[0] = make(1, 2)`, first row `Op`, the pick `i64` | compiles, **exit 139** | compiles, **exit 139** | refuses, `teko: Op takes a function, another Op, or null` |
+| `ops[0] = make(1, 2)`, first row `Boxed`, the pick `Op` | refuses | refuses, the generic words | runs, 42 |
+| `ops[0] = new Other();` | refuses, `teko: Op takes a function, another Op, or null` | refuses, `teko: a value of type Other does not convert to Op` | refuses, the delegate's own words |
+| `ops[0] = o;`, `o` a LOCAL of class `Other` | `teko: unknown function: o` | refuses, the generic words | refuses, the delegate's own words |
+| 128 late LOCAL element stores in one unit | `teko: unknown function: lo` | runs, 42 | runs, 42 |
+| 129 of them | `teko: too many stores into a slot of class type` | the same | the same |
+
+1. **`decl_find` is not the question a store may ask about a CALL either.** The sixth pass
+   struck that table for a bare NAME and left it standing for everything else:
+   `tk_deleg_store_late` (teko_deleg.tk) settled a value whenever `tk_deleg_expr_ty` typed
+   it as the element, and on an `N_CALL` that oracle reads the pass-time scope (empty at
+   parse) and then falls through to `tk_ty_of`, which asks `decl_find` for the FIRST
+   declaration of the called name -- no scope, no prepared overloads. Its two errors point
+   opposite ways and neither is recoverable at the site: a LOCAL delegate `chooser`
+   shadowing a free `Boxed chooser(i64)` was typed by the FUNCTION's return and a legal
+   store was refused, and an overload whose first row answers `Op` while the row the call
+   picks answers `i64` was SETTLED, the `i64` written into the `Op[]` unchecked, and the
+   first call through the element segfaulted (exit 139, on the base exactly as on the head).
+   The rule is the one D50 already states over `tk_fs_vty` and D48 over an argument: a call
+   whose return only the pass resolves is not an early check's to guess at. Every `N_CALL`
+   waits for `tk_deleg_walk`, which stands at the site with the lexical scope live and the
+   overloads already picked. A ternary IS an `N_CALL` (of `tk_ternary`), so the sixth pass's
+   branch-by-branch recursion goes with it -- the same verdict in one rule less, because a
+   bare name in a branch was already late at this site. A FUNCTION declared above the store
+   is still wrapped where the name is unambiguously a function, which at parse time means
+   nowhere: that is the sixth pass's own answer, unchanged, and it is why no accepted
+   program's tree moves here -- a wrap is what moves a tree, and nothing that waits is ever
+   wrapped.
+2. **A store that waits was judged twice, and the generic verdict spoke first.**
+   `tk_ha_store` (teko_heaparr.tk) ran `tk_check_field_store` (teko_struct.tk) over the
+   value whether it was deferred or not, and that check reads the SAME parse-time tables the
+   guard above had just refused to trust: `ops[0] = new Other()` and `ops[0] = o` on an
+   `Op[]` were refused `teko: a value of type Other does not convert to Op`, the generic
+   conversion words, where the delegate's own validator answers
+   `teko: Op takes a function, another Op, or null`; and finding 1's shadowed `chooser` was
+   refused by it over the FUNCTION's return type even after the coercion had waited. One
+   judgement per store: what waits is `tk_deleg_late_do`'s, whole, and `null` and the shapes
+   the site does type keep the check -- an element store is the only road to Q1a's null rule
+   (`cs[i] = null` on a `Cell[]`). The refusal is not lost, it is the right one: both shapes
+   above are refused in the delegate's own words now.
+3. **The queue's ceiling was derived from a table a LOCAL store never touches, and the
+   derivation is what was wrong -- not the number.** The fifth pass raised `TK_MAXDGLATE`
+   from 64 to 512 by reading `TK_MAXGDEF` (512, teko_array.tk), the writes into a
+   possibly-global array; a local store is never one of those, so the reviewer is right that
+   the ceiling has to be stated on its own terms. Measured before resizing anything: a
+   delegate is a COUNTED type, so `tk_os_mark` records every element store of one, local or
+   global, in `TK_MAXOS` (128, teko_struct.tk), a table never reset within a unit -- 128 late
+   local stores compile and run, and 513 are refused at the 129th,
+   `teko: too many stores into a slot of class type`, on the base as well (pre-existing, and
+   an adjacent finding, not this crumb's). The queue cannot be filled past 128 by any
+   program, so 512 stays where it is -- four times the deepest reach -- with its real feeder
+   named in the code and in
+   [diagnostics.md](docs/reference/diagnostics.md), where the row now says the ceiling is its
+   own and which refusal a program really meets first. Growing it to 4096 would have added
+   192KB of globals for rows nothing can add.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the seven probes above on the three
+builds, plus the **29** probes of passes 1 to 6 and the verifier finding re-run on this
+build -- every one at the verdict its own table records, and the head of this crumb and this
+fix agree on all 29; **63/63** fixtures at their `expect-exit`, with
+`tests/surface_globals.tk` (exit 42) gaining section 3f, `delegcallcheck` -- a call through
+a LOCAL `Chooser` that a free `Boxed chooser(i64)` shadows, and a call to the overload of
+`make` whose first row is `Boxed` and whose picked row is `Op` -- the head of this crumb
+refuses that section at its first store. The mirror image (a first row of `Op` over a pick
+that is not one) cannot be a fixture, so it is the `// no-run` sample added to
+[diagnostics.md](docs/reference/diagnostics.md). The `--dump-ast` of the 62 fixtures that
+existed at `da33ebd4`: **62 of 62 byte-identical to the head of this crumb**, and against
+the base, **61** byte-identical with `tests/surface_array_heap.tk` exactly as the sixth pass
+declared it (2439 lines, the same multiset, one 88-line block of eight wrap declarations
+moved to the end) -- deferring a call moves no tree, because only a bare name is ever
+wrapped; instrumented, `tk_deleg_late_rest` refusing any store that reaches it unjudged, the
+whole suite and all 36 probes pass -- no deferred store survives the walk (and the instrument
+is not vacuous: with `tk_deleg_late_pend` disabled it fires on `tests/surface_globals.tk:193`
+and on the probes at once); `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green (568 links, 385
+diagnostics -- none added, the ceiling's own row restated -- **123** samples, one added);
+`mc limits . --config mc.macos.toml` verdict identical to the head on both legs (the
+compiler leg `ok`, the `tests/hello.tk` leg `grew` there as here), measured back-to-back from
+the same clean state: that second leg is BYTE IDENTICAL down to its `heap` (estimate 16318
+against 464272 used of a 33554432 ceiling), and the compiler leg gives back what the deleted
+recursion cost (`nodes` used 154307 -> 154284, `ins` 212503 -> 212458, `funcs` 3137,
+`globals` 924, `strings` 2096 and `symbols` 6157 unchanged, used heap 85578928 -> 85637664 of
+a 149684224 reserve). `mc pkg hash .` at this pass's own code commit:
+`8f5a5276b4a1544adf52fc42f9e63c19aa9e0db51ae1b9efd5788421cef8155f`.
