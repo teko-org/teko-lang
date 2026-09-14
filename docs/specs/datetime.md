@@ -289,11 +289,12 @@ Also deliberately outside:
 
 | left out | why |
 |---|---|
-| `ToLocalTime`, `ToUniversalTime`, `DateTimeOffset` | a time-zone database is not a language feature |
+| `ToLocalTime`, `ToUniversalTime` | a time-zone database is not a language feature |
+| `DateTimeOffset` | designed in [datetime-extras.md](datetime-extras.md) (N5) -- no time-zone database needed, `.LocalDateTime` reads the offset the value carries -- and queued behind C3, the sixteen-byte machine it needs |
 | ~~`enum DateTimeKind`~~ | **landed** (N2c, D48): teko had no `enum` when this page was written, so C2 shipped a `type_alias` over `i32` plus three constants — the same surface, and `enum` a crumb of its own. It is now an ordinary `enum` declared in `lib/time.tk`, and the two registrations are gone |
 | culture, `ParseExact`, custom format strings | the market's answer is a formatting library, not a primitive |
 | `TimeSpan * f64`, `DateTime` in a `switch` pattern | neither is refused on principle; neither is in this design |
-| `DateOnly`, `TimeOnly` | C# has them; nothing asks for them yet |
+| ~~`DateOnly`, `TimeOnly`~~ | **landed** (N4a, D54; N4b, D58): designed in [datetime-extras.md](datetime-extras.md), which supersedes this row |
 
 ## 9. The hooks, by module
 
