@@ -36,7 +36,11 @@ roads accept and refuse exactly the same targets. A parameter the delegate decla
 `ref`/`out` travels through that wrapper as **the caller's own address**, not a copy, and the
 signature has to match on the kind as well as on the type — which is checked once, on the
 target, before any wrapper exists: `void byval(f64 x)` is `teko: byval does not match the
-delegate Mut(ref f64)` (D63).
+delegate Mut(ref f64)` (D63). The pointee is any type at all — a scalar, a class, a struct or
+a primitive such as `DateOnly` — and the target may write through the reference (`b.v = 3`) or
+rebind the caller's own slot (`b = new Box(7)`), exactly as a direct call does; a target whose
+pointee is a DIFFERENT type is refused by the same signature check, `teko: fillc does not
+match the delegate Fill(ref Box)`.
 
 ```teko
 // expect-exit: 42
