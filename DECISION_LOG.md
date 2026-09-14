@@ -2824,14 +2824,17 @@ load reaches the field-store door TYPED, which is what the judge then reads.
 builds nodes, and both halves of what it can build move the compiler's current position:
 `tk_num_widen` and `tk_nl_wrap` (teko_typeof.tk, teko_null.tk) set `tk_line`/`tk_file` to
 the VALUE's own node before writing the conversion. `tk_field_use` (teko_expr.tk) has
-always restored the store's own site after the call; the other three parse-time-ish sites
-did not, so the store node they built afterwards carried the value's line. Measured with a
-throwaway `err_at` on the store node, a store written over two lines: the implicit
-`r =`/`3;` reported line 7 and now reports 6 (`tk_this_assign`, teko_this.tk), the static
-`S.total =`/`3;` reported 8 and now reports 7 (`tk_static_use`), and the same store on the
+always restored the store's own site after the call; four of the other five did not, so
+the store node they built afterwards carried the value's line. Measured with a throwaway
+`err_at` on the store node, a store written over two lines: the implicit `r =`/`3;`
+reported line 7 and now reports 6 (`tk_this_assign`, teko_this.tk), the static
+`S.total =`/`3;` reported 8 and now reports 7 (`tk_static_use`), the same store on the
 FORWARD road reported 5 and now reports 4 (`tk_fwd_resolve_static_one`, both
-teko_access.tk). `tk_ha_store` (teko_heaparr.tk) and the fixed element's own door restore
-it for the same reason.
+teko_access.tk), and the deferred receiver's `h.r =`/`3;` reported 6 and now reports 5
+(`tk_pend_field`, teko_typeof.tk, whose row already gave the REFUSAL its own site in the
+third pass -- the store node it builds is the other half of that same rule).
+`tk_ha_store` (teko_heaparr.tk) and the fixed element's own door restore it for the same
+reason.
 
 **The row check asks `null` nothing.** `tk_check_field_store` (teko_struct.tk) kept a copy
 of Q1a's rule — `null` lands only in a slot declared `T?` — under a comment that called
@@ -2919,7 +2922,7 @@ pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that 
 `build/`; the floor leg's heap figure follows the state of `build/` and is not a gate — an
 independent run over a used `build/` reads 721776 on both sides), which is the two tables
 raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the eighth pass:
-`6f78bf105bc092c7d5f9846897f9db7a81fed8a6079ec741ac701bc7bb033f8b`.
+`a08d052371169f1d0ab1015a413bfc8028847de1eb07f304932b8722a22bff4b`.
 
 **What the element's own type bought for free.** With every array element load carrying
 its type (`tk_ha_load`, `tk_arr_index_of`, `tk_array_index`, the fixed-global rewrite), the
