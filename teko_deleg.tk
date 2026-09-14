@@ -1312,6 +1312,12 @@ i64 tk_lam_member(i64 n, uptr name) {
     i64 fi = tk_field_find(tk_body_class, name);
     if (fi >= 0) {
         if (fd_sym_at(fi)) {
+            // the same gate an unqualified member passes in the method itself
+            // (`tk_this_check`): a base's private static is not the derived
+            // class's to read, and an inline static ARRAY is no scalar load
+            tk_line = nd_line(n);
+            tk_file = nd_file(n);
+            tk_this_check(fi);
             i64 fty = fd_ty_at(fi);
             tk_node_replace(n, tk_ld(fty, tk_id(fd_sym_at(fi))));
             // the write door found while closing D70's own write twin
@@ -1405,11 +1411,14 @@ i64 tk_lam_member_store(i64 n, uptr name) {
     i64 fi = tk_field_find(tk_body_class, name);
     if (fi >= 0) {
         if (fd_sym_at(fi)) {
-            if (tk_lam_escapes(nd_a(n)))
-                err_at(nd_file(n), nd_line(n), "teko: a lambda that captures by reference cannot leave its scope");
-            i64 fty = fd_ty_at(fi);
             i64 line = nd_line(n);
             uptr fl = nd_file(n);
+            tk_line = line;                  // `tk_this_check` reads the globals
+            tk_file = fl;
+            tk_this_check(fi);
+            if (tk_lam_escapes(nd_a(n)))
+                err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
+            i64 fty = fd_ty_at(fi);
             i64 v = tk_field_store_val(fty, nd_a(n), line, fl);
             i64 st = tk_os_mark(tk_call2(tk_stn(fty), tk_id(fd_sym_at(fi)), v), fty);
             tk_node_replace(n, tk_stmt(st));
@@ -1515,6 +1524,11 @@ void tk_lam_check_call(i64 n) {
     if (tk_lc_find(name) >= 0) return;               // ...and so does a capture, by-value or by-reference
     i64 mi = tk_method_named_find(tk_body_class, name);
     if (mi < 0) {
+        // a property is reached by its name and never called (`tk_reject_prop_call`
+        // says it on the method's own road); judged before the delegate field so
+        // the call never falls through to a free function of the same name
+        if (tk_prop_find(tk_body_class, name) >= 0)
+            err_at2(nd_file(n), nd_line(n), "teko: the member is a property; it is not called", name);
         tk_lam_deleg_call(n, name);
         return;
     }
