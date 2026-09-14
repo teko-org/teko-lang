@@ -99,7 +99,7 @@ and no `MTASK_RELOC_KIND`, and `--dump-asm` needs no new mnemonic.
 | `MTASK_CALL` | for each wide argument depth, materialise its slot address into that depth's register; delegate; if the result is wide, copy sixteen bytes from the returned pointer into the depth's slot | delegate |
 | `MTASK_RET` | copy the depth's sixteen bytes into `$tk_wide_ret`, put its address in the depth, delegate | delegate |
 | `MTASK_LOAD` / `STORE` | copy sixteen bytes through the address the core computed — a field, an array element (**as built**) | delegate |
-| `MTASK_CALLP` | the same argument rewrite as `MTASK_CALL`; no cast names a wide type, so an indirect call never RETURNS one (**as built**) | delegate |
+| `MTASK_CALLP` | the same argument rewrite as `MTASK_CALL`; no cast names a wide type, so the machine never sees a wide RESULT here — a delegate or an interface method returning one hands back the buffer's address as a pointer, and the surface copies it out at the site that builds the call (`tk_callp_ret`, a call to `tk_dec_ld` over the `callp`) (**as built**; the first draft had no copy-out and read the depth's own uninitialised slot — found by D74's verifier, `tests/primitives_decimal_indirect.tk` pins it) | delegate |
 | `MTASK_PARAM_REG` | `die`: a sixteen-byte value is never allocated to a register. Owed because `MTASK_PARAM` is overridden, contract version 5 (**as built**) | delegate |
 | `MTASK_BIN`, `CMP`, `UN`, `CAST`, `CONST` | unreachable: teko refuses every one of them at the surface, with a line and a name. A guard that `die`s names the teko refusal it should have been | delegate |
 
@@ -322,6 +322,7 @@ verdict is `ok` on both sides.
 | `syntax` | 15 | **15** | **unmoved**: `syntax_lit` is not counted here, and C3 registers no `syntax_expr("decimal")` and no `syntax_stmt("decimal")` — those are what a RECEIVER (`decimal.Round(d)`) needs, and C5 is where they are spent |
 | `intrin` | 8 | **8** | **unmoved**, and the law's own row: the halves are reached with `&`, `ld64` and `st64`, all three already on the closed list |
 | `passes` | 15 | **15** | **unmoved**: the refusals ride `teko_ops.tk`'s and `teko_typeof.tk`'s existing passes |
+| `tokens` (teko's own row) | 103 | 104 | the `m` suffix the literal reader claims |
 | every other row | — | unmoved | |
 
 What C4 and C5 add on top of this is still an estimate: `syntax` +2 for the receiver form,
