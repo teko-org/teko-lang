@@ -6231,13 +6231,14 @@ proves it, per D2.
 
 Proof, macos/aarch64, with the pinned `~/.local/mc/mc-0.16.1-macos-arm64/mc`: `mc build .
 --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
-**75 passed, 74 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
+**75 passed, 83 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
 aarch64` → `FIXPOINT OK` (`teko2.o == teko3.o`, fixed point on the FIRST turn —
-`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 229127 lines);
-`sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments, 389 diagnostics, 74
-refusals, 144 samples`. `mc pkg hash .` is
-`87462ab0fda41429aadb57e5fa97dbdbf27a72d4792348cea2907804d11f7870` (base, `origin/main`
-`bcee28f2` under 0.15.23,
+`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 230438 lines);
+`sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments, 390 diagnostics, 83
+refusals, 144 samples` (re-measured on `abf3137b`, after `origin/main` `afdfae88` — D65 to
+D70 — was merged in). `mc pkg hash .` is
+`373c8f04a413bae0f5c86fab5a19f2dedfffc76c5fc0028691f162a2660bcdc2` (base, `origin/main`
+`afdfae88` under 0.15.23,
 `2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: the tree hash now moves
 with this pin, because `[package].mc` is new bytes in `mc.toml`, which the previous 0.16.0
 draft of this entry did not carry).
@@ -6255,9 +6256,9 @@ D69's own capacity raise (already on `main`, unrelated to this pin), the library
 SOURCE the build reads (one more include) instead of a blob, and 0.16.x registers one more
 backend (`mc --exe` for Windows PE) — and none of them is near its reserve.
 
-`--dump-ast` of all **149** fixtures (75 under `tests/`, 74 under `tests/refuse/`, the
+`--dump-ast` of all **158** fixtures (75 under `tests/`, 83 under `tests/refuse/`, the
 refusals compared on their stderr since they produce no tree), taken with the compiler
-built by 0.15.23 (`origin/main` `bcee28f2`) and with the compiler built by 0.16.1 over the
+built by 0.15.23 (`origin/main` `afdfae88`) and with the compiler built by 0.16.1 over the
 same unmodified tree, is **byte-identical on every one**. The taught compiler's own output
 does not depend on the host `mc`; what moved underneath it is codegen, one more capacity
 ceiling (D69) and library location, not grammar.
