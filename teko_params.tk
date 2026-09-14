@@ -150,6 +150,30 @@ i64 tk_bracket(i64 left) {
     // an index no road lowered, at the same line and with the same wording.
     if (nd_kind(left) == N_IDENT && tk_slv_find(nd_name(left)) >= 0)
         err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+    // ...and the very same binding one scope out: inside a member body, a bare
+    // name the class DECLARES is that field (C#'s rule, `tk_this_field`'s own),
+    // and the global road may not claim it either. With a global `i64[] src`
+    // beside an `i64 src` FIELD, `src[0]` in a method was rewritten into a load
+    // of the global while the base identifier under it was rewritten by
+    // `tk_this_ident` (teko_this.tk) into the FIELD's own load -- the array
+    // pass runs first (teko.tk's own order) -- so the field's eight bytes were
+    // read as the array's handle: exit 139, an invalid program neither compiled
+    // correctly nor refused (Copilot on #698, pass 11). The field that IS an
+    // array answers here instead of by accident: a `T[]` of heap takes
+    // `tk_ha_index`, exactly as a `T[]` PARAMETER does four lines above, over a
+    // base the pass turns into the field load -- which also gives the implicit
+    // `src[0]` a road when no global of that name exists at all, where it used
+    // to be refused. Everything else -- a scalar, an object, a delegate, and an
+    // INLINE array field, which is reached through `this.` and nowhere else
+    // (`tk_this_reject_array`) -- indexes nothing, and takes the refusal above.
+    if (nd_kind(left) == N_IDENT && tk_body_class >= 0) {
+        i64 bfi = tk_field_find(tk_body_class, nd_name(left));
+        if (bfi >= 0) {
+            i64 bsi = tk_struct_by_ty(fd_ty_at(bfi));
+            if (fd_nel_at(bfi) == 0 && tk_is_ha(bsi)) return tk_ha_index(left, bsi);
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        }
+    }
     i64 line = p_line();
     uptr fl = p_file();
     i64 idx = parse_expr(0);
