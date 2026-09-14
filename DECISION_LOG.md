@@ -2660,7 +2660,11 @@ the same defect:
   register the DECLARED return type, the row when the type has one and the type id in every
   case, which is the registration the pass-time road already makes for the very same call
   (`tk_pend_do`, teko_typeof.tk) and the one `tk_field_use` makes for a field load. A `void`
-  return registers nothing, having nothing to be asked about. A DIRECT call registers its ROW
+  return is registered too, as `TY_VOID` — the eleventh pass below is what made it so, and
+  what the twelfth turned into a refusal on both roads: the wording this paragraph carried
+  before, "a `void` return registers nothing", was the fourth pass's own and stopped being
+  true the moment `void` became an answer the store gate has to give a verdict on
+  (Copilot on #698, pass 12). A DIRECT call registers its ROW
   alone, exactly as it always did: it names its callee, `tk_ty_of` reads the declared return
   off that symbol, and a scalar row there answers nothing the oracle did not already have
   while spending one of `TK_MAXXT`'s 256 per call in the unit. The fourth pass registered
@@ -2993,8 +2997,12 @@ inside the helper; an element of a GLOBAL array in a field store, both kinds —
 heap and the fixed one — into an `f64` field and into a `Cell?` one; an element of a LOCAL
 fixed array and an element of an INLINE array field, the two loads the parser resolves on the
 spot, each into an `f64` field; and `rt_live()` back to
-its floor at the end, that floor being the three objects the two global arrays ROOT (a global
-array is never released, `surface_array_global.tk`'s own header); the element of a FIXED array as the store TARGET,
+its floor at the end, that floor being the four objects the three global `T[]`s ROOT — the
+arrays `gl`, `gc` and `gdst` themselves and the one `Cell` that `gc` holds, `gx` and `gf`
+being FIXED arrays the counter never sees (a global
+array is never released, `surface_array_global.tk`'s own header; the earlier "three objects,
+two global arrays" here was the count of a head that had one `T[]` fewer — Copilot on #698,
+pass 12); the element of a FIXED array as the store TARGET,
 global and local, the widening (`f64 gf[2]; gf[0] = 1;`), the compound over its own load
 (`gf[0] += 1;`) and an element whose type already matched, which the door has to leave
 exactly as it found it; a global element as the VALUE and as the INDEX of another global's
@@ -3091,3 +3099,64 @@ bisections, the constant lowered and every fixture recompiled until one trips. P
 outside `tests/` (not committed) measured each defect above before its fix and its absence
 after, and the two capacity boundaries from both sides: 300 scalar reads compile, 4200 are
 refused with the tripped table's own message.
+
+**The twelfth pass: `void` at the DOOR, and the inline array field's own sentence.** Two
+things the eleventh pass left half-done, both measured on its own head `fd05b9b8`:
+
+- **`TY_VOID` as a value is a refusal on EVERY road, not only the deferred one.** The
+  eleventh pass registered the declared return of the three indirect sites, `void` included,
+  so that `tk_fs_do` could refuse it — but a receiver the PARSER types registers that answer
+  at PARSE time, and `tk_field_store_val` reads a registered type as one it KNOWS and never
+  defers. `tk_check_scalar_compat` has no clause for `TY_VOID` (it names no row, is not a
+  float and is not one of `tk_is_int_ty`'s words), so the door took it: `i64 n; v.n = b.M();`
+  on a VIRTUAL `void M()` through a LOCAL receiver compiled and exited **32**, the INTERFACE
+  twin the same, and `f64[] xs; xs[0] = b.M();` — the element store, the same door — took it
+  too, exit **0** with the return register's leftovers in the element. `tk_fs_void_check`
+  (teko_typeof.tk) is one function called from BOTH doors, the parse-time store and the
+  judge, and the judge's own inline clause is now that call: all four roads refuse with the
+  same sentence, `teko: a value of type void does not convert to i64`, and a delegate FIELD
+  call, which used to answer the judge's *the type of this value is not known here* from the
+  wrong line, now says it too. No new `teko:` string.
+- **An INLINE array field keeps the sentence written for it.** The eleventh pass's guard for
+  a bare name the class declares (`tk_bracket`, teko_params.tk) refused everything that is
+  not a `T[]` with its generic ``teko: `[` needs an array``, and an inline array field is
+  exactly such a name: `items[0]` inside a method got that wording where `da33ebd4` gives
+  ``teko: an array field is reached through `this.`: items``
+  (docs/reference/diagnostics.md), the one the pass used to give when the bare name still
+  reached `tk_this_ident`. The specific road (`tk_this_reject_array`) is taken first now, and
+  the generic one is left for what really indexes nothing.
+
+**And the claim an element load carries its own type is read by a fixture now.** The two
+reference pages stated it with no executable regression behind them.
+`surface_timespan.tk` reads `xs[i] + t`, `xs[i] + xs[j]`, `t + xs[i]`, `-` and `>`, on a
+FIXED array and on a `T[]` of heap, with a VARIABLE index; `surface_timespan_overflow.tk`
+makes the panic at its end an element operand, which is where the overflow CHECK is proven
+(the raw `+` would wrap in silence), with two edge operations on elements above it that must
+not fire; `surface_datetime.tk` reads `ds[i] + t` with the `Kind` riding through,
+`ds[i] - ds[j]`, the comparison, and an element of a `DateTimeKind` array as the second
+ARGUMENT of the raw constructor (`new DateTime(1, ks[i])`). All three are REFUSED on
+`da33ebd4` — `teko: unknown member: Ticks`, `Month` — which is what makes them guards.
+
+Two figures of the entry above were corrected in place by this pass: "a `void` return
+registers nothing" (the fourth pass's own sentence, untrue since the eleventh) and "the
+three objects the two global arrays ROOT" (the count of a head with one `T[]` fewer; the
+fixture roots **four** objects through **three** global `T[]`s, `gl`/`gc`/`gdst` plus the
+`Cell` that `gc` holds, `gx` and `gf` being fixed arrays the counter never sees).
+
+**Proof**, mc **0.15.23**, macos/aarch64: `mc build . --config mc.macos.toml` clean;
+**63/63** fixtures at their `expect-exit`; `--dump-ast` of all **63** fixtures under the
+compiler of `fd05b9b8` and under this one, over the SAME sources — **63 byte-identical**,
+which is the whole of the code change being a refusal and nothing else; the three fixtures
+this pass edits, old source against new under this compiler, differ by ADDITION only (0
+lines removed, sorted diff); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK` (63/63 under the self-hosted `teko1`); `sh scripts/check-docs.sh` green (567
+links, 387 diagnostics, 122 samples — unmoved, the `void` paragraph gaining a sentence and
+no sample); `mc limits . --config mc.macos.toml` verdict `ok` with every table unmoved —
+`passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16, `heap`
+1114992 of 33554432 — no new pass and no new intrinsic (D2, D21). The throwaway
+instrumentation was re-run on this head: every row of the deferral table asserted `done`
+after the judgement over all 63 fixtures (0 survivors), and the two high-waters re-proved by
+bisection from both sides — `TK_MAXFS` **34** (`surface_field_store` trips a mark of 33) and
+`TK_MAXXT` **239** (`surface_nullable_ops` trips a mark of 238), both unmoved by this pass.
+`mc pkg hash .` over the source tree of this pass's code and fixture commits:
+`0c49cc1ddb4d6e6c91f44c17320fcf5bc2ba7518b70f3f8cbed11cfe9eecaafe`.
