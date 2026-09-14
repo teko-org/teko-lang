@@ -28,10 +28,11 @@ local or parameter carries the name — C#'s own rule, local shadows field. `thi
 the same thing out loud, `this` is only valid inside the body of a type, and neither
 `this` nor `base` exists in a static member.
 
-That member **shadows a free function of the same name**. `m(x)` inside a method of a
-class that declares `m` is the method, and `cb(x)` where the class declares a delegate
-field `cb` is the field ([delegates.md](delegates.md#calling)) — a top-level `i64 m(i64)`
-or `i64 cb(i64)` is not reached from there, and neither case is refused. C# has no free
+That member **shadows a free function of the same name, in or out of a namespace**.
+`m(x)` inside a method of a class that declares `m` is the method, and `cb(x)` where the
+class declares a delegate field `cb` is the field ([delegates.md](delegates.md#calling)) —
+neither a top-level `i64 m(i64)`/`i64 cb(i64)` nor one declared by the class's own
+namespace is reached from there, and neither case is refused. C# has no free
 functions; its nearest form, a static method of the enclosing class, is shadowed the same
 silent way by a member of the class whose body reads the name. From outside the class the
 free function answers as it always did, and `this.cb(x)` names the member explicitly.

@@ -5626,9 +5626,9 @@ answered `h.cb(2, 3)` only where the PARSER itself could type the receiver. Meas
 The fourth row broke the refusal law on its own: a diagnostic with no `teko:` prefix, from
 mc's own resolver, for a construct teko taught.
 
-**ROOT: one rule, written at one door out of four.** `tk_field_use` (teko_expr.tk) reads
+**ROOT: one rule, written at one door out of five.** `tk_field_use` (teko_expr.tk) reads
 `tk_deleg_row(fty)` and, on a `(`, hands the field's load to `tk_field_deleg_call` ->
-`tk_deleg_build`, the single builder of a delegate `callp`. The three other doors a field
+`tk_deleg_build`, the single builder of a delegate `callp`. The four other doors a field
 is reached through never asked the question:
 
   - `tk_pend_field` (teko_typeof.tk) is `tk_field_use`'s PASS-TIME twin — the emitter for
@@ -5655,6 +5655,25 @@ is reached through never asked the question:
     as the address. The lookup is deliberately NOT `tk_static_field_of`: that one refuses an
     INSTANCE member in words of its own, and `H.n(1)` on an instance field is a mistake
     whose report belongs where it already was (measured unmoved).
+  - `tk_ns_rewrite_call` (teko_ns.tk), the fifth door, found by the second verifier: inside
+    a NAMESPACE a bare call is rewritten to the namespace's own free function by pass 2,
+    BEFORE `tk_this_call`/`tk_this_deleg_call` ever read the node, and the member guard it
+    stopped on was `tk_method_named_find(cls, name)` alone — so `namespace geo { i64 cb(i64);
+    class H { public Op1 cb; i64 go(i64 x) { return cb(x); } } }` compiled to a direct call
+    to `geo__cb` (`--dump-ast`: `FUNC geo__h_go` -> `CALL geo__cb`) and answered 105 where
+    the same program outside a namespace answers 6. It now also stops on a FIELD whose type
+    names a delegate row (`tk_field_find` + `tk_deleg_row`), which is exactly what
+    `tk_this_deleg_call` then builds — and only on a delegate one, and only for an `N_CALL`:
+    a bare `n(1)` on an `i64` field keeps the fork below, and `&cb` keeps naming the free
+    function it names outside a namespace. Its twin `tk_ns_rewrite_ident` already asked
+    `tk_field_find`.
+    The same door carried a second defect of its own: `tk_ns_call_cls` was filled with
+    `tk_method_of_fn(...)`, a METHOD row number, and read by both rewrites as a STRUCT row
+    number — so the member guard answered for whatever type happened to sit at that index
+    and held only where the two numbers coincided (one class, its methods declared first).
+    With three classes ahead of it, even the METHOD half failed: a namespaced free `tag`
+    won over the class's own `tag`, 105 on `d028a7a0`. `tk_ns_cls_of_fn` reads `mt_cls_at`
+    off the row, the same pair `teko_this.tk` reads for its own `tk_pass_class`.
 
 **What does NOT move, and it is the larger half.** A method named `cb` still answers ahead
 of the field on both the bare-name road and the `Type.` road, as it does in C#. A
@@ -5758,7 +5777,9 @@ the rule.
 expected, 0 failed**, `tests/surface_delegate.tk` still `expect-exit: 42` with
 `shadowcheck` inside it and still refused by the base compiler (at `PH.scb`, line 429);
 `--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
-ORIGINAL sources — **byte-identical on all 73**, unchanged from the first pass;
+ORIGINAL sources — **72 byte-identical**, `tests/surface_delegate.tk` a pure INSERTION (the
+base's dump plus `shadowcheck`'s own nodes, nothing else moved), unchanged from the first
+pass;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
 `sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
 refusals, 141 samples` (the link and the fragment are `classes.md` -> `delegates.md#calling`;
@@ -5769,3 +5790,42 @@ mc.macos.toml` verdict `ok` on both legs with every counted row unmoved from the
 `intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0; `mc pkg hash .`
 `e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe`, unmoved — a fixture,
 the log and two reference pages are not listed files.
+
+**The fifth door, measured** (mc 0.15.23, macos/aarch64, base `d028a7a0`). Every shape is
+written inside `namespace geo` except the fourth, where the namespace holds only the free
+function and the class is top level under a `using geo;`; `delegate i64 Op1(i64 a);` and
+`i64 add1(i64 a)` are top level throughout, and the exit code is what `main` returns:
+
+| the shape | base | head |
+|---|---|---|
+| a delegate FIELD `cb` vs the namespace's free `cb`, bare `cb(x)` in a method | 105 | **6** |
+| a METHOD `tag` vs the namespace's free `tag`, bare `tag(x)` in a sibling method | 6 | 6 |
+| the namespace's free `lone` with NO member of that name, `lone(x)` in a method | 105 | 105 |
+| a `using`-imported free `cb` vs a delegate field of a top-level class | 105 | **6** |
+| `cb(5)` in a namespace FUNCTION, outside the class | 105 | 105 |
+| the METHOD twin with three classes declared ahead of it (the index defect) | 105 | **6** |
+
+Row 2 held on the base only by the coincidence row 6 breaks: `tk_ns_call_cls` carried a
+method row number where a struct row number was read.
+
+**Proof, third pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **73 passed, 64 refused as expected, 0 failed**, `tests/surface_delegate.tk`
+still `expect-exit: 42` with `shadowcheck` grown by the namespaced pair (`shd.NShad`) and
+exiting **214** on the pre-fix compiler — row 210 + 4, the field shape;
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **byte-identical on all 73**, and byte-identical on all 73 of the branch's
+own sources as they stood before this pass grew the fixture, compiler `cc43ad53` against the
+fixed one: this door fires only for a class that declares a delegate field named like a free
+function reachable from its namespace, and no fixture had one before this pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (no new literal: the ruling is still that nothing is refused);
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, the `tests/hello.tk` leg
+unmoved (`passes` 15/30, `types` 13, `intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4,
+`on_stmt` 4, `globals` 0) and the compiler leg moving only by the added surface code —
+`nodes` 156854 -> 156917, `ins` 216382 -> 216486, `funcs` 3185 -> 3187, `lowered` 3167 ->
+3169, `symbols` 6266 -> 6268, with `globals` **943** and `strings` **2138** both unmoved;
+`mc pkg hash .`
+`a0ef8936de1773c578ee8c9800524caef98a9837499b16f6e50b74f40af0e221` (`teko_ns.tk` is a
+listed file, so the hash moves by design).

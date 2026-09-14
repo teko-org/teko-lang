@@ -59,9 +59,11 @@ global, a field of either), by its bare name inside a method of the declaring ty
 (`cb(x)`, the unqualified spelling of `this.cb(x)`) and, for a `static` one, through the
 type (`H.cb(x)`). A method of the same name still answers first on the bare-name and the
 `Type.` roads, as it does in C#, and the class's own member — method, then field — answers
-before any FREE function of that name: inside `go`, `cb(x)` is the field even when a
-top-level `i64 cb(i64)` is declared. Outside the class that free function is untouched,
-and a local or a parameter named `cb` still answers before either.
+before any FREE function of that name, **in or out of a namespace**: inside `go`, `cb(x)`
+is the field both when a top-level `i64 cb(i64)` is declared and when the class's own
+namespace declares one. Outside the class that free function is untouched — including a
+call written in the namespace but not in the class — and a local or a parameter named `cb`
+still answers before either.
 
 Its arguments are judged and converted exactly as a direct call's are — the count, the
 `ref`/`out` kind, the pointee of a `ref`/`out` one, the type of one passed by value, and

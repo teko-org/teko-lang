@@ -38,7 +38,8 @@
 //  10. `shadowcheck` -- D65's precedence, both halves: a bare name inside a
 //      method is the class's own member -- method, then delegate field --
 //      before any FREE function of that name, and from outside the class
-//      that free function still answers.
+//      that free function still answers. `shd.NShad` is the same pair inside
+//      a NAMESPACE, where the free function is the namespace's own.
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
@@ -380,6 +381,16 @@ i64 pfcheck() {
 //
 // From OUTSIDE the class the free function is untouched: `cb(5)` in `main`
 // is still the free `cb`, and `sh.cb(5)` through the receiver is the field.
+//
+// The same rule holds INSIDE a namespace (`shd` below), and that is the door
+// D65 first missed: the namespace rewrite (teko_ns.tk's `tk_ns_rewrite_call`)
+// renames a bare call to the namespace's own free function BEFORE
+// `tk_this_deleg_call` can see it, so `shd.NShad.go` ran `shd__cb` and
+// answered +100. It now stops on a delegate field exactly as it already
+// stopped on a method, and the class index it reads that member table with is
+// the class's, not the method row's. A namespaced free function with no
+// member of its name is untouched (`plain`), and so is a call written outside
+// the class but inside the namespace (`shd.outside`).
 delegate i64 Op1(i64 a);
 
 i64 add1(i64 a) {
@@ -410,6 +421,44 @@ class Shad {
     }
 }
 
+namespace shd {
+    i64 cb(i64 a) {                               // a free function of the NAMESPACE,
+        return a + 100;                           // named like NShad's delegate field
+    }
+
+    i64 tag(i64 a) {                              // ...and like NShad's method
+        return a + 100;
+    }
+
+    i64 lone(i64 a) {                             // ...and named like no member at all
+        return a + 100;
+    }
+
+    class NShad {
+        public Op1 cb;
+
+        public i64 tag(i64 a) {
+            return a + 1;
+        }
+
+        public i64 go(i64 x) {                    // the FIELD shadows `shd.cb`
+            return cb(x);
+        }
+
+        public i64 tgo(i64 x) {                   // the METHOD shadows `shd.tag`
+            return tag(x);
+        }
+
+        public i64 plain(i64 x) {                 // no member named `lone`: the free fn
+            return lone(x);
+        }
+    }
+
+    i64 outside(i64 x) {                          // outside the class: the free fn
+        return cb(x);
+    }
+}
+
 i64 shadowcheck() {
     Shad sh = new Shad;
     sh.cb = new Op1(add1);
@@ -417,6 +466,14 @@ i64 shadowcheck() {
     if (sh.go(5) != 6) return 1;                  // the field, not the free `cb`
     if (sh.tgo(5) != 6) return 2;                 // the method, not the free `tag`
     if (sh.cb(5) != 6) return 3;                  // the field through a receiver
+
+    shd.NShad nsh = new shd.NShad;
+    nsh.cb = new Op1(add1);
+
+    if (nsh.go(5) != 6) return 4;                 // the field, not `shd__cb`
+    if (nsh.tgo(5) != 6) return 5;                // the method, not `shd__tag`
+    if (nsh.plain(5) != 105) return 6;            // no member of that name: the free fn
+    if (shd.outside(5) != 105) return 7;          // outside the class, inside the namespace
 
     return 0;
 }
