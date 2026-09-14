@@ -24,7 +24,7 @@ sed -e 's/^os   = .*/os   = "linux"/' -e 's/^arch = .*/arch = "x86_64"/' \
 # Build the taught compiler
 mc build . --config mc.host.toml
 
-# Run the fixtures: every program under tests/ (its // expect-exit: N is the oracle)
+# Run the fixtures: every tests/*.tk program (its // expect-exit: N is the oracle)
 # and every refusal under tests/refuse/ (its two-line // expect-refuse: / // expect-refuse-line:)
 sh scripts/fixtures.sh ./build/teko mc.host.toml
 ```
@@ -37,7 +37,7 @@ The fixed point proves the taught compiler reproduces itself:
 sh scripts/bootstrap.sh --os linux --arch x86_64
 # Output: teko0 (mc stock) → teko1 → teko2 → teko3 over mc_teko.tk
 # Green means: teko2.o ≡ teko3.o (byte-identical), --dump-asm identical,
-#              teko1 compiles and runs every fixture under tests/ with its own exit code.
+#              teko1 runs every tests/*.tk fixture at its exit code and refuses every tests/refuse/*.tk.
 ```
 
 Runs on five native legs in CI (`ngen.yml`, `fixpoint` job).
@@ -74,7 +74,7 @@ the rest.
 
 ## What a PR must contain
 
-- **Green `mc build ngen && run`**: every fixture under `tests/` compiles and exits as its `// expect-exit` header says
+- **Green `mc build ngen && run`**: every `tests/*.tk` fixture compiles and exits as its `// expect-exit` header says, and every `tests/refuse/*.tk` is refused at the message and line its headers name
   on your platform.
 - **Fixpoint closure** (if touching modules in `mc_teko.tk`): `teko1 == teko2 == teko3` byte-identical
   objects, matching `--dump-asm`.
@@ -119,7 +119,7 @@ If `mc` itself has a bug or limitation affecting teko's port:
 
 ## CI and workflows
 
-- **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen` and every fixture under `tests/`.
+- **`ngen.yml`**: matrix of 5 native legs, each runs `mc build ngen`, every `tests/*.tk` fixture and every `tests/refuse/*.tk` refusal.
 - **`fixpoint` job**: teko0→teko1→teko2→teko3, object comparison and ASM diff, every fixture via teko1.
 - **`docs` job**: `sh scripts/check-docs.sh` against `docs/**`.
 - **`site.yml`**: builds `mcsite` from the pinned mc tag and renders `docs/` into the

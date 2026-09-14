@@ -23,7 +23,9 @@ the same reason `mc`'s own ladder does not compare its first two.
 
 1. `cmp build/teko2.o build/teko3.o` — byte-identical **objects**.
 2. the `--dump-asm` of teko2 and of teko3, over the same source, differ nowhere.
-3. teko1 compiles and runs all 51 fixtures, each one's `// expect-exit: N` being the oracle.
+3. teko1 compiles and runs every `tests/*.tk` fixture, each one's `// expect-exit: N` being the
+   oracle, and refuses every `tests/refuse/*.tk` at the message and line its
+   `// expect-refuse:` / `// expect-refuse-line:` headers name.
 
 All three, then `FIXPOINT OK`.
 

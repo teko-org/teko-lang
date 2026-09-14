@@ -154,7 +154,7 @@ package has to be registered once by hand before it can be announced; until the 
 `MC_VERSION` is one line, without a leading `v`, and it is the answer to "which mc does CI
 use". Raising it is its own change, in this order:
 
-1. download the new release and run the whole local recipe against it — 51/51 fixtures;
+1. download the new release and run the whole local recipe against it — every fixture and every refusal;
 2. `sh scripts/bootstrap.sh` against the new release has to print `FIXPOINT OK`;
 3. **only then** write the new version into `MC_VERSION`.
 
