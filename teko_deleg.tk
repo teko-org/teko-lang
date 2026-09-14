@@ -63,6 +63,7 @@ i64 tk_lam_escapes(i64 e);
 // are forward-declared here for `tk_deleg_thunk` and `tk_new_deleg`, which
 // run ahead of it in the file.
 i64  tk_deleg_target_count(uptr fn);
+i64  tk_deleg_single_def(uptr fn);
 i64  tk_deleg_pick_target(i64 si, uptr fn, i64 line, uptr fl);
 void tk_deleg_new_defer(i64 n, i64 si, uptr fname, i64 ns, i64 line, uptr fl);
 
@@ -298,7 +299,12 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
     if (tk_deleg_target_count(fn) > 1) {
         d = tk_deleg_pick_target(si, fn, tk_line, tk_file);
     } else {
-        d = decl_find(fn);
+        // the ONE definition when there is one -- `decl_find` would answer
+        // with a PROTOTYPE of another signature declared above it (Copilot on
+        // #723) -- and the first declaration only when no definition exists
+        // in this unit (a prototype-only name)
+        d = tk_deleg_single_def(fn);
+        if (d < 0) d = decl_find(fn);
         if (d < 0 || !decl_valid(d)) err_at2(tk_file, tk_line, "teko: unknown function", fn);
         tk_deleg_check_sig(si, fn, d);
     }
@@ -573,6 +579,19 @@ i64 tk_deleg_target_count(uptr fn) {
         f = nd_next(f);
     }
     return c;
+}
+
+// the definition of `fn` when the unit carries exactly one, else -1: the node
+// the single-declaration road judges, so a prototype of ANOTHER signature
+// written above the definition is not mistaken for the target
+i64 tk_deleg_single_def(uptr fn) {
+    i64 f = tk_deleg_root;
+    loop {
+        if (f == 0) break;
+        if (tk_deleg_is_def(f) && str_eq(nd_name(f), fn)) return f;
+        f = nd_next(f);
+    }
+    return 0 - 1;
 }
 
 // D67: the ONE definition of `fn` whose signature -- arity, return, every
