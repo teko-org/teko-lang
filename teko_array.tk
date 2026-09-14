@@ -123,6 +123,10 @@ void tk_deleg_defer_all_set(i64 on);
 // (docs/specs/datetime.md § 3).
 i64  tk_prim_is(i64 ty);
 void tk_prim_own_cast(i64 n);
+// ...and `tk_cast` writes one over a NARROW primitive at every indirect load
+// (`tk_arr_load` below, `tk_ld` in teko_struct.tk), so a rewrite that copies
+// such a load into a placeholder carries the mark with it (N4a, D54).
+void tk_prim_own_cast_moved(i64 from, i64 to);
 
 // ---- a write the parser read but could not yet place ----
 i64  gd_node[TK_MAXGDEF];             // the placeholder the pass rewrites in place
@@ -623,8 +627,13 @@ void tk_array_maybe_rewrite_index(i64 n) {
     tk_file = fl;
     i64 idx = tk_arr_bounds(nd_b(n), nel, nm, line, fl);
     i64 keep = nd_next(n);
-    node_assign(n, tk_arr_load(ety, tk_arr_addr(base, ety, idx)));
+    i64 r = tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+    node_assign(n, r);
     set_nd_next(n, keep);
+    // a NARROW element load IS a cast the compiler wrote (`tk_arr_load`), and
+    // the tree holds the placeholder: the mark moves with the value or the
+    // cast walk reads it as one a source wrote (N4a, D54)
+    tk_prim_own_cast_moved(r, n);
     // the same tag the heap load below carries, for the same reason: this node
     // is what a field store, an argument or an operator is handed, and a load
     // nobody can type is refused by the judge (D50). `tk_arr_load` tags
@@ -651,6 +660,8 @@ void tk_hg_rewrite_index(i64 n) {
     i64 r = tk_ha_load(base, ety, nd_b(n));
     node_assign(n, r);
     set_nd_next(n, keep);
+    tk_prim_own_cast_moved(r, n);            // the same carry the fixed-array
+                                             // read above makes (N4a, D54)
     // the registration follows the VALUE into the node the tree holds:
     // `tk_ha_load` tags the node IT built (the element's row and its type id,
     // teko_heaparr.tk), and `node_assign` copies that value into `n`, leaving
