@@ -6239,7 +6239,7 @@ refusals, 144 samples` (re-measured on `abf3137b`, after `origin/main` `afdfae88
 D70 — was merged in). `mc pkg hash .` is
 `373c8f04a413bae0f5c86fab5a19f2dedfffc76c5fc0028691f162a2660bcdc2` (base, `origin/main`
 `afdfae88` under 0.15.23,
-`2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: the tree hash now moves
+`a8122b64a3235e39820a1cc1aa3fc1446e3b890fc684791fdbc12868b7343e50`: the tree hash now moves
 with this pin, because `[package].mc` is new bytes in `mc.toml`, which the previous 0.16.0
 draft of this entry did not carry).
 
