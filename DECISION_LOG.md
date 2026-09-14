@@ -6569,6 +6569,157 @@ every counted table exactly where `95e157cb` left it (`passes` 15/30, `syntax` 1
 `014f902503d1510e450ba4422be5b5a5d76bd58c73b678e98ed1b5e843c6106d` on `95e157cb`:
 `teko_expr.tk` is a listed file, so the hash moves by design.
 
+### D67 · The EXPLICIT thunk `new Op(f)` resolves `f` on the same late/contextual road the bare-name wrap already takes (2026-09-14)
+`new Op(f)` picked its target at PARSE time (`tk_new_deleg` -> `tk_deleg_wrap` -> `tk_deleg_thunk`
+-> `decl_find(f)`), which answers about the FIRST declaration of a name alone and only about one
+already read so far -- three measured wrong answers where the contextual road (`Op g = f;`,
+resolved in `tk_deleg_pass`, the walk) already gets it right:
+
+| the target | before (base `afdfae88`) | after |
+|---|---|---|
+| **overloaded**: `f64 pick(f64 a)` declared first, `i64 pick(i64 a)` second, `delegate i64 Op(i64 a)` | `teko: pick does not match the delegate Op(i64)` -- the FIRST declaration's own mismatch, even though the second matches exactly | resolves to `pick(i64)`, `f(5)` answers 6 |
+| **declared BELOW** the `new` | `teko: unknown function: later` | resolves, `f(2, 3)` answers the target's own return |
+| **namespaced**, reached from INSIDE its own namespace, no flat twin | `call to unknown function`, from the CORE at lowering -- no `teko:` prefix at all, D62's own "the road still out is the seventh, `new Op(col)`" | resolves to the namespaced target, `f(2, 3)` answers its own return |
+| **namespaced**, reached through a `using` alone, no flat twin | *runs, by accident*: the thunk is emitted un-namespaced, so `tk_ns_pass`'s own call-rewrite (which ALSO revisits every generated body) falls through the SAME file's `using`s with `ns` empty -- which is the identical accident that fails the row above the moment the same target is reached from inside its own namespace, since there the thunk's `ns` is EMPTY where the SITE's is not | resolves deliberately, from the recorded SITE namespace, not from an accident of where the generated code happens to land |
+
+**ROOT: the thunk was built while the file was still being read, and namespaces are not
+mangled -- nor is the whole unit's own declaration set complete -- until later.** The
+contextual road already answers all three questions correctly, in one shared resolver
+(`tk_deleg_resolve_fn`, D62) run from `tk_deleg_pass`, the walk that stands once the entire
+unit is parsed. `new Op(f)` never called that resolver at all; it called `decl_find` straight
+from the parser, which is the wrong tool for every one of the three defects above by
+construction, not by an oversight in one branch.
+
+**The fix: `new Op(f)` builds a PLACEHOLDER, not a thunk.** `tk_new_deleg`'s bare-name branch
+now calls `tk_deleg_new_placeholder`: an ordinary `N_CALL` naming `f` itself, with NO argument
+(the same 0-arg shape the resolved allocator call wears, so `tk_ref_check_call`'s own argument
+loop -- which would otherwise ask a question about a callee this node does not yet truly name --
+is a no-op over an empty list regardless of what `f` turns out to mean), tagged with the
+delegate row right away (`tk_xt_put`, the SAME row and type the resolved allocator call would
+carry). Every consumer that asks the node's TYPE between here and the walk that patches it --
+`tk_ty_of`, `tk_pty_of`, a nested delegate call's own argument judge, `tk_deleg_coerce`'s own
+"already a value of this type" fork -- answers correctly from the tag alone, so nothing between
+parse time and the walk (`tk_ns_pass`'s own bare-call rewrite included, which reaches every
+`N_CALL` a namespaced function's body holds and is free to rename the placeholder's `nd_name`
+however it likes) has anything to trip over: this function never reads that name back, only the
+one it captured at parse time into a table of its own.
+
+The site -- the delegate row, the raw name, the NAMESPACE live right now (`tk_ns_current()`,
+frozen at parse time, never read back off the mutable pass-time `tk_deleg_cur_ns`), the line, the
+file -- is recorded in the SAME late table an element store's own deferred value already waits in
+(`dl_*`, `teko_deleg.tk`, `dl_val` 2 here, never 0 or 1), reusing its bucket-by-node-id lookup
+(`tk_dg_bucket_insert`/`tk_deleg_late_pend`) rather than a second one: D51's eighth pass already
+measured that a per-node linear scan of this table is a real cost at compiler scale, and a
+SECOND per-node scan for a brand new "is this node a pending thunk" question would repeat the
+exact mistake it fixed. `tk_deleg_new_do` (the `dl_val` 2 branch of `tk_deleg_late_do`) is the
+patch: it resolves the recorded name through `tk_deleg_resolve_fn` -- unmoved, the identical
+namespace/flat/using order D62 already gave the contextual road, now taking `ns` as a PARAMETER
+rather than the pass's own global, since this road's backstop sweep (`tk_deleg_late_rest`, never
+actually reached in practice -- every `new Op(f)` site measured sits inside a function body, and
+a teko global's own initializer is core-checked to be a CONSTANT, so it cannot hold one) runs
+after that global is reset to 0 for the whole unit -- and then calls `tk_deleg_wrap`, exactly the
+allocator-call construction the parse-time road always built, splicing it into the placeholder's
+own identity (`tk_node_replace` + `tk_xt_move`, the same move `tk_deleg_val_do` makes for D62's
+own field-store wrap, one line up in the same file).
+
+**The overload pick, factored out of the single-declaration check rather than duplicated.**
+`tk_deleg_check_sig`'s own arity/return/parameter-type/`ref`-out-kind comparison is now
+`tk_deleg_sig_matches(si, d)`, a predicate the existing function calls unchanged (its own wording
+and line untouched, `tests/refuse/deleg_new_kind.tk` and `deleg_new_ref_pointee.tk` byte for byte
+the same) and `tk_deleg_pick_target` (new) calls too, walking `tk_deleg_root` for every DEFINITION
+(never a `N_PROTO`, excluded the way `tk_ov_dup_def`, teko_over.tk, already excludes one from its
+own "occupies the name" check -- `decl_valid` answers 1 for a prototype exactly as it does for a
+body, and a plain forward-declared function would otherwise count as two candidates sharing a
+name) named `f`, refusing `teko: <f> has no overload matching <Op(...)>` when none matches and
+`teko: ambiguous overload for <Op(...)>: <f>` when more than one does (C# §10.2.3's method group
+conversion, exact match, no widening -- teko has none for a delegate target either). `tk_deleg_
+thunk` takes this road only when `tk_deleg_target_count(f) > 1`; a name declared exactly once
+keeps the single-declaration path -- and its wording -- untouched, which is what makes the
+"declared BELOW" defect close for free: `decl_find`/the root walk both see the whole unit once
+this runs at pass time, whichever order the source wrote it in.
+
+**The second refusal is unreachable, and the log says so rather than fabricating a fixture for
+it.** Two declarations that both match a delegate's signature EXACTLY -- arity, return, every
+parameter's type and kind, all equal -- are two declarations of the identical signature INCLUDING
+return type, which is `function declared twice` at the CORE's own hand, checked incrementally as
+each is parsed, well before this resolver or any pass ever runs (measured: a program with `i64
+dup(i64 a)` declared twice, wrapped in `new Op(dup)`, refuses `function declared twice` at line 5
+on the base and on this branch alike, never reaching `tk_deleg_pick_target` at all). Every other
+angle this crumb tried to construct ambiguity from -- two overloads differing only by `ref`/`out`
+(`tk_ov_refout_clash` refuses that pairing outright, in `tk_over_pass`, before it could ever
+reach a delegate target -- but that pass runs AFTER this one, so this is not what saves it; the
+KIND is still part of the exact match, and two candidates cannot both carry the delegate's own
+kind at a position where they disagree), two namespace levels each supplying a candidate
+(`tk_ns_call_try_prefixes` stops at the CLOSEST level with any declaration at all, never
+considering a farther one), a `using` supplying a second namespace's overload (`tk_ns_call_try_
+usings` already refuses THAT collision itself, in its own words, upstream of this resolver) --
+was either refused earlier by an EXISTING gate or provably narrows to at most one exact match by
+construction. `tk_deleg_pick_target`'s ambiguous branch is kept anyway, mirroring the C# rule
+this crumb is built against and the project's own convention of a defensive branch documented as
+such (D63's own "seat" table) rather than trusted to be dead code by a proof no verifier re-runs
+by hand. No fixture reaches it, and none should be invented that does not measure a REAL defect.
+
+**The capacity table gains no new define.** The new pending-thunk row shares `TK_MAXDGLATE` (512)
+and its bucket with an element store's own deferred value (`dl_val` 0/1) rather than a table of
+its own: both are "a node in the tree that needs a walk-time judgement, keyed by its own
+identity, resolved once" in exactly the same shape, and giving the explicit thunk road a SEPARATE
+512-row budget would let one construct starve the other's ceiling for no reason either one needs
+its own. The overflow wording is its own, `teko: too many delegate targets awaiting resolution`,
+so a program that exhausts the shared table on either half says which one it was doing.
+
+**Dumps: identical for 154 of the 158 pre-existing fixtures; 4 differ by the SAME shape, and are
+the same program.** `tests/surface_dateonly.tk`, `tests/surface_delegate.tk`,
+`tests/surface_globals.tk` and `tests/surface_lambda.tk` (the four `tests/*.tk` fixtures whose
+base source writes `new Op(f)`/`new Mut(bumpf)`/`new SetDay(nextday)`/etc over a BARE name;
+`tests/surface_globals_rc.tk` also matches the same grep and is UNCHANGED, because its own use is
+the LAMBDA form, `new Op((x) => ...)`, untouched by this crumb) each print the identical SET of
+lines -- same line count, a sorted diff of zero, every declaration, every name, every type
+unmoved -- in a DIFFERENT ORDER: the four generated declarations (the thunk, its vtable, its
+release, its allocator) move from immediately after the declaration that wrote the `new`, to
+wherever `tk_top_emit` lands when `tk_deleg_pass`'s own walk resolves the placeholder, later in
+the unit. `mc`'s own resolver does not care about declaration order (a forward reference is
+ordinary, `decl_find` walks the whole list), and the reclaim/codegen passes read the SAME four
+declarations either way, which is what the sorted-diff-zero measurement is standing in for: not
+"the same in spirit" but the same bytes, relocated. No OTHER pre-existing fixture's dump moves by
+one byte.
+
+**Fixtures.** `tests/surface_delegate.tk` grows four cases: `ovcheck` (the overloaded target),
+`belowcheck` (declared below its own `new`), `ns_roads`'s own eighth road (`new Op(col)` from
+INSIDE `geo`, the seventh D62 left open) and `usingcheck` (a namespaced-only target, `geo.gadd`,
+reached through a file-level `using geo;` added for it), `expect-exit: 42` unmoved, `rt_live()`
+unmoved by all three new helpers (purely local, no static/global storage). One refusal,
+`tests/refuse/deleg_new_overload_none.tk`: neither arity of an overloaded `pick` matches the
+delegate, `teko: pick has no overload matching Op(i64, i64)` at the `new` line.
+
+**Docs.** `docs/reference/delegates.md`'s "Which function a bare name names" section states that
+`new Op(f)` takes the identical order the contextual road always has, with the overload and the
+namespace-through-`new` samples run inline; the stale paragraph claiming `new Op(name)` was the
+one form the order did not reach is replaced by a runnable one that closes it.
+`docs/reference/not-yet.md` drops its own row for the namespace gap this crumb closes.
+`docs/reference/diagnostics.md` gains the two new wordings under "Delegates, lambdas and
+captures" and a new row in the Capacity table for the shared `TK_MAXDGLATE` budget.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `afdfae88`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **75 passed, 84 refused as
+expected, 0 failed** (75/83 on the base: one refusal added, `surface_delegate.tk` grown in
+place); `--dump-ast` of every pre-existing `tests/*.tk` (75) and `tests/refuse/*.tk` (83), each
+compiled with its ORIGINAL base source by both binaries -- **154 byte-identical, 4 reordered-only
+(sorted-diff zero, see above)**; `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT
+OK` (93.7s); `sh scripts/check-docs.sh` -> `docs ok: 615 links, 45 fragments, 392 diagnostics, 84
+refusals, 146 samples`; `mc limits . --config mc.macos.toml` verdict **ok**, `grow` 0 on every
+row of the macos/aarch64 leg (the base's OWN verdict at this commit is `grew` on four rows --
+`passes`, `alias`, `types` grew, `syntax` tight -- a pre-existing property of the unmodified base
+at this exact source size, unrelated to and not fixed by this crumb; this crumb's own larger
+surface code is what happens to push those same four rows past their estimate threshold, closing
+them to `ok` as a side effect, not a goal reported as if it were one) -- the compiler leg's
+counted rows move only by the added surface code (`nodes` 158062 -> 166006, `funcs` 3199 -> 3292,
+`lowered` 3181 -> 3273, `globals` 945 -> 948, `strings` 2139 -> 2178, `symbols` 6283 -> 6418,
+`ins` 218423 -> 228120, all on the macos/aarch64 leg only -- a linux/x86_64 cross-build measured
+locally cannot LINK on this host, so that leg is CI's to confirm); `mc pkg hash .`
+`b8409a481cace40a589be06ecb92bd294c545e6be74c6471c335390eb3c75397` (base
+`a8122b64a3235e39820a1cc1aa3fc1446e3b890fc684791fdbc12868b7343e50`: `teko_deleg.tk` is a listed
+file, so the hash moves by design).
+
 ### D69 · Five capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256, `TK_MAXEMIT` 512 -> 4096, `TK_MAXMETHOD` 128 -> 1024 (2026-09-14)
 
 (D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
