@@ -423,6 +423,14 @@ struct is never a base class.
 A struct is **not reference-counted** — it has no vtable, hence no release function to
 reach. Its allocation lives for the run ([memory.md](memory.md)).
 
+A struct **global** is the same eight-byte slot a class global is: it converts by the same
+assignment corridor a local's own store takes (D53), and assigning one struct global (or a
+struct-typed local) to another copies the POINTER, not the fields — `gp = p;` makes `gp` and
+`p` the same allocation, so a field written through either name is read through the other
+(D5, D56). It cannot be built at its own declaration: `Point gp = new Point();` at file scope
+is refused by mc's own core, `global initializer must be constant` — `new` is a call, not a
+constant. Declare it bare (`Point gp;`) and build it in a body instead.
+
 ---
 
 ## `class`
@@ -696,6 +704,34 @@ i64 main() {
 where it is built (`new DateTime(2023, 2, 29)` is `teko: a date does not exist`, exit 70),
 and `DateTime.Now` is refused by name until `mc`'s `<sys>` carries a wall clock.
 [datetime.md](datetime.md) is the whole type.
+
+---
+
+## `DateOnly`
+
+A date with no time of day, behind the same include: the count of days since `0001-01-01`,
+**four bytes** — C#'s own `int` representation, and the first primitive here narrower than
+the machine word. The raw four bytes are `.DayNumber`.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    DateOnly leap = new DateOnly(2024, 2, 29);
+    if (leap.DayNumber != 738944) return 1;
+    if (leap.DayOfWeek != 4) return 2;              // a Thursday, 0 is Sunday
+    if (leap.AddMonths(1).Day != 29) return 3;      // 2024-03-29
+    if (new DateOnly(2024, 1, 31).AddMonths(1).Day != 29) return 4;   // C# clamps
+    if (DateOnly.FromDayNumber(leap.DayNumber) != leap) return 5;
+    return 42;
+}
+```
+
+C# declares **no arithmetic operator** on it and neither does teko: `d + t` and `d - d` are
+refused, and `d1.DayNumber - d2.DayNumber` is the form for a difference. The six
+comparisons are all it carries.
+[datetime.md § `DateOnly`](datetime.md#dateonly) is the whole type.
 
 ---
 

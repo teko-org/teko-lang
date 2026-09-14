@@ -487,6 +487,34 @@ uptr tk_cname(uptr name, uptr m) { return tk_join3(tk_case(name, 1), "_", tk_cas
 // ---- node constructors: only node_new/set_nd_* from src/ast.mc ----
 i64 tk_nd(i64 kind) { return node_new(kind, tk_line, tk_file); }
 
+void tk_prim_own_cast_moved(i64 from, i64 to);
+
+// ---- and the ONE door that puts a built node in a built node's place ----
+// Every in-place rewrite this compiler makes goes through here (mc
+// docs/reference/hooks.md § pass(): the parent keeps pointing at `n`, and `n`'s
+// content becomes `r`'s). Two things must survive that copy, and a door
+// spelling `node_assign` by hand forgets one of them sooner or later -- which
+// is what happened to the seventh door, the read of a by-reference capture
+// (`tk_lam_walk`, teko_deleg.tk), while six others were being taught the
+// second (N4a, D54):
+//   * `nd_next` -- `node_assign` copies the WHOLE node, sibling link included,
+//     so an `n` in the middle of a call's argument list would take `r`'s tail
+//     and lose its own;
+//   * the record of a cast the COMPILER wrote -- kept by node index
+//     (`tk_prim_own_cast`, teko_prim.tk), because `--dump-ast` prints every
+//     field a node has and a mark on the node would move the dump. A primitive
+//     NARROWER than the machine word makes every indirect load such a cast, so
+//     a mark left behind on `r` reads back as a cast the source hand-wrote and
+//     is refused.
+// A caller with more to move -- a type row, an owned store, a deferred call --
+// moves it after this returns, onto `n`.
+void tk_node_replace(i64 n, i64 r) {
+    i64 keep = nd_next(n);
+    node_assign(n, r);
+    set_nd_next(n, keep);
+    tk_prim_own_cast_moved(r, n);
+}
+
 i64 tk_int(i64 v) {
     i64 n = tk_nd(N_INT);
     set_nd_val(n, v);

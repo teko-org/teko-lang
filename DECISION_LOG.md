@@ -4612,6 +4612,18 @@ restored, `docs ok: 569 links, 387 diagnostics, 15 refusals, 122 samples`.
 
 ---
 
+**The fragment check, one step later still.** The site's own `mcsite --check` refused two
+pull requests in a row on something `scripts/check-docs.sh` had passed: a relative link
+leaving `docs/` (#700) and a `#slug` whose heading had been renamed (#703,
+`docs/reference/diagnostics.md:303` pointing at `#primitives-with-members-timespan-datetime`
+after the heading gained `DateOnly`). Step 1b now applies the generator's own rule to every
+`#slug` on a link, in-page or cross-page: a heading's id is its text lowercased, every run of
+characters outside `[a-z0-9_]` one dash, no dash at either end, and a repeated id numbered
+`-2`, `-3`, ... in page order (`u_slug` and `md_unique_id` in mc's `site/gen`). Drills: the
+#703 rename fails naming the page and the slug; a cross-page fragment with one letter added
+fails the same way; restored, `docs ok: 575 links, 26 fragments, 388 diagnostics, 21
+refusals, 133 samples`.
+
 ### D53 · A global SCALAR slot takes the same assignment corridor as a local (G-b, 2026-09-14)
 D48 gave a global a TYPE (`tk_ty_global`, teko_array.tk, over the slot table `tk_hg_collect`
 records) and D51 gave every by-name oracle a fallback into it. What neither gave it is the
@@ -4719,6 +4731,143 @@ same file; `mc pkg hash .`
 (base `93fab590c5fd29dc2ceaabab56ba296e39d41044b3b6e38bd6ee36861d45ed6e`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
 
+### D54 · `DateOnly`, and the width a primitive may have (2026-09-14)
+*This log ended at D52 when N4a started: D53 was already taken by a crumb in flight (it has
+landed since, and this branch was rebased onto it), so the number was assigned rather than
+taken in order.*
+
+`docs/specs/datetime-extras.md`'s N4 is split: **N4a is `DateOnly` and landed here**; N4b
+(`TimeOnly`) and N5 (`DateTimeOffset`) stand as designed. What it is at the surface is
+[datetime.md § `DateOnly`](docs/reference/datetime.md#dateonly) — the day number since
+`0001-01-01`, C#'s own `int` representation, one `type_new("DateOnly", 4, 4, TK_SINT)`,
+sixteen member rows, six operator rows and the `tk_do_*` half of `lib/time.tk`, which
+CALLS `DateTime`'s calendar rather than copying it: `new DateOnly(2024, 2, 30)` panics
+inside the very `tk_dt_days_from_ymd` the date constructor uses, and `AddMonths` clamps
+through the very `tk_dt_add_months` that makes `2024-01-31` plus one month `2024-02-29`.
+
+**Four bytes is the whole of what this crumb cost the mechanism.** Every primitive with
+members was eight bytes until now, which made the compiler's own two casts
+(`tk_prim_raw`'s `(i64) d`, `tk_prim_ret`'s `(DateOnly) r`) no instruction at all. Over
+four they are a sign extension in and a narrowing store out — the pair an `enum : i32`
+(`DateTimeKind`) already takes through every slot a value has (D38) — and no line of any
+machine changed. What DID have to change is the record that tells such a cast from one a
+source wrote: it is a list of node indices, and a node replaced **in place**
+(`node_assign`) keeps the placeholder's index, so the record has to be handed over.
+`tk_pend_do` (teko_typeof.tk) and `tk_ops_replace` (teko_ops.tk) did that already because
+a lowering's own result travelled through them; with every indirect load of a narrow
+primitive now being a cast too (`tk_ld`, `tk_arr_load`, `tk_callp_ret`), **six more doors
+were dropping it** and refusing a cast the compiler had just written itself:
+`tk_node_replace` (teko_this.tk — every implicit-`this` rewrite, so `d.DayNumber` on a
+field inside a method), `tk_ref_replace` (teko_ref.tk — a `ref`/`out` pointee read),
+`tk_array_maybe_rewrite_index` and `tk_hg_rewrite_index` (teko_array.tk — the fixed-global
+and `T[]`-global element reads), `tk_deleg_call` (teko_deleg.tk — a delegate whose return
+type is narrow declares it with a cast) and `tk_fwd_resolve_static_one` (teko_access.tk — a
+static field read before its own type is declared). This is the crumb's own gap, found by
+its own fixture, fixed here and not deferred — but patched door by door, which is what the
+verifier's first pass found a seventh copy of.
+
+**Verifier finding, first pass: the seventh door, and why counting doors was the wrong
+fix.** A by-reference capture read is an in-place replacement too, and it had no carry:
+
+```teko
+#include "../lib/time.tk"
+delegate DateOnly DOp();
+i64 main() {
+    DateOnly refd = new DateOnly(2024, 2, 29);
+    DOp byref = () use (&refd) => refd;
+    DateOnly viaref = byref();
+    if (viaref.DayNumber != 738944) return 108;
+    return 42;
+}
+```
+
+— refused with ``teko: a DateOnly does not cast; `.DayNumber` reads it and
+`new DateOnly(...)` builds it`` at the lambda's line, over a program that writes no cast at
+all. ROOT: `tk_lam_replace` (teko_deleg.tk) rewrote the captured identifier into the
+`tk_arr_load` its prologue derefs through — a compiler-own cast over four bytes — with
+`node_assign` plus `set_nd_next` and nothing else, so the mark stayed on the node the tree
+had just stopped pointing at and the cast walk read it as one a source wrote. Only the READ
+side was affected: the write side (`use (&d)` then `d = …`) rewrites with `set_nd_kind` /
+`set_nd_a` and never copies a node, so it compiled before and compiles now.
+
+The fix is not an eighth carry. `node_assign` now appears **once in the whole compiler**, in
+`tk_node_replace` (teko_struct.tk, beside `tk_nd` and the other node doors), which keeps
+`nd_next` and hands the cast record over; the twenty-two hand-written replacements — the
+seven above, `tk_ops_replace` and `tk_pend_do` which already carried it, the field store's
+own wrap, the ternary's three, the reclaim's three, the deferred `new`, the DI resolution,
+the `const` fold, the `??` lowering and the two deferred global stores — all call it,
+and the three one-off wrappers that had grown around the same three lines
+(`tk_ref_replace`, `tk_ops_replace`, `tk_lam_replace`) are gone. A door that forgets the
+record cannot exist any more, because there is no second place to write one. Five of the
+six forward declarations of `tk_prim_own_cast_moved` went with them.
+
+**The other four-byte value, measured.** `use (&k)` on a `DateTimeKind` local — an
+`enum : i32`, the same width — compiles and reads back correctly **on `e0129ba6` and here
+alike**: nothing in the language casts an enum, so an enum load never reaches
+`tk_prim_cast_check`, which only fires when one side of an `N_CAST` is a primitive carrying
+a member table. The enum road is a fixture now (`surface_dateonly.tk`, cases 81–83) exactly
+because it does NOT share the defect and must not start sharing it.
+
+**The cast refusal gained a column.** It was generated from the type name with `.Ticks`
+written into it, which over a `DateOnly` would have named a member the type does not have.
+The reader is now a per-primitive column of `tk_prim_type` (`` `.Ticks` ``,
+`` `.DayNumber` ``) and the builder stays the generated `new X(...)`, which `DateOnly` has:
+``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
+That amends the spec's § 2 line, which had named `DateOnly.FromDayNumber(n)` as the
+builder; both build one, and the shorter diff keeps one generated sentence.
+
+**Three amendments to the spec as written**, each marked on that page: `DateOnly`
+registers **no arithmetic operator at all** (C# declares none — `d + t` and `d - d` are
+``teko: no operator `+` takes these operands`` and `d1.DayNumber - d2.DayNumber` is the
+form); its six comparisons and `CompareTo`/`Equals` lower to `tk_ts_eq` … `tk_ts_ge` and
+`tk_ts_cmp` rather than to a `tk_do_*` family, because a day number is an ordinary
+non-negative `i64` and six wrappers that forward and nothing else are code not written;
+and `ToString`/`Parse`/`TryParse` and `.ToDateTime(TimeOnly)` are **out of N4a** — no
+`teko_prim.tk` primitive has a `str` member yet (`DateTime` has none either) and the
+fourth needs a type N4b registers. All four are rows in
+[not-yet.md](docs/reference/not-yet.md).
+
+`TK_MAXPRIMM` 96 → 160 and `TK_MAXPRIMO` 32 → 48, raised here rather than in N4b, which
+would have overflowed both. The tables stand at **3 primitives, 82 member rows, 28
+operator rows, 51 parameter positions** and one late type name.
+
+**Proof** (macOS/aarch64, mc 0.15.23, rebased onto `e0129ba6`):
+- `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **67 passed, 26 refused as
+  expected, 0 failed** (65/21 on the base): `tests/surface_dateonly.tk` at 42 — which walks
+  a `DateOnly` through a local, a parameter, a return, a field, a global, a fixed-array
+  element, a `T[]` element, a `ref`/`out` pointee, a closure's by-value capture and a
+  closure's by-REFERENCE capture read and written, with the largest day number there is,
+  because that set is what proves the four-byte width —
+  `tests/surface_dateonly_panic.tk` at 70, and `tests/refuse/dateonly_{from_int,to_i64,
+  to_datetime,cast,plus_datetime}.tk`.
+- `--dump-ast` of all **65** pre-existing `tests/*.tk`, `e0129ba6`'s compiler run over THIS
+  tree against this head's own: **byte-identical, 65 of 65**. The same 65 against this
+  head's compiler as it stood BEFORE the one-helper collapse: **byte-identical too** — the
+  refactor accepts the same code and builds the same tree, and the only dump that moves in
+  the whole set is `surface_dateonly.tk`'s, whose source gained the by-reference section.
+  Ten pre-existing fixtures include `lib/time.tk` (`surface_datetime`,
+  `surface_datetime_kind`, the two `*_panic`, `surface_timespan`,
+  `surface_timespan_overflow`, `surface_nullable_value`, `surface_nullable_ops`,
+  `surface_overload_ops`, `surface_globals_slot`); dumped with ONE compiler over the two
+  TREES, each differs by **+137 lines, −0** — the `tk_do_*` functions the library gained
+  and nothing else.
+- `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`.
+- `mc limits`, verdict `ok` on both legs, peak columns: the `tests/hello.tk` floor
+  `passes` 15, `intrin` 8 and `syntax` 15 **unmoved**, `types` 11 → **12** and `alias`
+  18 → **19** (each `type_new` takes an alias row too, as `TimeSpan` and `DateTime` each
+  did); the `tests/surface_datetime.tk` leg `passes` 15 and `intrin` 8 **unmoved**,
+  `types` 15 → **16**, `syntax` 16 → **17**, `alias` 22 → **23**.
+- `sh scripts/check-docs.sh` → `docs ok: 585 links, 388 diagnostics, 26 refusals, 137
+  samples` (137 blocks: 77 run, 60 no-run) — no new `teko: …` literal, the cast one
+  changed shape and is documented.
+- `mc pkg hash .` → `9380d2531e08563be1013612736d542f78d7105c6d45744b4214f6e6ccabf460`.
+
+**Left open, found here and not touched.** Two, both pre-existing and neither `DateOnly`'s:
+a `.` on the RESULT OF A CALL whose type is a primitive is not resolved —
+`f().DayNumber` on a delegate, and `f().Day` on a `DateTime` measured the same way, reach
+`teko: unknown member: DayNumber`, and a local in between is the spelling that works; and
+`class TimeSpan { }` compiles silently, because a primitive's type word is not protected
+against a declaration that shadows it.
 ### D55 · A store into a COUNTED global slot goes through `rt_store` (G-c, 2026-09-14)
 D53 left one half of `tk_rc_assign` (teko_rc.tk) still shut: the CHECK reached a global,
 the RC LOWERING did not. `Cell gc; void fill(){ Cell c = new Cell(42); gc = c; }
@@ -4815,15 +4964,72 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 `mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
 (base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
+### D56 · A STRUCT global is a class global (G-d, 2026-09-14)
+D5 already settled a struct value as a POINTER, eight bytes, so a struct global takes the
+door every other reference-typed global takes, three doors already cut: D48 gives it a ROW
+in the slot table, D53 runs its assignment through the same compat/widen corridor a local
+takes, and `tk_is_counted` (teko_struct.tk, D5) answers 0 for a struct row -- no vtable, no
+count -- so a struct global's own store never reaches `rt_store` at all, whether D55 (PR
+#704, in verification at this crumb's base and landed since) has landed or not: a struct is excluded
+from that corridor by TYPE, not by being a global. **Measured: G-d is zero compiler changes**
+-- one fixture, `tests/surface_globals_struct.tk`, ten shapes each proven green on the base
+(`e0129ba6`) before the file was written: built in a body (`new` at a struct global's own
+DECLARATION is refused by mc's own core, `global initializer must be constant` -- a `new` is
+a call, never a constant, so no `teko:` refusal of this crumb's own is possible or needed
+here); a field store and read; a whole-struct store aliasing a local (`gp = p; p.x = 42;`
+reads 42 through `gp`) -- the RECORDED semantics: **C# copies a struct on assignment; teko
+does not**, because a struct global (like a struct local) holds no sixteen-byte value to
+copy, only the pointer D5 already gave it, so `gp = p` is the exact alias a class global
+already licensed; a local built from the global (`Point q = gp;`) is the same alias; the
+global passed by value, by `ref` and by `out`; a method through the implicit `this`; a nested
+struct field two levels deep (`gl.a.x`); a struct global whose OWN field is counted (`struct
+S { Cell c; } S gs;`) survives two unrelated `Cell` allocations still reading its own value
+-- the field store is gated by the FIELD's type (`tk_os_mark`, teko_struct.tk), never by the
+struct's, so the reclaim serves it with no line of its own either; a `static` field of struct
+type; `Point? gp2;` at file scope (a struct is a REFERENCE, Q1a, so `T?` over it is a global
+like any other class nullable -- no box); a parameter shadowing the global's name. No refuse
+fixture: `tests/refuse/global_row_mismatch.tk` is a class-to-class mismatch (`Cell` into a
+`Box` slot), and it fixes the wording of the ROW case; the struct-to-struct form was measured
+to refuse with the identical message (`teko: a value of type Box does not convert to Point`,
+global and local alike) because `tk_check_compat` reads the row and judges a struct row the
+way it judges a class row -- so a struct-specific refuse fixture would prove nothing the
+class one does not, and none is added.
 
-**The fragment check, one step later still.** The site's own `mcsite --check` refused two
-pull requests in a row on something `scripts/check-docs.sh` had passed: a relative link
-leaving `docs/` (#700) and a `#slug` whose heading had been renamed (#703,
-`docs/reference/diagnostics.md:303` pointing at `#primitives-with-members-timespan-datetime`
-after the heading gained `DateOnly`). Step 1b now applies the generator's own rule to every
-`#slug` on a link, in-page or cross-page: a heading's id is its text lowercased, every run of
-characters outside `[a-z0-9_]` one dash, no dash at either end, and a repeated id numbered
-`-2`, `-3`, ... in page order (`u_slug` and `md_unique_id` in mc's `site/gen`). Drills: the
-#703 rename fails naming the page and the slug; a cross-page fragment with one letter added
-fails the same way; restored, `docs ok: 575 links, 26 fragments, 388 diagnostics, 21
-refusals, 133 samples`.
+**Docs.** `docs/reference/types.md` § struct: one paragraph beside the struct-vs-class
+boundary, naming the alias rule explicitly and the initializer refusal (build it in a body).
+`docs/reference/not-yet.md`: a row beside the definite-assignment table's existing "not
+judged at all" line, naming the segfault a reader hits reading a struct/class global's field
+before ever building it (a global slot is zero at load, so the read is a null-pointer deref,
+exit **139**/SIGSEGV) and pointing it at D42's ruling -- unguarded, the developer's error,
+not judged, the same ruling a local's own unguarded read already answers to. No
+`docs/reference/globals.md` exists to carry a row of its own (checked `docs/reference/
+README.md`'s own table; globals are folded into `arrays.md`, `types.md` and `memory.md`).
+
+**OPEN, found measuring this crumb, and NOT this crumb's:** the parse-time argument check at
+a VIRTUAL or an INTERFACE call skips every GLOBAL argument, silently, not merely unconverted.
+`tk_pty_of`'s `N_IDENT` arm (teko_struct.tk) answers only `tk_slv_find`, the parser's own
+stack of LOCALS -- a global holds no row there -- so `tk_vcall_args_check` (teko_expr.tk) and
+`tk_ifargs_check` (teko_iface.tk) judge nothing when a virtual/interface call argument is a
+bare global name. Measured: `class Point { public i64 x; } class Box { public i64 w; } class
+B { public virtual i64 take(Point p) { return p.x; } } Box gb; i64 main() { B b = new B(); gb
+= new Box(); gb.w = 7; return b.take(gb); }` compiles and exits **7**, `Box.w`'s bits read as
+`Point.x`; `class B { public virtual i64 take(i64 n) { return n; } } f64 gf = 1.5; i64
+main() { B b = new B(); return b.take(gf); }` compiles and exits **16**, the float bits read
+as an integer. The identical call with a LOCAL in place of the global is refused (measured:
+`teko: a value of type f64 does not convert to i64`). Not this crumb's: the fix is teaching
+`tk_pty_of` the global table, a change reached from every virtual and interface call site in
+the unit, not from a struct-only measurement. Recorded in `docs/reference/not-yet.md` §
+Numeric conversions, beside the row for the same check's other gap (a bare parameter name).
+
+**Proof** (mc 0.15.23, macos/aarch64, base `e0129ba6`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **66 passed, 21 refused as
+expected, 0 failed** (was 65/21: one fixture added, `tests/surface_globals_struct.tk`,
+exiting 42 on the first measurement -- no probe, no retry); no hook module touched by this
+crumb, so `./build/teko --dump-ast` is byte-identical to the base's for every pre-existing
+fixture BY CONSTRUCTION -- the strongest proof a G crumb has offered, since there is no diff
+to read at all; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh
+scripts/check-docs.sh` → `docs ok: 575 links, 388 diagnostics, 21 refusals, 133 samples`,
+unmoved; `mc limits . --config mc.macos.toml` verdict `ok`, `passes` 15/30, `types` 11,
+`intrin` 8/16, `alias` 18, `syntax` 15 -- every table exactly where D53 left them; `mc pkg
+hash .` `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`, UNMOVED against
+the base (no listed file changed -- `tests/` and `docs/` are not in `mc.toml`'s own list).

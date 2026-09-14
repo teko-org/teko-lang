@@ -281,6 +281,64 @@ reads `ds[i] + t`, `ds[i] - ds[j]` and `new DateTime(1, ks[i])` on both shapes o
 was the one gap left here — with a typed operand beside it the site was refused, and with
 an element on both sides the core's own arithmetic ran on the raw bits, `Kind` included.
 
+## `DateOnly`
+
+A **date with no time of day**, C#'s own: the count of days since `0001-01-01`, four bytes
+and nothing else — no hour, no `Kind`. It lives behind the same include, it is a primitive
+with members like `DateTime`, and the raw four bytes ARE `.DayNumber`, so that member is
+the identity read `TimeSpan.Ticks` is.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    DateOnly leap = new DateOnly(2024, 2, 29);
+    if (leap.DayNumber != 738944) return 1;
+    if (leap.Year != 2024 || leap.Month != 2 || leap.Day != 29) return 2;
+    if (leap.DayOfWeek != 4) return 3;              // a Thursday, 0 is Sunday
+    if (leap.DayOfYear != 60) return 4;             // 31 + 29
+    if (leap.AddDays(1).Month != 3) return 5;
+    if (new DateOnly(2024, 1, 31).AddMonths(1).Day != 29) return 6;   // C# clamps
+    if (new DateOnly(2000, 2, 29).AddYears(1).Day != 28) return 7;    // ...and here
+    if (DateOnly.FromDayNumber(738944) != leap) return 8;
+    if (DateOnly.FromDateTime(new DateTime(2024, 2, 29, 13, 45, 30)) != leap) return 9;
+    if (DateOnly.MaxValue.DayNumber != 3652058) return 10;            // 9999-12-31
+    if (!(leap < leap.AddDays(1))) return 11;
+    return 42;
+}
+```
+
+| what | is |
+|---|---|
+| `new DateOnly(y, m, d)` | the calendar constructor; a date that does not exist panics where it is built |
+| `DateOnly.MinValue`, `MaxValue` | `0001-01-01` and `9999-12-31`, day `0` and day `3652058` |
+| `DateOnly.FromDayNumber(n)`, `FromDateTime(d)` | the two other builders; the second drops the time of day and the `Kind` |
+| `.DayNumber` | the four bytes themselves, as an `i64` |
+| `.Year` `.Month` `.Day` `.DayOfWeek` `.DayOfYear` | the civil components, the same calendar a `DateTime` reads |
+| `.AddDays(n)` `.AddMonths(n)` `.AddYears(n)` | C#'s three, the month clamp included: `2024-01-31` plus one month is `2024-02-29` |
+| `.CompareTo(e)` `.Equals(e)` | `-1`/`0`/`1`, and `0`/`1` |
+| `==` `!=` `<` `<=` `>` `>=` | the six comparisons, on the day number |
+
+**There is no arithmetic operator on a `DateOnly`**, because C# declares none: `d + t` and
+`d + 1` are ``teko: no operator `+` takes these operands``, `d - d` is the same sentence
+with `-` in it, and `d1.DayNumber - d2.DayNumber` is how a difference in days is written —
+there as here.
+It converts to nothing either, in either direction: `i64 n = d;`, `DateOnly e = 5;` and
+`DateTime x = d;` are each refused, and so is `(i64) d` —
+``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
+
+`.ToString()`, `DateOnly.Parse` and `.ToDateTime(TimeOnly)` are not taught yet
+([not-yet.md](not-yet.md)): the first two wait on the text crumb every primitive waits on,
+the third on `TimeOnly` itself.
+
+**Four bytes, and that is the only thing that makes it different.** A `DateOnly` travels
+every slot a scalar travels — a local, a parameter, a return, a field, a global, an element
+of a fixed array or of a `T[]`, a `ref`/`out` pointee, a closure's captured copy — and the
+compiler's own two casts around each lowering are a sign extension in and a narrowing store
+out instead of nothing at all. `tests/surface_dateonly.tk` walks that whole set with the
+largest day number there is.
+
 ## Under the hood
 
 `DateTime` is a **primitive with members**, the mechanism [`TimeSpan`](timespan.md)
@@ -288,4 +346,7 @@ brought: one `type_new("DateTime", 8, 8, TK_SINT)` and a table of rows saying wh
 member lowers to — an ordinary call to an ordinary function of `lib/time.tk`, over the raw
 eight bytes. There is no vtable, no run-time tag and no new compiler pass;
 [the internals note](../internals/primitives.md) is the whole mechanism, and
-[the spec](../specs/datetime.md) is where it was designed.
+[the spec](../specs/datetime.md) is where it was designed. `DateOnly` is the same
+mechanism one width down — `type_new("DateOnly", 4, 4, TK_SINT)`, sixteen rows and the
+`tk_do_*` half of `lib/time.tk` — designed in
+[datetime-extras.md](../specs/datetime-extras.md).
