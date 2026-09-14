@@ -5703,3 +5703,69 @@ moving only by the added surface code — `nodes` 156565 -> 156854, `ins` 215968
 and `strings` **2138** both unmoved; `mc pkg hash .` `e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe` (base
 `15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: `teko_typeof.tk`,
 `teko_this.tk` and `teko_access.tk` are listed files, so the hash moves by design).
+
+**The precedence is written out, because this crumb moved it.** A verifier measured a
+shape the entry above did not name: a FREE function and a delegate FIELD sharing a name,
+the bare name called inside a method.
+
+```teko
+delegate i64 Op1(i64 a);
+i64 add1(i64 a) { return a + 1; }
+i64 cb(i64 a) { return a + 100; }         // a FREE function named `cb`
+class H {
+    public Op1 cb;                        // ...and a delegate FIELD named `cb`
+    public i64 go(i64 x) { return cb(x); }
+}
+i64 main() { H h = new H; h.cb = new Op1(add1); return h.go(5); }
+```
+
+`d028a7a0` exits **105** — the free function — and this crumb exits **6**, the field, with
+no diagnostic either way. The twin with a METHOD instead of a field (a free `i64 m(i64)`
+returning `a + 100`, a method `m` returning `a + 1`, `m(x)` inside a sibling method) exits
+**6 on the base as well**: `tk_this_call` (teko_this.tk:414) asks
+`tk_method_named_find(tk_pass_class, m)` FIRST and rewrites the site into `this.m(...)`,
+so a member has shadowed a free function of its name since long before D65.
+
+**The rule, and it is C#'s.** A bare name inside a method resolves to the class's own
+member — method, then field — before any free function of that name. C# has no free
+functions; its nearest forms, a static method of the enclosing (or a static) class and a
+top-level local function, are both shadowed by a same-named member of the class whose body
+reads the name, silently. teko already did that for the method half, so the head's
+behaviour is the consistent one and the base's was the outlier: the field half simply had
+no door (the name reached no rewrite and fell through to the core's resolver, which knows
+only the free function). A program that read a free function through a same-named delegate
+field changed meaning with this crumb, **deliberately**. From outside the class nothing
+moves — `cb(5)` in `main` is still 105 — and a local or a parameter of that name still
+answers before the member, which is `tk_this_field`'s own rule.
+
+**The honest alternative was measured and rejected.** A REFUSAL at the collision —
+`teko: cb is both a field of H and a function; write this.cb(...) or H's own name` — reads
+well, but it refuses what C# accepts, and it would have to refuse the METHOD twin too, or
+teko would refuse the field collision while silently shadowing the method one. Widening it
+to both halves breaks working programs for a shape C# has never complained about. Member
+wins, no refusal.
+
+`tests/surface_delegate.tk` grows `shadowcheck` for it: a free `cb` and a free `tag`, a
+class `Shad` with a delegate field `cb` and a method `tag`, `cb(5)` and `tag(5)` inside its
+methods both answering **6** (the members), `sh.cb(5)` = 6 through the receiver, and
+`main` reading both free functions at **105**. `docs/reference/delegates.md` (the
+precedence sentence) and `docs/reference/classes.md` ("The receiver is not written") carry
+the rule.
+
+**Proof, second pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`, only `tests/` and
+`docs/` moved — no module of the compiler changed in this pass):
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64 refused as
+expected, 0 failed**, `tests/surface_delegate.tk` still `expect-exit: 42` with
+`shadowcheck` inside it and still refused by the base compiler (at `PH.scb`, line 429);
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **byte-identical on all 73**, unchanged from the first pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (the link and the fragment are `classes.md` -> `delegates.md#calling`;
+no new diagnostic, because the ruling is that nothing is refused); `mc limits . --config
+mc.macos.toml` verdict `ok` on both legs with every counted row unmoved from the first pass
+— compiler leg `nodes` 156854, `ins` 216382, `funcs` 3185, `lowered` 3167, `symbols` 6266,
+`globals` 943, `strings` 2138, and the `tests/hello.tk` leg `passes` 15/30, `types` 13,
+`intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0; `mc pkg hash .`
+`e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe`, unmoved — a fixture,
+the log and two reference pages are not listed files.

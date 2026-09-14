@@ -35,6 +35,10 @@
 //   9. `sfcheck` -- the same on the two slots that OUTLIVE the helper: a
 //      STATIC field (`PH.scb(20, 1)`, and its bare name from a static
 //      method) and a GLOBAL receiver (`g_ph.cb(3, 4)`).
+//  10. `shadowcheck` -- D65's precedence, both halves: a bare name inside a
+//      method is the class's own member -- method, then delegate field --
+//      before any FREE function of that name, and from outside the class
+//      that free function still answers.
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
@@ -365,6 +369,58 @@ i64 pfcheck() {
     return 0;
 }
 
+// ---- D65: a member of the class shadows a free function of the same name ----
+// A bare name inside a method resolves to the class's OWN member -- method
+// first, then a delegate field -- before any free function of that name.
+// That is C#'s rule for the nearest form it has (a static method of an
+// enclosing class, a top-level local function): the member wins, silently.
+// The METHOD half was already so before D65 (`tag` below answers +1, not
+// +100, on the base compiler too); the FIELD half is what D65 added, and it
+// is the same rule written at the one door that did not have it.
+//
+// From OUTSIDE the class the free function is untouched: `cb(5)` in `main`
+// is still the free `cb`, and `sh.cb(5)` through the receiver is the field.
+delegate i64 Op1(i64 a);
+
+i64 add1(i64 a) {
+    return a + 1;
+}
+
+i64 cb(i64 a) {                                   // a FREE function named like
+    return a + 100;                               // Shad's delegate field
+}
+
+i64 tag(i64 a) {                                  // ...and like Shad's method
+    return a + 100;
+}
+
+class Shad {
+    public Op1 cb;
+
+    public i64 tag(i64 a) {
+        return a + 1;
+    }
+
+    public i64 go(i64 x) {                        // the FIELD shadows free `cb`
+        return cb(x);
+    }
+
+    public i64 tgo(i64 x) {                       // the METHOD shadows free `tag`
+        return tag(x);
+    }
+}
+
+i64 shadowcheck() {
+    Shad sh = new Shad;
+    sh.cb = new Op1(add1);
+
+    if (sh.go(5) != 6) return 1;                  // the field, not the free `cb`
+    if (sh.tgo(5) != 6) return 2;                 // the method, not the free `tag`
+    if (sh.cb(5) != 6) return 3;                  // the field through a receiver
+
+    return 0;
+}
+
 // the two slots that OUTLIVE the helper -- a static field and a global -- so
 // the live count after this one is not the floor, and `main` asserts what it
 // is instead
@@ -412,6 +468,12 @@ i64 main() {
     bad = pfcheck();
     if (bad != 0) return 170 + bad;
     if (rt_live() != 0) return 180;               // borrowed by the call, not kept
+
+    bad = shadowcheck();
+    if (bad != 0) return 210 + bad;
+    if (rt_live() != 0) return 220;
+    if (cb(5) != 105) return 230;                 // outside the class, the FREE
+    if (tag(5) != 105) return 231;                // functions still answer
 
     bad = sfcheck();
     if (bad != 0) return 190 + bad;
