@@ -1,0 +1,290 @@
+name: mc canary
+
+# TEKO'S HALF OF mc's FREEZE-AND-CANARY PROTOCOL (mc `docs/specs/M53.md` § 6,
+# DECISION_LOG.md D71). Nothing crosses the boundary but two public URLs, and
+# neither side holds a credential for the other:
+#
+#   mc publishes every tag as a GitHub PRE-RELEASE, assets complete.
+#   THIS workflow polls mc's public releases API, runs teko's WHOLE recipe
+#   against that candidate toolchain, and writes one file with its own
+#   `GITHUB_TOKEN` at the root of this repository's `canary` branch:
+#
+#       https://raw.githubusercontent.com/teko-org/teko-lang/canary/<version>.json
+#       {"version":"0.17.0","status":"ok","run":"<this run>","utc":"<ISO 8601>"}
+#
+#   mc's `promote` job reads that URL anonymously, every 60 s for 90 minutes:
+#   `ok` turns the pre-release into a release, `fail` leaves it a pre-release,
+#   a missing file is NEITHER and times out (advisory before mc 1.0.0).
+#
+# The recipe is not repeated here. `ngen.yml` IS the recipe -- five native
+# legs, five fixpoint legs, `docs` and the aggregator -- and it is called with
+# `mc_version` pointing at the candidate, so what a candidate mc has to pass is
+# exactly what a merge into `main` has to pass, by construction rather than by
+# a copy that drifts. The one thing `ngen.yml` does not cover is the standard
+# library, which mc counts as part of the recipe: the `std` job below is
+# `teko-org/teko-std`'s own CI leg, run against the same candidate.
+#
+# EVERY 15 MINUTES, and that number is mc's, not a preference: its `promote`
+# budgets "up to 15 minutes for teko's schedule to notice, plus its recipe"
+# inside a 90-minute poll (M53 § 6.2.4). Cron is GitHub's least punctual
+# trigger -- a scheduled run is queued, not guaranteed, and the whole schedule
+# is disabled after 60 days without a push to the default branch -- so a
+# `workflow_dispatch` with an explicit `version` is the manual road, and it is
+# the road that removes the 15 minutes.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          mc version to judge, without its leading `v` (e.g. `0.17.0`). Empty
+          takes the newest mc pre-release this repository has not answered yet.
+          A version named explicitly is judged even when its verdict is already
+          on the branch -- the file is rewritten with the newer run.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# One canary at a time, and never cancelled halfway: two runs would race for
+# the same `git push` of the `canary` branch, and a cancelled recipe publishes
+# a `fail` for a compiler nothing was actually wrong with.
+concurrency:
+  group: mc-canary
+  cancel-in-progress: false
+
+jobs:
+  # Which mc, if any. Everything below is `if: needs.discover.outputs.version
+  # != ''`, so an idle 15 minutes costs one API call and four skipped jobs.
+  discover:
+    name: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - name: the newest mc pre-release this repository has not answered
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASKED: ${{ inputs.version }}
+        run: |
+          set -eu
+          # A version is three numbers and nothing else, whichever road it
+          # came by: it becomes a file name on the canary branch and a JSON
+          # string, and neither may carry what a tag name can.
+          shape='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ -n "$ASKED" ]; then
+            ver="${ASKED#v}"
+            printf '%s' "$ver" | grep -Eq "$shape" || { echo "::error::not a version: $ASKED" >&2; exit 1; }
+            echo "dispatched for mc $ver; any verdict already on the branch is rewritten"
+            echo "version=$ver" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Newest FIRST is the releases API's own order, and only the newest
+          # pre-release is considered: mc cuts one tag at a time, and a
+          # candidate older than the newest one has already been promoted on
+          # its own timeout. If two pre-releases ever stack up unanswered, the
+          # older one is left to that timeout rather than tested late.
+          tag="$(gh api 'repos/minicompiler/mc/releases?per_page=100' \
+                   --jq 'map(select(.prerelease and (.draft | not))) | .[0].tag_name // empty')"
+          if [ -z "$tag" ]; then
+            echo "minicompiler/mc has no open pre-release; nothing to judge"
+            exit 0
+          fi
+          ver="${tag#v}"
+          printf '%s' "$ver" | grep -Eq "$shape" || { echo "::error::not a version tag: $tag" >&2; exit 1; }
+          # The branch itself is the record of what has been answered: a 404
+          # here is either "no verdict for this version" or "no canary branch
+          # yet", and both mean the same thing -- run the recipe.
+          if gh api "repos/${GITHUB_REPOSITORY}/contents/${ver}.json?ref=canary" >/dev/null 2>&1; then
+            echo "mc $ver is already answered on the canary branch; nothing to do"
+            exit 0
+          fi
+          echo "candidate: mc $ver ($tag)"
+          echo "version=$ver" >>"$GITHUB_OUTPUT"
+
+  # The recipe, unmodified, against the candidate: `ngen (<os>/<arch>)` x5,
+  # `fixpoint (<os>/<arch>)` x5, `docs` and `mc build ngen && run`.
+  recipe:
+    name: recipe
+    needs: discover
+    if: needs.discover.outputs.version != ''
+    uses: ./.github/workflows/ngen.yml
+    with:
+      mc_version: ${{ needs.discover.outputs.version }}
+
+  # The standard library, `teko-org/teko-std`, at its newest tag: the taught
+  # compiler built out of the `teko` tree that library's own `mc.lock` pins,
+  # then every one of its fixtures compiled and RUN. This is `std.yml`'s
+  # linux/x86_64 leg with one thing changed, the mc under it.
+  #
+  # The VENDORED road, exactly as `std.yml` takes it: `mc pkg sync` would make
+  # a canary depend on the registry being up, and `mc build` rehashes the
+  # vendored tree against `mc.lock` either way, so the bytes are the published
+  # package's bytes. Nothing here writes to the registry.
+  std:
+    name: teko_std (linux/x86_64)
+    needs: discover
+    if: needs.discover.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # This repository's own checkout is what `./.github/actions/setup-mc`
+      # and `scripts/fixtures.sh` are read from; teko_std goes in `std/`.
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: set up the candidate mc
+        id: mc
+        uses: ./.github/actions/setup-mc
+        with:
+          os: linux
+          arch: x86_64
+          asset: x86_64
+          version: ${{ needs.discover.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve the newest teko_std tag
+        id: std
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # sorted by version, not by the API's order: a tag list is not
+          # promised to be ordered and `sort -V` costs nothing
+          ver="$(gh api 'repos/teko-org/teko-std/tags?per_page=100' --jq '.[].name' \
+                 | sed 's/^v//' | sort -V | tail -1)"
+          if [ -z "$ver" ]; then
+            echo "::error::teko-org/teko-std has no tag" >&2
+            exit 1
+          fi
+          echo "tag=v$ver" >>"$GITHUB_OUTPUT"
+          echo "teko_std v$ver"
+
+      - name: check teko_std out at that tag
+        uses: actions/checkout@v5
+        with:
+          repository: teko-org/teko-std
+          ref: ${{ steps.std.outputs.tag }}
+          path: std
+          persist-credentials: false
+
+      # One source of truth for the dependency, `std.yml`'s own step: the lock
+      # row `mc build` rehashes is also the tag this checks out.
+      - name: resolve the teko tag that library's lock pins
+        id: teko
+        run: |
+          set -eu
+          ver="$(sed -n 's/^version *= *"\(.*\)"/\1/p' std/mc.lock | head -1)"
+          if [ -z "$ver" ]; then
+            echo "::error::teko_std's mc.lock carries no version for teko" >&2
+            exit 1
+          fi
+          echo "tag=v$ver" >>"$GITHUB_OUTPUT"
+          echo "pinned teko v$ver"
+
+      - name: check that teko tree out beside it
+        uses: actions/checkout@v5
+        with:
+          repository: teko-org/teko-lang
+          ref: ${{ steps.teko.outputs.tag }}
+          path: std/deps/teko
+          persist-credentials: false
+
+      # `teko.toml` is never edited, here either: the leg config is DERIVED,
+      # with the host pair written out and this runner's glibc loader named --
+      # mc's own ELF writer takes the default musl interp otherwise, and such a
+      # binary is `cannot run` on a GitHub runner.
+      - name: build the library's taught compiler with the candidate
+        env:
+          MC_DIR: ${{ steps.mc.outputs.dir }}
+        run: |
+          set -eu
+          cd std
+          printf 'interp = "/lib64/ld-linux-x86-64.so.2"\nlibc   = "gnu"\n' >mc.target-tail
+          awk '/^\[/ { skip = ($0 == "[linker]") } !skip' teko.toml \
+            | sed -e 's#^os   = .*#os   = "linux"#' \
+                  -e 's#^arch = .*#arch = "x86_64"#' \
+            | sed -e '/^arch = /r mc.target-tail' \
+            >mc.ci.toml
+          rm -f mc.target-tail
+          cat mc.ci.toml
+          "$MC_DIR/mc" build . --config mc.ci.toml
+
+      # The same corridor a teko leg takes (D52). teko_std has no
+      # `tests/refuse/`, and the script skips a glob that matches nothing, so
+      # what runs is the `// expect-exit: N` half and only that.
+      - name: run teko_std's fixtures
+        run: |
+          set -eu
+          cd std
+          sh ../scripts/fixtures.sh ./build/teko mc.ci.toml
+
+  # The verdict mc reads. `always()`, because a red leg is a `fail` that has to
+  # be PUBLISHED -- a canary that stays silent on failure is a canary that
+  # times mc out instead of answering it.
+  verdict:
+    name: verdict
+    needs: [discover, recipe, std]
+    if: always() && needs.discover.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: publish <version>.json on the canary branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.discover.outputs.version }}
+          RECIPE: ${{ needs.recipe.result }}
+          STD: ${{ needs.std.result }}
+        run: |
+          set -eu
+          # `ok` needs every needed job to have SUCCEEDED. Cancelled and
+          # skipped are `fail`: neither one is evidence that the candidate
+          # compiles teko, and mc's promote must not read silence as consent.
+          status=fail
+          if [ "$RECIPE" = success ] && [ "$STD" = success ]; then status=ok; fi
+          echo "recipe=$RECIPE std=$STD -> $status"
+          run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # The branch ACCUMULATES, one file per mc version, and is never
+          # force-pushed: mc polls a file for up to 90 minutes, so an orphan
+          # commit holding only the newest verdict could make a file vanish
+          # under a reader mid-poll. The workflow-level concurrency group is
+          # what keeps this push from racing another run of itself.
+          mkdir canary
+          cd canary
+          git init -q -b canary
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch -q origin canary 2>/dev/null; then
+            git reset -q --hard FETCH_HEAD
+          else
+            echo "the canary branch does not exist yet; this run creates it"
+          fi
+          printf '{"version":"%s","status":"%s","run":"%s","utc":"%s"}\n' \
+            "$VERSION" "$status" "$run" "$utc" >"$VERSION.json"
+          cat "$VERSION.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$VERSION.json"
+          git commit -q -m "canary: mc $VERSION $status" \
+            || { echo "byte-identical verdict already on the branch; nothing to push"; exit 0; }
+          git push -q origin canary:canary
+          echo "published https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/canary/${VERSION}.json"
+          {
+            printf '### mc %s: **%s**\n\n' "$VERSION" "$status"
+            printf '`https://raw.githubusercontent.com/%s/canary/%s.json`\n\n' \
+              "$GITHUB_REPOSITORY" "$VERSION"
+            printf '```json\n%s\n```\n' "$(cat "$VERSION.json")"
+          } >>"$GITHUB_STEP_SUMMARY"

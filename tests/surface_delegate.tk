@@ -10,6 +10,8 @@
 //      free-function overload `apply(Op)` vs `apply(i64)`;
 //   2. `fcheck` -- a class field of delegate type, called where it is read
 //      (`h.cb(2, 3)`), and released along with the object that holds it;
+//      the store is the plain function's own NAME (`h.cb = add;`, D62), the
+//      same wrap the local slot beside it gets;
 //   3. `ncheck` -- `null`, an `N_INT` 0, guarded by an `if`;
 //   4. `geo.use_gop()` -- the same declaration, INSIDE a namespace.
 //   5. `rcheck` -- a delegate whose RETURN is a counted class (`Make`):
@@ -32,21 +34,43 @@
 //   8. `pfcheck` -- D65, a delegate FIELD reached on the roads that had no
 //      call at all: a receiver only the PASS can type (a parameter, and a
 //      field of a field under one), and the BARE name inside a method;
-//   9. `sfcheck` -- the same on the two slots that OUTLIVE the helper: a
-//      STATIC field (`PH.scb(20, 1)`, and its bare name from a static
-//      method) and a GLOBAL receiver (`g_ph.cb(3, 4)`).
-//  10. `shadowcheck` -- D65's precedence, both halves: a bare name inside a
+//   9. `shadowcheck` -- D65's precedence, both halves: a bare name inside a
 //      method is the class's own member -- method, then delegate field --
 //      before any FREE function of that name, and from outside the class
 //      that free function still answers. `shd.NShad` is the same pair inside
-//      a NAMESPACE, where the free function is the namespace's own.
+//      a NAMESPACE, where the free function is the namespace's own, and
+//      `nsh.cgo()` is the CONST road the same index fix repaired.
+//  10. `dfcheck` -- D62, the three other field-store sites a bare function
+//      name reaches: `this.cb = add;` and the implicit `made = mul;` inside a
+//      CONSTRUCTOR, and a STATIC field (`D62H.scb = add;`). Plus the name that
+//      is NOT a function: `setcb` stores its PARAMETER `p` into the field
+//      while a free function `p` stands right above it, and the call
+//      afterwards proves the parameter is what landed there.
+//  11. `dfcheck2` -- D62, the same door's other callers: a receiver the parser
+//      cannot type yet, an element of an ARRAY FIELD, and a STATIC field
+//      reached before its own type is read.
+//  12. `sfcheck` -- D65 on the two slots that OUTLIVE the helper: a STATIC
+//      field (`PH.scb(20, 1)`, and its bare name from a static method) and a
+//      GLOBAL receiver (`g_ph.cb(3, 4)`).
+//  13. `pcheck` -- a `ref`/`out` delegate whose POINTEE is a CLASS (`ref Box`,
+//      `out Cell`) or a STRUCT (`ref Pt`), on both roads (D63, third pass).
+//      The thunk forwards the caller's address as a bare name of a slot
+//      declared `uptr`, and the reclaim's own argument check asked the
+//      ordinary compatibility question about it: harmless for a scalar
+//      pointee, `teko: a value of type uptr does not convert to Box` for a
+//      class or struct one. The target mutates through the ref (`b.v = 3`)
+//      and rebinds the caller's slot (`b = new Box(7)`, the prior reference
+//      released), and the caller sees both.
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
-// reference, teko_struct.tk's `tk_is_counted` the only line that changed.
-// `sfcheck` is the one exception, and by design -- a static field and a
-// global outlive every scope -- so `main` asserts the exact count it leaves
-// rather than the floor.
+// reference, teko_struct.tk's `tk_is_counted` the only line that changed. Four
+// helpers raise that floor and all four run last, so the floor is 0 through
+// `shadowcheck`: `dfcheck` and `dfcheck2` each leave a STATIC field alive by
+// definition, `sfcheck` leaves a static delegate plus a global object holding
+// one of its own, and `pcheck` allocates the one `Pt` -- a struct carries no
+// count and is live for the run (`lib/rt.tk`). `main` asserts the exact count
+// each of those four leaves rather than the floor.
 //
 // expect-exit: 42
 
@@ -112,11 +136,94 @@ i64 dcheck() {
     return 0;
 }
 
+// D62: the store is the FUNCTION's own name. A local of delegate type held
+// the wrap here (`Op cb = add; h.cb = cb;`) because the field door could not
+// type a bare name at all -- `teko: the type of this value is not known here`
+// on a program the slot one line up accepts.
 i64 fcheck() {
     H h = new H;
-    Op cb = add;
-    h.cb = cb;
+    h.cb = add;
     if (h.cb(2, 3) != 5) return 1;
+    return 0;
+}
+
+// ---- D62: the constructor, the implicit `f = e` and the static field ----
+
+class D62H {
+    public Op cb;
+    public Op made;
+    public static Op scb;
+
+    public D62H() {
+        this.cb = add;                            // teko_this.tk's `tk_this_assign`
+        made = mul;                               // ...and its implicit form
+    }
+}
+
+i64 p(i64 a, i64 b) {                             // a free function named `p`
+    return a + b + 100;
+}
+
+// the name stored here is the PARAMETER `p`, which shadows the function above
+// for the whole body: the judge runs in `tk_deleg_pass`, where the lexical
+// scope answers, and never at the parse-time door, where no table can tell
+// the two apart (D51's own sixth pass, one slot over on an element).
+void setcb(D62H h, Op p) {
+    h.cb = p;
+}
+
+i64 dfcheck() {
+    D62H h = new D62H();
+    if (h.cb(2, 3) != 5) return 1;
+    if (h.made(2, 3) != 6) return 2;
+
+    D62H.scb = add;                               // teko_access.tk's `tk_static_use`
+    Op s = D62H.scb;
+    if (s(2, 3) != 5) return 3;
+
+    setcb(h, mul);
+    if (h.cb(2, 3) != 6) return 4;
+    return 0;
+}
+
+// ---- D62, the door's other callers ----
+// `tk_field_store_val` is entered from more than the four stores `dfcheck`
+// covers, and a detection AT the door reaches every one of them. These are the
+// three that had no fixture: a receiver the parser cannot type yet (a class
+// declared BELOW the function that takes one, resolved in `tk_pend_field`,
+// teko_typeof.tk), an element of an ARRAY FIELD (`tk_array_index`,
+// teko_struct.tk) and a STATIC field reached before its own type is read
+// (`tk_fwd_resolve_static_one`, teko_access.tk). All three answered
+// `teko: the type of this value is not known here` on the base compiler.
+void set_late(LateH h) {                          // `h` is typed at PASS time
+    h.cb = add;
+}
+
+i64 set_late_static() {
+    LateH.scb = mul;                              // the forward-referenced static store
+    return 0;
+}
+
+class LateH {
+    public Op cb;
+    public Op cbs[2];
+    public static Op scb;
+}
+
+i64 dfcheck2() {
+    LateH h = new LateH;
+
+    set_late(h);                                  // the deferred receiver
+    if (h.cb(2, 3) != 5) return 1;
+
+    h.cbs[0] = mul;                               // an element of an array FIELD
+    Op e = h.cbs[0];                              // (the call through it is not taught:
+    if (e(2, 3) != 6) return 2;                   //  docs/reference/not-yet.md)
+
+    set_late_static();
+    Op s = LateH.scb;
+    if (s(2, 3) != 6) return 3;
+
     return 0;
 }
 
@@ -145,6 +252,22 @@ i64 fdcheck() {
     return 0;
 }
 
+// ---- D62, the namespace half: which `col` a bare name wraps ----
+// `col` is declared BOTH flat and inside `geo`, with the same signature and a
+// different answer, so the road that picks the wrong one is visible in the
+// exit code rather than silent. Every road that wraps a bare function name
+// goes through one resolver (`tk_deleg_resolve_fn`, teko_deleg.tk), which
+// reads the order `tk_ns_rewrite_call` (teko_ns.tk) gives a CALL: the site's
+// own namespace and its prefixes outward first, a flat declaration of the
+// exact name only when the namespace has none.
+i64 col(i64 a, i64 b) {                           // the FLAT one
+    return a + b + 1000;
+}
+
+i64 takes_op(Op f) {                              // a call argument's own road
+    return f(2, 3);
+}
+
 namespace geo {
     delegate i64 GOp(i64 a, i64 b);
 
@@ -155,6 +278,43 @@ namespace geo {
     i64 use_gop() {
         GOp f = gadd;
         return f(10, 20);
+    }
+
+    i64 col(i64 a, i64 b) {                       // `geo__col`, the namespaced one
+        return a * b;
+    }
+
+    Op ret_col() {
+        return col;                               // a `return` of a bare name
+    }
+
+    // every road the shared resolver serves, from INSIDE `geo`: 6 is the
+    // namespaced `col`, 1005 the flat one, 5 the flat `add` no namespaced
+    // twin competes with
+    i64 ns_roads() {
+        Op a = col;                               // a local initializer
+        if (a(2, 3) != 6) return 1;
+
+        Op b = add;                               // no `geo__add`: the FLAT one
+        if (b(2, 3) != 5) return 2;
+
+        b = col;                                  // an assignment
+        if (b(2, 3) != 6) return 3;
+
+        if (takes_op(col) != 6) return 4;         // a call argument
+
+        Op c = ret_col();                         // a `return`
+        if (c(2, 3) != 6) return 5;
+
+        Op[] ops = new Op[1];
+        ops[0] = col;                             // an element of an `Op[]`
+        if (ops[0](2, 3) != 6) return 6;
+
+        H h = new H;
+        h.cb = col;                               // a FIELD -- D62's own road
+        if (h.cb(2, 3) != 6) return 7;
+
+        return 0;
     }
 }
 
@@ -434,11 +594,19 @@ namespace shd {
         return a + 100;
     }
 
+    const i64 CX = 105;                           // ...and named like NShad's own const
+
     class NShad {
         public Op1 cb;
 
+        public const i64 CX = 6;
+
         public i64 tag(i64 a) {
             return a + 1;
+        }
+
+        public i64 cgo() {                        // the CONST road of the same rewrite
+            return CX;
         }
 
         public i64 go(i64 x) {                    // the FIELD shadows `shd.cb`
@@ -474,6 +642,7 @@ i64 shadowcheck() {
     if (nsh.tgo(5) != 6) return 5;                // the method, not `shd__tag`
     if (nsh.plain(5) != 105) return 6;            // no member of that name: the free fn
     if (shd.outside(5) != 105) return 7;          // outside the class, inside the namespace
+    if (nsh.cgo() != 6) return 8;                 // the member const, not `shd__CX`
 
     return 0;
 }
@@ -489,6 +658,79 @@ i64 sfcheck() {
     g_ph = new PH;
     g_ph.cb = new Op(mul);
     if (g_ph.cb(3, 4) != 12) return 3;            // a GLOBAL receiver
+
+    return 0;
+}
+
+// ---- 13. a `ref`/`out` delegate whose POINTEE is a class or a struct ----
+
+class Box {
+    public i64 v;
+
+    public Box(i64 x) {
+        v = x;
+    }
+}
+
+struct Pt {
+    public i64 x;
+    public i64 y;
+}
+
+delegate void Fill(ref Box b);
+delegate void Move(ref Pt p);
+delegate void Mk(out Cell c);
+
+void fill(ref Box b) {
+    b.v = 3;                                       // through the ref, into the caller's object
+}
+
+void rebind(ref Box b) {
+    b = new Box(7);                                // ...and the caller's SLOT, rebound
+}
+
+void mv(ref Pt p) {
+    p.x = 9;
+}
+
+void mkcellout(out Cell c) {
+    c = new Cell(5);
+}
+
+i64 pcheck() {
+    Box b = new Box(1);
+    Fill f = fill;
+    f(ref b);
+    if (b.v != 3) return 1;
+    Fill nf = new Fill(fill);                      // the same thunk, the explicit road
+    b.v = 1;
+    nf(ref b);
+    if (b.v != 3) return 2;
+
+    Fill r = rebind;
+    r(ref b);
+    if (b.v != 7) return 3;                        // the old Box released, the new one here
+    Fill nr = new Fill(rebind);
+    nr(ref b);
+    if (b.v != 7) return 4;
+
+    Pt p = new Pt();
+    p.x = 0;
+    Move m = mv;
+    m(ref p);
+    if (p.x != 9) return 5;
+    p.x = 0;
+    Move nm = new Move(mv);
+    nm(ref p);
+    if (p.x != 9) return 6;
+
+    Cell c = new Cell(0);
+    Mk k = mkcellout;
+    k(out c);
+    if (c.v != 5) return 7;
+    Mk nk = new Mk(mkcellout);
+    nk(out c);
+    if (c.v != 5) return 8;
 
     return 0;
 }
@@ -523,19 +765,37 @@ i64 main() {
     if (cell_dtors != 5) return 110 + cell_dtors;
 
     bad = pfcheck();
-    if (bad != 0) return 170 + bad;
-    if (rt_live() != 0) return 180;               // borrowed by the call, not kept
+    if (bad != 0) return 161 + bad;
+    if (rt_live() != 0) return 165;               // borrowed by the call, not kept
 
     bad = shadowcheck();
-    if (bad != 0) return 210 + bad;
-    if (rt_live() != 0) return 220;
-    if (cb(5) != 105) return 230;                 // outside the class, the FREE
-    if (tag(5) != 105) return 231;                // functions still answer
+    if (bad != 0) return 166 + bad;
+    if (rt_live() != 0) return 175;
+    if (cb(5) != 105) return 176;                 // outside the class, the FREE
+    if (tag(5) != 105) return 177;                // functions still answer
+
+    bad = dfcheck();
+    if (bad != 0) return 178 + bad;
+    if (rt_live() != 1) return 183;               // the STATIC field's own delegate
+
+    bad = dfcheck2();
+    if (bad != 0) return 184 + bad;
+    if (rt_live() != 2) return 188;               // ...and this helper's own static
+
+    bad = geo.ns_roads();
+    if (bad != 0) return 189 + bad;
+    if (rt_live() != 2) return 197;
 
     bad = sfcheck();
-    if (bad != 0) return 190 + bad;
-    if (rt_live() != 3) return 200;               // the static delegate, the global
-                                                  // object and the delegate it holds
+    if (bad != 0) return 198 + bad;
+    if (rt_live() != 5) return 202;               // the two statics above, plus
+                                                  // `PH.scb`, `g_ph` and the
+                                                  // delegate `g_ph` holds
+
+    bad = pcheck();
+    if (bad != 0) return 203 + bad;
+    if (rt_live() != 6) return 212;                // ...plus the one `Pt`
+    if (cell_dtors != 8) return 213 + cell_dtors;  // the two `out` rebinds, then the slot
 
     return 42;
 }

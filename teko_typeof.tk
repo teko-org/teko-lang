@@ -76,7 +76,7 @@
 // the temporaries the compiler declares itself (teko_null.tk,
 // teko_ternary.tk), which no source count bounds.
 #define TK_MAXSCOPE (TK_MAXSLV + MAXPARAMS)
-#define TK_MAXPEND  128               // member accesses waiting for the pass
+#define TK_MAXPEND  4096              // member accesses waiting for the pass (D61: every untagged call receiver waits here)
 
 // what the deferred access still has to become
 #define TK_PLOAD  0                   // p.m
@@ -288,6 +288,14 @@ i64 tk_nl_own_null_is(i64 n);
 void tk_nl_check_value(i64 tty, i64 ti, i64 ety, i64 en, i64 line, uptr fl);
 i64 tk_nl_wrap(i64 tty, i64 ety, i64 e);
 
+// teko_deleg.tk is included after this file: the delegate TABLE, asked about a
+// call through a slot. `f()` whose `f` is a local, a parameter or a global of
+// delegate type carries no declaration of its own until the eighth pass
+// (`tk_deleg_pass`) rewrites it into a `callp`, so nothing below could type it
+// while this pass -- the sixth -- resolves a deferred `.` over the call (D61).
+i64 tk_deleg_row(i64 ty);
+i64 dg_ret_at(i64 i);
+
 // A composite expression answers by the CORE's own rule, the one codegen will
 // apply to the very same node (mc/src/gen_resolve.mc, res_binary and res_expr's
 // N_UNARY arm): a logical operator and a comparison are `i64`, and every other
@@ -339,6 +347,18 @@ i64 tk_ty_of(i64 n) {
         return tk_ty_global(nd_name(n));            // a global slot, G1's `T[]` of heap included
     }
     if (k == N_CALL) {
+        // D61: a call THROUGH a delegate slot is typed by the slot's own row,
+        // ahead of every table below -- the name is the slot's, no declaration
+        // owns it, and `decl_find` answers -1 for it until `tk_deleg_pass`
+        // (the eighth) has rewritten the site. This pass is the sixth, so a
+        // deferred `.` over `f()` used to be resolved by member name alone and
+        // refused `teko: unknown member: DayNumber` on a legal program. Once
+        // the walk HAS rewritten the call, its name is the built one, no slot
+        // answers for it, and the arms below are exact again -- which is why
+        // this lookup is `tk_deleg_expr_ty`'s whole body, folded in here so
+        // that every consumer of the oracle gets the same answer.
+        i64 di = tk_deleg_row(tk_ty_scope_or_global(nd_name(n)));
+        if (di >= 0) return dg_ret_at(di);
         // D49: a name that carries several signatures is typed by the PICK its
         // own arguments make. `decl_find` answers the FIRST declaration of such
         // a name, which is a guess every consumer of this oracle then acted on
@@ -627,6 +647,11 @@ i64 dg_ret_at(i64 i);
 // and nothing here knows which link it is.
 i64 tk_nd_moved(i64 n);
 
+// teko_deleg.tk is included after this file too: 1 when it TOOK the value --
+// a bare name into a field of delegate type, parked for `tk_deleg_pass` to
+// judge in scope (D62, its own header states the whole rule).
+i64 tk_deleg_field_late(i64 fty, i64 v, i64 line, uptr fl);
+
 // `void` is no value, and a store refuses it wherever it LEARNS it -- at the
 // door below and at the judge further down, which is the whole of the rule.
 // The eleventh pass made the three indirect sites register their declared
@@ -750,6 +775,16 @@ i64 tk_fs_vty(i64 v) {
 // and the row one in one call -- over exactly the same node.
 i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     i64 vty = tk_fs_vty(v);
+    // D62: a value THIS door cannot type, into a field of delegate type, is
+    // the delegate validator's question and not the general judge's -- the
+    // same split the element road takes (`tk_ha_store`, teko_heaparr.tk). The
+    // judge below reads `tk_ty_of`, which answers -1 for a bare function name
+    // all over again, so every field of delegate type refused a plain
+    // function the slot beside it wraps (`Op cb = twice;`). Detected here,
+    // where EVERY caller of this door passes -- the list is in
+    // `tk_deleg_field_late`'s own header (teko_deleg.tk) and in
+    // docs/reference/diagnostics.md -- and judged where names have types.
+    if (vty < 0 && tk_deleg_field_late(fty, v, line, fl)) return v;
     if (vty < 0) return tk_fs_defer(fty, v, line, fl);
     tk_fs_void_check(fty, vty, line, fl);
     tk_check_scalar_compat(fty, vty, v, line, fl);
@@ -1236,10 +1271,12 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
         i64 val = pd_arg_at(pi);
         i64 vp = tk_pend_at(val);
         if (vp >= 0) tk_pend_do(vp);
-        // G-e: the SIXTH site that builds a field store, through the same gate
-        // as the other five (`tk_field_store_val`, above). It judged and
-        // widened on its own -- `tk_check_compat` and `tk_num_widen`, D34 and
-        // D33 -- and that is every rule of the store but ONE: Q1b's box. A
+        // G-e: one more site that builds a field store, through the same gate
+        // every other one passes (`tk_field_store_val`, above, whose full
+        // caller list is in `tk_deleg_field_late`'s header, teko_deleg.tk).
+        // It judged and widened on its own -- `tk_check_compat` and
+        // `tk_num_widen`, D34 and D33 -- and that is every rule of the store
+        // but ONE: Q1b's box. A
         // `i64? count;` written through a receiver the parser cannot type
         // (`void set(H h, i64 k) { h.count = k; }`) took the parameter's raw
         // eight bytes AS A BOX HANDLE, a segfault, measured (Copilot on #698,

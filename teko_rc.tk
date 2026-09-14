@@ -376,7 +376,27 @@ void tk_rc_park(i64 n) {
 // `tk_num_widen`, C# §10.2.3) and spliced into the list where it stood, so
 // `g(3)` against `f64 g(f64)` passes three point zero and not the bit pattern
 // of the integer three.
+//
+// D63, third pass: a DELEGATE THUNK's forwarding call is not judged here
+// either, by the same identity `tk_ref_pass` skips it under
+// (`tk_deleg_is_thunk`, teko_deleg.tk). The thunk forwards a `ref`/`out`
+// parameter as the bare name of a slot declared `uptr` (the address it
+// really carries, K2w), so the walk below reads `pt` = the POINTEE and
+// `at` = `uptr` and asks the ordinary compatibility question about a
+// pointer: permissive for a scalar pointee, a hard row-fit refusal for a
+// class or struct one -- `delegate void Fill(ref Box b)` died with `teko: a
+// value of type uptr does not convert to Box`, on both roads. The pointee
+// check that DOES own the question (`tk_ref_check_pointee`) is reached only
+// from the `N_ADDR` branch, which a forwarded name is not. There is nothing
+// here to judge: `tk_deleg_check_sig` has already proved the target
+// identical to the delegate parameter by parameter, type and kind, before
+// any thunk exists. Nothing to rewrite either -- with `pt` equal to `at` at
+// every by-value position, the widen and the box below are no-ops, which is
+// why no dump of a thunk moves. The reclaim's other work (the park, the
+// own, the releases) is untouched: this is one call's argument check, not
+// the pass.
 void tk_rc_call_args(i64 n) {
+    if (tk_deleg_is_thunk(tk_rc_cur_fn)) return;
     i64 d = decl_find(nd_name(n));
     if (d < 0) return;
     i64 prev = 0;
