@@ -143,6 +143,32 @@ uptr tk_ov_sig(i64 d) {
     return s;
 }
 
+// teko_wide.tk is included after this file (teko.tk's own order): the question
+// "is this id a sixteen-byte value" (D74).
+i64 tk_wide_is(i64 t);
+
+// docs/specs/decimal.md § 4 and § 9: a sixteen-byte value is passed as a
+// POINTER into an ordinary integer argument register and returned through a
+// buffer of teko's own (`teko_wide.tk`), which is a convention this project
+// invented and no C ABI shares. An `extern` is the one declaration whose other
+// side is a C function, so the two conventions would disagree in silence --
+// the call would compile, link and hand libc an address where sixteen bytes
+// were expected. It is refused at the declaration, which is the only place
+// both the type and the word `extern` are in hand.
+void tk_ov_extern_wide(i64 n) {
+    if (tk_wide_is(nd_type(n)))
+        err_at(nd_file(n), nd_line(n),
+               tk_join("teko: an `extern` takes no ", type_name(nd_type(n))));
+    i64 p = nd_a(n);
+    loop {
+        if (p == 0) break;
+        if (tk_wide_is(nd_type(p)))
+            err_at(nd_file(n), nd_line(n),
+                   tk_join("teko: an `extern` takes no ", type_name(nd_type(p))));
+        p = nd_next(p);
+    }
+}
+
 // the symbol an overload reaches the linker under
 uptr tk_ov_symbol(uptr name, uptr sig) {
     if (cstrlen(sig) == 0) return tk_join(name, "__void");
@@ -186,6 +212,7 @@ void tk_ov_collect(i64 root) {
         // would clash with them exactly as a function does
         if (k == N_FUNC || k == N_PROTO || k == N_EXTERN || k == N_GLOBAL) tk_ov_gen_clash(n);
         if (k == N_FUNC || k == N_PROTO || k == N_EXTERN) tk_ov_decl_add(n);
+        if (k == N_EXTERN) tk_ov_extern_wide(n);
         n = nd_next(n);
     }
 }

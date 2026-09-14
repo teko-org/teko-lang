@@ -1,0 +1,44 @@
+// decimal.tk -- the two copy helpers a sixteen-byte value needs, and the one
+// buffer a sixteen-byte RETURN travels through. Program code, not compiler
+// code: `#include "decimal.tk"` from the `.tk` source itself, exactly as
+// `rt.tk` and `time.tk` are included (docs/reference/runtime.md).
+//
+// C3 of docs/specs/decimal.md (§ 1, § 8, § 12) and D74. There is no arithmetic
+// here yet: C4 is the limb arithmetic, C5 round and text. What C3 owes is the
+// movement, and the movement is `teko_wide.tk`'s three derived machines plus
+// exactly these three declarations.
+
+// The return buffer (docs/specs/decimal.md § 1, "a return"). A function that
+// returns a `decimal` copies its sixteen bytes here and returns the ADDRESS of
+// this global; the call site copies them out into the call depth's own slot
+// immediately after the branch, before any other instruction is emitted, which
+// is what makes ONE buffer safe under recursion and under nesting
+// (`tw_call`/`tw_ret`, teko_wide.tk).
+//
+// It is declared here, in the PROGRAM, and not inside the compiler: a machine
+// emits code for the program being compiled, and the frame slot that would
+// otherwise hold it is gone the moment the epilogue runs. A program that
+// returns a `decimal` without this include is refused by name
+// (`teko: include "decimal.tk" before returning a sixteen-byte value`).
+decimal tk_dec_retbuf;
+
+// The field road and the array-element road (§ 1's last row): two `ld64`/`st64`
+// pairs, written in ordinary teko over the address of the sixteen bytes.
+// `&d` on a local or on a parameter of `decimal` type is the address of its own
+// frame slot -- the core's own `MTASK_LOCAL_ADDR`, untouched by the wide
+// machine -- so no new accessor and no new intrinsic is needed to reach the
+// halves. It is the same technique `tk_f64_bits`/`tk_f64_from_bits` already use
+// for an `f64`.
+decimal tk_dec_ld(ptr p) {
+    decimal d;
+    ptr q = &d;
+    st64(q, ld64(p));
+    st64(q + 8, ld64(p + 8));
+    return d;
+}
+
+void tk_dec_st(ptr p, decimal d) {
+    ptr q = &d;
+    st64(p, ld64(q));
+    st64(p + 8, ld64(q + 8));
+}

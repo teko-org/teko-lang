@@ -1,0 +1,450 @@
+// teko_wide.tk -- the sixteen-byte value: three derived machines that MOVE a
+// `TK_WIDE` type, and nothing else (docs/specs/decimal.md § 1 "How sixteen
+// bytes travel", § 2, § 13; D74).
+//
+// It is the first machine teko WRITES. `teko_float.tk` derives nothing -- it
+// includes `mc`'s bundled `<float>` and its two machines and calls their
+// inits -- and this file is the other half of the answer D74 records: a type
+// teko registers with `type_new` carries whatever its representation needs to
+// MOVE, a derived table per instruction set, and that is not an intrinsic.
+// `mc limits`' `intrin` row does not move (it is at 8/8, D21).
+//
+// **Everything moves by address, and nothing moves in a register pair.** That
+// single decision is what keeps this file small enough to be read on all five
+// legs at once:
+//
+//   a local, a global, a parameter   sixteen bytes of frame or of `__data`,
+//                                    sized by the registry from `type_width`;
+//                                    copied two words at a time
+//   an argument                      the caller materialises the ADDRESS of the
+//                                    value's slot into that argument's depth and
+//                                    lets the underlying machine's own ABI place
+//                                    the pointer, exactly as it places any `uptr`
+//   a return                         the callee copies its sixteen bytes into one
+//                                    program global (`tk_dec_retbuf`, lib/decimal.tk)
+//                                    and returns ITS address; the call site copies
+//                                    them out into the call depth's slot before
+//                                    anything else runs, which is what makes the
+//                                    buffer safe under recursion
+//   a field, an array element        two `ld64`/`st64` pairs written in ordinary
+//                                    teko (`tk_dec_ld`/`tk_dec_st`, lib/decimal.tk),
+//                                    which `tk_ldn`/`tk_stn` (teko_struct.tk)
+//                                    lower every indirect access of a wide type to
+//
+// teko therefore writes NO ABI. SysV's `rax:rdx`, Win64's hidden reference and
+// AAPCS64's even-numbered register pair are three different rules for a
+// sixteen-byte value; a pointer is ONE rule, and it is the rule each machine
+// already implements. Every handler below either delegates in full or rewrites
+// one depth into a pointer and then delegates in full, so the argument
+// counting, the stack area, the shadow space and the float/integer split stay
+// where they were written -- in `mc`'s own machines and in `<float>`'s.
+//
+// The measurement behind the decision is in D74: `mc`'s own `lib/i128.mc`
+// proves a register pair is writable from outside `src/`, on all three tables.
+// teko chooses by-address anyway, because that module needs three ABI
+// implementations and this one needs none.
+//
+// **No new opcode, on either instruction set.** Every byte emitted here is one
+// the base machine already encodes, so this file registers no `MTASK_ENCODE`,
+// no `MTASK_INS_SIZE`, no `MTASK_DUMP` and no `MTASK_RELOC_KIND`, and
+// `--dump-asm` needs no new mnemonic.
+//
+// **Derivation order.** `<float>`'s two machines shadow `arm64`, `x86_64` and
+// `x86_64-win` already, so `tk_wide_init()` runs AFTER `tk_float_init()` in
+// `teko_init()` and copies the table that is current THEN: a float operation
+// reaches `<float>`'s handler through the pristine copy and an integer one
+// reaches the base. Copying earlier would cut `<float>` out of the chain --
+// the one trap `mc`'s own guide warns about (docs/reference/hooks.md § 3).
+
+// ---- the wide id SET ----
+// Keyed by a set and never by `t == ty_decimal`: N3's `Guid`, N5's
+// `DateTimeOffset` and N6's `i128` are sixteen bytes that move exactly this
+// way, and each registers its own id here with no machine work at all. The
+// shape is `iw_is`'s in `mc`'s `lib/i128.mc`, widened from two ids to a set.
+#define TK_MAXWIDE 4                  // wide types this compiler may register
+
+i64  tw_ty[TK_MAXWIDE];
+uptr tw_ldsym[TK_MAXWIDE];            // the library function an INDIRECT load lowers to
+uptr tw_stsym[TK_MAXWIDE];            // ...and a store
+i64  tk_nwide = 0;
+
+// Called from a registering module's own `_init()`, before any program is
+// parsed: a compiler that overflows the set is a compiler bug and says so at
+// once, the way `mc`'s own tables do.
+//
+// `ldsym`/`stsym` are what an INDIRECT access lowers to (`tk_ldn`/`tk_stn`,
+// teko_struct.tk): a field, an array element, a `ref`/`out` pointee and a
+// closure capture are all reached through an ADDRESS, and teko lowers every one
+// of them to a raw `ld64`/`st64` picked by width -- which for a sixteen-byte
+// type would move exactly half the value, in silence. A wide type answers with
+// a library function of its own instead, and the two halves are copied there
+// (`tk_dec_ld`/`tk_dec_st`, lib/decimal.tk).
+void tk_wide_add(i64 ty, uptr ldsym, uptr stsym) {
+    if (tk_nwide == TK_MAXWIDE) die("teko: too many wide types");
+    st64(tw_ty + tk_nwide * 8, ty);
+    st64(tw_ldsym + tk_nwide * 8, ldsym);
+    st64(tw_stsym + tk_nwide * 8, stsym);
+    tk_nwide = tk_nwide + 1;
+}
+
+i64 tk_wide_slot(i64 t) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nwide) break;
+        if (ld64(tw_ty + i * 8) == t) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_wide_is(i64 t) { return tk_wide_slot(t) >= 0; }
+
+// 0 when `t` is not wide, which is what `tk_ldn`/`tk_stn` read as "ask the
+// width table instead".
+uptr tk_wide_ld(i64 t) {
+    i64 i = tk_wide_slot(t);
+    if (i < 0) return 0;
+    return ld64(tw_ldsym + i * 8);
+}
+
+uptr tk_wide_st(i64 t) {
+    i64 i = tk_wide_slot(t);
+    if (i < 0) return 0;
+    return ld64(tw_stsym + i * 8);
+}
+
+// ---- the sixteen-byte slot a wide depth lives in ----
+// The value lives in ONE depth backed by a sixteen-byte slot, which is the
+// constraint `mc`'s own `<i128>` records: a value spanning two depths would
+// collide with `gen_binary`'s `depth + 1` and `gen_call`'s `depth + i`, the
+// walker's own arithmetic. No `MTASK_DEPTH_SPAN`, and none is asked for.
+i64 tw_slot[MAXDEPTH];
+
+i64  tw_slot_at(i64 d)            { return ld64(tw_slot + d * 8); }
+void set_tw_slot_at(i64 d, i64 v) { st64(tw_slot + d * 8, v); }
+
+i64 tw_depth(i64 d) {
+    if (tw_slot_at(d) == 0) set_tw_slot_at(d, slot_new(16));
+    return tw_slot_at(d);
+}
+
+// ---- the four things an instruction set has to answer ----
+// Everything else below is written ONCE. The three tables differ in exactly
+// these: which pristine copy is in force, which register is the frame base,
+// which two are free as scratch, and how one word is loaded and stored. Each
+// prologue writes them, the way `<i128>`'s `xw_cur` is written by its own two
+// prologues -- and for the same reason: the Win64 table and the SysV one share
+// every handler and differ only in what they delegate to.
+uptr tw_cur   = 0;                    // the pristine table in force
+i64  tw_frame = 0;                    // the frame base register
+i64  tw_xfer  = 0;                    // the eight-byte transfer register
+i64  tw_scr   = 0;                    // the address scratch register
+uptr tw_ldh   = 0;                    // void f(reg, base, off)
+uptr tw_sth   = 0;                    // void f(reg, base, off)
+uptr tw_vrh   = 0;                    // i64  f(depth, scratch)
+i64  tw_pscr  = 0;                    // an 8-byte slot for an incoming pointer
+
+uptr tw_of(i64 task) { return ld64(tw_cur + task * 8); }
+
+void tw_ld(i64 r, i64 b, i64 off) { callp(tw_ldh, r, b, off); }
+void tw_st(i64 r, i64 b, i64 off) { callp(tw_sth, r, b, off); }
+
+// the register holding depth `d`'s value, spilled or not: contract version 5's
+// first obligation, never `REG_BASE + d`. `tw_scr` is the scratch a spilled
+// depth is reloaded into, and it is never `tw_xfer`, so a copy may run between
+// this call and the use of what it answers.
+i64 tw_val(i64 d) { return callp(tw_vrh, d, tw_scr); }
+
+void tw_cp(i64 db, i64 doff, i64 sb, i64 soff) {
+    tw_ld(tw_xfer, sb, soff);
+    tw_st(tw_xfer, db, doff);
+    tw_ld(tw_xfer, sb, soff + 8);
+    tw_st(tw_xfer, db, doff + 8);
+}
+
+// ---- the arm64 answers ----
+// x16/x17 (REG_S1/REG_S2) are the bundled machine's own spill scratch and are
+// never a depth register (depths start at REG_BASE = x9), so a copy cannot
+// clobber the address it was given.
+void twa_ld(i64 r, i64 b, i64 off) { em(I_LDR, r, b, off); }
+void twa_st(i64 r, i64 b, i64 off) { em(I_STR, r, b, off); }
+i64  twa_val(i64 d, i64 s)         { return val_reg(d, s); }
+
+// ---- the x86-64 answers, shared by SysV and Win64 ----
+// rax is the bundled machine's own transfer scratch (XREG_S1) and rcx its
+// second; the depths live in r8..r11, so neither is a depth register either.
+void twx_ld(i64 r, i64 b, i64 off) { em(X_LD64, r, b, off); }
+void twx_st(i64 r, i64 b, i64 off) { em(X_ST64, r, b, off); }
+i64  twx_val(i64 d, i64 s)         { return x86_val_reg(d, s); }
+
+// ---- the prologue ----
+uptr twa_tab;
+uptr twa_orig;
+uptr twx_tab;
+uptr twx_orig;
+uptr twx_tab_win;
+uptr twx_orig_win;
+
+void tw_pro(uptr pristine, i64 frame, i64 xfer, i64 scr, uptr ldh, uptr sth, uptr vrh) {
+    tw_cur   = pristine;
+    tw_frame = frame;
+    tw_xfer  = xfer;
+    tw_scr   = scr;
+    tw_ldh   = ldh;
+    tw_sth   = sth;
+    tw_vrh   = vrh;
+    tw_pscr  = 0;
+    i64 d = 0;
+    loop {
+        if (d >= MAXDEPTH) break;
+        set_tw_slot_at(d, 0);
+        d = d + 1;
+    }
+}
+
+void twa_prologue() {
+    tw_pro(twa_orig, REG_FRAME, REG_S1, REG_S2, &twa_ld, &twa_st, &twa_val);
+    callp(tw_of(MTASK_PROLOGUE));
+}
+
+void twx_prologue_sysv() {
+    tw_pro(twx_orig, XR_RBP, XR_RAX, XR_RCX, &twx_ld, &twx_st, &twx_val);
+    callp(tw_of(MTASK_PROLOGUE));
+}
+
+void twx_prologue_win() {
+    tw_pro(twx_orig_win, XR_RBP, XR_RAX, XR_RCX, &twx_ld, &twx_st, &twx_val);
+    callp(tw_of(MTASK_PROLOGUE));
+}
+
+// ---- the five roads a sixteen-byte value travels ----
+void tw_local_load(i64 ty, i64 d, i64 off) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_LOCAL_LOAD), ty, d, off); return; }
+    tw_cp(tw_frame, 0 - tw_depth(d), tw_frame, 0 - off);
+}
+
+void tw_local_store(i64 ty, i64 d, i64 off) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_LOCAL_STORE), ty, d, off); return; }
+    tw_cp(tw_frame, 0 - off, tw_frame, 0 - tw_depth(d));
+}
+
+// The global's address is asked of the machine itself (`MTASK_SYM_ADDR`), not
+// emitted here: that is the one task that already knows whether this target
+// reaches a symbol with `adrp`/`add`, with `lea [rip + disp32]` or with a
+// relocation of some fourth shape. Depth `d`'s own scalar register is free --
+// the sixteen bytes live in the depth's slot and never in it -- so the address
+// lands there and `tw_val` reads it back wherever the allocator put it.
+void tw_global_load(i64 ty, i64 d, i64 sym) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_GLOBAL_LOAD), ty, d, sym); return; }
+    callp(tw_of(MTASK_SYM_ADDR), d, sym);
+    i64 r = tw_val(d);
+    tw_cp(tw_frame, 0 - tw_depth(d), r, 0);
+}
+
+void tw_global_store(i64 ty, i64 d, i64 sym) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_GLOBAL_STORE), ty, d, sym); return; }
+    callp(tw_of(MTASK_SYM_ADDR), d, sym);
+    i64 r = tw_val(d);
+    tw_cp(r, 0, tw_frame, 0 - tw_depth(d));
+}
+
+// A FIELD and an ARRAY ELEMENT are the same road: the core computes the
+// address into a depth and asks for a load or a store at the type's width.
+// Sixteen is a width no base machine has an instruction for, so it would have
+// moved eight bytes in silence -- these two are what make `a[i] = d`,
+// `d = a[i]`, `p.f = d` and `d = p.f` move all sixteen, with nothing written at
+// the surface. `tk_dec_ld`/`tk_dec_st` (lib/decimal.tk) are the same two
+// instructions spelled by hand, for a caller that holds a raw `ptr`.
+void tw_load(i64 ty, i64 d) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_LOAD), ty, d); return; }
+    i64 r = tw_val(d);
+    tw_cp(tw_frame, 0 - tw_depth(d), r, 0);
+}
+
+void tw_store(i64 ty, i64 d) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_STORE), ty, d); return; }
+    i64 r = tw_val(d);
+    tw_cp(r, 0, tw_frame, 0 - tw_depth(d + 1));
+}
+
+// The callee is handed a POINTER, so the incoming argument is delegated as the
+// `uptr` it is -- into an eight-byte scratch slot of this function's own -- and
+// the sixteen bytes are copied out of it into the parameter's own slot. The
+// delegation is what keeps the underlying machine's argument counting right:
+// one integer slot per wide parameter, on every one of the three ABIs, with
+// nothing counted here.
+void tw_param(i64 ty, i64 i, i64 off) {
+    if (!tk_wide_is(ty)) { callp(tw_of(MTASK_PARAM), ty, i, off); return; }
+    if (tw_pscr == 0) tw_pscr = slot_new(8);
+    callp(tw_of(MTASK_PARAM), TY_UPTR, i, tw_pscr);
+    tw_ld(tw_scr, tw_frame, 0 - tw_pscr);
+    tw_cp(tw_frame, 0 - off, tw_scr, 0);
+}
+
+// Contract version 5's second obligation: a machine that overrides
+// `MTASK_PARAM` owes `MTASK_PARAM_REG`. This one keeps NO counter of its own
+// -- every parameter, wide or not, is delegated once and in order -- so the
+// delegated slot stays exactly as right as it was; the guard is there because a
+// sixteen-byte value in an allocatable register would be a silent wrong answer
+// rather than a diagnostic.
+void tw_param_reg(i64 ty, i64 i, i64 r) {
+    if (tk_wide_is(ty)) die("teko: a sixteen-byte value in an allocatable register");
+    callp(tw_of(MTASK_PARAM_REG), ty, i, r);
+}
+
+// Each wide argument depth becomes the ADDRESS of its own slot -- through
+// `MTASK_LOCAL_ADDR`, the machine's own task for exactly that -- and then the
+// whole call is delegated. `walk_depth_type` still answers the wide id, which
+// is not a float id on any of the three tables, so the delegated handler puts
+// the pointer in an integer argument position and keeps its float accounting
+// untouched: a `decimal` and an `f64` mix in one call with nothing written here.
+//
+// A wide RESULT comes back as the address of the callee's return buffer, and it
+// is copied out IMMEDIATELY -- before any other instruction this handler emits
+// and before the next call is lowered at all. That is what makes one global
+// buffer safe under recursion and under nesting, and it is a rule of this
+// handler rather than a hope: the recursive fixture is its oracle.
+void tw_args(i64 d, i64 na) {
+    i64 i = 0;
+    loop {
+        if (i >= na) break;
+        if (tk_wide_is(walk_depth_type(d + i)))
+            callp(tw_of(MTASK_LOCAL_ADDR), d + i, tw_depth(d + i));
+        i = i + 1;
+    }
+}
+
+i64 tw_any_wide(i64 d, i64 na) {
+    i64 i = 0;
+    loop {
+        if (i >= na) break;
+        if (tk_wide_is(walk_depth_type(d + i))) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+void tw_call(i64 d, i64 na, i64 sym) {
+    i64 rw = tk_wide_is(walk_ret_type());
+    if (!rw && !tw_any_wide(d, na)) { callp(tw_of(MTASK_CALL), d, na, sym); return; }
+    tw_args(d, na);
+    callp(tw_of(MTASK_CALL), d, na, sym);
+    if (rw) {
+        i64 r = tw_val(d);
+        tw_cp(tw_frame, 0 - tw_depth(d), r, 0);
+    }
+}
+
+// An INDIRECT call declares its return type by the cast that sits directly on
+// it, and no cast names a wide type (`tk_prim_cast_check` refuses one at the
+// surface), so only the arguments can be wide here. They travel the same road.
+void tw_callp(i64 d, i64 na) {
+    if (!tw_any_wide(d, na)) { callp(tw_of(MTASK_CALLP), d, na); return; }
+    tw_args(d, na);
+    callp(tw_of(MTASK_CALLP), d, na);
+}
+
+// The callee writes the buffer and returns its ADDRESS, which is an ordinary
+// pointer the delegated `MTASK_RET` puts wherever this ABI returns a `uptr`.
+// The buffer is a global of the PROGRAM (`lib/decimal.tk`), because a frame
+// slot of this function is gone the moment the epilogue runs -- reading it
+// after the return would be a red-zone read this compiler is not entitled to.
+uptr tw_retbuf_name() { return "tk_dec_retbuf"; }
+
+void tw_ret(i64 d) {
+    if (!tk_wide_is(walk_depth_type(d))) { callp(tw_of(MTASK_RET), d); return; }
+    i64 gi = global_find(tw_retbuf_name());
+    if (gi < 0) die("teko: include \"decimal.tk\" before returning a sixteen-byte value");
+    callp(tw_of(MTASK_SYM_ADDR), d, glb_sym(glb_at(gi)));
+    i64 r = tw_val(d);
+    tw_cp(r, 0, tw_frame, 0 - tw_depth(d));
+    callp(tw_of(MTASK_RET), d);
+}
+
+// ---- and the five that are unreachable ----
+// teko refuses every one of these at the surface, with a line and a name:
+// `d + d` and the six comparisons are `teko_ops.tk`'s "no operator `+` takes
+// these operands", a cast is `teko_prim.tk`'s own refusal, and a `decimal`
+// constant has no folded form and never becomes an `MTASK_CONST`. A guard that
+// `die`s is what turns a hole in that reasoning into a message instead of into
+// wrong bytes (docs/specs/decimal.md § 2's last row).
+void tw_bin(i64 op, i64 d, i64 d2) {
+    if (tk_wide_is(walk_depth_type(d)) || tk_wide_is(walk_depth_type(d2)))
+        die("teko: arithmetic is not defined on a sixteen-byte value yet");
+    callp(tw_of(MTASK_BIN), op, d, d2);
+}
+
+void tw_cmp(i64 cond, i64 d, i64 d2) {
+    if (tk_wide_is(walk_depth_type(d)) || tk_wide_is(walk_depth_type(d2)))
+        die("teko: a comparison is not defined on a sixteen-byte value yet");
+    callp(tw_of(MTASK_CMP), cond, d, d2);
+}
+
+void tw_un(i64 op, i64 d) {
+    if (tk_wide_is(walk_depth_type(d)))
+        die("teko: a unary operator is not defined on a sixteen-byte value yet");
+    callp(tw_of(MTASK_UN), op, d);
+}
+
+void tw_cast(i64 ty, i64 d) {
+    if (tk_wide_is(ty) || tk_wide_is(walk_depth_type(d)))
+        die("teko: a cast is not defined on a sixteen-byte value yet");
+    callp(tw_of(MTASK_CAST), ty, d);
+}
+
+void tw_const(i64 d, i64 imm) {
+    if (tk_wide_is(walk_ret_type()))
+        die("teko: a constant is not defined on a sixteen-byte value yet");
+    callp(tw_of(MTASK_CONST), d, imm);
+}
+
+// ---- registration ----
+// Seventeen slots, the same seventeen on all three tables. No `MTASK_ENCODE`, no
+// `MTASK_INS_SIZE`, no `MTASK_DUMP`, no `MTASK_RELOC_KIND`: this module emits
+// no opcode the base machine does not already have.
+void tw_fill(uptr tab, uptr orig, uptr src, uptr prologue) {
+    i64 t = 0;
+    loop {
+        if (t >= MTASK_COUNT) break;
+        st64(tab  + t * 8, ld64(src + t * 8));
+        st64(orig + t * 8, ld64(src + t * 8));
+        t = t + 1;
+    }
+    machine_slot(tab, MTASK_PROLOGUE,     prologue);
+    machine_slot(tab, MTASK_PARAM,        &tw_param);
+    machine_slot(tab, MTASK_PARAM_REG,    &tw_param_reg);
+    machine_slot(tab, MTASK_LOAD,         &tw_load);
+    machine_slot(tab, MTASK_STORE,        &tw_store);
+    machine_slot(tab, MTASK_LOCAL_LOAD,   &tw_local_load);
+    machine_slot(tab, MTASK_LOCAL_STORE,  &tw_local_store);
+    machine_slot(tab, MTASK_GLOBAL_LOAD,  &tw_global_load);
+    machine_slot(tab, MTASK_GLOBAL_STORE, &tw_global_store);
+    machine_slot(tab, MTASK_CALL,         &tw_call);
+    machine_slot(tab, MTASK_CALLP,        &tw_callp);
+    machine_slot(tab, MTASK_RET,          &tw_ret);
+    machine_slot(tab, MTASK_BIN,          &tw_bin);
+    machine_slot(tab, MTASK_CMP,          &tw_cmp);
+    machine_slot(tab, MTASK_UN,           &tw_un);
+    machine_slot(tab, MTASK_CAST,         &tw_cast);
+    machine_slot(tab, MTASK_CONST,        &tw_const);
+}
+
+// Called from `teko_init()` AFTER `tk_float_init()`, so the table each copy is
+// taken from is `<float>`'s and not the bundled one underneath it (§ 13, the
+// one trap of a derived machine). Windows on aarch64 uses the `arm64` table
+// like every other aarch64 leg, so three tables cover all five CI legs.
+void tk_wide_init() {
+    twa_tab      = xalloc(MTASK_COUNT * 8);
+    twa_orig     = xalloc(MTASK_COUNT * 8);
+    twx_tab      = xalloc(MTASK_COUNT * 8);
+    twx_orig     = xalloc(MTASK_COUNT * 8);
+    twx_tab_win  = xalloc(MTASK_COUNT * 8);
+    twx_orig_win = xalloc(MTASK_COUNT * 8);
+    tw_fill(twa_tab, twa_orig, machine_tab("arm64"), &twa_prologue);
+    tw_fill(twx_tab, twx_orig, machine_tab("x86_64"), &twx_prologue_sysv);
+    tw_fill(twx_tab_win, twx_orig_win, machine_tab("x86_64-win"), &twx_prologue_win);
+    tw_cur = twa_orig;
+    machine("arm64", twa_tab);
+    machine("x86_64", twx_tab);
+    machine("x86_64-win", twx_tab_win);
+}

@@ -247,6 +247,8 @@
 #include "teko_over.tk"
 #include "teko_prim.tk"
 #include "teko_time.tk"
+#include "teko_wide.tk"
+#include "teko_decimal.tk"
 #include "teko_ops.tk"
 #include "teko_rc.tk"
 #include "teko_loop.tk"
@@ -355,7 +357,21 @@ void teko_init() {
     tk_fwd_init();
 
     tk_types_init();
+    // BEFORE `tk_float_init()`, and the order is load-bearing
+    // (docs/specs/decimal.md § 3, § 13): `syntax_lit` handlers run in
+    // REGISTRATION order and the first non-zero node wins, so `<float>`'s own
+    // `fl_lit` -- which reads `1.5` and stops before the `m` -- has to be
+    // asked SECOND. Registered the other way round, `0.5m` becomes an `f64`
+    // followed by a stray identifier; `tests/primitives_decimal_order.tk` puts
+    // `0.5m` and `0.5` in one program and is the oracle for exactly this line.
+    tk_dec_init();
     tk_float_init();
+    // ...and the MACHINE after it, for the opposite reason (§ 2, § 13):
+    // `<float>`'s two machines shadow `arm64`, `x86_64` and `x86_64-win`
+    // already, and a derived table has to copy the one that is current NOW so
+    // that a float operation still reaches `<float>`'s handler through the
+    // pristine copy. Copying earlier cuts `<float>` out of the chain.
+    tk_wide_init();
     tk_time_init();
     tk_loop_init();
     tk_ns_init();

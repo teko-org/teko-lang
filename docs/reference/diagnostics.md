@@ -654,6 +654,57 @@ interval that starts at zero — `an hour/minute/second/millisecond is out of ra
 the three calendar-free constructors reach instead, the same checks a `DateTime`'s own time
 of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside them.
 
+## `decimal`, the sixteen-byte value
+
+`decimal` is registered with `type_new("decimal", 16, 16, TK_WIDE)` and MOVES by address:
+three derived machines copy its sixteen bytes between frame slots, globals, arguments and
+the return buffer ([`teko_wide.tk`](../../teko_wide.tk), D74). C3 carries the movement and
+nothing else — no arithmetic, no comparison, no conversion, no member — so almost every
+refusal below is a wording this compiler already had, reached because `decimal` is
+registered as a primitive with an **empty** member table
+([the specification](../specs/decimal.md) § 4, [not-yet.md](not-yet.md)).
+
+- `"teko: a decimal does not cast yet"` — ``(i64) d``, ``(f64) d``, ``(decimal) x``. The
+  explicit conversions land in C4, where each becomes a call; `MTASK_CAST` on a sixteen-byte
+  value has no meaning. A primitive registered with **no** reader and **no** constructor
+  names neither in this refusal, which is why it is shorter than `DateTime`'s own
+  (`tk_prim_cast_check`, [`teko_prim.tk`](../../teko_prim.tk)).
+- `"teko: decimal literal out of range"` — the mantissa is 96 bits and the literal needs
+  more. The digits are accumulated into four 32-bit limbs and a carry out of the top one is
+  remembered rather than dropped, so `1e40m` is refused instead of wrapping.
+- `"teko: a decimal carries at most 28 decimal places"` — the scale is eight bits of the
+  high word and runs `0..28`, C#'s own range. The exponent shifts the scale, so `1e-29m`
+  reaches it too.
+- ``"teko: an `extern` takes no "`` — completed by the type's name: the sixteen-byte
+  convention is teko's own (a pointer in an ordinary integer argument register, a buffer for
+  the return) and no C ABI shares it, so the two would disagree at run time rather than at
+  the declaration. Refused where the type and the word `extern` are both in hand
+  (`tk_ov_extern_wide`, [`teko_over.tk`](../../teko_over.tk)).
+- `"teko: include \""` — completed by *decimal.tk" before returning a sixteen-byte value*: a
+  wide return travels through `tk_dec_retbuf`, a global the **program** declares, and
+  `lib/decimal.tk` is where it is declared. It is the rule `lib/rt.tk` already has for an
+  `enum`'s own lowering symbols.
+
+Five more are **guards on the machine**, in the same file. Every one of them is unreachable
+from the surface — teko refuses each construct earlier, with a line and a name — and they
+are there so that a hole in that reasoning is a message rather than eight bytes moved where
+sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
+
+- `"teko: arithmetic is not defined on a sixteen-byte value yet"` — `MTASK_BIN`. The surface
+  refusal is ``teko: no operator `+` takes these operands``.
+- `"teko: a comparison is not defined on a sixteen-byte value yet"` — `MTASK_CMP`; the
+  surface refusal is the same one, naming the comparison.
+- `"teko: a unary operator is not defined on a sixteen-byte value yet"` — `MTASK_UN`.
+- `"teko: a cast is not defined on a sixteen-byte value yet"` — `MTASK_CAST`; the surface
+  refusal is `teko: a decimal does not cast yet`.
+- `"teko: a constant is not defined on a sixteen-byte value yet"` — `MTASK_CONST`. A
+  `decimal` has no folded form at all, so the surface refusals are
+  `teko: const requires a constant expression` and
+  `teko: a case label must be a constant expression`.
+- `"teko: a sixteen-byte value in an allocatable register"` — `MTASK_PARAM_REG` under
+  `--opt=1`. The walker allocates no sixteen-byte local today; the guard is what says so if
+  it ever does.
+
 ## Properties
 
 - ``"teko: a property declares `get`, `set` or both"`` — an empty accessor list, or a word
@@ -1598,6 +1649,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many consts"` | 128 member constants |
 | `"teko: too many compiler-written nulls in one unit"` | 64 ternaries over a reference type in one unit |
 | `"teko: too many top-level consts"` | 128 |
+| `"teko: too many wide types"` | 4 sixteen-byte types registered with `tk_wide_add` (`decimal` today; `Guid`, `DateTimeOffset` and `i128` are the three the design names next). It is a COMPILER ceiling, not a program's: it fires at `teko_init()` time and no source can reach it |
 | `"teko: too many local arrays"` | 1024 declarations in scope |
 | `"teko: too many global arrays"` | 512 in one source |
 | ``"teko: too many global `T[]` of heap"`` | 32 in one source |
