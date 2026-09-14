@@ -78,7 +78,34 @@ wrapped — it is already a value), then the site's own namespace and its prefix
 then a plain top-level declaration of the exact name, then the `using`s of the file. So
 inside `namespace geo`, `Op f = col;` wraps `geo.col` when `geo` declares one, and the flat
 `col` only when it does not — the same function `col(2, 3)` written one line over would
-call.
+call. `new Op(col)` takes the identical order (D67): both forms resolve `f` at the same
+LATE point, once the whole unit is read and every namespace and `using` is known, rather
+than `new Op(...)` guessing from whatever the parser has seen so far.
+
+`f` may also be **overloaded** — two or more declarations of the same name, at different
+arities or parameter types. Both forms pick the ONE declaration whose full signature
+(arity, return, every parameter's type AND `ref`/`out` kind) equals the delegate's own,
+never the first one written:
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+delegate i64 Op(i64 a, i64 b);
+
+i64 pick(i64 a) { return a + 1; }                // arity 1: not this delegate's
+i64 pick(i64 a, i64 b) { return a + b; }         // arity 2: the one that matches
+
+i64 main() {
+    Op f = new Op(pick);
+    if (f(3, 4) != 7) return 1;
+    return 42;
+}
+```
+
+A target declared BELOW the `new`/the contextual initializer resolves too, for the same
+reason: both roads read `f` once the whole unit is parsed, not while the parser is still on
+the line that writes it.
 
 ```teko
 // expect-exit: 42
@@ -107,9 +134,31 @@ i64 main() {
 }
 ```
 
-`new Op(name)` is the one form this order does **not** reach: its thunk is built while the
-file is still being read, before namespaces are mangled, so the name it takes has to be one
-that is already flat ([not-yet.md](not-yet.md)).
+`new Op(name)` reads the identical order, namespace and overload alike: the two sample
+programs above run unchanged with `new Op(col)`/`new Op(pick)` written in place of the
+contextual form, and this one wraps a namespace's own target through `new` directly, the
+seventh road D62 measured and left open, closed by D67:
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+delegate i64 Op(i64 a, i64 b);
+
+namespace geo {
+    i64 col(i64 a, i64 b) { return a * b; }
+
+    i64 pick() {
+        Op f = new Op(col);                       // geo.col, the explicit road
+        return f(2, 3);
+    }
+}
+
+i64 main() {
+    if (geo.pick() != 6) return 1;
+    return 42;
+}
+```
 
 `Op g;` at top level is a **global** slot, and every form above works on it exactly as it
 does on a local: `g = add;`, `g = new Op(mul);`, and `g(3, 4)` from any function of the

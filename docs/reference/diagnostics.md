@@ -785,6 +785,16 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
   `tests/refuse/lambda_method_call.tk`). `use (...)` captures a VALUE, never a method, so
   the wording above would read false here — this is its own sentence. A static method
   takes no receiver and still resolves.
+- `"teko: "` — completed by *X* ` has no overload matching ` *Op(...)* (D67, `tests/
+  refuse/deleg_new_overload_none.tk`): `new Op(f)` and the contextual `Op f = ...;` both
+  resolve `f` at the same LATE walk now, and a genuinely OVERLOADED `f` is judged by every
+  declaration's own signature — arity, return, every parameter's type AND `ref`/`out` kind
+  — rather than whichever one happened to be declared first.
+  `"teko: ambiguous overload for "` — completed by *Op(...)* `": "` *X*, its twin, when
+  more than one candidate's signature fits — kept defensively (C# §10.2.3, exact match, no
+  widening): two declarations of the identical signature, return type included, are
+  `function declared twice` at the core's own hand before this check ever runs, so no
+  fixture reaches it.
 
 An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
 of that type, and a GLOBAL array's element is judged exactly as a local array's. The store
@@ -1614,6 +1624,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `ref`/`out` arguments in one unit"`` | 512 |
 | `"teko: too many delegate targets"` | 64 (delegate, function) pairs |
 | `"teko: too many element stores of unknown type"` | 512 stores into an element of delegate type, in one unit, whose value only the walk can type. A delegate is a counted type, so every element store of one takes a row of the table above first, but that ceiling is 4096 now (D69) — comfortably past 512 — so this table's own ceiling is the one a program hits first: 513 of them refuse with this wording, at the 513th, not the row above's |
+| `"teko: too many delegate targets awaiting resolution"` | the same 512-row table (`TK_MAXDGLATE`, `teko_deleg.tk`), shared rather than duplicated (D67): an explicit `new Op(f)` site waits here exactly as an element store does, keyed by the SAME node-id bucket, so a unit's element stores and its explicit thunk sites draw on one combined budget of 512, not two separate ones |
 | `"teko: too many captures in one lambda"` | 32, summed across the lambdas being read |
 | `"teko: too many captures by value in one unit"` | 256, summed over every lambda: definite assignment reads each one's own node |
 | `"teko: too many capturing lambdas"` | 64 capturing by reference |
