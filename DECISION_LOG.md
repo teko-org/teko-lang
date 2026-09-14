@@ -2962,3 +2962,79 @@ source growth (`nodes` used 154187 -> 154215, `ins` 212286 -> 212326, `funcs` 31
 `globals` 922 -> 924, used heap 91854176 -> 91921088 of a 217448448 reserve). `mc pkg hash .`
 at this pass's own code commit:
 `766306c9be8a85b6788252ae2058b230cb2fe72726ae9ba665f4483afb1aca10`.
+
+**Copilot finding, fifth pass: the store that waits differed a NAME and nothing else, the
+global slot never asked the escape rule, and the queue was eight times shallower than the
+writes that fill it.** Three findings, each measured on `da33ebd4` (the base), on the head
+of this crumb (`945b94b1`) and on this fix, mc **0.15.23**, macos/aarch64 -- `Op` is
+`delegate i64 Op(i64 a)`, `Chooser` a `delegate Op Chooser(i64 k)`, `g_op` a global `Op`
+and `local` a local holding a lambda tainted by `use (&acc)`:
+
+| probe | `da33ebd4` | `945b94b1` | now |
+|---|---|---|---|
+| `ops[0] = chooser(1)` on a LOCAL `Op[]` | refuses, `teko: Op takes a function, another Op, or null` | same | runs, 42 |
+| the same store on a GLOBAL `Op[]` (fourth pass) | `unknown name` (the core) | runs, 42 | runs, 42 |
+| `g_op = local;` | compiles, `g_op` outlives `acc` | same | refuses, `teko: a lambda that captures by reference cannot leave its scope` |
+| `g_op = new Op((i64 x) use (&acc) => acc + x);` | compiles, the same dangling capture | same | refuses, the same words |
+| `Op local2 = local;` / `local2 = local;` (a LOCAL target) | runs, 42 | runs, 42 | runs, 42 |
+| 65 valid deferred stores in one unit (20 global, 45 local) | `teko: unknown function: lo` (the third pass's own gap) | refuses, `teko: too many element stores of unknown type` | runs, 42 |
+
+1. **The store differed a bare `N_IDENT` and judged everything else on the spot.**
+   `tk_deleg_store_late` (teko_deleg.tk) asked its question only of a NAME, so every other
+   shape went straight to `tk_deleg_coerce` at PARSE time, where `tk_ty_scope_find` is empty
+   and `tk_ty_global` is not filled yet -- and a value those two cannot type is refused
+   there in the delegate's own mismatch words. `ops[0] = chooser(1)`, with `chooser` a local
+   delegate answering `Op`, is exactly that value, and
+   [arrays.md](docs/reference/arrays.md) promises it "in a local array and in a global one"
+   alike: the global half has waited for the walk since the fourth pass, the local half
+   refused a legal program. It is ONE rule at both halves now, the global store's own: what
+   the site's oracles TYPE (`tk_deleg_expr_ty`, the same oracle the validator asks one line
+   later) is settled where it stands, and what they do not type waits for `tk_deleg_walk`,
+   which stands at the site with the lexical scope live and every global row collected.
+   Deferring only what the site types WRONG is what keeps the accepted programs where they
+   are: a wrap emits four declarations through `tk_top_emit`, and moving a wrap that already
+   worked would move them (the 62 dumps). A ternary is the one value the validator takes
+   APART, one branch at a time, so it stays at the site whenever the site is judging at all.
+2. **A GLOBAL of delegate type took a capture that dies before it does.** `tk_deleg_assign`
+   read the target through `tk_ty_scope_or_global` (pass 1) but never asked D221 decision
+   21's first escape, so `g_op = local;` and `g_op = new Op(... use (&acc) ...)` parked the
+   ADDRESS of a dead local in a slot that survives the call -- accepted on the base and on
+   the head alike. A field, a static field, an element of a `T[]` and a `return` already
+   carry that verdict; the plain global slot was the one write of a delegate with none. It
+   asks `tk_lam_escapes` when, and only when, the target is NOT in the lexical scope
+   (`tk_ty_scope_find` < 0, the same helper the walk keeps live): a LOCAL target keeps the
+   taint PROPAGATION it always had (`tk_lam_taint_stmt`) and no refusal, because the scope
+   that owns the capture is still the one holding it.
+3. **The queue was 64 where the writes that fill it are capped at 512.** `TK_MAXDGLATE`
+   (teko_deleg.tk) is the table of element stores waiting for the walk, and `TK_MAXGDEF`
+   (teko_array.tk, 512) is the ceiling on the array writes of a unit that wait for
+   `tk_array_pass` -- every one of which may need a row in the first. 65 perfectly ordinary
+   stores were refused ``teko: too many element stores of unknown type``. The table is as
+   deep as the one that feeds it now, and `null` -- the one value that means the same thing
+   at every site, judged identically by the pass and by the parse site -- takes no row at
+   all. The ceiling and its refusal are stated in
+   [diagnostics.md](docs/reference/diagnostics.md).
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: the six probes above on the three
+builds; **63/63** fixtures at their `expect-exit`, with `tests/surface_globals.tk` (exit 42)
+gaining section 3d, `delegarrlocalcheck` -- a LOCAL `Op[]` taking a call through a local
+delegate and a lambda typed at the site, and a by-reference capture handed to another LOCAL
+through an initializer and through an assignment; the head of this crumb refuses that
+section at its first store. The two new refusals are one `// no-run` sample in
+[diagnostics.md](docs/reference/diagnostics.md), whose escape entry now names a GLOBAL of
+delegate type beside the field, the static field and the element it already named, and says
+that another LOCAL is not one. The `--dump-ast` of the **62** fixtures that existed at
+`da33ebd4`, byte-identical to that base; instrumented, `tk_deleg_late_rest` refusing any
+store that reaches it unjudged, the whole suite and every probe pass -- no deferred store
+survives the walk (and the instrument is not vacuous: with `tk_deleg_late_pend` disabled it
+fires on the first probe at once); `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK` (63/63 under `teko1`); `sh scripts/check-docs.sh` green (568 links, 385
+diagnostics -- none added, the ceiling's own row is corrected from 64 to 512 -- **121**
+samples, the one added above); `mc limits . --config mc.macos.toml` verdict `ok` on both
+legs, measured back-to-back against `945b94b1` from the same clean state: the
+`tests/hello.tk` leg BYTE IDENTICAL down to its `heap` (used 464272 of a 33554432 ceiling),
+the compiler leg moving by this pass's own source growth and its one deeper table (`nodes`
+used 154215 -> 154279, `ins` 212326 -> 212446, `funcs` 3137 and `globals` 924 unchanged,
+used heap 85187904 -> 85532512 of a 149487616 reserve). `mc pkg hash .` at this pass's own
+code commit:
+`709748245e85b6ca08389ff24e75bbbdf4e13883d59411c484361f08e8d015b1`.
