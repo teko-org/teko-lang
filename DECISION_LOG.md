@@ -4803,8 +4803,11 @@ sources are mc, which has no class, no interface, no delegate and no `T[]` of he
 byte-for-byte; `sh scripts/check-docs.sh` green (`docs ok: 575 links, 388 diagnostics,
 21 refusals, 133 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on both legs,
 every table unmoved except the size of the added surface code itself
-(`nodes` used 155529 → 155533, `ins` 214246 → 214257, `heap` +12128 on the compiler leg;
-the `tests/hello.tk` leg byte-identical), with `passes` 15/30, `types` 11, `intrin` 8/16,
+(`nodes` used 155529 → 155533, `ins` 214246 → 214257; the `heap` column is not a proof
+figure -- the verifier measured +405344 on the compiler leg and +393216 on the `tests/hello.tk`
+leg where the first pass had written +12128 and "byte-identical": `mc limits`'s heap `used`
+reflects the state of `build/` at the time of the run, so only the verdict and the table
+rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 `alias` 18 and `syntax` 15 exactly where D53 left them, and
 `./build/teko limits tests/hello.tk` byte-identical to the base compiler's own output;
 `mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
