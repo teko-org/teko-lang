@@ -5710,6 +5710,73 @@ park use; measured: 600 such reads in one function compile and run (exit 248 = 6
 256), `mc limits` verdict `ok` with `globals` 943/2544 unmoved and `grow` 0 on every row.
 The ceiling is a fact of the shared table, not a fixture: a refuse fixture that pins it
 would break the day it grows.
+
+**Copilot findings on #718 (two, both at the root).**
+
+*1. The deferral guard stood one lookup too late.* Fix B's check
+(`nd_kind(left) == N_CALL && tk_xt_ty(left) < 0`) was written BELOW
+`i64 si = tk_struct_of_expr(left)` in `tk_dot` (teko_expr.tk), and that lookup carries an
+N_CALL arm of its own -- `tk_struct_by_ty(decl_ret(decl_find(name)))`, the same
+first-declaration guess, for a receiver whose type is a ROW. So a call whose FIRST
+declaration returns a class, a struct or an enum never reached the deferral at all: it went
+through `tk_member_of` with the wrong row. Measured on this branch's own head
+(`3546684c`), one probe per shape:
+
+| written | before | after |
+|---|---|---|
+| `Cell cpick(i64)` ahead of `Box cpick(i64, i64)`, `cpick(1, 2).w` (both declare `w`, at 8 and at 0) | **exit 0** -- the Box read at Cell's offset | 7 |
+| the same pair, `cpick(1, 2).v` (only Box declares `v`) | refused `teko: unknown member of Cell: v` on a legal program | 9 |
+| the mirror order, `cmirror(1, 2).pad` (only Cell declares `pad`) | refused `teko: unknown member of Box: pad` | 100 |
+| the struct pair, `spick(1, 2).w` (`SPad`/`SBare`) | **exit 0** | 7 |
+| two enums, `epick(1, 2).ToString()` / the mirror order | the other enum's name table | `Wild` / `Green` |
+
+The fix is the move: the untagged-call check now stands ahead of BOTH oracles, since both
+answer a call the same wrong way. The BROAD form is kept a second time, and measured the
+same way: `--dump-ast` is byte-identical against `59652293`'s compiler for all **73**
+pre-existing `tests/*.tk` with that commit's own sources. One dump DOES move, on a shape no
+fixture had before -- a program that reads `.ToString()` off a call returning an ENUM emits
+`Hue__names`/`Hue__vals` at the END of the unit instead of ahead of `main`, because
+`tk_enum_ensure` (teko_enum.tk) now runs from the pass rather than from the parse: the two
+globals are byte-identical in content, only their position in the dump moved, and the
+values they answer are the fixture's own rows 46-49. Everything else in that probe --
+`mk().w`, `mk().in.v`, `mk().bump()`, `mks().b`, a 200-iteration loop over `mk().w` -- dumps
+byte-identical on both compilers. No narrowing to overloaded callees was written: nothing
+measures a reason for it.
+
+*2. The diagnostics table still quoted the old ceiling.* `docs/reference/diagnostics.md`
+read `128 waiting for the pass` for `teko: too many member accesses on a value of unknown
+type` after `TK_MAXPEND` became 4096; the row now names the new ceiling, what spends a slot
+in it (a receiver the parser cannot type, and since D61 any untagged call receiver) and
+what the 128 used to cover. `TK_MAXPEND` and that sentence are quoted nowhere else in
+`docs/` -- grepped over `docs/internals/` and `docs/reference/` -- so the one row is the
+whole fix.
+
+**Fixtures.** `tests/surface_prim_call_member.tk` keeps its name (a rename would only churn
+what D61 and `docs/reference/diagnostics.md` already cite; its header names the widened
+reach) and grows to **52 checks**: rows 34-41 and 43-45 are the class and struct pairs in both
+orders (42 is the fixture's own success code and is no row), rows 46-49 the two enums in
+both orders, rows 50-53 the same three returns with NO
+overload anywhere -- the shapes the moved check carries from the parse road onto the
+deferred one. `tests/refuse/call_member_unknown.tk` is new: `cpick(1, 2).pad` is refused
+`teko: unknown member of Box: pad`, where before the move the same line COMPILED and exited
+7, reading Box's own `w` through `Cell.pad`'s offset.
+
+**Proof** (mc 0.15.23, macos/aarch64, pre-fix head `3546684c` merged with `origin/main`
+at `111559fb`): `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **74 passed, 64
+refused as expected, 0 failed** (was 74/63); `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 611 links, 41 fragments,
+389 diagnostics, 64 refusals, 143 samples`; `mc limits . --config mc.macos.toml` verdict
+`ok`, `grow` 0 on every row, and every counted row identical to the pre-fix head's --
+`nodes` used 156713, `ins` 216188, `funcs` 3184, `lowered` 3166, `globals` 944, `symbols`
+6266, `strings` 2138, `passes` 15, `syntax` 15, `alias` 20, `types` 13, `intrin` 8, `rules`
+6, `on_stmt` 4 -- only the `nodes` ESTIMATE moving (179815 → 179872, the comment this crumb
+writes); the linux/x86_64 config gives the same compiler-leg table and the same `ok`
+verdict; `./build/teko limits tests/hello.tk` identical to the pre-fix compiler's own output
+on every table. `mc pkg hash .`
+`aa4a07da80f7336a739d3aa37cdc40e8a06da9bc7e38ec24c396bffbaf9c9731` (pre-fix head
+`23c318e282b1019fd7eb7aa294e2aac069aa67a90e4fcb2c9579e1e5a2e6c9a4`: `teko_expr.tk` is a
+listed file, so the hash moves by design).
+
 ### D62 · A bare FUNCTION name lands in a FIELD of delegate type, judged where names have types (2026-09-14)
 `Op cb = twice;` on a local wraps the function in the thunk every delegate value shares
 (D221 §41), and `h.cb = twice;` on the field beside it answered `teko: the type of this
