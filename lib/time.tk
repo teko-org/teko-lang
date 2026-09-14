@@ -519,3 +519,89 @@ i64 tk_do_add_years(i64 n, i64 years) {
 // `tk_ts_cmp`. The rows in teko_time.tk name those six functions directly
 // rather than six wrappers that would forward and nothing else (the spec's
 // § 3 named them `tk_do_eq` … `tk_do_ge`; this is that amendment).
+
+// ============================================================================
+// `TimeOnly` (docs/specs/datetime-extras.md, crumb N4b)
+// ============================================================================
+//
+// EIGHT bytes, and the value IS the ticks since midnight: an ordinary,
+// non-negative `i64` in `0 .. TICKS_PER_DAY - 1`, C#'s own representation.
+// There is no `Kind` and no date above it, so `.Ticks` is the identity row
+// `TimeSpan.Ticks` is, and the six comparisons and `.CompareTo`/`.Equals` are
+// `TimeSpan`'s own functions -- a tick count of a time of day is an ordinary
+// non-negative `i64`, exactly the case `DateOnly` already made (D54).
+//
+// THE CALENDAR IS NOT REWRITTEN HERE EITHER: `.Hour`, `.Minute`, `.Second`
+// and `.Millisecond` are `DateTime`'s own component functions, called
+// directly and unmasked -- `DATETIME_TICK_MASK` clears only the top two
+// bits, and every `TimeOnly` value already fits well under them, so masking
+// it is a no-op and writing four more functions that would do the same
+// division and modulo is code not written.
+
+// `TimeOnly.MaxValue`, `23:59:59.9999999`: TICKS_PER_DAY - 1
+const i64 TIMEONLY_MAX_TICKS = 863999999999;
+
+i64 tk_to_min() { return 0; }
+i64 tk_to_max() { return TIMEONLY_MAX_TICKS; }
+
+// the one range check both `new TimeOnly(ticks)` and `FromTimeSpan` take: a
+// raw `i64` tick count has to fall inside a single day. C# raises
+// `ArgumentOutOfRangeException` for the first and `ArgumentException` for the
+// second; a teko program has no exceptions, so both answer the one `panic`
+// this crumb adds -- no existing wording fits an interval that starts at
+// zero, unlike every `DateTime`/`TimeSpan` range this file already panics on.
+i64 tk_to_from_ticks(i64 t) {
+    if (t < 0 || t > TIMEONLY_MAX_TICKS) panic("a time of day is out of range");
+    return t;
+}
+
+// the three calendar-free constructors: C#'s own `TimeToTicks`, the same
+// check `new DateTime(y, m, d, h, mi, s)` already takes for its own time of
+// day, so `new TimeOnly(24, 0, 0)` panics on the very function that panics
+// under a `DateTime` too.
+i64 tk_to_hm(i64 h, i64 mi)                   { return tk_dt_time_ticks(h, mi, 0, 0); }
+i64 tk_to_hms(i64 h, i64 mi, i64 s)           { return tk_dt_time_ticks(h, mi, s, 0); }
+i64 tk_to_hmsms(i64 h, i64 mi, i64 s, i64 ms) { return tk_dt_time_ticks(h, mi, s, ms); }
+
+// ---- the arithmetic: wrapping, C#'s own ----
+// `Add` wraps at both ends of the day and never panics, unlike every
+// `TimeSpan`/`DateTime` arithmetic function above. `ts % TICKS_PER_DAY` is
+// reduced FIRST so the sum that follows cannot overflow the `i64` itself: a
+// `TimeSpan` may carry ticks far outside a single day (its own range is
+// about ±10675199 days), and adding one in raw would wrap the machine word
+// before the day-wrap below ever saw it. The double `+ TICKS_PER_DAY` before
+// the final `%` is what keeps the answer non-negative regardless of the sign
+// `%` truncating toward zero would otherwise leave it with.
+i64 tk_to_add(i64 t, i64 ts) {
+    i64 d = ts % TICKS_PER_DAY;
+    return ((t + d) + TICKS_PER_DAY) % TICKS_PER_DAY;
+}
+
+// C#'s own form: `.AddHours(v)` IS `.Add(TimeSpan.FromHours(v))`, and
+// `.AddMinutes` its sibling -- both wrap through `tk_to_add` above, so
+// neither can panic where `TimeSpan.FromHours` itself does not.
+i64 tk_to_add_hours(i64 t, f64 v)   { return tk_to_add(t, tk_ts_from_hours(v)); }
+i64 tk_to_add_minutes(i64 t, f64 v) { return tk_to_add(t, tk_ts_from_minutes(v)); }
+
+// C#'s own `IsBetween`: `start` inclusive, `end` exclusive, and it WRAPS when
+// `start` is after `end` -- `22:00` to `02:00` covers midnight and is not the
+// empty interval a naive `t >= start && t < end` would answer.
+i64 tk_to_is_between(i64 t, i64 s, i64 e) {
+    if (s <= e) return t >= s && t < e;
+    return t >= s || t < e;
+}
+
+// ---- the operator: a difference, never negative ----
+// C#'s own rule for `t1 - t2`: the ELAPSED time from `t2` to `t1`, wrapping
+// FORWARD across midnight when `t1` is earlier than `t2` -- never the
+// negative `TimeSpan` a raw subtraction would answer. Both operands are
+// already inside `0 .. TICKS_PER_DAY - 1`, so `a - b` cannot overflow and the
+// `+ TICKS_PER_DAY` before the final `%` is the same non-negative trick
+// `tk_to_add` uses above.
+i64 tk_to_sub(i64 a, i64 b) { return ((a - b) + TICKS_PER_DAY) % TICKS_PER_DAY; }
+
+// ---- `DateOnly.ToDateTime(TimeOnly)`, the member N4a left out ----
+// The argument's type did not exist when `DateOnly` landed (D54); it does
+// now, and the packing is exactly `tk_dt_ymd`'s own: the day number back into
+// ticks, plus a time of day already in ticks, `Kind` Unspecified.
+i64 tk_do_to_datetime(i64 n, i64 t) { return tk_dt_pack(n * TICKS_PER_DAY + t, 0); }

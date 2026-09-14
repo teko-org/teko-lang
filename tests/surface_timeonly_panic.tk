@@ -1,0 +1,48 @@
+// surface_timeonly_panic.tk -- the one panic `TimeOnly` adds
+// (docs/specs/datetime-extras.md § "PANIC"): a raw tick count outside
+// `0 .. 863999999999` is not a time of day, whether it arrives through
+// `new TimeOnly(ticks)` or `TimeOnly.FromTimeSpan(ts)` -- both hand the same
+// range check the same raw `i64` (`tk_to_from_ticks`, `lib/time.tk`). No
+// existing panic reads honestly for an interval that starts at zero, so this
+// is the one new wording the crumb adds: `teko: a time of day is out of
+// range`, exit 70.
+//
+// Every check BELOW builds a `TimeOnly` in every other way this crumb
+// teaches and must NOT panic -- the calendar-free constructors at both ends
+// of a day, the wrapping arithmetic, `FromTimeSpan` at the very top of the
+// range -- so reaching the final panic is a proof and not a false positive.
+//
+// expect-exit: 70
+
+#include "../lib/time.tk"
+
+i64 main() {
+    // the calendar-free constructors, both ends of a day
+    TimeOnly midnight = new TimeOnly(0, 0, 0, 0);
+    if (midnight.Ticks != 0) return 1;
+    TimeOnly last = new TimeOnly(23, 59, 59, 999);
+    if (last.Hour != 23 || last.Second != 59 || last.Millisecond != 999) return 2;
+
+    // the raw-ticks constructor, at both ends of the range that DOES exist
+    TimeOnly viamin = new TimeOnly(0);
+    if (viamin.Ticks != 0) return 3;
+    TimeOnly viamax = new TimeOnly(863999999999);
+    if (viamax.Ticks != 863999999999) return 4;
+
+    // `FromTimeSpan`, at the very top of the range
+    TimeOnly fromts = TimeOnly.FromTimeSpan(TimeSpan.FromTicks(863999999999));
+    if (fromts.Ticks != 863999999999) return 5;
+
+    // the wrapping arithmetic, which never panics no matter how far it goes
+    TimeOnly wrapped = last.Add(TimeSpan.FromDays(1000.0));
+    if (wrapped.Hour != 23) return 6;
+    TimeOnly wrappedback = midnight.Add(TimeSpan.FromDays(0 - 1000.0));
+    if (wrappedback.Ticks != 0) return 7;
+    i64 farhour = last.AddHours(1000000.0).Hour;
+    if (farhour < 0 || farhour > 23) return 8;
+
+    // ...and the value one tick past the end of the day: a range this
+    // crumb's own check catches, not the calendar-free one above
+    TimeOnly impossible = new TimeOnly(864000000000);
+    return impossible.Hour;                        // never reached: the build panicked
+}
