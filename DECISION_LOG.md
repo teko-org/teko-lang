@@ -4719,6 +4719,95 @@ same file; `mc pkg hash .`
 (base `93fab590c5fd29dc2ceaabab56ba296e39d41044b3b6e38bd6ee36861d45ed6e`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
 
+### D54 · `DateOnly`, and the width a primitive may have (2026-09-14)
+*D53 is reserved for another crumb in flight; this log ended at D52 when N4a started, and
+the number was assigned rather than taken in order.*
+
+`docs/specs/datetime-extras.md`'s N4 is split: **N4a is `DateOnly` and landed here**; N4b
+(`TimeOnly`) and N5 (`DateTimeOffset`) stand as designed. What it is at the surface is
+[datetime.md § `DateOnly`](docs/reference/datetime.md#dateonly) — the day number since
+`0001-01-01`, C#'s own `int` representation, one `type_new("DateOnly", 4, 4, TK_SINT)`,
+sixteen member rows, six operator rows and the `tk_do_*` half of `lib/time.tk`, which
+CALLS `DateTime`'s calendar rather than copying it: `new DateOnly(2024, 2, 30)` panics
+inside the very `tk_dt_days_from_ymd` the date constructor uses, and `AddMonths` clamps
+through the very `tk_dt_add_months` that makes `2024-01-31` plus one month `2024-02-29`.
+
+**Four bytes is the whole of what this crumb cost the mechanism.** Every primitive with
+members was eight bytes until now, which made the compiler's own two casts
+(`tk_prim_raw`'s `(i64) d`, `tk_prim_ret`'s `(DateOnly) r`) no instruction at all. Over
+four they are a sign extension in and a narrowing store out — the pair an `enum : i32`
+(`DateTimeKind`) already takes through every slot a value has (D38) — and no line of any
+machine changed. What DID have to change is the record that tells such a cast from one a
+source wrote: it is a list of node indices, and a node replaced **in place**
+(`node_assign`) keeps the placeholder's index, so the record has to be handed over.
+`tk_pend_do` (teko_typeof.tk) and `tk_ops_replace` (teko_ops.tk) did that already because
+a lowering's own result travelled through them; with every indirect load of a narrow
+primitive now being a cast too (`tk_ld`, `tk_arr_load`, `tk_callp_ret`), **five more doors
+were dropping it** and refusing a cast the compiler had just written itself:
+`tk_node_replace` (teko_this.tk — every implicit-`this` rewrite, so `d.DayNumber` on a
+field inside a method), `tk_ref_replace` (teko_ref.tk — a `ref`/`out` pointee read), the
+fixed-global and `T[]`-global element reads (teko_array.tk) and `tk_deleg_call`
+(teko_deleg.tk — a delegate whose return type is narrow declares it with a cast). Each
+carries `tk_prim_own_cast_moved` now, and the rule is written where the list is defined:
+every in-place replacement of a VALUE node hands the record over. This is the crumb's own
+gap, found by its own fixture, fixed here and not deferred.
+
+**The cast refusal gained a column.** It was generated from the type name with `.Ticks`
+written into it, which over a `DateOnly` would have named a member the type does not have.
+The reader is now a per-primitive column of `tk_prim_type` (`` `.Ticks` ``,
+`` `.DayNumber` ``) and the builder stays the generated `new X(...)`, which `DateOnly` has:
+``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
+That amends the spec's § 2 line, which had named `DateOnly.FromDayNumber(n)` as the
+builder; both build one, and the shorter diff keeps one generated sentence.
+
+**Three amendments to the spec as written**, each marked on that page: `DateOnly`
+registers **no arithmetic operator at all** (C# declares none — `d + t` and `d - d` are
+``teko: no operator `+` takes these operands`` and `d1.DayNumber - d2.DayNumber` is the
+form); its six comparisons and `CompareTo`/`Equals` lower to `tk_ts_eq` … `tk_ts_ge` and
+`tk_ts_cmp` rather than to a `tk_do_*` family, because a day number is an ordinary
+non-negative `i64` and six wrappers that forward and nothing else are code not written;
+and `ToString`/`Parse`/`TryParse` and `.ToDateTime(TimeOnly)` are **out of N4a** — no
+`teko_prim.tk` primitive has a `str` member yet (`DateTime` has none either) and the
+fourth needs a type N4b registers. All four are rows in
+[not-yet.md](docs/reference/not-yet.md).
+
+`TK_MAXPRIMM` 96 → 160 and `TK_MAXPRIMO` 32 → 48, raised here rather than in N4b, which
+would have overflowed both. The tables stand at **3 primitives, 82 member rows, 28
+operator rows, 51 parameter positions** and one late type name.
+
+**Proof** (macOS/aarch64, mc 0.15.23, on `84c63025`):
+- `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **66 passed, 20 refused as
+  expected, 0 failed** (64/15 before): `tests/surface_dateonly.tk` at 42 — which walks a
+  `DateOnly` through a local, a parameter, a return, a field, a global, a fixed-array
+  element, a `T[]` element, a `ref`/`out` pointee and a closure capture, with the largest
+  day number there is, because that set is what proves the four-byte width —
+  `tests/surface_dateonly_panic.tk` at 70, and `tests/refuse/dateonly_{from_int,to_i64,
+  to_datetime,cast,plus_datetime}.tk`.
+- `--dump-ast` of all **64** pre-existing `tests/*.tk`, this head against `84c63025`'s
+  compiler over this tree: **byte-identical, 64 of 64** (and the same, 63 of 63, for the
+  first commit alone against `704d6497`, the base this crumb started from). Nine of them
+  include `lib/time.tk` (`surface_datetime`, `surface_datetime_kind`, the two `*_panic`,
+  `surface_timespan`, `surface_timespan_overflow`, `surface_nullable_value`,
+  `surface_nullable_ops`, `surface_overload_ops`); dumped with ONE compiler over the two
+  TREES, each differs by **+137 lines, −0** — the `tk_do_*` functions the library gained
+  and nothing else.
+- `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`.
+- `mc limits`, verdict `ok` on both legs, peak columns: the `tests/hello.tk` floor
+  `passes` 15, `intrin` 8 and `syntax` 15 **unmoved**, `types` 11 → **12** and `alias`
+  18 → **19** (each `type_new` takes an alias row too, as `TimeSpan` and `DateTime` each
+  did); the `tests/surface_datetime.tk` leg `passes` 15 and `intrin` 8 **unmoved**,
+  `types` 15 → **16**, `syntax` 16 → **17**, `alias` 22 → **23**.
+- `sh scripts/check-docs.sh` → `docs ok: 583 links, 388 diagnostics, 20 refusals, 136
+  samples` (136 blocks: 76 run, 60 no-run) — no new `teko: …` literal, the cast one
+  changed shape and is documented.
+- `mc pkg hash .` → `3029e8b4104c120188f50036c5cad6fa7efb202f25afb54e0073fb2c7155c69c`.
+
+**Left open, found here and not touched.** Two, both pre-existing and neither `DateOnly`'s:
+a `.` on the RESULT OF A CALL whose type is a primitive is not resolved —
+`f().DayNumber` on a delegate, and `f().Day` on a `DateTime` measured the same way, reach
+`teko: unknown member: DayNumber`, and a local in between is the spelling that works; and
+`class TimeSpan { }` compiles silently, because a primitive's type word is not protected
+against a declaration that shadows it.
 ### D55 · A store into a COUNTED global slot goes through `rt_store` (G-c, 2026-09-14)
 D53 left one half of `tk_rc_assign` (teko_rc.tk) still shut: the CHECK reached a global,
 the RC LOWERING did not. `Cell gc; void fill(){ Cell c = new Cell(42); gc = c; }
