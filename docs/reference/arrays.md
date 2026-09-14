@@ -272,8 +272,9 @@ i64 main() {
 ### A global `T[]`
 
 `i64[] g;` at top level declares the reference with no length; `g = new i64[n];` fills it
-later, and `g[i]`, the compound forms and `g.Length` all answer. A global is a **root**: it
-is never released, so `rt_live()` never returns to its floor once one has been filled
+later, and `g[i]`, the compound forms and `g.Length` all answer. Overwriting it (`g = new i64[m];`)
+releases the array it held; the array it holds at the end of the run is never released -- the
+slot is a **root** -- so `rt_live()` never returns to its floor once one has been filled
 ([memory.md](memory.md)).
 
 ---

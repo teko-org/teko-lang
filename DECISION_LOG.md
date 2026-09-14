@@ -4757,8 +4757,10 @@ slot already had -- it releases its OLD value when it is overwritten
 wrote for the defect is deleted, and D53's own OPEN paragraph carries a pointer to this
 entry. No refusal is added or moved, so `docs/reference/diagnostics.md` is untouched.
 
-**BLAST RADIUS, measured, not assumed.** Of the 86 `--dump-ast` outputs of the tree's
-fixtures (65 `tests/*.tk` and 21 `tests/refuse/*.tk`), **81 are byte-identical** to the
+**BLAST RADIUS, measured, not assumed.** Of the 86 `--dump-ast` outputs of the PRE-EXISTING
+fixtures (the base's 65 `tests/*.tk` and 21 `tests/refuse/*.tk`; the new
+`tests/surface_globals_rc.tk`, whose every section stores into a counted global, has no base
+dump to compare against and is left out of this count), **81 are byte-identical** to the
 base compiler's. The five that move hold **27 stores into a counted global** between them,
 and the diff is exactly those 27 statements, each `ASSIGN name=<g>` becoming
 `EXPRSTMT · CALL rt_store[_own] · ADDR <g>` with its value subtree unchanged: with the
