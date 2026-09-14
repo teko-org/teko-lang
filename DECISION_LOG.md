@@ -5695,4 +5695,7 @@ tests/hello.tk` byte-identical to the base compiler's own output -- `passes` 15,
 15, `alias` 20, `types` 13, `intrin` 8, no registration of any kind added -- and `mc
 limits . --config mc.macos.toml` `ok` on both legs with only the size-of-surface-code rows
 moving (`nodes` 179091 → 179246, `ins` 215968 → 215980, and `funcs`/`symbols` DOWN by two,
-the deleted helper).
+the deleted helper); `mc pkg hash .`
+`c71e2f944b688166f76bad309b374fa2ab32add347cec1d0c92666258451c8af` (base
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: three hook modules and
+two fixtures are listed files, so the hash moves by design).
