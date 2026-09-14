@@ -927,6 +927,50 @@ refusal, at the branch that wrote it. It was refused before too, but by the lowe
 pass later — *teko: the two arms of ?: have different types*, which named the shape of the
 ternary and not the cause.
 
+A FIELD of delegate type takes a bare function name the same way, and by the same judge
+(D62). `Op cb = add;` on a local wraps the function, and `h.cb = add;` on the field beside
+it answered *teko: the type of this value is not known here* — a free function's name is in
+no slot table, so the oracle every field store reads types it -1 and the general judge
+refused what no one could name. The name is handed to the delegate's own validator instead,
+at the ONE door every field store passes through (`tk_field_store_val`,
+[teko_typeof.tk](../../teko_typeof.tk)), and judged in `tk_deleg_pass` where names have
+types. The detection sits at the door, so every caller of the door gets the same verdict —
+these are all of them:
+
+| the store | the caller of the door |
+|---|---|
+| `h.cb = add;` and `this.cb = add;` | `tk_field_use`, [teko_expr.tk](../../teko_expr.tk) |
+| the implicit `cb = add;` of a method or constructor | `tk_this_assign`, [teko_this.tk](../../teko_this.tk) |
+| `H.scb = add;` on a STATIC field | `tk_static_use`, [teko_access.tk](../../teko_access.tk) |
+| the same, on a type declared BELOW the store | `tk_fwd_resolve_static_one`, [teko_access.tk](../../teko_access.tk) |
+| `h.cbs[0] = add;`, an element of an ARRAY FIELD | `tk_array_index`, [teko_struct.tk](../../teko_struct.tk) |
+| `h.cb = add;` through a receiver typed at pass time (a parameter of a class declared below) | `tk_pend_field`, [teko_typeof.tk](../../teko_typeof.tk) |
+| `a[i] = e` on a FIXED array | `tk_arr_elem_store`, [teko_array.tk](../../teko_array.tk) — no element of delegate type reaches it: ``teko: an array of this type is not taught yet`` refuses the declaration |
+| `xs[i] = e` on a `T[]` | `tk_ha_store`, [teko_heaparr.tk](../../teko_heaparr.tk) — a bare name there never reaches the door at all: the element road's own validator judges it (D51) |
+
+All six that can carry one are exercised by `tests/surface_delegate.tk`. A
+signature that is not the delegate's is refused in the delegate's own words, the same
+sentence the local slot gives:
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+i64 wrong(i64 a, i64 b) { return a + b; }
+class H { public Op cb; }
+i64 main() {
+    H h = new H;
+    h.cb = wrong;                   // teko: wrong does not match the delegate Op(i64)
+    return 0;
+}
+```
+
+A PARAMETER of delegate type stored into a field is the name that proves the judge is the
+walk's and not the door's: `void setcb(H h, Op p) { h.cb = p; }` stores the parameter, never
+a wrap of a free function `p` declared elsewhere in the unit. And a name of a type that is
+neither is refused in those same words — `i64 g_n; h.cb = g_n;` now reads *teko: Op takes a
+function, another Op, or null*, the delegate's own sentence, where the general conversion
+words (*a value of type i64 does not convert to Op*) used to answer for it.
+
 ## Arrays
 
 - ``"teko: `new T[]` needs a length; write `new T[n]`"`` — the length is an expression, and
@@ -1211,13 +1255,13 @@ the scope open at the site nor the table of globals holds a row for.
 A call through a DELEGATE is judged by the same rule, from the delegate's own signature.
 That call is a `callp`, built after the `ref` pass and naming no callee, so nothing
 downstream ever reads its arguments: the delegate's own argument check
-(`tk_deleg_check_arg_kinds`, [teko_deleg.tk](../../teko_deleg.tk)) is the only door, and it
-compared the `ref`/`out` TAG alone — an `i64`'s address reached a callee that writes a
-double through it, and the integer came back holding that double's bits (D51, twelfth
-pass). A delegate LOCAL, PARAMETER or GLOBAL called by name is judged whole; the two roads
-whose `callp` is built while the file is still being parsed, a delegate FIELD and an `Op[]`
-ELEMENT, stand where neither the scope nor the table of globals is filled, so the pointee
-there is a name no oracle holds a row for and the check stays silent on it:
+(`tk_deleg_check_arg_kinds`, [teko_deleg.tk](../../teko_deleg.tk)) is the only door — and
+it is the door for all three roads alike, a delegate LOCAL, PARAMETER or GLOBAL called by
+name, a delegate FIELD, and an `Op[]` ELEMENT. An argument whose type that door cannot read
+where it stands is deferred to the same point a virtual call's is, so the pointee is judged
+on every road (D59; before it, the two roads whose `callp` is built while the file is still
+being parsed read no pointee at all and an `i64`'s address reached a callee that writes a
+double through it):
 
 ```teko
 // no-run
@@ -1230,6 +1274,13 @@ i64 main() {
     return 0;
 }
 ```
+
+The argument passed BY VALUE takes the same judgement at that same door, and the same
+conversion: `delegate i64 Op(i64); Op f = twice; f64 lf = 8.5; f(lf);` is refused
+`teko: a value of type f64 does not convert to i64`, exactly as `twice(lf)` is, and
+`delegate f64 F(f64); F f = half; f(5);` widens the 5 the way `half(5)` does (D59 — before
+it the door read the `ref`/`out` kind and nothing else, so the value crossed as its own raw
+bits on all three roads).
 
 A VIRTUAL call, an INTERFACE call and the UNQUALIFIED form of either inside a method are
 `callp`s too, and their arguments take the judgement a direct call's take — by type
@@ -1271,14 +1322,21 @@ An interface call refuses each of the three in the same words. A name that reach
 judge with no type at all is `"teko: the type of this argument is not known here"`, the
 sentence a primitive row's deferred argument already gets.
 
+An argument that is a COMPOSITE EXPRESSION — a binary, a ternary, a negation — is judged
+and widened exactly like a bare name, on all four roads: `b.takef(1 + 2)` on an `f64`
+parameter gets C# §10.2.3's widening, and `b.takei(lf * 2.0)` is refused *teko: a value of
+type f64 does not convert to i64*, in the direct call's own words
+(`tests/refuse/vcall_arg_expr_narrow.tk`, `deleg_arg_expr_narrow.tk`).
+
 Two things are skipped in silence here, and on the direct road for the same reason. The
 first is a `ref`/`out` argument whose POINTEE is named by neither the lexical scope nor the
 table of globals: the address was built by the source, its target has no declared type, and
 there is nothing to compare it against — every road reads that one rule
-(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument that is not a
-bare name and not a call to an overloaded one — a local array's element, an indirect
-`callp`, an address written out by hand: no later pass knows more about it than the call
-site did, so it is left alone rather than refused.
+(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument no reader teko
+has can type even at the last pass — a `.` on a receiver no pass resolved, an indirect
+`callp` — where refusing would refuse code with nothing wrong with it. That second case was
+a wider hole until D59's second pass: it read "not a bare name and not a call to an
+overloaded one", which covered every composite expression and let each one cross unjudged.
 
 The `ref`/`out` TAG itself is not skipped on any road. It is compared with the parameter's
 own kind before anything else, in the direct call's own words — *teko: argument 2 is not
