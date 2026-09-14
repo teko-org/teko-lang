@@ -754,6 +754,35 @@ i64 main() {
 element declared `Op?` (the array's own rule, above), and `Op? h = null;` still passes; the
 fix is the ONE predicate, `tk_is_null_lit`, asked in both places instead of the value alone.
 
+…and *which slot a `null` may land in* is a question the delegate's own validator has to ask
+itself, not one it may leave to the check beside it (D51, tenth pass). A store into an
+element of an `Op[]` that waits for the walk is coerced by `tk_deleg_coerce`
+([teko_deleg.tk](../../teko_deleg.tk)) and by nothing else — `tk_check_field_store`, which
+carries rule 1 for every element store decided at its own site, is skipped for a value that
+site cannot type (seventh pass, above) — and that validator returned every `null` unjudged.
+A ternary is taken apart branch by branch, so an all-`null` one had no check at all in front
+of it: both branches came back unchanged, the lowering saw two arms of the same `uptr` type,
+and the element held a null until the first call through it paniced, *teko: call through a
+null delegate*, exit 70. The rule is the one every other slot reads, in the same words: a
+`null` branch at an `Op[]` element is a refusal, and an `Op?[]` is the array that takes one
+(its element type answers `tk_deleg_row` with -1 and never reaches this validator at all):
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+i64 main() {
+    i64 flag = 1;
+    Op[] ops = new Op[1];
+    ops[0] = flag == 1 ? null : null;   // teko: null needs a slot declared Op?
+    return ops[0](1);
+}
+```
+
+One `null` branch beside a real one (`ops[0] = flag == 1 ? addOne : null;`) is the same
+refusal, at the branch that wrote it. It was refused before too, but by the lowering and one
+pass later — *teko: the two arms of ?: have different types*, which named the shape of the
+ternary and not the cause.
+
 ## Arrays
 
 - ``"teko: `new T[]` needs a length; write `new T[n]`"`` — the length is an expression, and

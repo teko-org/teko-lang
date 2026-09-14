@@ -3396,3 +3396,105 @@ limits --config mc.macos.toml` verdict `ok` on both legs -- compiler leg `nodes`
 unchanged, floor leg (`tests/hello.tk`) `passes` 15/30, `syntax` 15, `alias` 18, `types` 11,
 `intrin` 8/16, heap 1114992, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias`
 21, `types` 14, heap 3875392 (against a 33554432-byte reservation).
+
+**Copilot finding, tenth pass: one name, two oracles -- the check read the block and the
+rewrite read the signature.** `tk_ref_pass` (teko_ref.tk) does two things to a `ref x` at a
+call: it CHECKS the pointee against the parameter it is handed to (`tk_ref_arg_pointee`,
+which D51's verifier finding moved onto the lexical scope this walk keeps) and, when `x` is
+itself a `ref`/`out` PARAMETER of the function being walked, it REWRITES `&x` into `x` --
+the repass, because the parameter's value already IS the caller's slot address. The rewrite
+asked `tk_ref_param_named`, a scan of the signature's parameter list with no position in it
+at all, so a local shadowing the parameter was invisible to it:
+
+```teko
+void bumpf(ref f64 v) { v = v + 1.0; }
+i64 f(ref i64 x) {
+    if (x > 0) {
+        f64 x = 2.0;
+        bumpf(ref x);        // checked as `ref f64` -- and rewritten as the OUTER `ref i64`
+    }
+}
+```
+
+The check accepts it, correctly: `x` there is the block's own `f64`. The rewrite then hands
+`bumpf` the address the CALLER passed in, so `v = v + 1.0` writes a float over the caller's
+`i64` variable and the local stays at 2.0 -- silent memory corruption from a program with no
+error in it. Measured on `5b14e695`, mc **0.15.23**, macos/aarch64:
+
+| probe | `5b14e695` | with this fix |
+|---|---|---|
+| `p10_shadow`: the shape above, caller's `i64 a = 7` read back after the call | exit **20** -- `a` holds 3.0's bit pattern, and the local was never bumped | exit 0 -- local 3.0, `a` still 7 |
+| `p10_shadow_closed`: the same, then `bumpi(ref x)`, `x = x + 10` and `x != 18` AFTER the block | exit 20 (same corruption) | exit 0 -- the repass, the write and the read through the parameter all stand |
+| `tests/surface_globals.tk` with section 6b added | exit **131** (`refshadow` returns 1: the local was not bumped) | exit 42 |
+
+**The fix is the binding, asked once.** `tk_ref_fn` already opens the oracle's scope with
+the parameters and keeps it block by block; `tk_ref_nparams` records the mark right after
+`tk_ty_scope_params`, and `tk_ref_param_named` now answers the parameter only while
+`tk_ty_scope_index(name)` -- the innermost entry binding that name, a new two-line accessor
+beside `tk_ty_scope_find`, which is rewritten to call it -- is still below that mark. Above
+it a local declared inside the body owns the name, and the name is not a repass: the `&x`
+the parser built stands, which is exactly the local's address. The same guard covers the
+other two rewrites this walk makes on a bare name (`x = e` into `stW(x, e)`, and a read into
+`ldW(x)`), which had the identical blindness and no reported case only because a shadow of
+a `ref` parameter is rare. One question, one answer, the same one the check reads.
+
+**Copilot finding, tenth pass (suppressed): the store validator returned every `null`
+unjudged, and the check that used to catch it is skipped for a waiting store.**
+`tk_deleg_coerce` (teko_deleg.tk) accepted `null` unconditionally, and a ternary is coerced
+branch by branch, so `ops[0] = flag ? null : null` on an `Op[]` came back untouched, the
+lowering saw two arms of the same `uptr` type, and the element held a null -- `teko: call
+through a null delegate`, exit 70, at the first call through it. Q1a's rule (`null` lands
+only in a slot declared `T?`) reached an element store through `tk_check_field_store`
+(teko_struct.tk), and the seventh pass stopped running that check over a value the store
+site cannot type: a waiting store is `tk_deleg_late_do`'s alone, and that one calls this
+validator and nothing else. Instrumented builds of `5b14e695`, mc **0.15.23**:
+
+| store | trace | verdict |
+|---|---|---|
+| `ops[0] = flag == 1 ? null : null` | `PROBE store late=1` / `PROBE late_do i=0` / `PROBE coerce ternary` / `PROBE coerce null accepted` x2 -- no `PROBE field_store ran` | compiles, **exit 70** |
+| `ops[0] = null` (no ternary) | `PROBE store late=0` / `PROBE coerce null accepted` / `PROBE field_store ran` | refused, `teko: null needs a slot declared Op?` |
+
+The second row is also a correction to the ninth pass's own entry above, which said a
+`null` written into a non-nullable element "is refused one line later by `tk_deleg_coerce`":
+it is not, and never was -- the refusal came from `tk_check_field_store` beside it, which is
+precisely why the shape that skips that check had none.
+
+**The fix is Q1a's rule, asked by the validator itself**, in the same words the other two
+sites give it (`teko: null needs a slot declared Op?`): `si` is a DELEGATE row and a `T?` is
+a row of its own (`TK_KNULL`, which `tk_deleg_row` answers -1 for), so every `null` that
+reaches this validator is one written into a slot not declared to hold it. A compiler-written
+null (`tk_nl_own_null_is`, teko_null.tk) keeps the standing D41 gives it. Verdicts, same
+build pair:
+
+| probe | `5b14e695` | with this fix |
+|---|---|---|
+| `p10_tern_null`: `ops[0] = flag == 1 ? null : null` on an `Op[]` | compiles, **exit 70** | refuses, `teko: null needs a slot declared Op?` |
+| `p10_tern_mixed`: `ops[0] = flag == 1 ? addOne : null` | refuses one pass later, `teko: the two arms of ?: have different types` | refuses at the branch, `teko: null needs a slot declared Op?` |
+| `p10_bare_null`: `ops[0] = null` | refuses, `teko: null needs a slot declared Op?` | unchanged (the validator answers first now, in the same words) |
+| `p10_null_sites`: `Op h = null;`, `takeOp(null)`, `return null;` from an `Op` | refuses, `teko: null needs a slot declared Op?` | unchanged |
+| `p10_nl_array`: `Op?[] ops = new Op?[1]; ops[0] = null; ops[0] = c ? null : null;` | runs, 42 | runs, 42 -- the element type answers `tk_deleg_row` with -1 and never reaches the validator |
+
+The last row is the accepted side of the rule, and the array [arrays.md](docs/reference/arrays.md)
+now names: an `Op[]` element is declared `Op`, an `Op?[]` element is the slot a `null`
+belongs in. The refused shapes cannot be a fixture (a refusal has no exit code), so they are
+`// no-run` samples in [diagnostics.md](docs/reference/diagnostics.md), checked by
+`scripts/check-docs.sh` like every other one.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
+clean; **63/63** fixtures at their `expect-exit`, `tests/surface_globals.tk` (exit 42)
+gaining section 6b, `refshadowcheck` -- the first executable cover for a local shadowing a
+`ref` parameter, and 131 on `5b14e695`; the seven probes above, each run on both builds;
+the **76** probes of passes 1 to 9 re-run whole on both builds -- every verdict identical,
+line for line. `--dump-ast` of **62** of the 63 fixtures byte-identical to `5b14e695`, the
+63rd being `surface_globals.tk`, whose dump grows by exactly the 70 lines of the two new
+functions and loses none: inside the block `bumpf(ADDR name=x)` (the local's own address),
+after it `bumpi(IDENT name=x)`, `st64(x, ld64(x) + 10)` and `ld64(x)` -- the repass, the
+write and the read through the parameter, unmoved. `sh scripts/bootstrap.sh --os macos
+--arch aarch64` -> `FIXPOINT OK` (63/63 under `teko1`, 41.2s); `sh scripts/check-docs.sh`
+green (573 links, 385 diagnostics, 125 samples -- one no-run sample added); `mc limits
+--config mc.macos.toml` verdict `ok` on both legs -- compiler leg `nodes` 154421 -> 154484
+(+63, `tk_ty_scope_index`, the guard and their headers), `funcs` 3139 -> 3140 (+1,
+`tk_ty_scope_index`), `globals` 926 -> 927 (+1, `tk_ref_nparams`), floor leg
+(`tests/hello.tk`) unchanged at `nodes` 38, `funcs` 2, heap 1114992.
+`mc pkg hash .` at this pass's own code commit:
+`184b554c9ca066b0bf0d3997626e08387f10d40daeb5943a400341acd88b51a2`.

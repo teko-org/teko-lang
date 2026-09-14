@@ -233,7 +233,10 @@ receives a `ref u8`. A pointee narrower than a word (`u8`, `i32`) and a float po
 (`f64`) both work: the slot is a pointer and the value is read and written at its own width.
 A `ref`/`out` parameter is passed on to another `ref`/`out` parameter as many levels down as
 you like. When the pointee is a class, assigning through the reference releases what the
-caller's variable held.
+caller's variable held. A block may shadow the name, exactly as it shadows a by-value
+parameter ([control-flow.md](control-flow.md)): inside the block the name is the local, so
+`bumpf(ref x)` there passes the local's own address, and after the `}` the same `ref x` is
+the parameter being repassed again (D51, tenth pass).
 
 `ref`/`out` is valid **only** in parameter position, and a parameter with one takes no
 default.

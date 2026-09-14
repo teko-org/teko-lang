@@ -198,7 +198,11 @@ type — a local, a parameter or a global alike, in a local array and in a globa
 ternary whose branches are any of those. A name a PARAMETER of the enclosing function
 shadows is that parameter, never the free function of the same name (D51, sixth pass).
 A value of any other type is refused in the delegate's own words, *`Op` takes a function,
-another `Op`, or null*.
+another `Op`, or null*. `null` itself is not one of them here: an element of an
+`Op[]` is declared `Op`, so `ops[0] = null` — and any ternary branch writing one — is
+*teko: null needs a slot declared `Op?`*, the rule every slot of the language reads
+([diagnostics.md](diagnostics.md), [nullable.md](nullable.md)). Declare the array `Op?[]`
+and the same store is accepted.
 
 ### Elements of a counted type
 
