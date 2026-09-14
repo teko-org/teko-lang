@@ -699,10 +699,14 @@ a day number outside `0 .. 3652058` raises `a date is out of range`.
 - `"teko: unknown function"` — the name given to a delegate is no function.
 - `"teko: argument "` — completed by *N is not passed by reference* or by *N needs
   `ref`/`out`*: a delegate or a function declares that parameter by reference and the site
-  does not say so. The POINTEE is checked beside the kind, by the identity
+  does not say so, or it declares it by value and the site writes `ref`/`out` anyway. The
+  POINTEE is checked beside the kind, by the identity
   rule every `ref`/`out` argument takes (`ref i64` does not fit a `ref f64` slot), and a
   call through a delegate reads it from the delegate's own signature — the same wording a
-  direct call gives, *teko: a value of type i64 does not convert to f64*.
+  direct call gives, *teko: a value of type i64 does not convert to f64*. A VIRTUAL call, an
+  INTERFACE call and the unqualified form of either give the same two sentences, with N
+  counting the RECEIVER as argument 1 exactly as the mangled `Owner_method` a direct
+  method call lowers to does.
 - `"teko: wrong number of arguments for "` — completed by the name: the call's arity does
   not match.
 - `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
@@ -1213,9 +1217,26 @@ i64 main() {
 
 An interface call refuses each of the three in the same words. A name that reaches the
 judge with no type at all is `"teko: the type of this argument is not known here"`, the
-sentence a primitive row's deferred argument already gets; a `ref`/`out` pointee no scope
-and no table of globals holds a row for stays silently skipped, exactly as it does on the
-direct road.
+sentence a primitive row's deferred argument already gets.
+
+Two things are skipped in silence here, and on the direct road for the same reason. The
+first is a `ref`/`out` argument whose POINTEE is named by neither the lexical scope nor the
+table of globals: the address was built by the source, its target has no declared type, and
+there is nothing to compare it against — every road reads that one rule
+(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument that is not a
+bare name and not a call to an overloaded one — a local array's element, an indirect
+`callp`, an address written out by hand: no later pass knows more about it than the call
+site did, so it is left alone rather than refused.
+
+The `ref`/`out` TAG itself is not skipped on any road. It is compared with the parameter's
+own kind before anything else, in the direct call's own words — *teko: argument 2 is not
+passed by reference* for `b.takei(ref x)` on a by-value `i64`, *teko: argument 2 needs
+`ref` at the call site* for `b.bump(x)` on a `ref f64`.
+
+An argument that is a CALL to an OVERLOADED name is judged after the pick, never against
+the first declaration of that name: with `f64 pick(f64)` declared ahead of `i64 pick(i64)`,
+`b.takei(pick(2))` is accepted and `b.takef(pick(2))` gets the widening it is owed
+(`tests/vcall_overloaded_arg.tk`).
 
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps

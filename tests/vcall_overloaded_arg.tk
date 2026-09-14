@@ -1,0 +1,43 @@
+// vcall_overloaded_arg.tk -- an argument of an INDIRECT call that is a call to
+// an OVERLOADED name is judged and converted AFTER the pick, never against the
+// first declaration of the name (D57, Copilot's second pass).
+//
+// `tk_pty_of` (teko_struct.tk) types an `N_CALL` as `decl_ret(decl_find(name))`
+// and `decl_find` answers with the FIRST declaration in the unit, while which
+// overload a call site reaches is settled at pass 14. So with `f64 pick(f64)`
+// declared ahead of `i64 pick(i64)`, every line below was wrong on `d0fbe9a4`
+// in one of the two ways: `takef(pick(2))` saw an `f64` where the parameter
+// asks for one, wrote no widening at all and handed the raw integer 3 to a
+// float parameter (exit 40 against 30 on the measured probe), and
+// `takei(pick(2))` saw that same `f64` against an `i64` parameter and REFUSED
+// a legal program. The argument is parked instead and judged by `tk_ty_of`,
+// which reads the overload the pick committed to.
+//
+// expect-exit: 39
+#include "../lib/rt.tk"
+
+interface Sink {
+    i64 takef(f64 d);
+    i64 takei(i64 n);
+}
+
+class Box : Sink {
+    public i64 w;
+    public Box(i64 v) { w = v; }
+    public virtual i64 takef(f64 d) { if (d > 2.0) return 10; return 0; }
+    public virtual i64 takei(i64 n) { return n; }
+    public virtual i64 mine() { return takef(pick(2)) + takei(pick(2)); }
+}
+
+f64 pick(f64 d) { return d + 1.0; }
+i64 pick(i64 n) { return n + 1; }
+
+i64 main() {
+    Box b = new Box(1);
+    Sink s = new Box(2);
+    i64 r = b.takef(pick(2));        // vtable, the conversion the pick decides
+    r = r + b.takei(pick(2));        // vtable, the check the pick decides
+    r = r + s.takef(pick(2));        // itab, the same two
+    r = r + s.takei(pick(2));
+    return r + b.mine();             // the unqualified road, both again
+}

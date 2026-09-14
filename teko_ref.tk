@@ -476,6 +476,31 @@ void tk_ref_check_pointee(i64 pn, i64 a, i64 line, uptr fl) {
     tk_ref_check_pointee_ty(tk_param_ty(pn), a, line, fl);
 }
 
+// ONE argument's tag against ONE parameter's kind, in the words the direct
+// call has always refused the mismatch with. `i` is the argument's 0-based
+// position in the call's OWN list -- the receiver included on a method call,
+// so `b.m(ref x)` on a by-value first parameter says "argument 2" whichever
+// road carries it, the mangled `Owner_method` a non-virtual call lowers to
+// counting the receiver exactly the same way.
+//
+// The indirect roads had no way to state this rule before D57: a `callp`
+// names no symbol, so `tk_ref_check_call` below never reaches one and the tag
+// crossed unread. Measured on `d0fbe9a4` and on this branch alike:
+// `b.takei(ref x)` handed an ADDRESS to an `i64` parameter (exit 209, the low
+// byte of a stack address, where the direct twin refuses) and `b.bump(x)`
+// handed a VALUE to a `ref f64` parameter, whose `d = 2.0` then wrote through
+// it (SIGSEGV) -- on the vtable road, the itab road and the unqualified form
+// of either (Copilot on #707, second pass).
+void tk_ref_check_kind(i64 pk, i64 a, i64 i, i64 line, uptr fl) {
+    i64 ak = tk_rfarg_kind(a);
+    if (pk == ak) return;
+    if (pk == TK_RP_NONE)
+        err_at(fl, line, tk_join3("teko: argument ", tk_num(i + 1), " is not passed by reference"));
+    err_at(fl, line,
+           tk_join(tk_join3("teko: argument ", tk_num(i + 1), " needs `"),
+                   tk_join(tk_ref_kindname(pk), "` at the call site")));
+}
+
 // a call to a name declared exactly ONCE in the unit (teko_default.tk's own
 // decl-count guard: an overloaded name is left to teko_over.tk's own
 // kind-aware match, run over every declaration together) -- every argument
@@ -492,14 +517,7 @@ void tk_ref_check_call(i64 n) {
         if (a == 0) break;
         i64 pn = tk_decl_param_node(d, i);
         i64 pk = tk_rp_kind(pn);
-        i64 ak = tk_rfarg_kind(a);
-        if (pk != ak) {
-            if (pk == TK_RP_NONE)
-                err_at(nd_file(a), nd_line(a), tk_join3("teko: argument ", tk_num(i + 1), " is not passed by reference"));
-            err_at(nd_file(a), nd_line(a),
-                   tk_join(tk_join3("teko: argument ", tk_num(i + 1), " needs `"),
-                           tk_join(tk_ref_kindname(pk), "` at the call site")));
-        }
+        tk_ref_check_kind(pk, a, i, nd_line(a), nd_file(a));
         if (pk != TK_RP_NONE) tk_ref_check_pointee(pn, a, nd_line(a), nd_file(a));
         i = i + 1;
         a = nd_next(a);

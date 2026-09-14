@@ -959,19 +959,44 @@ i64  vca_line_at(i64 i) { return ld64(vca_line + i * 8); }
 uptr vca_file_at(i64 i) { return ld64(vca_file + i * 8); }
 i64  vca_done_at(i64 i) { return ld64(vca_done + i * 8); }
 
+// ...and the one shape the parse-time oracle answers WRONG rather than not at
+// all: a call to an OVERLOADED name. `tk_pty_of` reads `decl_ret(decl_find)`,
+// and `decl_find` (mc/src/parse.mc) answers with the FIRST declaration of the
+// name in the unit, while which one a call site reaches is settled by
+// `tk_ov_pick` at pass 14. The count is taken from that same first
+// declaration, because the core's own walk is over `unit_head` in declaration
+// order and a second declaration of the name is further along the same
+// `nd_next` chain -- teko_over.tk's `tk_ov_find` is the same question, and it
+// cannot be asked here: its table is built at pass 6 and this door runs while
+// the parser is still reading the body.
+i64 tk_vca_ov_call(i64 a) {
+    if (nd_kind(a) != N_CALL) return 0;
+    uptr name = nd_name(a);
+    i64 d = decl_find(name);
+    if (d < 0) return 0;
+    i64 n = nd_next(d);
+    loop {
+        if (n == 0) break;
+        if (decl_valid(n) && str_eq(nd_name(n), name)) return 1;
+        n = nd_next(n);
+    }
+    return 0;
+}
+
 // Called from both doors with the argument the parse-time oracle answered -1
 // for, and it decides for itself whether the argument is one this table can
 // answer LATER. A `ref`/`out` one always is (the pointee is a name, or it is
-// nothing anywhere). A by-value one is parked only when it is a bare NAME:
-// that is the whole of what a later pass adds -- the scope, the global table,
-// the load an unqualified field name becomes -- and everything else the parser
+// nothing anywhere). A by-value one is parked only when it is a bare NAME or
+// a call to an overloaded one: that is the whole of what a later pass adds --
+// the scope, the global table, the load an unqualified field name becomes, the
+// overload pick -- and everything else the parser
 // could not type (a local array's element, an indirect `callp`, an address the
 // source built by hand) is no better known at pass 14 than it is here, so
 // parking it would only move today's silence into a refusal of code that has
 // nothing wrong with it.
 void tk_vca_defer(i64 pt, i64 a, i64 line, uptr fl) {
     i64 isref = tk_rfarg_kind(a) != TK_RP_NONE;
-    if (!isref && nd_kind(a) != N_IDENT) return;
+    if (!isref && nd_kind(a) != N_IDENT && !tk_vca_ov_call(a)) return;
     if (tk_nvca == TK_MAXVCA) err_at(fl, line, "teko: too many deferred call arguments");
     st64(vca_node + tk_nvca * 8, a);
     st64(vca_ty + tk_nvca * 8, pt);
@@ -980,6 +1005,23 @@ void tk_vca_defer(i64 pt, i64 a, i64 line, uptr fl) {
     st64(vca_file + tk_nvca * 8, fl);
     st64(vca_done + tk_nvca * 8, 0);
     tk_nvca = tk_nvca + 1;
+}
+
+// The door's whole decision in one call: `at` is what the parse-time oracle
+// answered for the argument, and what comes back is what the door may JUDGE
+// and CONVERT by -- the same answer when it is trustworthy, and -1, the
+// "refuse nothing, convert nothing" both readers already understand, when the
+// argument was parked instead. An overloaded call is parked even though the
+// oracle gave a type, because that type is the first declaration's and not the
+// picked one's: judging by it refuses legal code (`b.takei(pick(2))` with
+// `f64 pick(f64)` declared ahead of `i64 pick(i64)`) and converting by it
+// writes the wrong node or none at all (the mirror pair let the raw integer 3
+// cross into an `f64` parameter -- measured, exit 40 where the direct call
+// reads 30; Copilot on #707, second pass).
+i64 tk_vca_park(i64 pt, i64 a, i64 at, i64 line, uptr fl) {
+    if (at >= 0 && !tk_vca_ov_call(a)) return at;
+    tk_vca_defer(pt, a, line, fl);
+    return 0 - 1;
 }
 
 // Two rules, and neither is this crumb's invention -- each is the one the
