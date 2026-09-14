@@ -2846,6 +2846,14 @@ independent run over a used `build/` reads 721776 on both sides), which is the t
 raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits:
 `3b494b9d138ad4420f8492f43802cdf7ffaf0cde03b36b9a6df9c8b0a12ab015`.
 
+**What the element's own type bought for free.** With every array element load carrying
+its type (`tk_ha_load`, `tk_arr_index_of`, `tk_array_index`, the fixed-global rewrite), the
+oracle now types an array element as an OPERAND too: `xs[0] + xs[1]` over a `TimeSpan[]`
+(and over a fixed `TimeSpan fx[2]`) lowers through the row's own `tk_ts_add`, overflow check
+included, where it used to fall to the core's raw `+` — measured on this head, exit 42, five
+`tk_ts_add` calls in the dump of a probe mixing heap and fixed elements with a local. The
+`not-yet.md` row that documented the gap ("an array element as an operand") is removed.
+
 A throwaway instrumentation after the judgement — every row of the deferral table asserted
 `done` — proved that no deferred store survives it, over the 63 fixtures and the whole
 bootstrap; re-run on every later pass, where a row the judge cannot type is a refusal rather

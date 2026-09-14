@@ -207,7 +207,6 @@ not:
 | `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
 | `+t` (C#'s unary plus) | ``teko: no operator `+` takes these operands`` — the unary minus is taught, its C# twin is not |
 | `new TimeSpan(h, m, s)` and the two longer constructors | `teko: wrong number of arguments for new` — one row, one argument: the tick constructor. Build it from `FromHours(h) + FromMinutes(m) + FromSeconds(s)` |
-| an **array element** as an operand | the oracle answers "not known" for an array element ([types.md](types.md)). With a typed operand on the other side (`xs[i] + t`) the operator table claims the node and refuses it, ``teko: the type of the left side of `+` is not known here`` (or `right`); with an array element on BOTH sides (`xs[i] + xs[j]`) nothing claims it and the core's own `+` runs on the two raw values — for a `TimeSpan` the value is right and only the OVERFLOW CHECK is skipped, and for a `DateTime` it is wrong outright, `Kind` bits included. Bind the elements to locals first |
 | `switch` on a `TimeSpan` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a `TimeSpan` takes no integer operand |
 
 ## Dependency injection
