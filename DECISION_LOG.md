@@ -4612,6 +4612,18 @@ restored, `docs ok: 569 links, 387 diagnostics, 15 refusals, 122 samples`.
 
 ---
 
+**The fragment check, one step later still.** The site's own `mcsite --check` refused two
+pull requests in a row on something `scripts/check-docs.sh` had passed: a relative link
+leaving `docs/` (#700) and a `#slug` whose heading had been renamed (#703,
+`docs/reference/diagnostics.md:303` pointing at `#primitives-with-members-timespan-datetime`
+after the heading gained `DateOnly`). Step 1b now applies the generator's own rule to every
+`#slug` on a link, in-page or cross-page: a heading's id is its text lowercased, every run of
+characters outside `[a-z0-9_]` one dash, no dash at either end, and a repeated id numbered
+`-2`, `-3`, ... in page order (`u_slug` and `md_unique_id` in mc's `site/gen`). Drills: the
+#703 rename fails naming the page and the slug; a cross-page fragment with one letter added
+fails the same way; restored, `docs ok: 575 links, 26 fragments, 388 diagnostics, 21
+refusals, 133 samples`.
+
 ### D53 · A global SCALAR slot takes the same assignment corridor as a local (G-b, 2026-09-14)
 D48 gave a global a TYPE (`tk_ty_global`, teko_array.tk, over the slot table `tk_hg_collect`
 records) and D51 gave every by-name oracle a fallback into it. What neither gave it is the
@@ -4953,6 +4965,76 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 (base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
 
+### D56 · A STRUCT global is a class global (G-d, 2026-09-14)
+D5 already settled a struct value as a POINTER, eight bytes, so a struct global takes the
+door every other reference-typed global takes, three doors already cut: D48 gives it a ROW
+in the slot table, D53 runs its assignment through the same compat/widen corridor a local
+takes, and `tk_is_counted` (teko_struct.tk, D5) answers 0 for a struct row -- no vtable, no
+count -- so a struct global's own store never reaches `rt_store` at all, whether D55 (PR
+#704, in verification at this crumb's base and landed since) has landed or not: a struct is excluded
+from that corridor by TYPE, not by being a global. **Measured: G-d is zero compiler changes**
+-- one fixture, `tests/surface_globals_struct.tk`, ten shapes each proven green on the base
+(`e0129ba6`) before the file was written: built in a body (`new` at a struct global's own
+DECLARATION is refused by mc's own core, `global initializer must be constant` -- a `new` is
+a call, never a constant, so no `teko:` refusal of this crumb's own is possible or needed
+here); a field store and read; a whole-struct store aliasing a local (`gp = p; p.x = 42;`
+reads 42 through `gp`) -- the RECORDED semantics: **C# copies a struct on assignment; teko
+does not**, because a struct global (like a struct local) holds no sixteen-byte value to
+copy, only the pointer D5 already gave it, so `gp = p` is the exact alias a class global
+already licensed; a local built from the global (`Point q = gp;`) is the same alias; the
+global passed by value, by `ref` and by `out`; a method through the implicit `this`; a nested
+struct field two levels deep (`gl.a.x`); a struct global whose OWN field is counted (`struct
+S { Cell c; } S gs;`) survives two unrelated `Cell` allocations still reading its own value
+-- the field store is gated by the FIELD's type (`tk_os_mark`, teko_struct.tk), never by the
+struct's, so the reclaim serves it with no line of its own either; a `static` field of struct
+type; `Point? gp2;` at file scope (a struct is a REFERENCE, Q1a, so `T?` over it is a global
+like any other class nullable -- no box); a parameter shadowing the global's name. No refuse
+fixture: `tests/refuse/global_row_mismatch.tk` is a class-to-class mismatch (`Cell` into a
+`Box` slot), and it fixes the wording of the ROW case; the struct-to-struct form was measured
+to refuse with the identical message (`teko: a value of type Box does not convert to Point`,
+global and local alike) because `tk_check_compat` reads the row and judges a struct row the
+way it judges a class row -- so a struct-specific refuse fixture would prove nothing the
+class one does not, and none is added.
+
+**Docs.** `docs/reference/types.md` § struct: one paragraph beside the struct-vs-class
+boundary, naming the alias rule explicitly and the initializer refusal (build it in a body).
+`docs/reference/not-yet.md`: a row beside the definite-assignment table's existing "not
+judged at all" line, naming the segfault a reader hits reading a struct/class global's field
+before ever building it (a global slot is zero at load, so the read is a null-pointer deref,
+exit **139**/SIGSEGV) and pointing it at D42's ruling -- unguarded, the developer's error,
+not judged, the same ruling a local's own unguarded read already answers to. No
+`docs/reference/globals.md` exists to carry a row of its own (checked `docs/reference/
+README.md`'s own table; globals are folded into `arrays.md`, `types.md` and `memory.md`).
+
+**OPEN, found measuring this crumb, and NOT this crumb's:** the parse-time argument check at
+a VIRTUAL or an INTERFACE call skips every GLOBAL argument, silently, not merely unconverted.
+`tk_pty_of`'s `N_IDENT` arm (teko_struct.tk) answers only `tk_slv_find`, the parser's own
+stack of LOCALS -- a global holds no row there -- so `tk_vcall_args_check` (teko_expr.tk) and
+`tk_ifargs_check` (teko_iface.tk) judge nothing when a virtual/interface call argument is a
+bare global name. Measured: `class Point { public i64 x; } class Box { public i64 w; } class
+B { public virtual i64 take(Point p) { return p.x; } } Box gb; i64 main() { B b = new B(); gb
+= new Box(); gb.w = 7; return b.take(gb); }` compiles and exits **7**, `Box.w`'s bits read as
+`Point.x`; `class B { public virtual i64 take(i64 n) { return n; } } f64 gf = 1.5; i64
+main() { B b = new B(); return b.take(gf); }` compiles and exits **16**, the float bits read
+as an integer. The identical call with a LOCAL in place of the global is refused (measured:
+`teko: a value of type f64 does not convert to i64`). Not this crumb's: the fix is teaching
+`tk_pty_of` the global table, a change reached from every virtual and interface call site in
+the unit, not from a struct-only measurement. Recorded in `docs/reference/not-yet.md` §
+Numeric conversions, beside the row for the same check's other gap (a bare parameter name).
+
+**Proof** (mc 0.15.23, macos/aarch64, base `e0129ba6`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **66 passed, 21 refused as
+expected, 0 failed** (was 65/21: one fixture added, `tests/surface_globals_struct.tk`,
+exiting 42 on the first measurement -- no probe, no retry); no hook module touched by this
+crumb, so `./build/teko --dump-ast` is byte-identical to the base's for every pre-existing
+fixture BY CONSTRUCTION -- the strongest proof a G crumb has offered, since there is no diff
+to read at all; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh
+scripts/check-docs.sh` → `docs ok: 575 links, 388 diagnostics, 21 refusals, 133 samples`,
+unmoved; `mc limits . --config mc.macos.toml` verdict `ok`, `passes` 15/30, `types` 11,
+`intrin` 8/16, `alias` 18, `syntax` 15 -- every table exactly where D53 left them; `mc pkg
+hash .` `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`, UNMOVED against
+the base (no listed file changed -- `tests/` and `docs/` are not in `mc.toml`'s own list).
+
 ### D57 · The arguments of an INDIRECT call are judged like a direct call's (2026-09-14)
 An ordinary call names its callee, so the last pass of all looks the symbol up and judges
 every argument against the declaration (`tk_rc_call_args`, teko_rc.tk). A VIRTUAL call, an
@@ -5061,13 +5143,20 @@ code and its tables, `nodes` 155615 -> 155975, `globals` 935 -> 942, `ins` 21450
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: five listed `.tk`
 modules moved, so the hash moves by design).
 
-**A row of `not-yet.md` is CLOSED by this entry**, not merely amended: "an integer argument
-at a virtual or an interface call, written as a bare parameter name (`a.by(n)` inside
-`g(i64 n)`) -- not converted". Probed both ways: `s.by(n)` on a `virtual f64 by(f64)` and
-`k.take(n)` on an interface `f64 take(f64)`, with an `i64` parameter `n`, read the raw bits
-on the base and read 8.0 here. The `switch`-on-an-enum-parameter row that cited it as a
-sibling limitation is amended to say why it is NOT one: a `switch` subject's hidden local is
-DECLARED at parse time, so there is no later point at which its type could still be chosen.
+**TWO rows of `not-yet.md` are CLOSED by this entry**, not merely amended. The first, older
+one: "an integer argument at a virtual or an interface call, written as a bare parameter
+name (`a.by(n)` inside `g(i64 n)`) -- not converted". Probed both ways: `s.by(n)` on a
+`virtual f64 by(f64)` and `k.take(n)` on an interface `f64 take(f64)`, with an `i64`
+parameter `n`, read the raw bits on the base and read 8.0 here. The second is the row D56
+([#705](https://github.com/teko-org/teko-lang/pull/705)) wrote for this very gap while
+measuring a struct global -- "a virtual or an interface call argument written as a bare
+global name ... not judged AT ALL" -- whose own reproducer is
+`tests/refuse/vcall_global_arg.tk` here. This branch was rebased onto D56 and #706 at the
+end; the merge kept D56 ahead of this entry and removed both rows, since the conversion and
+the judgement they name are what the fixtures now lock. The `switch`-on-an-enum-parameter
+row that cited the first as a sibling limitation is amended to say why it is NOT one: a
+`switch` subject's hidden local is DECLARED at parse time, so there is no later point at
+which its type could still be chosen.
 
 **Left open, found here and NOT touched** -- a call through a DELEGATE slot does not judge a
 by-value argument. `tk_deleg_check_arg_kinds` (teko_deleg.tk) checks the `ref`/`out` KIND and,
