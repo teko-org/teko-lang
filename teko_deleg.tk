@@ -455,20 +455,6 @@ uptr tk_deleg_resolve_fn(uptr fname, i64 line, uptr fl) {
     return nd_name(d);
 }
 
-// the static type a slot of delegate type would read `e` as, peeking through
-// a CALL THROUGH a delegate-typed local before this pass's own walk gets to
-// rewrite it (the same `dg_ret_at` lookup `tk_deleg_call` makes once it does)
-// -- everything else is the general oracle's own answer (a local/param, a
-// field already resolved, a call to a plain function, or an already-wrapped
-// `new Op(...)`, xt-typed since the parser built it)
-i64 tk_deleg_expr_ty(i64 e) {
-    if (nd_kind(e) == N_CALL) {
-        i64 di = tk_deleg_row(tk_ty_scope_or_global(nd_name(e)));
-        if (di >= 0) return dg_ret_at(di);
-    }
-    return tk_ty_of(e);
-}
-
 // `teko: Op takes a function, another Op, or null`
 uptr tk_deleg_mismatch_msg(i64 si) {
     uptr nm = sr_name_at(si);
@@ -527,7 +513,7 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
     // still answers -1 here and is still wrapped.
     if (nd_kind(e) == N_IDENT && tk_ty_scope_or_global(nd_name(e)) < 0)
         return tk_deleg_wrap(si, tk_deleg_resolve_fn(nd_name(e), line, fl), line, fl);
-    if (tk_deleg_expr_ty(e) == sr_ty_at(si)) return e;
+    if (tk_ty_of(e) == sr_ty_at(si)) return e;
     err_at(fl, line, tk_deleg_mismatch_msg(si));
     return e;
 }
@@ -687,8 +673,8 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // nothing there names is the function to wrap.
 //
 // A CALL is the same dead end, for the same reason (D51, seventh pass). The
-// site asked `tk_deleg_expr_ty`, which reads the pass-time scope for a call
-// THROUGH a delegate slot -- empty here -- and then `tk_ty_of`, which asks
+// site asked `tk_ty_of`, whose own delegate arm (D61) reads the pass-time
+// scope for a call THROUGH a delegate slot -- empty here -- and then falls to
 // `decl_find` for the FIRST declaration of that name, with no scope and no
 // overload table in front of it. Both of its answers were wrong and in
 // opposite directions: a LOCAL delegate `chooser` shadowing a function
@@ -710,7 +696,7 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // validator still takes it APART where it is judged; it is the walk that
 // judges it now.
 //
-// Every OTHER shape asks `tk_deleg_expr_ty`, which is the oracle the
+// Every OTHER shape asks `tk_ty_of`, which is the oracle the
 // validator itself would ask one line later: an element read, a literal,
 // arithmetic -- what the node itself types, with no table in between. A
 // `new Op(...)` and a lambda are calls to their own allocator, so they wait
@@ -732,7 +718,7 @@ i64 tk_deleg_store_late(i64 si, i64 v) {
     if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
     if (nd_kind(v) == N_IDENT) return tk_ty_scope_or_global(nd_name(v)) < 0;
     if (nd_kind(v) == N_CALL) return 1;           // a CALL is the pass's own answer, never this site's
-    return tk_deleg_expr_ty(v) != sr_ty_at(si);
+    return tk_ty_of(v) != sr_ty_at(si);
 }
 
 void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
