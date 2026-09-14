@@ -5255,6 +5255,118 @@ verifier measured it moving while every counted row stood) and the compiler leg 
 `nodes` 155975 -> 156097, `ins` 215007 -> 215225, `funcs` 3173 -> 3176, `lowered` 3155 ->
 3158, `globals` **942 unmoved** (no table is added, the park test only widens);
 `mc pkg hash .` `ef81724394452c08172a4a47bfcf2cfd2c463bc6861bcf1c40496a4122831b51`.
+### D58 · `TimeOnly`, the fourth primitive that costs nothing new (2026-09-14)
+*D57 was already taken by a crumb in flight (`fix/vcall-args-judge`, PR #707, D57), the
+same reason D54 gives for its own number: assigned rather than taken in order.*
+
+`docs/specs/datetime-extras.md`'s N4b lands: `TimeOnly`, ticks since midnight,
+`0 .. 863999999999` (`TICKS_PER_DAY - 1`), C#'s own representation, eight bytes —
+`type_new("TimeOnly", 8, 8, TK_SINT)`, twenty member rows of its own, seven operator rows,
+and one MORE row on `DateOnly`'s own table, `.ToDateTime(TimeOnly)`, the member N4a left out
+because the argument's type did not exist yet. Registered in `tk_time_init`
+BETWEEN `tk_dt_operators()` and the `DateOnly` block, so both new columns —
+`TimeOnly.FromDateTime`'s own (naming `DateTime`) and `DateOnly.ToDateTime`'s own (naming
+`TimeOnly`) — read a LIVE id at registration time and neither table needs `tk_prim_late`.
+
+**Eight bytes, and half its rows call no new function at all.** Unlike `DateOnly` (D54),
+`TimeOnly` costs the mechanism nothing: no width, no new `TK_PM*` kind, no new door in the
+own-cast list, no pass.
+
+- `.Hour` `.Minute` `.Second` `.Millisecond` point straight at `DateTime`'s own `tk_dt_hour`
+  / `tk_dt_minute` / `tk_dt_second` / `tk_dt_ms`: masking `DATETIME_TICK_MASK` off a value
+  that never carried a `Kind` above it is a no-op (a `TimeOnly` needs under 40 bits, the mask
+  clears only the top two), so four functions that would repeat the same division and modulo
+  are code not written.
+- The six comparisons, `.CompareTo` and `.Equals` point at `TimeSpan`'s own `tk_ts_eq` …
+  `tk_ts_ge` / `tk_ts_cmp`, the exact reuse `DateOnly` made under D54: a tick count of a time
+  of day is an ordinary non-negative `i64` too.
+- `.Ticks` and `.ToTimeSpan()` are symbol-less identity rows (`tk_prim_emit`'s `sym == 0`
+  path, teko_prim.tk § "the emission"): the same eight bytes read back under the other type,
+  a cast and no call. `.Ticks` repeats `TimeSpan.Ticks`'s own precedent; `.ToTimeSpan()` is
+  the first time the trick is used on a METHOD (`TK_PMFUN`) rather than a property
+  (`TK_PMPROP`) — and needed no change, because nothing in `tk_prim_emit` special-cases the
+  row's `kind` except `TK_PMCTOR`, so the identity path was already general enough for a
+  zero-argument instance method with a receiver.
+
+**What IS new: the wrapping arithmetic, and one panic.** `.Add(TimeSpan)`, `.AddHours(f64)`
+and `.AddMinutes(f64)` never panic — C#'s own rule — wrapping at both ends of the day
+(`tk_to_add`, `lib/time.tk`: the `TimeSpan` operand is reduced mod `TICKS_PER_DAY` FIRST so
+the sum cannot overflow the `i64` itself, since a `TimeSpan` may carry ticks far outside one
+day). `.IsBetween(a, b)` is C#'s own rule too: `a` inclusive, `b` exclusive, and it WRAPS
+when `a` is after `b` (`22:00` to `02:00` covers midnight). The one operator, `t1 - t2`, is
+NEVER negative — the elapsed time from `t2` to `t1`, wrapping FORWARD across midnight when
+`t1` is earlier (`tk_to_sub`); `t + t` has no row and is refused by absence, and so does
+`t + TimeSpan`/`t - TimeSpan` — C# has no such operators either, `.Add` is the form. The one
+new panic, `teko: a time of day is out of range`, fires on `new TimeOnly(ticks)` and
+`TimeOnly.FromTimeSpan(ts)` alone: no existing wording in `lib/time.tk` reads honestly for
+an interval that starts at zero, unlike every other range that file already guards. The
+three calendar-free constructors (`new TimeOnly(h, mi)`, `(h, mi, s)`, `(h, mi, s, ms)`)
+reuse `tk_dt_time_ticks` and so reuse its four existing panics
+(`an hour`/`a minute`/`a second`/`a millisecond is out of range`) — the same function
+`new DateTime(y, m, d, h, mi, s)` panics on.
+
+**Seven amendments to the spec, recorded on that page and not repeated here:** the panic it
+named, `` `that time of day does not exist` ``, does not exist — the landed wordings are the
+five above; a `DateOnly` drift N4a itself left in that page (`` `that date does not exist` ``
+where D54 actually landed `` `a date does not exist` ``) is fixed now, since the page is open
+again; the fixtures landed under `tests/surface_timeonly*.tk`, not the `primitives_*.tk`
+names the page had used; `ToString`/`Parse`/`TryParse` are out of N4b, the same reason N4a's
+own amendment gives; the `(h, mi)` two-argument constructor, missing from the page's own
+table, is added to it; `TimeOnly.ToString()`'s own row is removed from that table for the
+same reason; and § 6's `types +3`/`syntax +3` are the PAGE's total across all three crumbs
+(N4a, N4b, N5), not one crumb's — N4b's own share is `+1`/`+1`, one `type_new` and one type
+word.
+
+**Docs.** `docs/reference/datetime.md` gains `## TimeOnly` (after `## DateOnly`) and its
+"Under the hood" closing note is updated for the fourth primitive and `DateOnly`'s own
+seventeenth row. `docs/reference/types.md` gets the matching short section.
+`docs/reference/diagnostics.md`: the "Primitives with members" heading gains a name, a
+`TimeOnly` example beside the generated cast refusal, a `### TimeOnly (N4b)` subsection
+mirroring `DateOnly`'s, and the panic-list paragraph corrected — `.ToDateTime(t)` is no
+longer "not yet". `docs/reference/runtime.md`: the `tk_to_*` signature table, the
+`DateOnly.ToDateTime` row, `TIMEONLY_MAX_TICKS`, and the panic table's fifteenth row.
+`docs/reference/not-yet.md`: `TimeOnly` and `.ToDateTime(t)` come out of the not-taught
+rows, and a `TimeOnly`-shaped `ToString`/`Parse` row goes in beside `DateOnly`'s.
+`docs/internals/primitives.md`: the ceilings recomputed and a new "What the fourth primitive
+cost: nothing" section. `docs/specs/README.md` row 9b marked landed.
+
+**Proof** (macOS/aarch64, mc 0.15.23, base `d0fbe9a4`):
+- `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **71 passed, 31 refused as
+  expected, 0 failed** (69/26 on the base): `tests/surface_timeonly.tk` at 42 (58 checks: all
+  four constructors, both ends of the range, both other builders agreeing, `.Add` wrapping
+  both ways, `.AddHours`/`.AddMinutes` wrapping, `.ToTimeSpan()`, `.IsBetween` ordinary and
+  wrapping with both inclusive/exclusive edges, the six comparisons plus `.CompareTo`/
+  `.Equals`, `t - t` ordinary and forward-wrapping, `DateOnly.ToDateTime(TimeOnly)`
+  round-tripped through both `FromDateTime`s and `.TimeOfDay`, the spec's own § 2 sample
+  lifted into a real `expect-exit` block, and the value through a local, a field, a global,
+  both shapes of array element and a closure capture — short, since eight bytes needs no
+  width proof) — `tests/surface_timeonly_panic.tk` at 70 (`new TimeOnly(864000000000)`, one
+  tick past the range, after a page of checks that must not fire: both calendar-free ends of
+  a day, the raw-ticks constructor and `FromTimeSpan` at the very top of the range, and
+  wrapping arithmetic that goes nowhere near it) — and `tests/refuse/timeonly_{from_int,
+  to_i64,to_datetime,cast,plus_timeonly}.tk`.
+- `--dump-ast`, `d0fbe9a4`'s own compiler run over both trees (one compiler, two trees —
+  D54's own form): the **57** pre-existing `tests/*.tk` that do not include `lib/time.tk`
+  are byte-identical, 57 of 57; the **12** that do (`surface_dateonly`,
+  `surface_dateonly_panic`, `surface_datetime`, `surface_datetime_kind`,
+  `surface_datetime_kind_panic`, `surface_datetime_panic`, `surface_globals_slot`,
+  `surface_nullable_ops`, `surface_nullable_value`, `surface_overload_ops`,
+  `surface_timespan`, `surface_timespan_overflow`) each differ by exactly **+140 lines, −0**,
+  one insertion point at the end of the dump — the `tk_to_*`/`tk_do_to_datetime` functions
+  `lib/time.tk` gained and nothing else; `d0fbe9a4`'s OLD compiler dumping `lib/time.tk`'s
+  new tail at all is itself a finding worth naming: none of the new functions names
+  `TimeOnly`, so an unmodified base compiler parses and dumps them with no error.
+- `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`.
+- `mc limits`, verdict `ok` on both legs: the `tests/hello.tk` floor `passes` 15/30,
+  `intrin` 8/16 and `syntax` 15/30 **unmoved**, `types` 12 → **13** and `alias` 19 → **20**
+  (the fourth `type_new`'s own alias row); the `tests/surface_dateonly.tk` leg — the SAME
+  source both before and after, only the compiler under it changed — `passes` and `intrin`
+  unmoved, `types` 18 → **19**, `syntax` 19 → **20**, `alias` 25 → **26**.
+- `sh scripts/check-docs.sh` → `docs ok: 593 links, 38 fragments, 388 diagnostics, 31
+  refusals, 140 samples` — one stale `#fragment` link fixed (the "Primitives with members"
+  heading's own slug shifted with the new name), one new `teko: …` literal
+  (`a time of day is out of range`), documented.
+- `mc pkg hash .` → `246d6defa97f3a76094ddf1469e8512c0a815d4d45269f3bb3565fc219c757d3`.
 ### D59 · A delegate call's arguments are judged and widened like a direct call's (2026-09-14)
 D57 taught the vtable road, the itab road and the unqualified form of either. The DELEGATE
 road was the fourth `callp` in the tree and it kept the whole gap: its own door

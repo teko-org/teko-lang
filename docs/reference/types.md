@@ -735,6 +735,35 @@ comparisons are all it carries.
 
 ---
 
+## `TimeOnly`
+
+A time of day with no date, behind the same include: the count of ticks since midnight,
+`0 .. 863999999999`, **eight bytes** — so, unlike `DateOnly`, every slot it travels needs
+none of the compiler's own sign-extend/narrow pair.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    TimeOnly t = new TimeOnly(13, 45, 30);
+    if (t.Hour != 13) return 1;
+    if (t.AddHours(11).Hour != 0) return 2;         // wraps at midnight, never panics
+    TimeSpan since = t - new TimeOnly(12, 45, 30);
+    if (since.TotalHours != 1.0) return 3;
+    return 42;
+}
+```
+
+C# declares **one** arithmetic operator, `t - t`, and teko's answer is never negative: it
+wraps forward across midnight when the left side is earlier. `t + t` is refused, and
+`.Add(ts)`/`.AddHours(f)`/`.AddMinutes(f)` are C#'s own wrapping form for advancing one.
+[datetime.md § `TimeOnly`](datetime.md#timeonly) is the whole type, including
+`DateOnly.ToDateTime(TimeOnly)`, the member N4a left out because this type did not exist
+yet.
+
+---
+
 ## Members
 
 The same member grammar serves a struct and a class.

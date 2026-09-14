@@ -328,9 +328,9 @@ It converts to nothing either, in either direction: `i64 n = d;`, `DateOnly e = 
 `DateTime x = d;` are each refused, and so is `(i64) d` —
 ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
 
-`.ToString()`, `DateOnly.Parse` and `.ToDateTime(TimeOnly)` are not taught yet
-([not-yet.md](not-yet.md)): the first two wait on the text crumb every primitive waits on,
-the third on `TimeOnly` itself.
+`.ToString()` and `DateOnly.Parse` are not taught yet ([not-yet.md](not-yet.md)): the text
+crumb every primitive waits on. `.ToDateTime(TimeOnly)` **is** — [`TimeOnly`](#timeonly)
+below — the one member N4a left out because the argument's type did not exist yet.
 
 **Four bytes, and that is the only thing that makes it different.** A `DateOnly` travels
 every slot a scalar travels — a local, a parameter, a return, a field, a global, an element
@@ -338,6 +338,61 @@ of a fixed array or of a `T[]`, a `ref`/`out` pointee, a closure's captured copy
 compiler's own two casts around each lowering are a sign extension in and a narrowing store
 out instead of nothing at all. `tests/surface_dateonly.tk` walks that whole set with the
 largest day number there is.
+
+## `TimeOnly`
+
+A **time of day with no date**, C#'s own: the count of ticks since midnight,
+`0 .. 863999999999` (one tick short of a full day), eight bytes and no `Kind` — a
+`TimeOnly` behaves under the compiler exactly like `TimeSpan` and `DateTime` do, so no slot
+it travels through needs the sign-extend/narrow pair `DateOnly`'s four bytes do.
+
+```teko
+// expect-exit: 42
+#include "time.tk"
+
+i64 main() {
+    TimeOnly t = new TimeOnly(13, 45, 30);
+    if (t.Hour != 13) return 1;
+    if (t.Ticks != 495300000000) return 2;
+    TimeSpan since = t - new TimeOnly(12, 45, 30);      // a TimeSpan, never negative
+    if (since.TotalHours != 1.0) return 3;
+    if (t.AddHours(11).Hour != 0) return 4;             // it wraps at midnight
+
+    DateOnly d = new DateOnly(2024, 2, 29);
+    DateTime dt = d.ToDateTime(t);
+    if (dt.Day != 29) return 5;
+    if (DateOnly.FromDateTime(dt) != d) return 6;
+    if (TimeOnly.FromDateTime(dt) != t) return 7;
+    return 42;
+}
+```
+
+| what | is |
+|---|---|
+| `new TimeOnly(h, mi)`, `(h, mi, s)`, `(h, mi, s, ms)` | the calendar-free constructors; an hour/minute/second/millisecond out of range panics where it is built |
+| `new TimeOnly(ticks)` | that many ticks since midnight, checked against the range |
+| `TimeOnly.MinValue`, `MaxValue` | `00:00:00` and `23:59:59.9999999`, ticks `0` and `863999999999` |
+| `TimeOnly.FromDateTime(d)` | the time-of-day half of a `DateTime`, `Kind` dropped |
+| `TimeOnly.FromTimeSpan(ts)` | a raw `TimeSpan`'s ticks, checked against the same range |
+| `.Hour` `.Minute` `.Second` `.Millisecond` | the components, `DateTime`'s own functions read directly |
+| `.Ticks` | the eight bytes themselves, as an `i64` |
+| `.Add(ts)` `.AddHours(f)` `.AddMinutes(f)` | C#'s **wrapping** family: past either end of the day, never a panic |
+| `.ToTimeSpan()` | the same ticks under `TimeSpan` |
+| `.IsBetween(a, b)` | `a` inclusive, `b` exclusive, and it **wraps** when `a` is after `b` (`22:00` to `02:00` covers midnight) |
+| `.CompareTo(u)` `.Equals(u)` | `-1`/`0`/`1`, and `0`/`1` |
+| `==` `!=` `<` `<=` `>` `>=` | the six comparisons, on the tick count |
+
+**One arithmetic operator, and it is never negative.** `t1 - t2` answers the elapsed
+`TimeSpan` from `t2` to `t1`, wrapping **forward** across midnight when `t1` is earlier than
+`t2` — C#'s own rule for two times of day with no date attached. `t + t` has no row and is
+refused, the same sentence `DateOnly`'s own arithmetic reaches:
+``teko: no operator `+` takes these operands``. It converts to nothing either, in either
+direction, exactly as `DateOnly` does not: `i64 n = t;`, `TimeOnly u = 5;` and
+`DateTime x = t;` are each refused, and so is `(i64) t` —
+``teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it``.
+
+`.ToString()`, `TimeOnly.Parse` and `TryParse` are not taught yet ([not-yet.md](not-yet.md)):
+the same text crumb `DateOnly` waits on.
 
 ## Under the hood
 
@@ -347,6 +402,9 @@ member lowers to — an ordinary call to an ordinary function of `lib/time.tk`, 
 eight bytes. There is no vtable, no run-time tag and no new compiler pass;
 [the internals note](../internals/primitives.md) is the whole mechanism, and
 [the spec](../specs/datetime.md) is where it was designed. `DateOnly` is the same
-mechanism one width down — `type_new("DateOnly", 4, 4, TK_SINT)`, sixteen rows and the
-`tk_do_*` half of `lib/time.tk` — designed in
+mechanism one width down — `type_new("DateOnly", 4, 4, TK_SINT)` and sixteen rows plus a
+seventeenth, `.ToDateTime(TimeOnly)`, added with N4b once the argument's type existed — and
+`TimeOnly` is the mechanism again at the ORIGINAL width — `type_new("TimeOnly", 8, 8,
+TK_SINT)`, twenty rows of its own and the `tk_to_*` half of `lib/time.tk`, registered
+BEFORE `DateOnly` so that seventeenth row's own column reads a live id. Both are designed in
 [datetime-extras.md](../specs/datetime-extras.md).

@@ -306,7 +306,7 @@ with that line in its stderr (D52).
 ### `ToString`, `Parse`, `TryParse`, `IsDefined` (N2b)
 
 Four names, dispatched by the enum's own row rather than by
-[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime-dateonly): registering
+[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime-dateonly-timeonly): registering
 an enum there would make `tk_ty_binary` ask a table its own bitwise/comparison operators
 never populate. The two globals a text-using enum needs (`Color__names`, `Color__vals`)
 are built lazily, the first time one of these four names is spelled on that enum — an enum
@@ -337,7 +337,7 @@ never panics. Both are runtime messages, from `lib/rt.tk`, not a compile-time `t
 refusal, so they carry no entry of their own in this list (D19 scans `teko*.tk`, the
 compiler's own sources, not the runtime library it teaches programs to link).
 
-## Primitives with members (`TimeSpan`, `DateTime`, `DateOnly`)
+## Primitives with members (`TimeSpan`, `DateTime`, `DateOnly`, `TimeOnly`)
 
 A primitive is a type of four or eight bytes with no row in the type table — no field, no vtable,
 no method — whose members come from a lowering table instead
@@ -398,6 +398,9 @@ messages reuse the wordings a declared type already gets; only a handful are its
   primitive's registration since D54 and not one word for every primitive: a `DateOnly` has
   no `.Ticks` at all, so it reads
   ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
+  A `TimeOnly` DOES have `.Ticks` — the same identity `TimeSpan` and `DateTime` read by — so
+  its own reads
+  ``teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it``.
 - `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
   `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
   to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
@@ -598,9 +601,9 @@ i64 main() {
 The `+` is refused because **the table registers no arithmetic row for a `DateOnly` at
 all** — C# declares none either — so `d + t` and `d + 1` reach that wording, `d - d`
 reaches ``teko: no operator `-` takes these operands``, and `d1.DayNumber -
-d2.DayNumber` is the form. `.ToString()`, `DateOnly.Parse` and
-`.ToDateTime(t)` reach `teko: unknown member of DateOnly` and its static twin
-([not-yet.md](not-yet.md)).
+d2.DayNumber` is the form. `.ToString()` and `DateOnly.Parse` reach
+`teko: unknown member of DateOnly` and its static twin ([not-yet.md](not-yet.md));
+`.ToDateTime(t)` is taught now — [`TimeOnly` (N4b)](#timeonly-n4b) below.
 
 The three panics `lib/time.tk` raises for a `TimeSpan` at RUN time (`a time span
 overflowed`, `a time span divided by zero`, `a time span is out of range`) and the eleven it
@@ -611,6 +614,43 @@ range`, `a month count is out of range`, `a year count is out of range`) are exi
 are listed in [runtime.md](runtime.md#the-time-library). A `DateOnly` adds no panic of its
 own: `new DateOnly(2024, 2, 30)` raises the `a date does not exist` of that same list, and
 a day number outside `0 .. 3652058` raises `a date is out of range`.
+
+### `TimeOnly` (N4b)
+
+`TimeOnly` is the same mechanism at the ORIGINAL width — eight bytes, the ticks since
+midnight — so every wording above is its own too, and each of the five has a fixture under
+`tests/refuse/` ([datetime.md § `TimeOnly`](datetime.md#timeonly)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 main() {
+    TimeOnly t = new TimeOnly(13, 45, 30);
+    TimeOnly u = new TimeOnly(1, 0, 0);
+
+    TimeOnly e = 5;          // teko: a value of type i64 does not convert to TimeOnly
+    i64 n = t;               // teko: a value of type TimeOnly does not convert to i64
+    DateTime x = t;          // teko: a value of type TimeOnly does not convert to DateTime
+    i64 c = (i64) t;         // teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it
+    TimeOnly y = t + u;      // teko: no operator `+` takes these operands
+    TimeOnly z = new TimeOnly(864000000000);   // teko: a time of day is out of range, exit 70
+    return 0;
+}
+```
+
+The `+` is refused the same way `DateOnly`'s is: **the table registers only `-` for a
+`TimeOnly`**, C# declares no `operator +` between two times of day either, and `.Add(ts)`
+is the form for advancing one by a `TimeSpan`. `.ToString()`, `TimeOnly.Parse` and
+`TryParse` reach `teko: unknown member of TimeOnly` and its static twin
+([not-yet.md](not-yet.md)).
+
+`TimeOnly` adds **one** panic of its own, `teko: a time of day is out of range`: a raw tick
+count outside `0 .. 863999999999`, whether it arrives through `new TimeOnly(ticks)` or
+`TimeOnly.FromTimeSpan(ts)`. No existing wording in the list above reads honestly for an
+interval that starts at zero — `an hour/minute/second/millisecond is out of range` are what
+the three calendar-free constructors reach instead, the same checks a `DateTime`'s own time
+of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside them.
 
 ## Properties
 

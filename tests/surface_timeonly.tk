@@ -1,0 +1,163 @@
+// surface_timeonly.tk -- `TimeOnly` as C# spells it
+// (docs/specs/datetime-extras.md, crumb N4b): EIGHT bytes holding the ticks
+// since midnight, `0 .. 863999999999`, with `DateTime`'s own calendar
+// functions reached directly for the components --
+//
+//   new TimeOnly(h, mi)                the three calendar-free constructors
+//   new TimeOnly(h, mi, s)
+//   new TimeOnly(h, mi, s, ms)
+//   new TimeOnly(ticks)                the raw one, range-checked
+//   TimeOnly.MinValue / MaxValue       00:00:00 and 23:59:59.9999999
+//   TimeOnly.FromDateTime(d)           the time-of-day half of a `DateTime`
+//   TimeOnly.FromTimeSpan(ts)          a raw `TimeSpan`'s ticks, checked
+//   t.Hour t.Minute t.Second t.Millisecond t.Ticks
+//   t.Add(ts) t.AddHours(f) t.AddMinutes(f)   all WRAPPING, never panic
+//   t.ToTimeSpan()                     the same ticks under the other type
+//   t.IsBetween(a, b)                  start inclusive, end exclusive, wraps
+//   t.CompareTo(u) t.Equals(u)
+//   a < b  a == b  ...                 the six comparisons
+//   a - b                              a TimeSpan, NEVER negative
+//   d.ToDateTime(t)                    the member N4a left out
+//
+// EIGHT BYTES NEEDS NO WIDTH PROOF: unlike `DateOnly`'s four, every slot a
+// `TimeOnly` travels is one the compiler's own two casts around it are no
+// instruction at all, the same as `TimeSpan` and `DateTime` (D54's own
+// finding). The slot-travel section below is short on purpose.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+class Holder {
+    public TimeOnly at;
+    public Holder() { at = TimeOnly.MinValue; }
+}
+
+TimeOnly g_t;
+delegate TimeOnly TOp();
+
+i64 main() {
+    // ---- the four constructors ----
+    TimeOnly hm = new TimeOnly(13, 45);
+    if (hm.Hour != 13 || hm.Minute != 45 || hm.Second != 0) return 1;
+    TimeOnly hms = new TimeOnly(13, 45, 30);
+    if (hms.Hour != 13 || hms.Minute != 45 || hms.Second != 30) return 2;
+    if (hms.Ticks != 495300000000) return 3;
+    TimeOnly hmsms = new TimeOnly(13, 45, 30, 250);
+    if (hmsms.Millisecond != 250) return 4;
+    if (hmsms.Ticks != 495302500000) return 5;
+    TimeOnly fromticks = new TimeOnly(495300000000);
+    if (fromticks != hms) return 6;
+
+    // ---- the two ends of the range ----
+    TimeOnly min = TimeOnly.MinValue;
+    TimeOnly max = TimeOnly.MaxValue;
+    if (min.Ticks != 0) return 7;
+    if (max.Ticks != 863999999999) return 8;
+    if (max.Hour != 23 || max.Minute != 59 || max.Second != 59) return 9;
+    if (max.Millisecond != 999) return 10;
+    if (!(min < max)) return 11;
+
+    // ---- the two other builders ----
+    DateTime moment = new DateTime(2024, 2, 29, 13, 45, 30);
+    TimeOnly cut = TimeOnly.FromDateTime(moment);
+    if (cut != hms) return 12;
+    // `FromDateTime(d)` and `FromTimeSpan(d.TimeOfDay)` answer the same value
+    TimeOnly viaspan = TimeOnly.FromTimeSpan(moment.TimeOfDay);
+    if (viaspan != cut) return 13;
+    TimeOnly fromhours = TimeOnly.FromTimeSpan(TimeSpan.FromHours(1.0));
+    if (fromhours.Hour != 1) return 14;
+
+    // ---- `.Add`, wrapping past midnight in both directions ----
+    TimeOnly wrapfwd = new TimeOnly(23, 30, 0).Add(TimeSpan.FromHours(1.0));
+    if (wrapfwd.Hour != 0 || wrapfwd.Minute != 30) return 15;
+    TimeOnly wrapback = new TimeOnly(0, 30, 0).Add(TimeSpan.FromHours(0 - 1.0));
+    if (wrapback.Hour != 23 || wrapback.Minute != 30) return 16;
+
+    // ---- `.AddHours`/`.AddMinutes`, C#'s own `Add(TimeSpan.From*(v))` form
+    if (hms.AddHours(11.0).Hour != 0) return 17;              // 13:45 + 11h wraps
+    TimeOnly addmin = new TimeOnly(23, 50, 0).AddMinutes(20.0);
+    if (addmin.Hour != 0 || addmin.Minute != 10) return 18;   // wraps forward
+    if (new TimeOnly(1, 0, 0).AddMinutes(0 - 90.0).Hour != 23) return 19; // backward
+
+    // ---- `.ToTimeSpan()`, the identity the other way ----
+    TimeSpan back = hms.ToTimeSpan();
+    if (back.Ticks != 495300000000) return 20;
+
+    // ---- `.IsBetween`, both the ordinary and the wrapping form ----
+    if (hms.IsBetween(new TimeOnly(10, 0, 0), new TimeOnly(15, 0, 0)) != 1) return 21;
+    if (hms.IsBetween(new TimeOnly(14, 0, 0), new TimeOnly(15, 0, 0)) != 0) return 22;
+    // start inclusive, end exclusive
+    if (new TimeOnly(10, 0, 0).IsBetween(new TimeOnly(10, 0, 0), new TimeOnly(15, 0, 0)) != 1) return 23;
+    if (new TimeOnly(15, 0, 0).IsBetween(new TimeOnly(10, 0, 0), new TimeOnly(15, 0, 0)) != 0) return 24;
+    // wraps across midnight when start is after end
+    if (hms.IsBetween(new TimeOnly(22, 0, 0), new TimeOnly(2, 0, 0)) != 0) return 25;
+    if (new TimeOnly(23, 30, 0).IsBetween(new TimeOnly(22, 0, 0), new TimeOnly(2, 0, 0)) != 1) return 26;
+    if (new TimeOnly(1, 0, 0).IsBetween(new TimeOnly(22, 0, 0), new TimeOnly(2, 0, 0)) != 1) return 27;
+    if (new TimeOnly(22, 0, 0).IsBetween(new TimeOnly(22, 0, 0), new TimeOnly(2, 0, 0)) != 1) return 28;
+    if (new TimeOnly(2, 0, 0).IsBetween(new TimeOnly(22, 0, 0), new TimeOnly(2, 0, 0)) != 0) return 29;
+
+    // ---- the six comparisons, and the two methods ----
+    TimeOnly earlier = new TimeOnly(10, 0, 0);
+    TimeOnly later = new TimeOnly(20, 0, 0);
+    if (!(earlier < later)) return 30;
+    if (!(later > earlier)) return 31;
+    if (!(earlier <= earlier)) return 32;
+    if (!(earlier >= earlier)) return 33;
+    if (!(earlier == earlier)) return 34;
+    if (!(earlier != later)) return 35;
+    if (earlier.CompareTo(later) != 0 - 1) return 36;
+    if (later.CompareTo(earlier) != 1) return 37;
+    if (earlier.Equals(earlier) != 1) return 38;
+    if (earlier.Equals(later) != 0) return 39;
+
+    // ---- `t - t`: a TimeSpan, and NEVER negative ----
+    TimeSpan fwd = later - earlier;
+    if (fwd.TotalHours != 10.0) return 40;
+    // `t1 - t2` when `t1` is EARLIER than `t2`: forward across midnight, not
+    // a negative TimeSpan -- C#'s own rule for the difference of two times
+    // of day with no date attached.
+    TimeSpan wrapdiff = earlier - later;
+    if (wrapdiff.TotalHours != 14.0) return 41;               // 20:00 -> 10:00 next day
+
+    // ---- `DateOnly.ToDateTime(TimeOnly)`, the member N4a left out ----
+    DateOnly day = new DateOnly(2024, 2, 29);
+    DateTime packed = day.ToDateTime(hms);
+    if (packed.Day != 29 || packed.Month != 2 || packed.Year != 2024) return 142;   // not 42: reserved for success
+    if (packed.Hour != 13 || packed.Minute != 45 || packed.Second != 30) return 43;
+    if (packed.Kind != DateTimeKind.Unspecified) return 44;
+    if (DateOnly.FromDateTime(packed) != day) return 45;
+    if (TimeOnly.FromDateTime(packed) != hms) return 46;
+    if (packed.TimeOfDay.Ticks != hms.ToTimeSpan().Ticks) return 47;
+
+    // ---- the spec's own sample (docs/specs/datetime-extras.md § 2), lifted
+    DateOnly d = new DateOnly(2024, 2, 29);
+    TimeOnly t = new TimeOnly(13, 45, 30);
+    if (t.Hour != 13) return 48;
+    if (t.Ticks != 495300000000) return 49;
+    TimeSpan since = t - new TimeOnly(12, 45, 30);
+    if (since.TotalHours != 1.0) return 50;
+    if (t.AddHours(11).Hour != 0) return 51;
+    DateTime dt = d.ToDateTime(t);
+    if (dt.Day != 29) return 52;
+    if (DateOnly.FromDateTime(dt) != d) return 53;
+
+    // ---- every slot the eight bytes travel through, short: no width proof
+    TimeOnly loc = new TimeOnly(9, 15, 0);
+    Holder h = new Holder();
+    h.at = loc;
+    if (h.at.Hour != 9) return 54;
+    g_t = loc;
+    if (g_t.Minute != 15) return 55;
+    TimeOnly arr[2];
+    arr[0] = loc;
+    if (arr[0].Hour != 9) return 56;
+    TimeOnly[] heap = new TimeOnly[1];
+    heap[0] = loc;
+    if (heap[0].Hour != 9) return 57;
+    TOp cap = () use (loc) => loc.AddHours(1.0);
+    TimeOnly capr = cap();
+    if (capr.Hour != 10) return 58;
+
+    return 42;
+}

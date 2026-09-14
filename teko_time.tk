@@ -40,6 +40,7 @@
 i64 tk_ty_timespan = 0;
 i64 tk_ty_datetime = 0;
 i64 tk_ty_dateonly = 0;
+i64 tk_ty_timeonly = 0;
 
 // the include the lowering symbols live in, named in the refusal a program
 // that forgot it gets (docs/specs/datetime.md § 9)
@@ -237,6 +238,90 @@ void tk_dt_operators() {
 // but itself, so `DateTimeKind k = 7;` and `i64 n = d.Kind;` are refused where
 // they used to compile.
 
+// ---- `TimeOnly` (crumb N4b) ----
+// EIGHT bytes, and the value IS the ticks since midnight: an ordinary,
+// non-negative `i64` in `0 .. TICKS_PER_DAY - 1` (`lib/time.tk`'s own
+// `TIMEONLY_MAX_TICKS`). There is no `Kind` and no date above it, so
+// `.Ticks` is the identity row `TimeSpan.Ticks` is, and the six comparisons
+// are `TimeSpan`'s own functions -- a tick count of a time of day is an
+// ordinary non-negative `i64`, exactly the case `DateOnly` already made
+// (D54, and this crumb's own amendment to the spec's § 3).
+//
+// Registered BEFORE `DateOnly`: `DateOnly.ToDateTime(TimeOnly)`'s own column
+// needs this id live, the same reason `DateOnly` itself is registered after
+// `DateTime`.
+void tk_to_statics() {
+    i64 to = tk_ty_timeonly;
+    tk_prim_member(to, "MinValue", TK_PMSVAL, 0 - 1, "tk_to_min", to);
+    tk_prim_member(to, "MaxValue", TK_PMSVAL, 0 - 1, "tk_to_max", to);
+    // the time of day half of a `DateTime`: `tk_dt_tod` already answers ticks
+    // since midnight, masked and modulo `TICKS_PER_DAY` -- exactly a
+    // `TimeOnly`'s own range, so it is named here directly and not copied.
+    tk_prim_member(to, "FromDateTime", TK_PMSFUN, tk_ty_datetime, "tk_dt_tod", to);
+    // a raw `TimeSpan`'s ticks, range-checked: the same guard `new
+    // TimeOnly(ticks)` takes below, because both hand it one raw i64.
+    tk_prim_member(to, "FromTimeSpan", TK_PMSFUN, tk_ty_timespan, "tk_to_from_ticks", to);
+}
+
+// the four constructors, each its own row of arity (`tk_prim_pick`): three
+// calendar-free ones over `tk_dt_time_ticks` -- the same check
+// `new DateTime(y, m, d, h, mi, s)` takes for its own time of day -- and the
+// raw-ticks one, which needs its own range check because `tk_dt_time_ticks`
+// only ever answers a value already inside range.
+void tk_to_ctors() {
+    i64 to = tk_ty_timeonly;
+    tk_prim_membern(to, "new", TK_PMCTOR, 2, TY_I64, "tk_to_hm",    to);
+    tk_prim_membern(to, "new", TK_PMCTOR, 3, TY_I64, "tk_to_hms",   to);
+    tk_prim_membern(to, "new", TK_PMCTOR, 4, TY_I64, "tk_to_hmsms", to);
+    tk_prim_membern(to, "new", TK_PMCTOR, 1, TY_I64, "tk_to_from_ticks", to);
+}
+
+void tk_to_members() {
+    i64 to = tk_ty_timeonly;
+    i64 ts = tk_ty_timespan;
+    // the identity row: the eight bytes under the other type, no call
+    tk_prim_member(to, "Ticks", TK_PMPROP, 0 - 1, 0, TY_I64);
+    // the components, reached through `DateTime`'s own: a tick count of a
+    // TIME OF DAY is exactly what those functions already mask for, and a
+    // `TimeOnly` carries no `Kind` to mask off in the first place -- the mask
+    // is a no-op over a value already inside `0 .. TICKS_PER_DAY - 1`.
+    tk_prim_member(to, "Hour",        TK_PMPROP, 0 - 1, "tk_dt_hour",   TY_I64);
+    tk_prim_member(to, "Minute",      TK_PMPROP, 0 - 1, "tk_dt_minute", TY_I64);
+    tk_prim_member(to, "Second",      TK_PMPROP, 0 - 1, "tk_dt_second", TY_I64);
+    tk_prim_member(to, "Millisecond", TK_PMPROP, 0 - 1, "tk_dt_ms",     TY_I64);
+    // C#'s wrapping `Add*` family: `Add` never panics, it wraps at both ends
+    // of the day, and `AddHours`/`AddMinutes` are C#'s own form,
+    // `Add(TimeSpan.FromHours(v))`.
+    tk_prim_member(to, "Add",        TK_PMFUN, ts,    "tk_to_add",         to);
+    tk_prim_member(to, "AddHours",   TK_PMFUN, ty_f64, "tk_to_add_hours",   to);
+    tk_prim_member(to, "AddMinutes", TK_PMFUN, ty_f64, "tk_to_add_minutes", to);
+    // the identity the other way: the same ticks under `TimeSpan`, no call
+    tk_prim_member(to, "ToTimeSpan", TK_PMFUN, 0 - 1, 0, ts);
+    tk_prim_member2(to, "IsBetween", TK_PMFUN, to, to, "tk_to_is_between", TY_I64);
+    // ...and the two methods, the `TimeSpan`/`DateOnly` functions again: a
+    // tick count of a time of day compares exactly like one of a day number.
+    tk_prim_member(to, "CompareTo", TK_PMFUN, to, "tk_ts_cmp", TY_I64);
+    tk_prim_member(to, "Equals",    TK_PMFUN, to, "tk_ts_eq",  TY_I64);
+}
+
+// The six comparisons, `TimeSpan`'s own functions for the reason `CompareTo`
+// is above, and ONE arithmetic operator: `t - t`, which C# answers as the
+// ELAPSED time and never as a negative `TimeSpan` (`tk_to_sub`,
+// `lib/time.tk`). `t + t` has no row and is refused where it is written --
+// C# declares no such operator -- and neither does `d + t`/`d - d` gain one
+// here: those stay `DateOnly`'s own refusal, `tk_do_operators` below.
+void tk_to_operators() {
+    i64 to = tk_ty_timeonly;
+    i64 ts = tk_ty_timespan;
+    tk_prim_op(K_EQ, 2, to, to, "tk_ts_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, to, to, "tk_ts_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, to, to, "tk_ts_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, to, to, "tk_ts_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, to, to, "tk_ts_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, to, to, "tk_ts_ge", TY_I64, 0);
+    tk_prim_op(K_SUB, 2, to, to, "tk_to_sub", ts, 0);
+}
+
 // ---- `DateOnly` (crumb N4a) ----
 // FOUR bytes, not eight, and C#'s own representation: the value IS the day
 // number since `0001-01-01`, an `int` there and a width-4 `TK_SINT` here. That
@@ -263,6 +348,7 @@ void tk_do_statics() {
 
 void tk_do_members() {
     i64 dy = tk_ty_dateonly;
+    i64 dt = tk_ty_datetime;
     tk_prim_membern(dy, "new", TK_PMCTOR, 3, TY_I64, "tk_do_ymd", dy);
     // the identity row: the four bytes under the other type, no call
     tk_prim_member(dy, "DayNumber", TK_PMPROP, 0 - 1, 0, TY_I64);
@@ -279,6 +365,11 @@ void tk_do_members() {
     // `i64`, so `tk_ts_cmp` and `tk_ts_eq` already answer exactly this.
     tk_prim_member(dy, "CompareTo", TK_PMFUN, dy, "tk_ts_cmp", TY_I64);
     tk_prim_member(dy, "Equals",    TK_PMFUN, dy, "tk_ts_eq",  TY_I64);
+    // the member N4a left out because the argument's type did not exist yet
+    // (docs/specs/datetime-extras.md § 4): the day number back into ticks,
+    // plus the time of day, `Kind` Unspecified -- the id is LIVE here because
+    // `TimeOnly` is registered before `DateOnly` (`tk_time_init`, below).
+    tk_prim_member(dy, "ToDateTime", TK_PMFUN, tk_ty_timeonly, "tk_do_to_datetime", dt);
 }
 
 // The six comparisons and NOTHING else: C# declares no arithmetic operator on
@@ -316,9 +407,24 @@ void tk_time_init() {
     tk_dt_members();
     tk_dt_operators();
 
-    // AFTER `DateTime`: `DateOnly.FromDateTime(d)`'s own column carries that
-    // id, and a column is read where it is written and not late by name
-    // (`tk_prim_late` is for a type the very include declares).
+    // AFTER `DateTime`, BEFORE `DateOnly`: `TimeOnly.FromDateTime(d)`'s own
+    // column carries `DateTime`'s id, and `DateOnly.ToDateTime(t)`'s own
+    // column below carries THIS one -- both read where they are written and
+    // neither is late by name (`tk_prim_late` is for a type the very include
+    // declares, not one this same function has already registered).
+    tk_ty_timeonly = type_new("TimeOnly", 8, 8, TK_SINT);
+    syntax_expr("TimeOnly", &tk_prim_expr);
+    syntax_stmt("TimeOnly", &tk_prim_stmt);
+    tk_prim_type(tk_ty_timeonly, "TimeOnly", tk_time_include(), "`.Ticks`");
+    tk_to_statics();
+    tk_to_ctors();
+    tk_to_members();
+    tk_to_operators();
+
+    // AFTER `DateTime` AND `TimeOnly`: `DateOnly.FromDateTime(d)`'s and
+    // `.ToDateTime(t)`'s own columns carry those ids, and a column is read
+    // where it is written and not late by name (`tk_prim_late` is for a type
+    // the very include declares).
     tk_ty_dateonly = type_new("DateOnly", 4, 4, TK_SINT);
     syntax_expr("DateOnly", &tk_prim_expr);
     syntax_stmt("DateOnly", &tk_prim_stmt);
