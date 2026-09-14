@@ -426,11 +426,22 @@ i64 tk_arr_store(i64 ety, i64 at, i64 v) {
 // and global alike (Copilot on #698, pass 8) -- the very defect the HEAP
 // element had one slot over until the fourth pass (`tk_ha_store`,
 // teko_heaparr.tk), whose shape this mirrors exactly.
+// ...and the door REPORTS the store it built, exactly as the other five do
+// (`tk_os_mark`, teko_struct.tk): a store into a slot of counted type is what
+// the reclaim pass turns into `rt_store_own` (teko_rc.tk), and a store it
+// never heard of keeps the raw `stW` -- one retain and one release lost. No
+// fixed element is counted TODAY, and the refusal that makes it so is three
+// files away: an element of class, of `struct` or of `T?` type is refused at
+// the DECLARATION (`tk_arr_on_stmt` and `tk_garr_collect` above,
+// ``teko: an array of objects is not taught yet``, measured on all three), and
+// an `enum` element is the exempt one `tk_is_counted` answers "no" for. The
+// mark is what makes "every element store is reported" a property of this
+// door rather than a coincidence of that refusal.
 i64 tk_arr_elem_store(i64 ety, i64 at, i64 v, i64 line, uptr fl) {
     v = tk_field_store_val(ety, v, line, fl);
     tk_line = line;                    // the gate builds nodes of its own
     tk_file = fl;
-    return tk_arr_store(ety, at, v);
+    return tk_os_mark(tk_arr_store(ety, at, v), ety);
 }
 
 // `a[i] OP= e` / `a[i]++` / `a[i]--`: the address is built TWICE (`tk_clone`
@@ -672,6 +683,12 @@ void tk_array_resolve_write(i64 i) {
     i64 keep = nd_next(n);
     node_assign(n, r);
     set_nd_next(n, keep);
+    // what the TREE holds is the placeholder, not the node the door built, so
+    // a store the door reported is re-marked under the identity the reclaim
+    // pass walks -- the same re-mark `tk_hg_resolve_write` below makes for a
+    // `T[]` of heap, asked the other way round (was the store marked?) so the
+    // two halves cannot drift apart.
+    if (tk_os_has(r)) tk_os_add(n);
 }
 
 // the write half of a global `T[]` (G1): the address is the SAME

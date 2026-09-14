@@ -891,15 +891,6 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
         i64 val = pd_arg_at(pi);
         i64 vp = tk_pend_at(val);
         if (vp >= 0) tk_pend_do(vp);
-        // ...and the value's own array READS are rewritten first, for the
-        // same reason: `pd_arg` is a subtree the parser PARKED here, so
-        // `tk_array_walk_reads` (teko_array.tk, pass 2) never saw it and an
-        // index on a global array stood raw inside it. `void set(H h) {
-        // h.rate = gl[0]; }` was REFUSED, ``teko: `[` needs an array: gl``,
-        // for a read the compiler knows how to build (Copilot on #698, pass
-        // 8). The walk reaches a nested one (`h.rate = gl[0] + gl[1];`) and
-        // is a no-op for a value that indexes nothing.
-        tk_array_walk_reads(val);
         // G-e: the SIXTH site that builds a field store, through the same gate
         // as the other five (`tk_field_store_val`, above). It judged and
         // widened on its own -- `tk_check_compat` and `tk_num_widen`, D34 and
@@ -1111,6 +1102,36 @@ i64 tk_pend_by_name(i64 pi, uptr pty, uptr ppure, uptr pown) {
     return tk_pend_emit_method(pi, mi, pty, ppure, pown);
 }
 
+// EVERY subtree a deferred access PARKED, walked by the one walk that rewrites
+// a global array's reads (`tk_array_walk_reads`, teko_array.tk, pass 2). A
+// parked subtree is not in the tree that pass reads -- the parser handed it to
+// `tk_pend_add` and only the rewrite below splices it back -- so an `N_INDEX`
+// on a global array inside one of them survived raw and was refused by the
+// check that finds an index nothing lowered, ``teko: `[` needs an array: gl``
+// (`tk_pm_check_index`, teko_params.tk). The table parks THREE:
+//
+//   - `pd_recv`, the receiver (`gc[gl[0]].v`: the outer index was rewritten
+//     one node at a time and a NESTED one under it was not);
+//   - `pd_na`, which is the receiver's own INDEX for the two `p.items[i]`
+//     forms -- and a call's ARGUMENT COUNT for every other form, an integer
+//     that is no node at all, so the walk is asked only where it is one;
+//   - `pd_arg`, the value of a store and the argument LIST of a call, which
+//     is how a nested member call (`h.rate = 1 + h.m(gl[0])`) reaches it: the
+//     inner access parks its own arguments and is resolved through this very
+//     function.
+//
+// Measured on `a9e0b0d7`, each refused for a read the compiler knows how to
+// build: `h.items[gl[0]] = 1;` (Copilot on #698, pass 9), `gc[gl[0]].v` and
+// `h.rate = 1 + h.m(gl[0]);`. One walk at the one point every road out of the
+// table goes through, rather than one per emitter: `tk_pend_field`'s own call
+// on the value was the eighth pass's half of this rule.
+void tk_pend_park_reads(i64 pi) {
+    i64 form = pd_form_at(pi);
+    tk_array_walk_reads(pd_recv_at(pi));
+    if (form == TK_PIXLOAD || form == TK_PIXSTORE) tk_array_walk_reads(pd_na_at(pi));
+    tk_array_walk_reads(pd_arg_at(pi));
+}
+
 // The rewrite is IN PLACE, so the node index stays what the parent points at
 // and the sibling list is put back untouched -- `mc` docs/reference/hooks.md
 // § pass(). A receiver that is itself deferred is resolved first, which is what
@@ -1127,8 +1148,8 @@ void tk_pend_do(i64 pi) {
     // teko_array.tk's own pass walks -- the `.` deferred it as a RECEIVER,
     // an orphan reachable only through `pd_recv`, same as an inner `.` in a
     // chain -- so it is resolved here, on the very same chase, before its
-    // type is asked for.
-    if (nd_kind(recv) == N_INDEX) tk_array_maybe_rewrite_index(recv);
+    // type is asked for, and so is every other subtree this row parked.
+    tk_pend_park_reads(pi);
     tk_line = pd_line_at(pi);
     tk_file = pd_file_at(pi);
     i64 recv_ty = tk_ty_of(recv);

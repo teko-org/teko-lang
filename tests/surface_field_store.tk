@@ -87,15 +87,33 @@
 //                       rewrites an index does not walk;
 //  19. `pendglobalcheck` -- the same parked subtree on the deferred
 //                       RECEIVER's road (`pd_arg`);
+//  23. `parkedcheck`  -- the three OTHER subtrees that same table parks and
+//                       no walk reached: the receiver's own INDEX
+//                       (`h.items[gl[1]] = 7;`, `pd_na`), the argument of a
+//                       NESTED member call inside the value
+//                       (`h.rate = 1 + h.mul(gl[1]);`, the inner row's own
+//                       `pd_arg`) and an index NESTED inside the receiver
+//                       (`gc[gl[1] - 1].v`, where only the outer one was
+//                       rewritten). Each was refused, ``teko: `[` needs an
+//                       array: gl``;
 //  20. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released, the global arrays
 //                       above excepted: those are roots.
 //
 // A refusal has no exit code to assert (D33's own harness note): the
-// narrowing refusal, the reference/number mismatch (D34) and `null` in a
-// non-`T?` field are probed outside `tests/` and documented as `// no-run`
-// in [types.md](../docs/reference/types.md) and
+// narrowing refusal, the reference/number mismatch (D34), `null` in a
+// non-`T?` field and the local that SHADOWS a global array
+// (``teko: `[` needs an array: src``, the one thing the rewrite of a global's
+// reads may not do by name alone) are probed outside `tests/` and documented
+// as `// no-run` in [types.md](../docs/reference/types.md) and
 // [diagnostics.md](../docs/reference/diagnostics.md).
+//
+// A COUNTED element of a fixed array has no shape to be written here: an
+// element of class, `struct` or `T?` type is refused at the DECLARATION
+// (``teko: an array of objects is not taught yet``), so the door's own
+// `tk_os_mark` (teko_array.tk) reports a store no program can write today --
+// what it buys is that the reclaim pass hears about every element store
+// whatever a later crumb teaches, instead of depending on that refusal.
 //
 // Compound assignment on a field (`this.rate += 2;`, `H.total *= 2;`) is
 // not taught: the `+=`/`*=` sugar (`<teko-loop-prelude>`) takes a bare NAME
@@ -183,7 +201,8 @@ class H {
     public i64? count;
     public i64 sum;
     public Cell? rc;
-    i64 items[2];                     // 19b: an INLINE array field, read below
+    public i64 items[2];              // 19b: an INLINE array field, read below
+                                      // ...and written through a DEFERRED receiver (23)
 
     public H(i64 k) {
         this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
@@ -243,6 +262,13 @@ class H {
     public void frominline() {
         this.rate = this.items[0];    // 19b: an element of an INLINE array field
     }
+
+    // 23: the two readers the parked-subtree helpers below are proved by --
+    // an inline element written through a deferred receiver's own INDEX, and
+    // the method a nested member call reaches
+    public i64 item1() { return this.items[1]; }
+
+    public i64 mul(i64 x) { return x * 2; }
 }
 
 class I {
@@ -307,6 +333,20 @@ void setthrough(H h, i64 k) {
 // Nested, to prove the whole subtree is rewritten and not just its root.
 void setfromglobal(H h) {
     h.rate = gl[0] + gx[0];
+}
+
+// (23) the other two subtrees the SAME table parks, on the same deferred
+// receiver: the INDEX of `h.items[i]` (`pd_na`, which is a call's argument
+// COUNT in every other form and a node only in these two) and the arguments
+// of a NESTED member call inside the value (`pd_arg` of the inner row, which
+// this very road resolves). Each was refused, ``teko: `[` needs an array:
+// gl``, for a read the compiler knows how to build (Copilot on #698, pass 9).
+void setitem(H h) {
+    h.items[gl[1]] = 7;
+}
+
+void setcall(H h) {
+    h.rate = 1 + h.mul(gl[1]);
 }
 
 // the two INDIRECT calls, the shapes `tk_callp_ret` (teko_array.tk) leaves
@@ -616,6 +656,23 @@ i64 pendglobalcheck() {
     return 0;
 }
 
+// 23: the three OTHER subtrees a deferred access parks, each walked by the
+// one walk that rewrites a global array's reads -- the receiver's own index,
+// a nested member call's argument, and an index NESTED inside the receiver
+// itself (`gc[gl[1] - 1].v`, where the outer index was rewritten one node at
+// a time and the inner one under it was not). Nothing here allocates: the
+// `Cell` read back is the one `gloadcheck` above already put in `gc`.
+i64 parkedcheck() {
+    gl[1] = 1;
+    H h = new H(0);
+    setitem(h);                       // `h.items[gl[1]] = 7;`  -- pd_na
+    if (h.item1() != 7) return 1;
+    setcall(h);                       // `h.rate = 1 + h.mul(gl[1]);` -- pd_arg
+    if (h.rate != 3.0) return 2;      // of the INNER access, one row over
+    if (gc[gl[1] - 1].v != 7) return 3;   // a nested index in the RECEIVER
+    return 0;
+}
+
 // the global `T[]`s the helpers above fill are ROOTS: a global array is never
 // released (surface_array_global.tk's own header), so the floor this counter
 // returns to is those four objects -- the three arrays (`gl`, `gc`, `gdst`)
@@ -696,8 +753,11 @@ i64 main() {
     bad = pendglobalcheck();
     if (bad != 0) return 230 + bad;
 
-    bad = rccheck();
+    bad = parkedcheck();
     if (bad != 0) return 240 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 250 + bad;
 
     return 42;
 }
