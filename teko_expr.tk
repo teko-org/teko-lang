@@ -583,6 +583,30 @@ i64 tk_dot(i64 left) {
         i64 pty = tk_hp_find(nd_name(left));      // a `T[]` PARAMETER (K3): known at parse time too
         if (pty >= 0) return tk_member_of(left, tk_struct_by_ty(pty), m, line, fl);
     }
+    // D61: a CALL whose type the node does not already carry is not typed
+    // here at all. Both oracles this door used to ask answer it the same wrong
+    // way -- `decl_ret(decl_find(name))`, the FIRST declaration of the name,
+    // the guess D49 took out of the pass-time oracle and left standing here:
+    // `tk_pty_of` (teko_struct.tk) for a primitive row, and `tk_struct_of_expr`
+    // (same file, its own N_CALL arm) for a class, a struct or an enum. With
+    // `DateTime pick(i64)` declared ahead of `DateOnly pick(i64, i64)`,
+    // `pick(1, 2).Day` read a DateOnly through the DateTime row and answered
+    // 1 instead of 29, and in the other order (`TimeSpan pick(i64)` first) a
+    // legal program was refused `teko: unknown member of TimeSpan: Day`; with
+    // `Cell pick(i64)` ahead of `Box pick(i64, i64)`, `pick(1, 2).w` read the
+    // Box through Cell's row -- a field at the wrong OFFSET where both declare
+    // the name, `teko: unknown member of Cell: w` on a legal program where
+    // only one does, and the wrong enum's name table for `.ToString()`. So the
+    // check stands AHEAD of both (Copilot on #718): the deferred road answers
+    // every one of them -- `tk_prim_pend` (teko_prim.tk) is `tk_prim_dot`'s
+    // twin and `tk_pend_do` (teko_typeof.tk) is `tk_member_of`'s, both at
+    // `atpass`, where the oracle is `tk_ty_of` -- `tk_ov_pick` for an
+    // overloaded name, the delegate table for a call through a slot. A call the
+    // node DOES type (`new DateOnly(...)`, `new Box()`, a static or an instance
+    // row the parser already emitted, all `tk_xt_put`) keeps the parse-time
+    // road it always had.
+    if (nd_kind(left) == N_CALL && tk_xt_ty(left) < 0)
+        return tk_defer_member(left, m, line, fl);
     i64 si = tk_struct_of_expr(left);
     if (si >= 0 && sr_part_at(si) == TK_PFWD) return tk_defer_member(left, m, line, fl);
     if (si >= 0) return tk_member_of(left, si, m, line, fl);
@@ -591,22 +615,6 @@ i64 tk_dot(i64 left) {
     // (`tk_pty_of`, teko_struct.tk). What it cannot tell (a parameter, a
     // receiver built by another deferred `.`) falls through to the same defer
     // every other receiver takes, and teko_typeof.tk's pass lowers it there.
-    // D61: a CALL whose type the node does not already carry is not typed
-    // here at all. `tk_pty_of`'s own N_CALL arm is `decl_ret(decl_find(name))`
-    // -- the FIRST declaration of the name -- which is exactly the guess D49
-    // took out of the pass-time oracle and left standing at this door: with
-    // `DateTime pick(i64)` declared ahead of `DateOnly pick(i64, i64)`,
-    // `pick(1, 2).Day` read a DateOnly through the DateTime row and answered
-    // 1 instead of 29, and in the other order (`TimeSpan pick(i64)` first) a
-    // legal program was refused `teko: unknown member of TimeSpan: Day`. The
-    // deferred road answers both: `tk_prim_pend` (teko_prim.tk) is
-    // `tk_prim_dot`'s twin at `atpass`, where the oracle is `tk_ty_of` --
-    // `tk_ov_pick` for an overloaded name, the delegate table for a call
-    // through a slot. A call the node DOES type (`new DateOnly(...)`, a static
-    // or an instance row the parser already emitted, all `tk_xt_put`) keeps
-    // the parse-time road it always had.
-    if (nd_kind(left) == N_CALL && tk_xt_ty(left) < 0)
-        return tk_defer_member(left, m, line, fl);
     i64 lty = tk_pty_of(left);
     if (tk_prim_is(lty)) return tk_prim_dot(left, lty, m, line, fl);
     i64 ty = tk_xt_ty(left);                      // a scalar this module already typed:
