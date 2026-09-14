@@ -193,12 +193,20 @@ void tk_rc_var(i64 n) {
 // here and the function returned above the three shared rules: `gw = 5;` on an
 // `f64` global wrote the raw integer bits, `gn = 1.5;` on an `i64` one and
 // `gc = null;` on a non-nullable class one both compiled, where every one of
-// them is refused or converted on a local. The RC lowering below still needs a
-// scope slot of its own (the address it stores through, the borrowed-parameter
-// rule), so the global leaves at the `li < 0` return, one line lower than it
-// used to. `tk_nl_wrap` is a no-op for a global by construction: a global
-// declared `T?` over a VALUE is already refused, at pass 5, by `tk_gs_check`
-// (teko_array.tk).
+// them is refused or converted on a local. `tk_nl_wrap` is a no-op for a global
+// by construction: a global declared `T?` over a VALUE is already refused, at
+// pass 5, by `tk_gs_check` (teko_array.tk).
+//
+// D55: the RC lowering runs for a global too, and the leave is `tty < 0` --
+// the name is neither a local nor a global -- rather than `li < 0`. The
+// lowering needs nothing else: `tk_addr` of a global is `&g`, which mc's core
+// takes at any scope, and the counted global slot then keeps a reference of
+// its own, so `gc = c;` in one function survives whatever the next one
+// allocates. It releases the slot's OLD value at every store, exactly as a
+// local's slot does (docs/reference/memory.md); a global is still a ROOT and
+// is still never released at program end. The BORROWED-parameter rule is a
+// rule about parameters only, so its guard asks for a scope slot first: a
+// global's `li` is -1, which is below the floor and is not a parameter.
 void tk_rc_assign(i64 n) {
     i64 li = tk_rc_index(nd_name(n));
     i64 tty = tk_ty_global(nd_name(n));
@@ -209,11 +217,11 @@ void tk_rc_assign(i64 n) {
         set_nd_a(n, tk_num_widen(tty, aty, nd_a(n)));        // `y = 5;` on an `f64 y`
         set_nd_a(n, tk_nl_wrap(tty, aty, nd_a(n)));          // `n = 7;` on an `i64? n`
     }
-    if (li < 0) return;
+    if (tty < 0) return;
     if (!tk_is_counted(tty)) return;
     tk_rc_at(n);
     i64 dest = tk_addr(nd_name(n));
-    if (li < tk_rc_floor) {
+    if (li >= 0 && li < tk_rc_floor) {
         if (tk_rp_named_in(tk_rc_cur_fn, nd_name(n)) < 0)
             err_at2(tk_file, tk_line, "teko: a parameter of class type is borrowed; it is not reassigned",
                     nd_name(n));

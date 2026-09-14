@@ -1,0 +1,252 @@
+// surface_globals_rc.tk -- a store into a COUNTED global slot goes through
+// `rt_store`/`rt_store_own`, exactly as a local's store does (D55).
+//
+// Before it, `tk_rc_assign` (teko_rc.tk) left at `li < 0` -- a global is in no
+// pass-time scope -- so the global took the raw pointer and counted nothing:
+// `Cell gc; void fill(){ Cell c = new Cell(42); gc = c; }` left `gc` pointing
+// at memory `fill`'s own release had already handed back, and the next two
+// allocations wrote over it. The leave is `tty < 0` now -- the name is neither
+// a local nor a global -- and the lowering below it runs unchanged: `&g` is an
+// address mc's core takes at any scope, `new`/a call result is `rt_store_own`
+// and everything borrowed is `rt_store`.
+//
+// A global is still a ROOT: it is never released at program end
+// (docs/reference/memory.md). What D55 adds is the other half of the slot
+// rule -- the OLD value goes away at every store.
+//
+// What each helper proves, in order:
+//
+//   1. `reprocheck`   -- the reproducer itself: the object a function stored
+//      into a global survives the allocations of the two that follow.
+//   2. `overwritecheck` -- the overwrite releases the old object: two stores
+//      into the same global leave ONE object alive and run ONE destructor.
+//   3. `nullcheck`    -- `gq = null` on a `Cell?` global releases what the
+//      slot held and leaves the count back at the floor.
+//   4. `hasvaluecheck` -- a `Cell?` global beside a plain `Cell` one, read
+//      through `.HasValue`/`.Value` after the store.
+//   5. `sourcecheck`  -- the four shapes of the value: a PARAMETER, a FIELD, a
+//      CALL result and a TERNARY arm. Three of them are borrowed and their
+//      source stays alive; the call result moves in.
+//   6. `lambdacheck`  -- the store written inside a LAMBDA body is lowered
+//      too: `tk_rc_pass` walks every top-level function, and a lambda is one.
+//   7. `delegcheck`   -- a delegate global assigned and re-assigned: the first
+//      delegate object is released by the second store.
+//   8. `arrcheck`     -- a `T[]` global re-assigned: the old array, and the
+//      elements it owned, go away.
+//   9. `loopcheck`    -- a global read after a loop that churns allocations,
+//      which is the reproducer's failure mode at scale.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 dtors = 0;                                   // how many destructors have run
+
+class Cell {
+    public i64 v;
+    public Cell(i64 x) { v = x; }
+    ~Cell() { dtors = dtors + 1; }
+}
+
+class Box {
+    public Cell head;
+    public Box(i64 x) { head = new Cell(x); }
+}
+
+// ---- 1. the reproducer ----
+
+Cell gc;
+
+void fill() { Cell c = new Cell(42); gc = c; }    // borrowed out of a local
+void churn() { Cell a = new Cell(7); Cell b = new Cell(9); }
+
+i64 reprocheck() {
+    fill();
+    churn();
+    churn();
+    if (gc.v != 42) return 1;
+    return 0;
+}
+
+// ---- 2. the overwrite releases the old value ----
+
+Cell g2;
+
+i64 overwritecheck() {
+    i64 floor = rt_live();
+    i64 d0 = dtors;
+    g2 = new Cell(1);
+    if (rt_live() != floor + 1) return 1;         // the slot owns one object
+    g2 = new Cell(2);
+    if (rt_live() != floor + 1) return 2;         // ...still one, not two
+    if (dtors != d0 + 1) return 3;                // ...and the first one died
+    if (g2.v != 2) return 4;
+    return 0;
+}
+
+// ---- 3. `null` into a `T?` global releases what it held ----
+
+Cell? gq;
+
+i64 nullcheck() {
+    i64 floor = rt_live();
+    i64 d0 = dtors;
+    gq = new Cell(3);
+    if (rt_live() != floor + 1) return 1;
+    gq = null;                                    // the null handle is 0
+    if (rt_live() != floor) return 2;
+    if (dtors != d0 + 1) return 3;
+    if (gq != null) return 4;
+    return 0;
+}
+
+// ---- 4. `Cell?` and `Cell` side by side, read after the store ----
+
+i64 hasvaluecheck() {
+    gq = new Cell(4);
+    if (!gq.HasValue) return 1;
+    Cell got = gq.Value;
+    if (got.v != 4) return 2;
+    g2 = new Cell(5);                             // the plain one beside it
+    if (g2.v != 5) return 3;
+    gq = null;
+    if (gq.HasValue) return 4;
+    if (got.v != 4) return 5;                     // the local still holds it
+    return 0;
+}
+
+// ---- 5. where the value comes from ----
+
+Cell gp;
+
+void storeParam(Cell c) { gp = c; }               // a parameter is BORROWED
+Cell makeCell(i64 x) { return new Cell(x); }      // a call result is OWNED
+
+i64 sourcecheck() {
+    Cell local = new Cell(6);
+    i64 mark = rt_live();
+    storeParam(local);                            // a PARAMETER
+    if (rt_live() != mark) return 1;              // nothing allocated, nothing freed
+    if (gp.v != 6) return 2;
+    if (local.v != 6) return 3;                   // the source is alive
+
+    Box b = new Box(7);                           // the box and its head
+    mark = rt_live();
+    gp = b.head;                                  // a FIELD
+    if (rt_live() != mark) return 4;              // `local` is still held by `local`
+    if (gp.v != 7) return 5;
+    if (b.head.v != 7) return 6;                  // the source is alive
+
+    mark = rt_live();
+    gp = makeCell(8);                             // a CALL result: it moves in
+    if (rt_live() != mark + 1) return 7;          // the box still owns its head
+    if (gp.v != 8) return 8;
+    if (b.head.v != 7) return 9;
+
+    Cell t1 = new Cell(9);
+    Cell t2 = new Cell(10);
+    i64 k = 1;
+    mark = rt_live();
+    gp = k == 1 ? t1 : t2;                        // a TERNARY arm: borrowed
+    if (rt_live() != mark - 1) return 10;         // the call result of 8 died
+    if (gp.v != 9) return 11;
+    if (t1.v != 9) return 12;                     // the source is alive
+    if (t2.v != 10) return 13;
+    return 0;
+}
+
+// ---- 6. the store inside a lambda body ----
+
+delegate i64 Op(i64 a);
+
+Cell gl;
+
+i64 lambdacheck() {
+    Op setter = new Op((i64 x) => { gl = new Cell(x); return x; });
+    if (setter(11) != 11) return 1;
+    if (gl.v != 11) return 2;
+    churn();                                      // the reproducer's own pressure
+    churn();
+    if (gl.v != 11) return 3;
+    return 0;
+}
+
+// ---- 7. a delegate global assigned and re-assigned ----
+
+i64 addOne(i64 a) { return a + 1; }
+i64 addTwo(i64 a) { return a + 2; }
+
+Op g_op;
+
+i64 delegcheck() {
+    i64 floor = rt_live();
+    g_op = addOne;
+    if (g_op(10) != 11) return 1;
+    if (rt_live() != floor + 1) return 2;         // the delegate object
+    g_op = addTwo;
+    if (g_op(10) != 12) return 3;
+    if (rt_live() != floor + 1) return 4;         // the first one was released
+    return 0;
+}
+
+// ---- 8. a `T[]` global re-assigned ----
+
+Cell[] garr;
+
+i64 arrcheck() {
+    i64 floor = rt_live();
+    garr = new Cell[2];
+    if (rt_live() != floor + 1) return 1;         // the array object
+    garr[0] = new Cell(12);
+    if (rt_live() != floor + 2) return 2;
+    garr = new Cell[1];                           // the old array AND its element
+    if (rt_live() != floor + 1) return 3;
+    garr[0] = new Cell(13);
+    if (garr[0].v != 13) return 4;
+    return 0;
+}
+
+// ---- 9. a global read after a loop that churns allocations ----
+
+i64 loopcheck() {
+    i64 i = 0;
+    loop {
+        if (i >= 1000) break;
+        Cell tmp = new Cell(i);
+        i = i + 1;
+    }
+    if (gc.v != 42) return 1;                     // stored back in `reprocheck`
+    if (gl.v != 11) return 2;                     // ...and in the lambda
+    return 0;
+}
+
+i64 main() {
+    i64 bad = reprocheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = overwritecheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = nullcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = hasvaluecheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = sourcecheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = lambdacheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = delegcheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = arrcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = loopcheck();
+    if (bad != 0) return 90 + bad;
+
+    return 42;
+}
