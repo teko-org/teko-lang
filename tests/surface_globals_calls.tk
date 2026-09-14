@@ -1,0 +1,218 @@
+// surface_globals_calls.tk -- the arguments of an INDIRECT call are judged
+// and converted exactly like a direct call's, whichever of the three roads
+// builds it (D57): a VIRTUAL call `b.m(x)`, an INTERFACE call `i.m(x)`, and
+// the UNQUALIFIED form of either inside a method, which is the same `callp`
+// as the written-out `this.m(x)` beside it.
+//
+// Every section here is a program that must RUN, and the refusals that share
+// the rule are seven fixtures of their own under `tests/refuse/`. On the base
+// (`af2fffad`) this file exits 14: section 1's fourth check is an `i64`
+// global handed to an `f64` parameter, and it crossed as raw bits because the
+// site that built the `callp` could not type the name and so converted
+// nothing. Every other section passes there -- this fixture locks the
+// conversion and the judgement, not a crash.
+//
+// What each helper proves, in order:
+//
+//   1. `abovecheck`  -- globals declared ABOVE `main`, through a virtual
+//      call: an exact `i64`, an exact `f64`, a reference of the parameter's
+//      own class, and C# §10.2.3's widening of an `i64` global onto an `f64`
+//      parameter.
+//   2. `belowcheck`  -- the same through globals declared BELOW every body
+//      that reads them: the judge reads the pass-time table, which is filled
+//      for the whole unit before it runs, so declaration order is nothing.
+//   3. `ifacecheck`  -- the itab road, with the same four shapes.
+//   4. `thischeck`   -- the unqualified spelling and the written-out `this.`
+//      one, each with a local, a parameter, a field and a global argument,
+//      and each with the widening onto an `f64` parameter that the
+//      unqualified road used to drop on the floor.
+//   5. `refcheck`    -- a `ref` GLOBAL whose pointee IS the parameter's,
+//      through a virtual and through an interface call: the callee writes
+//      through it and the global carries the new value out.
+//   6. `shadowcheck` -- a LOCAL shadowing a global of another type resolves
+//      to the LOCAL, at the site, lexically -- the rule the judge inherits
+//      from the walk it rides (`tk_ty_scope_or_global`, teko_typeof.tk).
+//   7. `constcheck`  -- a top-level `const` as the argument, on all three
+//      roads. It is an `N_INT` by the time any of them reads it, so it is
+//      never parked at all, and a `const` that does NOT fit the parameter is
+//      refused at the site as an ordinary literal is.
+//   8. `primcheck`   -- a `DateOnly` and a `TimeSpan` global onto a parameter
+//      of that type. `DateOnly` is four bytes wide (D54), so this is the one
+//      section where what crosses the `callp` is narrower than a word.
+//
+// expect-exit: 42
+#include "../lib/time.tk"
+
+const i64 K = 3;
+
+i64  g_i = 4;
+f64  g_f = 2.5;
+i64  g_widen = 2;                                 // onto an `f64` parameter
+DateOnly g_day;
+TimeSpan g_span;
+f64  g_shadow = 9.5;                              // a LOCAL `i64 g_shadow` shadows it
+
+interface IT {
+    i64 takei(i64 n);
+    i64 takef(f64 d);
+    i64 takeb(Box b);
+    i64 bump(ref f64 d);
+}
+
+class Box : IT {
+    public i64 w;
+    public Box(i64 v) { w = v; }
+
+    public virtual i64 takei(i64 n) { return n; }
+    public virtual i64 takef(f64 d) {
+        if (d > 2.4 && d < 2.6) return 25;        // 2.5, an `f64` global as it stands
+        if (d > 1.9 && d < 2.1) return 20;        // 2, widened onto the parameter
+        return 1;                                 // whatever raw bits used to arrive
+    }
+    public virtual i64 takeb(Box b) { return b.w; }
+    public virtual i64 bump(ref f64 d) { d = d + 1.0; return 42; }
+    public virtual i64 day(DateOnly d) { return d.DayNumber; }
+    public virtual i64 span(TimeSpan t) { return t.Hours; }
+
+    // the UNQUALIFIED road: four sources of one argument, and the widening
+    public virtual i64 unqual(i64 p) {
+        i64 local = 6;
+        if (takei(local) != 6) return 1;
+        if (takei(p) != 7) return 2;
+        if (takei(w) != 9) return 3;
+        if (takei(g_i) != 4) return 4;
+        if (takei(g_below) != 8) return 5;
+        if (takef(2) != 20) return 6;             // the literal widened at the site
+        if (takef(g_widen) != 20) return 7;       // ...and the global widened at the judge
+        return 0;
+    }
+
+    // ...and the same call written out, which always routed through the check
+    public virtual i64 qual(i64 p) {
+        i64 local = 6;
+        if (this.takei(local) != 6) return 1;
+        if (this.takei(p) != 7) return 2;
+        if (this.takei(w) != 9) return 3;
+        if (this.takei(g_i) != 4) return 4;
+        if (this.takef(g_widen) != 20) return 5;
+        return 0;
+    }
+
+    public virtual i64 constarg() {
+        if (takei(K) != 3) return 1;
+        if (this.takei(K) != 3) return 2;
+        return 0;
+    }
+}
+
+i64 g_below = 8;                                  // read by `unqual` above
+Box g_box;
+f64 g_ref = 1.5;                                  // passed as `ref g_ref`
+
+// 1. globals declared above, through a virtual call
+i64 abovecheck() {
+    Box b = new Box(9);
+    if (b.takei(g_i) != 4) return 1;
+    if (b.takef(g_f) != 25) return 2;
+    if (b.takeb(g_box) != 3) return 3;
+    if (b.takef(g_widen) != 20) return 4;         // 2 -> 2.0, the conversion D57 restored
+    return 0;
+}
+
+// 2. ...and globals declared below every body that reads them
+i64 belowcheck() {
+    Box b = new Box(9);
+    if (b.takei(g_below) != 8) return 1;
+    if (b.takeb(g_box2) != 5) return 2;
+    if (b.takef(g_widen2) != 20) return 3;
+    return 0;
+}
+
+// 3. the interface road, the same four shapes
+i64 ifacecheck() {
+    IT i = new Box(9);
+    if (i.takei(g_i) != 4) return 1;
+    if (i.takef(g_f) != 25) return 2;
+    if (i.takeb(g_box) != 3) return 3;
+    if (i.takef(g_widen) != 20) return 4;
+    if (i.takei(g_below) != 8) return 5;
+    return 0;
+}
+
+// 4. the unqualified form, and the written-out `this.` beside it
+i64 thischeck() {
+    Box b = new Box(9);
+    i64 bad = b.unqual(7);
+    if (bad != 0) return bad;
+    bad = b.qual(7);
+    if (bad != 0) return 10 + bad;
+    return 0;
+}
+
+// 5. a `ref` GLOBAL with the parameter's own pointee, both roads
+i64 refcheck() {
+    Box b = new Box(9);
+    if (b.bump(ref g_ref) != 42) return 1;
+    if (g_ref < 2.4 || g_ref > 2.6) return 2;     // 1.5 + 1.0, written by the callee
+    IT i = new Box(9);
+    if (i.bump(ref g_ref) != 42) return 3;
+    if (g_ref < 3.4 || g_ref > 3.6) return 4;
+    return 0;
+}
+
+// 6. a local of another type shadows the global of that name, lexically
+i64 shadowcheck() {
+    Box b = new Box(9);
+    i64 g_shadow = 4;                             // the `f64` global is not in sight here
+    if (b.takei(g_shadow) != 4) return 1;
+    IT i = new Box(9);
+    if (i.takei(g_shadow) != 4) return 2;
+    return 0;
+}
+
+// 7. a top-level `const` as the argument, on all three roads
+i64 constcheck() {
+    Box b = new Box(9);
+    if (b.takei(K) != 3) return 1;
+    IT i = new Box(9);
+    if (i.takei(K) != 3) return 2;
+    i64 bad = b.constarg();
+    if (bad != 0) return 2 + bad;
+    return 0;
+}
+
+// 8. a primitive WITH MEMBERS as the global, four bytes wide and eight
+i64 primcheck() {
+    Box b = new Box(9);
+    if (b.day(g_day) != 738944) return 1;         // 2024-02-29, D54's own width
+    if (b.span(g_span) != 3) return 2;
+    return 0;
+}
+
+Box g_box2;
+i64 g_widen2;
+
+i64 main() {
+    g_box = new Box(3);
+    g_box2 = new Box(5);
+    g_widen2 = 2;
+    g_day = new DateOnly(2024, 2, 29);
+    g_span = TimeSpan.FromHours(3);
+    i64 bad = abovecheck();
+    if (bad != 0) return 10 + bad;
+    bad = belowcheck();
+    if (bad != 0) return 20 + bad;
+    bad = ifacecheck();
+    if (bad != 0) return 30 + bad;
+    bad = thischeck();
+    if (bad != 0) return 40 + bad;
+    bad = refcheck();
+    if (bad != 0) return 60 + bad;
+    bad = shadowcheck();
+    if (bad != 0) return 70 + bad;
+    bad = constcheck();
+    if (bad != 0) return 80 + bad;
+    bad = primcheck();
+    if (bad != 0) return 90 + bad;
+    return 42;
+}
