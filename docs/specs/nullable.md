@@ -575,7 +575,7 @@ Measured against D42's own baseline (`types` 11, `alias` 19, `syntax` 15, `passe
 | `intrin` | **not at all** | every function has surface code: three in `lib/rt.tk`, and the loads and stores are `tk_ld`/`tk_stn`, which are the core's own fixed intrinsics already in use |
 | `nodes`, `funcs`, `globals` | up | one module of roughly 600 lines, and one vtable global |
 | a **compiled program**'s `types` | **+1 per distinct `T?` spelled** | exactly what `T[]` costs, and the registry doubles rather than dies |
-| `TK_MAXSTRUCT` (teko's own, 32) | one row per distinct `T?` | shared with every class, struct, interface, delegate and `T[]`; the ceiling is the existing `teko: too many type declarations`. **Measure before raising it** — a raise costs BSS in `globals` and no fixture on this page needs more than four |
+| `TK_MAXSTRUCT` (teko's own, 256 since D69; was 32 at write time) | one row per distinct `T?` | shared with every class, struct, interface, delegate and `T[]`; the ceiling is the existing `teko: too many type declarations`. **Measure before raising it** — a raise costs BSS in `globals` and no fixture on this page needs more than four |
 
 ---
 
@@ -757,7 +757,7 @@ unblock on whichever `mc` release answers.
 | **`c.v` on a `Cell?` is refused, and it is the first thing a C# reader writes.** | It is `Nullable<T>`'s own rule, which C# applies to `int?` and would apply to `Cell?` if `Cell?` were a `Nullable<Cell>`. The message names the two forms that work, and `?.` (Q2) is the one a C# reader reaches for anyway. Flow narrowing is a row in not-yet, honestly priced |
 | **`??` cannot sit where C# puts it**, because `mc`'s table starts at 1. | § 5: tie it at 1, document the one shape that differs, do not renumber the base grammar (D3) |
 | **Two suffixes now compete at one type position** (`[]` and `?`). | `take_type` dispatches the chain once per position, so the cooperation is two lines in each of two handlers, and `T[][]`'s existing refusal is the precedent for how the second suffix is judged |
-| **`TK_MAXSTRUCT` is 32 and a nullable row consumes one.** | The ceiling already exists with a message (`teko: too many type declarations`), and a raise is BSS. Measure in Q1a; raise only against a fixture that proves it |
+| **`TK_MAXSTRUCT` is 256 (D69; was 32 at write time) and a nullable row consumes one.** | The ceiling already exists with a message (`teko: too many type declarations`), and a raise is BSS. Measure in Q1a; raise only against a fixture that proves it |
 | **The definite-assignment analysis is weaker than C#'s.** | Deliberately: it never refuses what it is not sure about, so it can never break a correct program. The gap is a not-yet row, and the strong version is a dominator pass nobody has asked for. **As built (D46)**, that row is written out shape by shape in [not-yet.md](../reference/not-yet.md), and the fixture asserts the accepted half rather than the refused one |
 | **`GetValueOrDefault()` diverges from C# on a reference nullable.** | Ruling 1 beats C# fidelity here: `default(T)` for a reference is `null`, and handing a `null` to a `T` slot is what the whole page exists to stop. The refusal names `??`, which is the form that says which default it means |
 

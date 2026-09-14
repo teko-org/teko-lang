@@ -41,6 +41,11 @@ DateOnly g_day;                                     // a global of primitive typ
 delegate DateOnly DOp();
 delegate void VOp();                                // a write through a capture
 delegate DateTimeKind KOp();                        // the OTHER four-byte value
+delegate void SetDay(ref DateOnly d);               // ...and the POINTEE of a `ref`
+
+// D63, third pass: through the thunk a delegate value is, the `ref` parameter
+// is the CALLER's own four-byte slot, written at its own width
+void nextday(ref DateOnly d) { d = d.AddDays(1); }
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same table
@@ -236,6 +241,21 @@ i64 main() {
     kind_wr();
     if (kind != DateTimeKind.Local) return 82;
     if (kind_rd() != DateTimeKind.Local) return 83;
+
+    // ---- a `ref DateOnly` reached through a DELEGATE, on both roads ----
+    // The thunk forwards the caller's address as a bare name of a slot
+    // declared `uptr`, and the reclaim's own argument check read that pointer
+    // against the POINTEE: `teko: a value of type uptr does not convert to
+    // DateOnly`, on both roads, until D63's third pass (teko_rc.tk).
+    DateOnly rf = new DateOnly(2024, 2, 28);
+    SetDay bump = nextday;
+    bump(ref rf);
+    if (rf.DayNumber != 738944) return 84;
+    if (rf.Month != 2 || rf.Day != 29) return 85;
+    SetDay nbump = new SetDay(nextday);              // the same thunk, explicitly
+    nbump(ref rf);
+    if (rf.DayNumber != 738945) return 86;
+    if (rf.Month != 3 || rf.Day != 1) return 87;
 
     return 42;
 }

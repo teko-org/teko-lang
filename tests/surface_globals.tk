@@ -96,7 +96,8 @@
 //      store took TWO rows of `TK_MAXOS`, one of them on the node
 //      `tk_hg_resolve_write` had already dropped, so 65 stores were refused
 //      `teko: too many stores into a slot of class type` where 128 local ones
-//      compile. The row is moved, not added (D51, eleventh pass).
+//      compiled (`TK_MAXOS` was 128 then; 4096 since D69). The row is moved,
+//      not added (D51, eleventh pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -435,8 +436,9 @@ i64 delegcallcheck() {
 // alone there, which asks `decl_find` about a name no declaration owns: -1,
 // no row matched, and every store below was refused `teko: Op takes a
 // function, another Op, or null` on a legal program, in either order of the
-// rows. It asks the delegate oracle now (`tk_deleg_expr_ty`), which is the
-// same peek the validator one frame up already takes.
+// rows. The delegate table answers now: since D61 that peek is `tk_ty_of`'s
+// own first arm for an `N_CALL`, the same one the validator one frame up and
+// every other consumer of the oracle read.
 Op make(Op o) { return o; }
 
 i64 delegovcallcheck() {
@@ -461,10 +463,11 @@ i64 delegovcallcheck() {
 // `tk_hg_resolve_write` (teko_array.tk) copies the store it has built into the
 // placeholder node the tree holds and then MARKED that placeholder as a second
 // store into a counted slot, leaving the row `tk_ha_store` had already written
-// pointing at the orphan it dropped. Two rows of `TK_MAXOS` (128,
-// teko_struct.tk) per global element store: the 65th of the stores below was
-// refused `teko: too many stores into a slot of class type` on a program with
-// no error in it, where 128 stores into a LOCAL `Op[]` compile. The row is
+// pointing at the orphan it dropped. Two rows of `TK_MAXOS` (128 at the time,
+// teko_struct.tk; 4096 since D69) per global element store: the 65th of the
+// stores below was refused `teko: too many stores into a slot of class type`
+// on a program with no error in it, where 128 stores into a LOCAL `Op[]`
+// compiled. The row is
 // MOVED now, so 65 is an ordinary number of stores and the ceiling is the one
 // the table says it is.
 Op[] g_many;
@@ -637,8 +640,19 @@ i64 addrcheck() {
 // one alike (D51, twelfth pass). What runs below is the accepted side: the
 // pointee the signature declares, over both kinds of slot. The mismatch has no
 // exit code and is a `// no-run` sample in docs/reference/diagnostics.md.
+//
+// The rows from `return 5` on are D63: `new Mut(bumpf)` is the SAME thunk the
+// contextual `Mut m = bumpf;` builds -- one per (delegate row, function),
+// memoized -- and it was the only road refused, ``teko: argument 1 needs
+// `ref` at the call site``, because the parse-time thunk is the one
+// `tk_ref_pass` walks. The thunk forwards a `ref`/`out` parameter as the
+// ADDRESS it holds; it now says so (`tk_deleg_thunk_arg`, teko_deleg.tk).
+// `Setter` is the first `out` delegate any fixture has, on both roads.
 delegate void Mut(ref f64 x);
 delegate void MutI(ref i64 x);
+delegate void Setter(out i64 x);
+
+void seti(out i64 x) { x = 7; }
 
 Mut g_mut;
 MutI g_muti;
@@ -660,6 +674,24 @@ i64 delegrefcheck() {
     g_muti = bumpi;
     g_muti(ref g_mi);
     if (g_mi != 2) return 4;
+
+    Mut nm = new Mut(bumpf);                      // D63: the explicit road, same thunk
+    f64 nv = 1.0;
+    nm(ref nv);
+    if (nv != 2.0) return 5;
+    MutI nmi = new MutI(bumpi);
+    i64 nn = 1;
+    nmi(ref nn);
+    if (nn != 2) return 6;
+
+    Setter s = new Setter(seti);                  // ...and `out`, over both roads
+    i64 r = 0;
+    s(out r);
+    if (r != 7) return 7;
+    Setter cs = seti;
+    i64 cr = 0;
+    cs(out cr);
+    if (cr != 7) return 8;
     return 0;
 }
 

@@ -76,7 +76,7 @@
 // the temporaries the compiler declares itself (teko_null.tk,
 // teko_ternary.tk), which no source count bounds.
 #define TK_MAXSCOPE (TK_MAXSLV + MAXPARAMS)
-#define TK_MAXPEND  128               // member accesses waiting for the pass
+#define TK_MAXPEND  4096              // member accesses waiting for the pass (D61: every untagged call receiver waits here)
 
 // what the deferred access still has to become
 #define TK_PLOAD  0                   // p.m
@@ -288,6 +288,14 @@ i64 tk_nl_own_null_is(i64 n);
 void tk_nl_check_value(i64 tty, i64 ti, i64 ety, i64 en, i64 line, uptr fl);
 i64 tk_nl_wrap(i64 tty, i64 ety, i64 e);
 
+// teko_deleg.tk is included after this file: the delegate TABLE, asked about a
+// call through a slot. `f()` whose `f` is a local, a parameter or a global of
+// delegate type carries no declaration of its own until the eighth pass
+// (`tk_deleg_pass`) rewrites it into a `callp`, so nothing below could type it
+// while this pass -- the sixth -- resolves a deferred `.` over the call (D61).
+i64 tk_deleg_row(i64 ty);
+i64 dg_ret_at(i64 i);
+
 // A composite expression answers by the CORE's own rule, the one codegen will
 // apply to the very same node (mc/src/gen_resolve.mc, res_binary and res_expr's
 // N_UNARY arm): a logical operator and a comparison are `i64`, and every other
@@ -339,6 +347,18 @@ i64 tk_ty_of(i64 n) {
         return tk_ty_global(nd_name(n));            // a global slot, G1's `T[]` of heap included
     }
     if (k == N_CALL) {
+        // D61: a call THROUGH a delegate slot is typed by the slot's own row,
+        // ahead of every table below -- the name is the slot's, no declaration
+        // owns it, and `decl_find` answers -1 for it until `tk_deleg_pass`
+        // (the eighth) has rewritten the site. This pass is the sixth, so a
+        // deferred `.` over `f()` used to be resolved by member name alone and
+        // refused `teko: unknown member: DayNumber` on a legal program. Once
+        // the walk HAS rewritten the call, its name is the built one, no slot
+        // answers for it, and the arms below are exact again -- which is why
+        // this lookup is `tk_deleg_expr_ty`'s whole body, folded in here so
+        // that every consumer of the oracle gets the same answer.
+        i64 di = tk_deleg_row(tk_ty_scope_or_global(nd_name(n)));
+        if (di >= 0) return dg_ret_at(di);
         // D49: a name that carries several signatures is typed by the PICK its
         // own arguments make. `decl_find` answers the FIRST declaration of such
         // a name, which is a guess every consumer of this oracle then acted on
@@ -611,6 +631,14 @@ i64  fst_ty_at(i64 i)   { return ld64(fst_ty + i * 8); }
 i64  fst_line_at(i64 i) { return ld64(fst_line + i * 8); }
 uptr fst_file_at(i64 i) { return ld64(fst_file + i * 8); }
 i64  fst_done_at(i64 i) { return ld64(fst_done + i * 8); }
+
+// teko_deleg.tk is included after this file: D65's own road for a delegate
+// FIELD called through a receiver only this pass can type -- the row the
+// field's type names, the one builder of a delegate `callp`, and that row's
+// declared return
+i64 tk_deleg_row(i64 ty);
+i64 tk_deleg_build(i64 si, i64 obj, i64 args, i64 na, i64 line, uptr fl);
+i64 dg_ret_at(i64 i);
 
 // teko_prim.tk is included after this file: the in-place rewrite D48 already
 // owns -- the node keeps its identity and BECOMES the conversion, while a
@@ -1203,6 +1231,30 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
     i64 fty = fd_ty_at(fi);
     i64 nel = fd_nel_at(fi);
     i64 addr = tk_bin(K_ADD, pd_recv_at(pi), tk_int(fd_off_at(fi)));
+    // D65: a field of DELEGATE type is callable wherever it is read, and this
+    // emitter is the pass-time twin of `tk_field_use` (teko_expr.tk) -- whose
+    // own delegate branch had no counterpart here, so every receiver the
+    // PARSER cannot type (a parameter, a global, a `TK_PFWD` type, a field of
+    // any of them) was refused the call outright. `tk_deleg_build` is the one
+    // builder of a delegate `callp` and it carries D59's own argument judge,
+    // which parks what it cannot type here for pass 14 -- later than this
+    // pass, so the park is read where it is written.
+    //
+    // Reported through `pty`/`ppure`/`pown`, never through `tk_xt_put`: the
+    // node that ends up in the TREE is `tk_pend_do`'s placeholder, not what is
+    // built for it, and that is the split `tk_deleg_build`'s own contract
+    // (teko_deleg.tk) leaves to its caller.
+    if (form == TK_PCALL && nel == 0) {
+        i64 di = tk_deleg_row(fty);
+        if (di >= 0) {
+            i64 r = tk_deleg_build(di, tk_ld(fty, addr), pd_arg_at(pi), pd_na_at(pi),
+                                   tk_line, tk_file);
+            st64(pty, dg_ret_at(di));
+            st64(ppure, 0);
+            st64(pown, TK_OWNED);
+            return r;
+        }
+    }
     if (form == TK_PCALL)
         err_at2(tk_file, tk_line, "teko: the member is a field, not a method", m);
     if ((form == TK_PIXLOAD || form == TK_PIXSTORE) && nel == 0)
