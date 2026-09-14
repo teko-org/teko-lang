@@ -7,6 +7,15 @@ program. Both steps are one `build` command reading one config file.
 The `mc` a build uses is **pinned** by [`../../MC_VERSION`](../../MC_VERSION): download the
 release of exactly that version. Another one may teach a different compiler, or none.
 
+Since **mc 0.16.0** the standard library is a directory beside the compiler, not a bundle
+inside it. `mc build` stages it next to the `[compiler]` product — `build/lib/mc/v0.16.0/`
+beside `build/teko` — and the taught compiler looks for it next to its own binary and one
+directory up. `lib/rt.tk` includes `<sys>`, so `build/teko` moved away from that tree
+refuses every program with `lib/rt.tk:40: unknown bundled include: sys` (`mc` itself, which
+resolves the same names through its own driver, says `not in this compiler and mc 0.16.0's
+library tree was not found`). A release archive therefore ships `lib/mc/` beside the
+binary.
+
 ---
 
 ## `teko build`

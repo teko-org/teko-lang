@@ -108,14 +108,22 @@ bytes, that is the brake on a compiler-module package: those modules **run** at 
 inside the compiler `mc build` assembles, so a teko dependency is trusted code and the lock is
 the review.
 
-## The mc 0.16.0 migration
+## The mc 0.16.0 migration, as it actually landed
 
-Today `teko_float.tk` includes `<float>`, `<machine_arm64_float>` and
-`<machine_x86_64_float>` — the float library and the two float machines — and they are
-answered by the bundle inside the `mc` binary. On **mc 0.16.0 they move into the `stdlib`
-package**: teko declares `[deps] stdlib` and the same names are answered by the lock instead
-of the bundle. Raising [`MC_VERSION`](../../MC_VERSION) to 0.16.0 and declaring that
-dependency is one change, made after the whole local recipe is green on the new release.
+`teko_float.tk` includes `<float>`, `<machine_arm64_float>` and `<machine_x86_64_float>` —
+the float library and the two float machines. Up to 0.15.23 those names were answered by a
+bundle inside the `mc` binary. This page used to predict that 0.16.0 would move them into a
+`stdlib` **package**, reached through `[deps] stdlib` and the lock; that is not what
+shipped. **mc 0.16.0 moved the library out of the binary and onto the disk beside it** —
+`lib/mc/v0.16.0/`, looked up next to the compiler and one directory up — and left the
+include names, the closure rule and `[deps]` exactly as they were. There is no `stdlib`
+dependency to declare, and nothing in `mc.toml` changes.
+
+What the pin did change is the shape of an artefact: `mc build` stages that library tree
+beside the `[compiler]` product, so `build/lib/mc/v0.16.0/` travels with `build/teko`, and
+`.github/actions/package-teko` puts it in the release archive under `lib/mc/`. A teko
+binary moved away from that tree cannot resolve `<sys>`, which `lib/rt.tk` includes, so it
+cannot compile a program at all.
 
 ## What is still missing here
 

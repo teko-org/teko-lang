@@ -5436,3 +5436,85 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
+
+
+### D64 · The pin rises to 0.16.0 (2026-09-14)
+`MC_VERSION` moves from `0.15.23` to `0.16.0` — twenty-one `minicompiler/mc` commits, of
+which one changes the SHAPE of what a build produces here. **M52: the standard library
+left the binary.** Up to 0.15.23 `<sys>`, `<prelude>`, `<io>`, `<float>` and the two float
+machines were a blob inside `mc`; in 0.16.0 they are 41 files on disk under
+`lib/mc/v0.16.0/`, which `mc` resolves next to its own binary (by realpath, so a symlinked
+`mc` still finds it) and one directory up. `mc build` **stages that tree beside a
+`[compiler]` product**, so `build/lib/mc/v0.16.0/` now travels with `build/teko`, and the
+child resolves its own roots — teko passes **no `--libs-dir` anywhere**, and none was
+added. The rest of the range is invisible from here: the x86-64/Win64 register allocator
+and peephole (M49 D2), the arm64 peephole, loop-invariant hoisting, the reproducible bench
+cell (M50), `mc --exe` for Windows PE, version constraints for `[deps]`/`[tools]`,
+`[package].mc`, the registry index snapshot, `$` as a claimable surface token, and
+`i128`/`u128` on x86-64 (SysV and Win64).
+
+**`mc.toml` and `teko.toml` stay BARE.** 0.16.0 accepts `=`, `~`, `^`, `*` and `>=` ranges
+and a `[package].mc` minimum, and this repository writes none of them: the registry's
+validator still pins 0.15.20 until the owner redeploys it, and a manifest it cannot parse
+is a manifest it cannot publish. There is also no `[deps] stdlib` to declare —
+`docs/specs/packages.md` predicted the library would become a *package* reached through the
+lock; what shipped moved it to a *directory*, leaving the include names, the closure rule
+and `[deps]` untouched. That section is rewritten to what landed.
+
+**One change beyond the version string, and it is not cosmetic.**
+`.github/actions/package-teko` staged `teko` and `lib/rt.tk` into the release archive and
+nothing else. `lib/rt.tk` includes `<sys>`; under 0.16.0 a `teko` binary with no
+`lib/mc/` beside it answers `lib/rt.tk:40: unknown bundled include: sys` and cannot compile
+a single program — measured, by copying `build/teko` out of `build/` and running it, and
+measured again on a full staged archive, which compiles `#include "lib/rt.tk"` to
+`exit 42` with the tree and refuses with that line the moment `lib/mc/` is removed. (`mc`
+itself, whose driver resolves the same names, says `not in this compiler and mc 0.16.0's
+library tree was not found`; the taught compiler is built on `<mc/core_min>` and keeps the
+core's shorter wording.) The action now copies the tree `mc build` staged beside the
+binary into the archive's own `lib/mc/`, and fails loudly if it is not there; the archive's
+`INSTALL.txt` and the release notes gained the `cp -R lib /usr/local/` (and the Windows
+`xcopy`) that the install needs. `docs/guide/00-getting-started.md` gained the same line for
+`mc` itself, `docs/reference/build.md` states where the tree lives, and both were verified
+by installing `mc` into a `bin/` + `lib/` pair and into a bare directory: the first
+compiles `#include <sys>`, the second refuses with that exact message.
+`.github/actions/setup-mc` needed nothing — it already untars the WHOLE asset into
+`.mc-toolchain/mc-<version>-<os>-<asset>/` and addresses the binary inside it, so
+`lib/mc/v0.16.0/` lands beside it by construction.
+`.github/actions/windows-sysroot`'s `kernel32.def` needed nothing either: mc's own
+`scripts/sysroot-windows.sh` at `v0.16.0` lists the same nineteen names, compared verbatim.
+
+Proof, macos/aarch64, with the pinned `~/.local/mc/mc-0.16.0-macos-arm64/mc`: `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml`
+**73 passed, 50 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK` (`teko2.o == teko3.o`, fixed point on the FIRST turn —
+`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 227935 lines);
+`sh scripts/check-docs.sh <mc>` green (597 links, 41 fragments, 389 diagnostics, 50
+refusals, 141 samples). `mc pkg hash .` is
+`571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75` on both releases: it
+digests `mc.toml`'s bytes and this pin touches none of them, so the tree hash does not move
+with the compiler that reads it.
+
+`mc limits . --config mc.macos.toml` keeps verdict `ok` on every row of both tables, and
+no table appeared, disappeared or changed its ceiling. The rows that MOVED, `build/teko.mc`
+first (estimate / used, 0.15.23 → 0.16.0): `includes` 78/78 → 79/79, `nodes` 178817/156558
+→ 186217/164041, `defines` 1246/1198 → 1331/1281, `funcs` 3816/3182 → 3961/3265, `lowered`
+3816/3164 → 3961/3246, `globals` 1272/943 → 1320/944, `strings` 2668/2138 → 2726/2172,
+`ins` 216018 → 224999, `symbols` 7756/6263 → 8007/6381, `undef` 18 → 19, `backends` 8 → 9.
+On `tests/hello.tk` exactly one row moves: `backends` 8 → 9. Every one of them is the same
+cause read twice — the library is now SOURCE the build reads (one more include) instead of
+a blob, and 0.16.0 registers one more backend (`mc --exe` for Windows PE) — and none of
+them is near its reserve.
+
+`--dump-ast` of all **123** fixtures (73 under `tests/`, 50 under `tests/refuse/`, the
+refusals compared on their stderr since they produce no tree), taken with the compiler
+built by 0.15.23 and with the compiler built by 0.16.0 over the same unmodified tree, is
+**byte-identical on every one**. The taught compiler's own output does not depend on the
+host `mc`; what moved underneath it is codegen and library location, not grammar. The first
+run of that comparison failed on all 123 for a reason worth recording: the 0.16.0-built
+`teko` had been COPIED out of `build/`, away from the staged `lib/mc/v0.16.0/`, and every
+fixture refused at `lib/rt.tk:40: unknown bundled include: sys`. That failure is the
+measurement the packaging fix above is built on, not an mc defect.
+
+**Nothing to report to `minicompiler/mc`.** No behaviour in the range broke anything here;
+the one break was this repository's own packaging assuming a library that no longer travels
+inside the binary.

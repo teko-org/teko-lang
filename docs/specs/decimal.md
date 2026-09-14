@@ -405,8 +405,9 @@ first row of § 13.
 
 ## 15. What the `mc` channel is asked
 
-1. **Does `mc` want an x86-64 half for `<i128>`?** Only C7 cares, and only for speed. If
-   `mc` would take it, teko contributes it there rather than carrying a module of its own.
+1. ~~**Does `mc` want an x86-64 half for `<i128>`?**~~ **Answered by mc 0.16.0**, whose
+   `lib/i128.mc` carries the x86-64 machines (SysV and Win64) beside the arm64 one. C7
+   needs no module of its own.
 2. **Is a sixteen-byte value's ABI anything the core decides?** The reading of `<i128>` and
    of the machine contract says no — the module owns `MTASK_PARAM`, `MTASK_CALL` and
    `MTASK_RET` — and this design is built on that answer. A one-line confirmation closes
