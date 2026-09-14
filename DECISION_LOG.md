@@ -3253,7 +3253,7 @@ mc **0.15.23**, macos/aarch64 -- `Op` is `delegate i64 Op(i64 a)`:
 
 1. **`nd_kind(v) == N_INT && nd_val(v) == 0` is not `null`.** `tk_deleg_store_late` and
    `tk_deleg_coerce` (teko_deleg.tk) both asked that predicate for "is this value `null`",
-   and an ordinary `i64` literal `0` answers it exactly as `tk_type.tk`'s own `tk_null` does
+   and an ordinary `i64` literal `0` answers it exactly as `teko_type.tk`'s own `tk_null` does
    -- the two differ only in `nd_type`, `TY_I64` against the `TY_UPTR` only `tk_null`
    carries, which neither check read. `ops[0] = 0;` slipped past `tk_deleg_store_late`'s
    null branch as if it were `null` (so the store was never deferred to the walk) and then
@@ -3300,8 +3300,10 @@ its own table (or narrative) records; **63/63** fixtures at their `expect-exit`,
 `tests/surface_globals.tk` (exit 42) gaining a comment (section 3g) that names the fixed
 predicate and points at the `// no-run` case this refusal cannot be a fixture of
 ([diagnostics.md](docs/reference/diagnostics.md)) -- no new code path in the fixture itself,
-because every store it already makes is a real function and the validator's null branch is
-exercised, correctly, by the ones already there (`storeParam`, `h = ops[1]`, and so on). The
+because every store it already makes is a real function. The claim this entry made about the
+validator's null ARM is corrected by the ninth pass below: `storeParam` and `h = ops[1]`
+carry a function and a delegate value, never `null`, and nothing executable reaches that arm
+at all. The
 `--dump-ast` of all **63** fixtures: byte-identical to `fa596667` at every one -- neither
 finding moves an accepted program's tree, the first because no fixture ever wrote a literal
 `0` where a delegate is expected, the second because the bucket table answers the exact same
@@ -3311,3 +3313,86 @@ links, 385 diagnostics -- one no-run sample added and documented in the same par
 samples); `mc limits --config mc.macos.toml` verdict `ok` on both legs, deltas in finding 2
 above. `mc pkg hash .` at this pass's own code commit:
 `5fa74991ce956317f690c012c26789d1b0fab809cd724956e8aca950ddf83d95`.
+
+**Copilot finding, ninth pass: an entry has ONE chain link, and the move gave it two
+buckets.** `dl_chain` (teko_deleg.tk) is one link per ENTRY, not one per (entry, bucket)
+pair, so an entry belongs to exactly one bucket at a time. `tk_deleg_late_move` -- the one
+caller that re-points a waiting store at a new node id, a global `T[]`'s own store copied
+into its placeholder by `tk_hg_resolve_write` (teko_array.tk) -- called
+`tk_dg_bucket_insert` WITHOUT taking the entry out of the bucket it was already in, and the
+eighth pass above called the leftover slot "a single harmless dead link". It is not one.
+The insert overwrites `dl_chain[i]` with the new bucket's head, so the OLD chain is cut at
+`i`: everything behind `i` there stops being reachable, and when the two buckets coincide
+the entry ends up pointing at itself. Both modes measured on `ba0dc27f` (the head this fix
+sits on), mc **0.15.23**, macos/aarch64, with a build instrumented to print every move, every
+entry `tk_deleg_late_rest` still finds undone, and a 4096-step guard in
+`tk_deleg_late_pend`:
+
+| probe | `ba0dc27f` | with `tk_dg_bucket_remove` |
+|---|---|---|
+| `tests/surface_globals.tk`, the SHIPPED fixture | `PROBE dgrest leftover i=13 node=1908` -- one of its six global stores never judged at the walk | no leftover, no cycle; the six are judged where the scope is live |
+| the same, exit | 42 | 42 |
+| `p9_cycle`, one global `Op[]` store padded with 1002 filler globals so the built store node (2395) and the placeholder it is copied into (1371) differ by exactly `TK_DGBUCKETS` -- bucket 347 for both | spins: killed at **30s** of CPU (`alarm 30`), nothing compiled | 0.06s, exit 42 |
+| the same padded to 1001 (`p9_ctrl`, buckets 346/347) | 0.06s, exit 42 | unchanged |
+
+The first row is the refutation of "harmless": the cut is real, on a file this repository
+already ships. Entry 13 is `g_ops2[0] = new Op((i64 a) => a * 3)`, moved into bucket 884;
+entry 14 (`g_ops2[1] = chooser(1)`, node 2932, the same bucket) was deferred after it and
+then moved out to bucket 893, and that insert overwrote the link entry 14 held to entry 13.
+Bucket 884 then answered "entry 14" alone, the walk never found entry 13 at its own node,
+and `tk_deleg_late_rest` judged it at the END of the pass, with the scope closed -- the
+exact place D51's fourth pass moved this judgement OUT of. The fixture's exit did not move
+because the value that fell through is a lambda, whose verdict is the same in a closed
+scope; the store two rows below it (`g_ops2[2] = shadowed`, a LOCAL shadowing a free
+function) judged there would have wrapped the FUNCTION and answered 110 instead of 11. The
+sweep is a backstop, not a second judgement point, and nothing may be pushed into it by an
+index that lost its own chain.
+
+**The fix is the unlink the insert always needed**: `tk_dg_bucket_remove(i, from)` walks the
+OLD bucket's chain, drops `i` out of it (head or interior, `dl_bucket` or the predecessor's
+own `dl_chain`), and only then does `tk_deleg_late_move` write the new node id and insert.
+Cost is the length of the one chain the entry sits in -- the same order the lookup it
+protects already pays, and paid once per moved store (at most one per global element store)
+rather than per node visited. The alternative the recon weighed, dropping the index and
+keeping a node-sorted vector, buys nothing here: the table is built in defer order, a move
+would have to re-sort it, and the lookup this replaces is already one or two comparisons.
+
+**No new fixture, and the reason is measured**: both modes need two node ids congruent mod
+`TK_DGBUCKETS`, and the ids are absolute counts of every node the compiler's own passes
+have built by then -- `p9_cycle` needs exactly 1002 filler globals on THIS build and a
+different number on the next one. A fixture written on that arithmetic would stop exercising
+anything the first time an unrelated pass adds a node, while claiming it still does. The
+invariant lives in the code instead (`tk_dg_bucket_remove`, and the header above it), and
+`tests/surface_globals.tk` is the program where the first mode was actually caught.
+
+**Two corrections to the eighth pass's own entry**, both Copilot's:
+
+- the module is `teko_type.tk`, not `tk_type.tk` -- the name is written correctly now here
+  and in [diagnostics.md](docs/reference/diagnostics.md).
+- the claim that `storeParam` and `h = ops[1]` exercise the store validator's `null` arm is
+  **false**: both carry a function and a delegate value, never `null`. Measured with a print
+  in `tk_deleg_store_late`'s `tk_is_null_lit` branch over all **63** fixtures -- not one
+  reaches it, and none can. The arm sits behind `dsi = tk_deleg_row(ety)` (teko_heaparr.tk)
+  and the validator's own `si < 0` guard, so only a NON-nullable `Op[]` element ever gets
+  there, and a `null` written into one is refused one line later by `tk_deleg_coerce`
+  (`teko: null needs a slot declared Op?`). The shape where the store is ACCEPTED, an
+  `Op?[]` element, answers `tk_deleg_row` with -1 and never reaches this validator at all
+  (probed: `Op?[] ops = new Op?[1]; ops[0] = null;` compiles and runs, and prints nothing).
+  So the `// no-run` sample in [diagnostics.md](docs/reference/diagnostics.md) is the only
+  cover that arm has, and the only one it can have while `null` in a delegate element is
+  refused.
+
+Proof, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
+clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of all **63** byte-identical
+to `ba0dc27f` (the fix changes which pass reaches a waiting store, never the tree any
+accepted program ends with); the probe corpora of passes 1 to 7 re-run whole -- **70** files
+from those passes' own worktrees, plus the eighth pass's four and this pass's two, **76** in
+all, each compiled and run on `ba0dc27f` and on this fix: every verdict identical except
+`p9_cycle`, which is the finding (no binary at all against exit 42). `sh
+scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (63/63 under `teko1`,
+44.3s); `sh scripts/check-docs.sh` green (569 links, 385 diagnostics, 124 samples); `mc
+limits --config mc.macos.toml` verdict `ok` on both legs -- compiler leg `nodes` 154332 ->
+154421 (+89, `tk_dg_bucket_remove` and its header), `funcs` 3138 -> 3139 (+1), `globals` 926
+unchanged, floor leg (`tests/hello.tk`) `passes` 15/30, `syntax` 15, `alias` 18, `types` 11,
+`intrin` 8/16, heap 1114992, and the `tests/surface_datetime.tk` leg `syntax` 16, `alias`
+21, `types` 14, heap 3875392 (against a 33554432-byte reservation).

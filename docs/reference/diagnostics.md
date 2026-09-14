@@ -730,7 +730,7 @@ i64 f(i64 c) {
 }
 ```
 
-The `null` a store or a `return` accepts is one shape and one only: `tk_type.tk`'s own
+The `null` a store or a `return` accepts is one shape and one only: `teko_type.tk`'s own
 `tk_null`, the single `N_INT` this project ever types `TY_UPTR` (`tk_is_null_lit`,
 [teko_struct.tk](../../teko_struct.tk)). An ordinary `i64` literal `0` is a DIFFERENT
 node with the same kind and the same value, typed `TY_I64` — and the two checks that decide
