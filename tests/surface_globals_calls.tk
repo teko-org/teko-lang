@@ -39,6 +39,15 @@
 //   8. `primcheck`   -- a `DateOnly` and a `TimeSpan` global onto a parameter
 //      of that type. `DateOnly` is four bytes wide (D54), so this is the one
 //      section where what crosses the `callp` is narrower than a word.
+//   9. `exprcheck`   -- an argument that is a COMPOSITE EXPRESSION (a binary,
+//      a ternary, a negation) onto an `f64` parameter, on all four roads.
+//      D57 parked only a bare NAME and a call to an overloaded one, so these
+//      reached the site's `at < 0` path and crossed RAW. Nothing crosses at
+//      all in that case on aarch64 -- the integer goes in an integer register
+//      and the callee reads the FP one -- so each road starts by passing 2.0,
+//      and the rows that follow read that 2.0 back instead of their own 3.0
+//      (measured on `9b6c4180`: exit 102, section 9's second row). D59's
+//      second pass parks them too.
 //
 // expect-exit: 42
 #include "../lib/time.tk"
@@ -67,6 +76,7 @@ class Box : IT {
     public virtual i64 takef(f64 d) {
         if (d > 2.4 && d < 2.6) return 25;        // 2.5, an `f64` global as it stands
         if (d > 1.9 && d < 2.1) return 20;        // 2, widened onto the parameter
+        if (d > 2.9 && d < 3.1) return 30;        // 3, section 9's own answer
         return 1;                                 // whatever raw bits used to arrive
     }
     public virtual i64 takeb(Box b) { return b.w; }
@@ -95,6 +105,15 @@ class Box : IT {
         if (this.takei(w) != 9) return 3;
         if (this.takei(g_i) != 4) return 4;
         if (this.takef(g_widen) != 20) return 5;
+        return 0;
+    }
+
+    // ...and the composite argument on the unqualified and `this.` roads
+    public virtual i64 exprarg() {
+        if (takef(1 + 2) != 30) return 1;
+        if (takef(g_widen + 1) != 30) return 2;
+        if (this.takef(g_i > 0 ? 3 : 4) != 30) return 3;
+        if (this.takef(0 - (g_widen - 5)) != 30) return 4;
         return 0;
     }
 
@@ -189,6 +208,25 @@ i64 primcheck() {
     return 0;
 }
 
+// 9. an argument that is a COMPOSITE EXPRESSION, on all four roads
+i64 exprcheck() {
+    Box b = new Box(9);
+    if (b.takef(g_widen) != 20) return 1;         // 2.0 left in the FP register...
+    if (b.takef(1 + 2) != 30) return 2;           // ...so a binary that crossed RAW
+    if (b.takef(g_widen + 1) != 30) return 3;     //    reads it back as 2.0, not 3.0
+    if (b.takef(g_i > 0 ? 3 : 4) != 30) return 4; // a ternary
+    if (b.takef(0 - (g_widen - 5)) != 30) return 5;   // a negation
+    IT i = new Box(9);
+    if (i.takef(g_widen) != 20) return 6;         // the itab road, the same five
+    if (i.takef(1 + 2) != 30) return 7;
+    if (i.takef(g_widen + 1) != 30) return 8;
+    if (i.takef(g_i > 0 ? 3 : 4) != 30) return 9;
+    if (i.takef(0 - (g_widen - 5)) != 30) return 10;
+    i64 bad = b.exprarg();
+    if (bad != 0) return 10 + bad;                // the unqualified and `this.` roads
+    return 0;
+}
+
 Box g_box2;
 i64 g_widen2;
 
@@ -214,5 +252,7 @@ i64 main() {
     if (bad != 0) return 80 + bad;
     bad = primcheck();
     if (bad != 0) return 90 + bad;
+    bad = exprcheck();
+    if (bad != 0) return 100 + bad;
     return 42;
 }

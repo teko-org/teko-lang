@@ -351,6 +351,106 @@ i64 rcheck() {
     return 0;
 }
 
+// ---- 7. an argument JUDGED and CONVERTED at a delegate call (D59) ----
+// All three roads into a delegate `callp` are built by one function
+// (`tk_deleg_build`, teko_deleg.tk) and pass one door, and until D59 that door
+// read the `ref`/`out` KIND alone: an integer handed to an `f64` parameter
+// crossed as its own raw bits, and a value of the wrong type crossed at all.
+// What runs below is the accepted side -- the widening C# 10.2.3 owes the
+// argument, on the LOCAL, PARAMETER, FIELD and ELEMENT roads, an
+// integer LITERAL and an integer NAME alike; an argument that is a COMPOSITE
+// EXPRESSION -- a binary, a ternary, a negation -- which the parse-time oracle
+// types no better than a global and which D59's second pass added to the park;
+// an argument that is a call to an
+// OVERLOADED name, whose type is the pick's and not the first declaration's;
+// a right-typed global; and a `ref` global whose pointee is the one the
+// signature declares, through a FIELD slot -- the road whose parse-time door
+// could not read a pointee at all. Every refusal this door now gives is a
+// fixture of its own (tests/refuse/deleg_arg_*.tk, deleg_field_*.tk,
+// deleg_elem_*.tk).
+
+delegate f64 Sc(f64 x);
+delegate void MutD(ref f64 x);
+
+f64 five(f64 x) {
+    return x * 5.0;
+}
+
+void bumpd(ref f64 x) {
+    x = x + 1.0;
+}
+
+// an overloaded name: `tk_pty_of` answers the FIRST declaration's return at
+// the door, and `pick(2)` reaches the second -- so the argument is parked and
+// typed by the pick, at pass 14
+f64 pick(f64 k) {
+    return k + 0.5;
+}
+
+i64 pick(i64 k) {
+    return k;
+}
+
+class SH {
+    public Sc cb;
+    public MutD mut;
+}
+
+i64 g_n = 3;
+f64 g_rate = 4.0;
+f64 g_bumped = 1.0;
+
+i64 use_sc(Sc f) {                                // the PARAMETER road
+    return (i64)f(2);
+}
+
+i64 use_sce(Sc f, i64 k) {                        // ...with a composite argument
+    return (i64)f(k * 2);
+}
+
+i64 argcheck() {
+    Sc f = five;
+    i64 li = 3;
+
+    if (f(5) != 25.0) return 1;                   // LOCAL road, integer LITERAL
+    if (f(li) != 15.0) return 2;                  // LOCAL road, integer NAME
+    if (f(g_n) != 15.0) return 3;                 // ...a GLOBAL integer
+    if (f(g_rate) != 20.0) return 4;              // ...a right-typed global
+    if (f(pick(2)) != 10.0) return 5;             // ...a call to an OVERLOADED name
+
+    if (use_sc(f) != 10) return 6;                // the PARAMETER slot
+
+    SH h = new SH;
+    h.cb = new Sc(five);
+    if (h.cb(5) != 25.0) return 7;                // the FIELD road, literal
+    if (h.cb(li) != 15.0) return 8;               // ...and a name
+
+    Sc[] scs = new Sc[1];
+    scs[0] = new Sc(five);
+    if (scs[0](5) != 25.0) return 9;              // the ELEMENT road, literal
+    if (scs[0](li) != 15.0) return 10;            // ...and a name
+
+    MutD m = bumpd;                               // a `ref` pointee through a FIELD
+    h.mut = m;
+    h.mut(ref g_bumped);
+    if (g_bumped != 2.0) return 11;
+
+    // ...and an argument that is a COMPOSITE EXPRESSION, which no oracle types
+    // at the door: parked like every other one and judged at pass 14 (D59,
+    // second pass). Each row below handed its integer's own raw bits to the
+    // `f64` parameter before that, on this road and on the three below it.
+    if (f(1 + 2) != 15.0) return 12;              // a binary over two literals
+    if (f(li * 2) != 30.0) return 13;             // ...over a name
+    if (f(li > 0 ? 3 : 4) != 15.0) return 14;     // a ternary
+    if (f(0 - li) != 0.0 - 15.0) return 15;       // a negation
+
+    if (h.cb(li * 2) != 30.0) return 16;          // the FIELD road
+    if (scs[0](1 + 2) != 15.0) return 17;         // the ELEMENT road
+    if (use_sce(f, li) != 30) return 18;          // the PARAMETER road
+
+    return 0;
+}
+
 i64 main() {
     i64 bad = dcheck();
     if (bad != 0) return 10 + bad;
@@ -370,6 +470,10 @@ i64 main() {
 
     if (geo.use_gop() != 30) return 70;
     if (rt_live() != 0) return 80;
+
+    bad = argcheck();
+    if (bad != 0) return 140 + bad;
+    if (rt_live() != 0) return 160;
 
     bad = rcheck();
     if (bad != 0) return 90 + bad;
