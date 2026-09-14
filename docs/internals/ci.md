@@ -1,7 +1,7 @@
 # CI
 
-Five workflows and three composite actions. Everything a change has to pass runs from
-`.github/workflows/ngen.yml`; the other four guard the edges.
+Six workflows and three composite actions. Everything a change has to pass runs from
+`.github/workflows/ngen.yml`; the other five guard the edges.
 
 ## The jobs of `ngen.yml`
 
@@ -82,10 +82,11 @@ disagree about which compiler they tested. `latest` resolves only when asked for
 an unannounced release must never change what CI tests. Both Windows jobs use the same
 sysroot action, so they cannot assemble different sysroots.
 
-## The other four workflows
+## The other five workflows
 
 | workflow | runs on | does |
 |---|---|---|
+| `mc-canary.yml` | every 15 minutes, or a dispatch | runs the recipe against a CANDIDATE mc and publishes a verdict mc's own release reads ([below](#the-mc-canary)) |
 | `site.yml` | a push to `main`, a pull request touching `docs/**` or `site/**`, a dispatch | renders `docs/` into the website and publishes it to the `site` branch, which the server behind teko-lang.org pulls |
 | `branch-policy.yml` | every pull request | refuses an ungated source namespace against a protected base. The head branch name is read through `env:`, never interpolated into a `run:` — it is text the opener of the pull request controls |
 | `codeql.yml` | pull requests only | the `actions` analyzer. There is no analyzer for `.tk` or `.mc`, and what is left to scan is CI that downloads a toolchain, creates a release with `contents: write` and interpolates branch names. No `paths:` filter: a required check that stops **reporting** goes pending forever rather than red |
@@ -119,6 +120,60 @@ writes can drop it.
 
 `docs` (in `ngen.yml`) and `site` prove different things and neither replaces the other: the
 first compiles and runs the samples, the second checks the pages they end up on.
+
+## The mc canary
+
+`mc-canary.yml` is teko's half of mc's freeze-and-canary protocol (mc `docs/specs/M53.md`
+§ 6, [D65](../../DECISION_LOG.md)). mc publishes **every** tag as a GitHub *pre-release* with
+its assets complete; a pre-release becomes a release only after this repository says the
+compiler still teaches teko.
+
+Neither side holds a credential for the other. mc cannot dispatch a workflow here and this
+repository does not receive mc's `release` webhook, so both halves **pull**, and the only
+thing that crosses is a URL each side reads anonymously.
+
+| step | who | what |
+|---|---|---|
+| poll | teko, every 15 min | `repos/minicompiler/mc/releases` — the newest pre-release with no verdict on the `canary` branch yet |
+| judge | teko | `ngen.yml` called with `mc_version` = that candidate: the five legs, the five fixpoint legs, `docs` and the aggregator; plus `teko_std` at its newest tag |
+| publish | teko | `<version>.json` at the root of the `canary` branch, committed with this repository's own `GITHUB_TOKEN` |
+| promote | mc | reads that file every 60 s for 90 minutes: `ok` flips the pre-release to a release, `fail` leaves it a pre-release, and a file that never appears is neither — advisory before mc 1.0.0 |
+
+The verdict is one line at a fixed URL:
+
+```
+https://raw.githubusercontent.com/teko-org/teko-lang/canary/0.17.0.json
+{"version":"0.17.0","status":"ok","run":"<this workflow run>","utc":"2026-09-15T12:34:56Z"}
+```
+
+Four fields, and `version` is bare — no leading `v`. `status` is `ok` only when **every**
+needed job succeeded; cancelled and skipped are `fail`, because neither is evidence that the
+candidate compiles teko and mc must not read silence as consent. The verdict job is
+`if: always()`: a canary that goes quiet on a red leg times mc out instead of answering it.
+
+**The recipe is not copied.** `ngen.yml` is called with one input, `mc_version`, which every
+`setup-mc` in it takes instead of `MC_VERSION`; empty — a push, a pull request, a release —
+is the pin, unchanged. So what a candidate mc has to pass is exactly what a merge into `main`
+has to pass, and the two cannot drift. The one thing `ngen.yml` does not cover is the
+standard library, which mc counts as part of the recipe, so a `std` job runs
+`teko-org/teko-std`'s own linux/x86_64 leg — the vendored `deps/teko` its `mc.lock` pins,
+`scripts/fixtures.sh` over its fixtures — with the same candidate. Nothing there writes to
+the registry.
+
+Three properties the branch has on purpose: it **accumulates**, one file per mc version, and
+is never force-pushed (mc polls one file for up to 90 minutes, and a file must not vanish
+under a reader); the workflow holds a single `concurrency` group so two runs cannot race the
+same push; and a dispatch naming a `version` explicitly rewrites a verdict already there,
+which is how a re-run corrects itself.
+
+The 15 minutes are mc's number, not a preference: its `promote` budgets a quarter of an hour
+for this schedule to notice inside its 90-minute poll. Cron is GitHub's least punctual
+trigger and the schedule is disabled after 60 days with no push to `main`, so the manual road
+— `gh workflow run mc-canary.yml -f version=0.17.0` — is the one that removes the wait.
+
+`canary` must be **pushable by `GITHUB_TOKEN`**: the `All Green` ruleset covers `~ALL` and
+requires a pull request, so `refs/heads/canary` needs to sit in its exclude list beside
+`refs/heads/site`, which is there for the same reason.
 
 ## The release promotes, it does not rebuild
 

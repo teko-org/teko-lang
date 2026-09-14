@@ -5436,3 +5436,68 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
+
+### D65 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
+mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one
+thing of the language it compiles: **that a release be proved by teko before it is a release
+at all.** The constraint the direction set is "no credential" in either direction — mc cannot
+dispatch a workflow here (that needs a PAT) and this repository does not get mc's `release`
+webhook (a foreign repository never does), so both halves PULL and the only thing that crosses
+the boundary is a URL each side reads anonymously. This is teko's half.
+
+**The protocol.** mc publishes every tag as a GitHub **pre-release**, assets and checksums
+complete and identical to a release's — the flag is the one property of a published release a
+later job can flip. `.github/workflows/mc-canary.yml` polls
+`repos/minicompiler/mc/releases` every 15 minutes (mc's own number: its `promote` budgets a
+quarter of an hour for this schedule to notice inside a 90-minute poll), takes the newest
+pre-release with no verdict yet, runs the recipe against that toolchain, and commits with its
+own `GITHUB_TOKEN`, at the ROOT of this repository's `canary` branch:
+
+```
+https://raw.githubusercontent.com/teko-org/teko-lang/canary/<version>.json
+{"version":"0.17.0","status":"ok","run":"<the actions run>","utc":"2026-09-15T12:34:56Z"}
+```
+
+**Those four fields are the contract**, and nothing else is in the file: no commit sha (a
+verdict is about an *mc version*, not a teko commit — that is also why it is a file and not a
+commit status, whose subject would have to be a teko commit and the mapping invented), no
+date beside `utc`, and `version` BARE, without its leading `v`. mc's `promote` polls that URL
+with `curl` and no token, every 60 s for 90 minutes: `ok` runs `gh release edit --prerelease=false`,
+`fail` leaves the pre-release standing, and a file that never appears is **neither** — a
+timeout, advisory until mc 1.0.0 so a teko outage cannot hold an mc patch. `publish-to-registry`
+is `needs: promote` on mc's side, so a pre-release never becomes the registry's newest row.
+
+**The recipe is called, not copied.** `ngen.yml` gains ONE input, `mc_version`, which its
+three `setup-mc` uses take instead of `MC_VERSION`; empty — a push, a pull request,
+`release.yml` — is the pin, so nothing about the twelve jobs changes for anyone else. The
+canary calls it with the candidate. What a candidate mc must pass is therefore exactly what a
+merge into `main` must pass, by construction: five native legs, five fixpoint legs, `docs` and
+the aggregator. The one part of the recipe `ngen.yml` does not hold is the standard library,
+which mc counts in, so a `std` job runs `teko-org/teko-std`'s own linux/x86_64 leg against the
+same candidate — the vendored `deps/teko` its `mc.lock` pins (never `mc pkg sync`: a canary
+must not depend on the registry being up, and `mc build` rehashes the vendored tree against the
+lock either way), then `scripts/fixtures.sh` over its fixtures. Nothing there writes to the
+registry.
+
+**`ok` needs every needed job green.** The `verdict` job is `if: always()` — a canary that goes
+quiet on a red leg times mc out instead of answering it — and `cancelled` and `skipped` count
+as `fail`, because neither is evidence that the candidate compiles teko and `promote` must not
+read silence as consent. The branch **accumulates**, one file per mc version, and is never
+force-pushed the way `site` is (D36): mc polls one file for up to 90 minutes and a file must
+not vanish under a reader. One `concurrency` group for the whole workflow, uncancellable, is
+what keeps two runs from racing the same push, and a `workflow_dispatch` naming a `version`
+explicitly rewrites a verdict already on the branch — that is how a re-run corrects itself.
+
+**What this asks of the repository, once:** `refs/heads/canary` in the `All Green` ruleset's
+exclude list, beside `refs/heads/site`, which is there for the same reason — the ruleset covers
+`~ALL` and requires a pull request, and `GITHUB_TOKEN` has no bypass. Without it the `verdict`
+job's push is refused and every candidate times out into mc's advisory promotion, which is
+exactly the pipeline mc has today.
+
+**Proof.** `actionlint` clean beyond the `SC2016` information `ngen.yml`'s own summary step
+already reports (a `printf` format in single quotes, which is what a format string is);
+`sh scripts/check-docs.sh` → `docs ok: 599 links, 42 fragments, 389 diagnostics, 50 refusals,
+141 samples`; and the workflow dispatched against mc 0.16.0 — a real release, so an `ok` there
+is a true statement about it — landing its verdict at the contract URL. No `.tk`, `.mc` or
+`teko.toml` byte moves in this crumb, so `--dump-ast` is unchanged by inspection: nothing the
+parser reads was touched.
