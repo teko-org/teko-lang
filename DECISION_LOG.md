@@ -2543,12 +2543,12 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in five passes over
-[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and four Copilot reviews
+*This entry is the whole of D50 as it stands. It was written in six passes over
+[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and five Copilot reviews
 — and every earlier wording of it, including the `tk_member_fn` push described below, the
 two-oracle door the third pass removed, the silent `-1` the fourth one turned into a
-refusal and every intermediate proof block, is **superseded in this entry**, which is the
-only current one.*
+refusal, the registration the fourth one gave every call alike and every intermediate proof
+block, is **superseded in this entry**, which is the only current one.*
 
 **The defect.** A field store had SIX code paths and only one of them ran the value through
 `tk_field_store_val` (teko_typeof.tk): D33's widening, its narrowing refusal, D43's `null`
@@ -2656,12 +2656,20 @@ had no type for anyone to read: `f64 rate; this.rate = b.M();` on an `i64 M()` r
 `tk_fs_do` with `tk_ty_of` answering -1 (Copilot on #698, pass 4). Two halves, both of them
 the same defect:
 
-- the three sites now register the DECLARED return type, the row when the type has one and
-  the type id in every case — the registration the pass-time road already makes for the very
-  same call (`tk_pend_do`, teko_typeof.tk) and the one `tk_field_use` makes for a field load.
-  A `void` return registers nothing, having nothing to be asked about. Measured cost on the
-  worst fixture, `surface_nullable_ops`: **238 → 239** rows of `TK_MAXXT`'s 256 — one row,
-  and that ceiling was already 238 before this crumb;
+- the INDIRECT sites — `tk_emit_call`'s vtable branch, `tk_iface_call`, `tk_iface_prop_use` —
+  register the DECLARED return type, the row when the type has one and the type id in every
+  case, which is the registration the pass-time road already makes for the very same call
+  (`tk_pend_do`, teko_typeof.tk) and the one `tk_field_use` makes for a field load. A `void`
+  return registers nothing, having nothing to be asked about. A DIRECT call registers its ROW
+  alone, exactly as it always did: it names its callee, `tk_ty_of` reads the declared return
+  off that symbol, and a scalar row there answers nothing the oracle did not already have
+  while spending one of `TK_MAXXT`'s 256 per call in the unit. The fourth pass registered
+  every call alike, and a body with enough of them began refusing `teko: too many expressions
+  whose type is known` where it used to compile: measured by bisection on one body of direct
+  calls, **253** calls was the ceiling it left, against **2000** before the crumb and 2000
+  again after this pass (Copilot on #698, pass 5). The worst fixture is unmoved by that
+  narrowing — `surface_nullable_ops` needs **239** rows of 256, where the crumb found 238 —
+  since what it registers is boxes and indirect returns, not direct calls;
 - a cast written DIRECTLY over a `callp` is how mc's core is TOLD what an indirect call
   returns (`tk_callp_ret`'s own contract, mc src/gen_resolve.mc), so the widening cast
   `tk_num_widen` writes was read as that declaration instead of as a conversion — the core
@@ -2676,6 +2684,24 @@ The same "a node this module built carries its type" closes the element LOAD: `t
 (teko_heaparr.tk) registered a row and nothing else, so `xs[0] += 100;` — the compound the
 element store is built from — reached the judge as a binary over a load no oracle could type.
 It registers the element type like a field load does.
+
+**A registration follows the VALUE into the node the TREE holds.** An index on a GLOBAL array
+is a bare `N_INDEX` while the body is parsed — neither array table is filled yet — and a pass
+replaces it in place afterwards: `tk_hg_rewrite_index` (teko_array.tk) builds the load with
+`tk_ha_load` and copies it into the tree's own node with `node_assign`, so the tag the
+builder had just written stayed on a node nobody reads. `f64 rate; this.rate = g[0];` on a
+global `i64[] g` reached the judge with no type at all and was REFUSED, `teko: the type of
+this value is not known here` — a false refusal, for a value the compiler itself had just
+typed (Copilot on #698, pass 5). The registration is MOVED (`tk_xt_move`, teko_struct.tk),
+which is also one row fewer than the row re-add it replaces; it is the same move `tk_fs_do`
+and `tk_pend_do` already make for a node they rewrite. The FIXED-array rewrite beside it
+(`tk_array_maybe_rewrite_index`) tagged nothing at all and was refused the same way, so it
+registers the element type itself: `tk_arr_load` cannot do it for both, being shared with a
+`ref` parameter's read and a lambda capture's, which are elements of nothing. Measured on
+`0f96fdf2`/`21ca62ae` and after: `this.rate = g[0]` with an `i64[] g` global refused, then
+**5.0**; `i64 n; this.n = gf[0]` on an `f64[]` global refused as "not known", then refused as
+the NARROWING it is; `Cell[] gc; this.c = gc[0]` and a fixed `i64 gx[2]` the same. Before the
+crumb all four compiled and wrote the raw eight bytes.
 
 **An ELEMENT of a `T[]` of heap goes through the one door.** `tk_ha_store` called
 `tk_check_field_store` directly, which is the ROW half judged with the PARSE-TIME oracle and
@@ -2706,7 +2732,7 @@ parameter answers -1 there — one table for two questions is what that rule was
 against. Deletion over addition: there is no such push, and the 62 pre-existing dumps are
 byte-identical either way.
 
-**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), nineteen helpers: the
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty helpers: the
 constructor's explicit `this.rate = k` and the implicit `rate = k`; a method's
 `this.rate = this.rate + 1`; a `static f64` written and read back; a `Cell?` field boxing
 `null` and a live reference; an `enum` field; `this.rate = k + 1` (an N_BINARY); `rate =
@@ -2723,7 +2749,10 @@ field, on both roads — a receiver the parser types and a receiver only the pas
 the float return beside them, which never had the bug; an ELEMENT of a `T[]` of heap in its
 four shapes (the pick that returns a row, the compound over a load nobody typed, the
 widening an `f64[]` writes, the box an `i64?[]` wraps) with `rt_live()` back to its floor
-inside the helper; and `rt_live()` back to its floor at the end. The file exits **71** on
+inside the helper; an element of a GLOBAL array in a field store, both kinds — the `T[]` of
+heap and the fixed one — into an `f64` field and into a `Cell?` one; and `rt_live()` back to
+its floor at the end, that floor being the three objects the two global arrays ROOT (a global
+array is never released, `surface_array_global.tk`'s own header). The file exits **71** on
 `c7df7787` (the first head of the PR); on `5ecae153` it is REFUSED at the operator store,
 exits **139** with that helper neutralised (the box segfault) and **131** with the box
 neutralised too (the pick); on `bb05ed0e` (the third head) it is REFUSED at the row pick,
@@ -2732,7 +2761,9 @@ the two mirror stores neutralised. On `0f96fdf2` (the fourth head, this entry's 
 "before") it is REFUSED at `cs[0] = rick(1, 2)`, the element store judged by the first
 declaration; with that one neutralised it exits **171**, the virtual `i64 M()` whose raw
 bits the `f64` field kept; with the virtual helper neutralised too it exits **181**,
-`f64[] fs; fs[0] = 1;` writing the integer's.
+`f64[] fs; fs[0] = 1;` writing the integer's. On `21ca62ae` (the fifth head, and this
+paragraph's own "before") it is REFUSED at `this.rate = gl[0]`, the global element no
+registration reached.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
 NAME on its left, ``the rule expected a name on the left``, a pre-existing and unrelated gap,
@@ -2757,11 +2788,13 @@ self-hosted `teko1`); `sh scripts/check-docs.sh` green (570 links, 387 diagnosti
 samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table unmoved — `passes`
 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new pass, no new
 intrinsic (D2, D21). `mc pkg hash .` over the source tree of this entry's code commits:
-`b99cab7333c62b9bdf476384610933a36642015c5adcbf6456d4dd3c7f7126b6`.
+`4f17b27134763dbbc70911197d4e5814b6a99858b6aa834da5d24f52925221b7`.
 
 A throwaway instrumentation after the judgement — every row of the deferral table asserted
 `done` — proved that no deferred store survives it, over the 63 fixtures and the whole
-bootstrap; re-run on this pass, where a row the judge cannot type is a refusal rather than a
-silent store, it also proves that no store is ACCEPTED with `-1`: every fixture compiles and
-none of them trips the refusal. Probe matrices outside `tests/` (not committed) measured each
-defect above before its fix and its absence after.
+bootstrap; re-run on every later pass, where a row the judge cannot type is a refusal rather
+than a silent store, it also proves that no store is ACCEPTED with `-1`: every fixture
+compiles and none of them trips the refusal. The `TK_MAXXT` ceilings quoted above are
+bisections: the constant is lowered, the compiler rebuilt and all 63 fixtures compiled, and
+the smallest value none of them trips is the worst case. Probe matrices outside `tests/`
+(not committed) measured each defect above before its fix and its absence after.
