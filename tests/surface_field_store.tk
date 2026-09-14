@@ -71,7 +71,13 @@
 //                       (`node_assign`), which left the element's type on the
 //                       node the load was BUILT as -- the store was refused
 //                       for a value the compiler itself had just typed;
-//  15. `rccheck`      -- `rt_live()` back to its floor once every object
+//  15. `localcheck`   -- an element of a LOCAL fixed array and an element of
+//                       an INLINE array field, both in a field store: the
+//                       parser lowers each to an address and a load on the
+//                       spot and no pass revisits them, so a SCALAR element
+//                       was tagged with nothing and the store was refused
+//                       for a value the parser had known all along;
+//  16. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released, the global arrays
 //                       above excepted: those are roots.
 //
@@ -157,11 +163,14 @@ class H {
     public i64? count;
     public i64 sum;
     public Cell? rc;
+    i64 items[2];                     // 19b: an INLINE array field, read below
 
     public H(i64 k) {
         this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
         this.c = null;                // 5a: `null` written through `this.`
         this.count = k;               // 11: the Q1b BOX, built from a parameter
+        this.items[0] = 4;
+        this.items[1] = 9;
     }
 
     public void bump() {
@@ -202,6 +211,17 @@ class H {
 
     public void fromrowglobal() {
         this.c = gc[0];               // 18c: the same load, with a ROW element
+    }
+
+    public void fromlocal() {
+        i64 a[2];
+        a[0] = 6;
+        a[1] = 8;
+        this.rate = a[0];             // 19a: an element of a LOCAL fixed array
+    }
+
+    public void frominline() {
+        this.rate = this.items[0];    // 19b: an element of an INLINE array field
     }
 }
 
@@ -504,6 +524,23 @@ i64 gloadcheck() {
     return 0;
 }
 
+// 19: the two loads the PARSER itself resolves and used to tag nothing -- an
+// element of a LOCAL fixed array (`tk_arr_index_of`, teko_array.tk) and an
+// element of an INLINE array field (`tk_array_index`, teko_struct.tk). Both
+// are lowered to an address and a load right where they are read, so no pass
+// ever revisits them: the store was refused, `teko: the type of this value is
+// not known here`, for a value the parser had known all along. The scalar
+// element was the whole of it -- a ROW element was tagged and a row is what
+// the global fixed array above already reads.
+i64 localcheck() {
+    H h = new H(0);
+    h.fromlocal();
+    if (h.rate != 6.0) return 1;      // the widening the store writes
+    h.frominline();
+    if (h.rate != 4.0) return 2;
+    return 0;
+}
+
 // the two global `T[]`s `gloadcheck` fills are ROOTS: a global array is never
 // released (surface_array_global.tk's own header), so the floor this counter
 // returns to is those three objects -- the two arrays and the one `Cell` that
@@ -571,8 +608,11 @@ i64 main() {
     bad = gloadcheck();
     if (bad != 0) return 190 + bad;
 
-    bad = rccheck();
+    bad = localcheck();
     if (bad != 0) return 200 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 210 + bad;
 
     return 42;
 }
