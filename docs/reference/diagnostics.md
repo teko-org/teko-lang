@@ -31,7 +31,13 @@ with that line in its stderr (D52).
   `struct`, `interface`, `trait` or `enum` inside another type's body. Move it out; there
   is no nested type.
 - `"teko: the name is already a type"` — the name is already a `class`, `struct`,
-  `interface`, `trait` or `delegate` in this namespace.
+  `interface`, `trait` or `delegate` in this namespace — or a primitive's own type word:
+  a teko primitive (`TimeSpan`, `DateTime`, `DateOnly`, `ref`, `out`, `params`, `i8`,
+  `i16`), mc's own core word (`f64`, `f32`, `f64raw`, `i32`) or one of the seven
+  `type_alias` words teko declares (`bool`, `char`, `byte`, `isize`, `usize`, `ptr`,
+  `str`) (D60). A namespaced type keeps the word free for its own namespace
+  (`geo.TimeSpan` beside the primitive `TimeSpan`) — only the exact qualified name
+  collides.
 - `"teko: the name is already a generic"` — the name belongs to a generic declaration.
 - `"teko: name of "` — completed by *`<what>` expected*: a declaration keyword was read and
   what followed is not a usable name.
