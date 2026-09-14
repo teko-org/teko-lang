@@ -53,6 +53,11 @@ i64 main() {
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
 called is a panic with exit 70, never a segfault ([memory.md](memory.md)).
 
+The call's **result carries the delegate's own return type wherever it is read** — an
+initializer, an operand, an argument, and a `.` on it: `DOp f = mk; f().DayNumber` reads
+`DateOnly`'s member, on a local, a parameter, a global slot, a field and a lambda bound to
+a slot alike.
+
 Its arguments are judged and converted exactly as a direct call's are — the count, the
 `ref`/`out` kind, the pointee of a `ref`/`out` one, the type of one passed by value, and
 C# §10.2.3's widening of an integer onto a float parameter — on all three roads a delegate

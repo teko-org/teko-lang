@@ -1375,7 +1375,10 @@ the first declaration of that name: with `f64 pick(f64)` declared ahead of `i64 
 
 - ``"teko: the type of the left side of `.` is not known here"`` — the receiver's type could
   not be determined at that site. Bind it to a local of the right type.
-- `"teko: unknown member of "` — completed by the type's name.
+- `"teko: unknown member of "` — completed by the type's name. Since D61 a receiver that
+  is a CALL is among them — `mk().Nope`, `pick(1, 2).Nope` and `f().Nope` through a
+  delegate slot all read `teko: unknown member of DateOnly: Nope`, the type named, where
+  a call through a slot used to be refused by the member's name alone.
 - `"teko: unknown member"` — the same, where the type has no name to print.
 - `"teko: the member is a field, not a method"` — drop the `()`.
 - `"teko: the member is a method; call it with ()"` — add them.

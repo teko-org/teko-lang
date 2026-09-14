@@ -5607,3 +5607,92 @@ tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
 listed file, so the hash moves by design).
+
+### D61 · A call is typed by the pick and by the slot, at the `.` door too (2026-09-14)
+*(The number D61 was reserved when this crumb was cut; the entry is appended here, after
+D60, which is where it belongs chronologically.)*
+
+Two defects met on ONE door -- the `.` whose RECEIVER is a CALL, over a primitive with
+members (`DateOnly`, `DateTime`, `TimeSpan`, `TimeOnly`) or an enum. Measured on
+`d028a7a0`:
+
+| written | before | after |
+|---|---|---|
+| `DOp f = mk; f().DayNumber` (`delegate DateOnly DOp()`) | refused `teko: unknown member: DayNumber` | 738944 |
+| the same through a parameter, a global slot, a lambda bound to a slot | refused, identically | reads the member |
+| `DateTime pick(i64)` ahead of `DateOnly pick(i64, i64)`, `pick(1, 2).Day` | **exit 1** -- the DateOnly value lowered through the DateTime row | 29 |
+| the mirror order, `TimeSpan pick(i64)` first, `pick(1, 2).Day` | refused `teko: unknown member of TimeSpan: Day` on a legal program | 29 |
+
+A LOCAL in between (`DateOnly d = f(); d.DayNumber`) always worked, and so did a delegate
+FIELD call (`h.cb().Day`) and every call the parser itself writes -- direct, static,
+method, virtual, interface, constructor.
+
+**ROOT A: the pass-time oracle had no arm for a call through a slot.** `tk_typeof_pass`
+(pass 6, teko.tk) resolves the deferred `.`; `tk_deleg_pass` (pass 8) is what rewrites
+`f()` into a `callp`. Until it runs, the call's name is the SLOT's, no declaration owns
+it, and `tk_ty_of`'s N_CALL arm (teko_typeof.tk) asked `tk_ov_find`/`decl_find` only --
+both -1 -- so the member was resolved by its own name and refused. The lookup already
+existed one file over, `tk_deleg_expr_ty` (teko_deleg.tk), written for `tk_ov_arg_ty` for
+exactly this reason. Reordering the passes is not the fix and is rejected: the delegate
+pass reads types the typeof pass writes (teko.tk's own note on the order).
+
+**FIX A:** the two lines move INTO `tk_ty_of`'s N_CALL branch, ahead of the overload
+table, with `tk_deleg_row`/`dg_ret_at` forward-declared as `tk_nl_pend` already is. Every
+consumer of the oracle -- the operator pass, the ternary, `??`, a primitive row's
+argument, the deferred `.` -- gets the one answer. `tk_deleg_expr_ty` then read
+`return tk_ty_of(e)` and is DELETED, its three call sites (`tk_deleg_coerce`,
+`tk_deleg_store_late`, `tk_ov_arg_ty`) asking the oracle directly.
+
+**ROOT B: `tk_dot` still typed a call receiver by the FIRST declaration.** D49 took
+`decl_ret(decl_find(name))` out of the pass-time oracle and left it standing at the parse
+door: `tk_dot` (teko_expr.tk) asked `tk_pty_of` (teko_struct.tk), whose N_CALL arm is
+exactly that guess, and handed the answer to `tk_prim_dot`. On an overloaded callee the
+guess is wrong in both directions -- a silently wrong RESULT in one order, a refusal of a
+legal program in the other.
+
+**FIX B:** a call receiver carrying no `tk_xt_ty` tag of its own is DEFERRED
+(`tk_defer_member`) instead of typed here, so `tk_prim_pend` -- `tk_prim_dot`'s twin, at
+`atpass` -- answers with the pass-time oracle, which is `tk_ov_pick` for an overloaded
+name and, since fix A, the delegate table for a call through a slot. A call the node DOES
+type (`new DateOnly(...)`, a static or an instance row the parser already emitted, all
+`tk_xt_put`) keeps the parse-time road unchanged.
+
+**The choice inside fix B, measured rather than assumed.** `atpass` also flips the oracle
+a row's ARGUMENT is checked with (`tk_prim_ty_of`, teko_prim.tk), so the deferral could
+have moved an accepted tree; the narrow alternative was to defer only receivers whose
+callee name carries more than one declaration. The BROAD form was measured first and kept:
+`--dump-ast` is byte-identical against the base compiler for all 73 pre-existing
+`tests/*.tk`, `tomorrow(leap).Month` (surface_datetime.tk) among them, and for a probe of
+the shape at risk, `tomorrow(leap).AddTicks(k).Day` with `k` a parameter -- identical tree
+and identical exit on both compilers. A narrowing nothing measures is complexity, so it
+was not written.
+
+**Fixtures.** `tests/surface_prim_call_member.tk` (`expect-exit: 42`, 33 checks): the
+delegate LOCAL reading `.DayNumber`, `.Year`, `.Month` and the chain `.AddDays(1).Day`;
+the delegate PARAMETER; the GLOBAL slot; a lambda bound to a slot; `TimeSpan.Ticks`,
+`DateTime.Day`/`.Hour`/`.Date.Day` and `DateTimeKind.ToString()` through a slot; both
+overload orders; and the seven receiver shapes that already worked, anchored because the
+fix moves every call receiver onto the deferred road. `tests/refuse/deleg_call_member.tk`:
+`f().Nope` is now refused `teko: unknown member of DateOnly: Nope` -- the TYPE named,
+where the same line used to be refused by the member's name alone.
+
+**Docs.** `docs/reference/delegates.md` says a call through a slot carries the delegate's
+return type wherever it is read; `docs/reference/diagnostics.md` records that a CALL
+receiver is among the receivers `teko: unknown member of <type>: <name>` now names;
+`docs/reference/not-yet.md` gains the row no page owned -- two METHOD overloads of one
+arity are refused `teko: ambiguous overload; two signatures take this many arguments`,
+the method road picking by argument COUNT alone (the ruling in
+`tests/surface_overload_method.tk`) -- and its `switch`-subject row now lists the `.` on a
+call result among the sites a PASS types.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d028a7a0`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **74 passed,
+62 refused as expected, 0 failed** (was 73/61); `--dump-ast` byte-identical against the
+base compiler for every one of the 73 pre-existing `tests/*.tk`; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 598
+links, 41 fragments, 389 diagnostics, 62 refusals, 141 samples`; `./build/teko limits
+tests/hello.tk` byte-identical to the base compiler's own output -- `passes` 15, `syntax`
+15, `alias` 20, `types` 13, `intrin` 8, no registration of any kind added -- and `mc
+limits . --config mc.macos.toml` `ok` on both legs with only the size-of-surface-code rows
+moving (`nodes` 179091 → 179246, `ins` 215968 → 215980, and `funcs`/`symbols` DOWN by two,
+the deleted helper).
