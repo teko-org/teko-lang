@@ -515,10 +515,34 @@ i64  tk_ndglate = 0;
 i64  dl_bucket[TK_DGBUCKETS];         // 0 = empty; else 1 + the newest entry here
 i64  dl_chain[TK_MAXDGLATE];          // 0 = chain ends; else 1 + the next entry sharing it
 
-// `tk_deleg_late_move` (below) re-points an entry at a NEW node id without
-// unlinking the old bucket slot: the stale one never matches again (`dl_node`
-// itself changed), so it is left as a single harmless dead link rather than
-// taught how to remove itself from a chain it shares with live entries.
+// `dl_chain` is ONE link per entry, not one per (entry, bucket) pair, so an
+// entry belongs to exactly one bucket at a time and `tk_deleg_late_move` has
+// to take it out of the old one before putting it in the new. Inserting
+// without unlinking -- what the eighth pass wrote, calling the stale slot a
+// harmless dead link -- overwrites `dl_chain[i]` with the NEW bucket's head
+// and so cuts the old chain at `i`: everything behind `i` there stops being
+// reachable, and when the two buckets coincide the entry points at itself and
+// `tk_deleg_late_pend` never leaves the loop (D51, ninth pass). Both were
+// measured, see the entry in DECISION_LOG.md.
+void tk_dg_bucket_remove(i64 i, i64 n) {
+    i64 b = n % TK_DGBUCKETS;
+    i64 h = ld64(dl_bucket + b * 8);
+    if (h == i + 1) {
+        st64(dl_bucket + b * 8, ld64(dl_chain + i * 8));
+        return;
+    }
+    loop {
+        if (h == 0) break;
+        i64 j = h - 1;
+        i64 nx = ld64(dl_chain + j * 8);
+        if (nx == i + 1) {
+            st64(dl_chain + j * 8, ld64(dl_chain + i * 8));
+            break;
+        }
+        h = nx;
+    }
+}
+
 void tk_dg_bucket_insert(i64 i, i64 n) {
     i64 b = n % TK_DGBUCKETS;
     st64(dl_chain + i * 8, ld64(dl_bucket + b * 8));
@@ -679,9 +703,10 @@ void tk_deleg_late_move(i64 from, i64 to) {
     loop {
         if (i < 0) break;
         if (dl_node_at(i) == from) {
-            st64(dl_node + i * 8, to);
-            tk_dg_bucket_insert(i, to);   // the OLD bucket slot is left dangling (harmless,
-        }                                 // `dl_node` no longer answers `from`) -- see above
+            tk_dg_bucket_remove(i, from); // out of the old chain BEFORE the new
+            st64(dl_node + i * 8, to);    // one takes `dl_chain[i]` -- see above
+            tk_dg_bucket_insert(i, to);
+        }
         i = i - 1;
     }
 }
