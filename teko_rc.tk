@@ -184,14 +184,33 @@ void tk_rc_var(i64 n) {
 // exception: a `ref`/`out` parameter of counted type already IS the caller's
 // own slot address, so writing through it is exactly what the parameter is
 // for -- `x` itself is the destination, not `&x`.
+//
+// D53: the slot the value is judged against is the LOCAL's when the name is one
+// and the GLOBAL's otherwise, in that order -- `tk_rc_index` holds the
+// parameters below its floor, so the fallback is taken only when no local and
+// no parameter of the name is in scope, the very order `tk_ty_scope_or_global`
+// (teko_typeof.tk, D51) reads a bare name in. Before it, a global answered -1
+// here and the function returned above the three shared rules: `gw = 5;` on an
+// `f64` global wrote the raw integer bits, `gn = 1.5;` on an `i64` one and
+// `gc = null;` on a non-nullable class one both compiled, where every one of
+// them is refused or converted on a local. The RC lowering below still needs a
+// scope slot of its own (the address it stores through, the borrowed-parameter
+// rule), so the global leaves at the `li < 0` return, one line lower than it
+// used to. `tk_nl_wrap` is a no-op for a global by construction: a global
+// declared `T?` over a VALUE is already refused, at pass 5, by `tk_gs_check`
+// (teko_array.tk).
 void tk_rc_assign(i64 n) {
     i64 li = tk_rc_index(nd_name(n));
+    i64 tty = tk_ty_global(nd_name(n));
+    if (li >= 0) tty = sc_ty_at(li);
+    if (tty >= 0) {
+        i64 aty = tk_ty_of(nd_a(n));
+        tk_check_compat(tty, aty, nd_a(n), nd_line(n), nd_file(n));
+        set_nd_a(n, tk_num_widen(tty, aty, nd_a(n)));        // `y = 5;` on an `f64 y`
+        set_nd_a(n, tk_nl_wrap(tty, aty, nd_a(n)));          // `n = 7;` on an `i64? n`
+    }
     if (li < 0) return;
-    i64 aty = tk_ty_of(nd_a(n));
-    tk_check_compat(sc_ty_at(li), aty, nd_a(n), nd_line(n), nd_file(n));
-    set_nd_a(n, tk_num_widen(sc_ty_at(li), aty, nd_a(n)));   // `y = 5;` on an `f64 y`
-    set_nd_a(n, tk_nl_wrap(sc_ty_at(li), aty, nd_a(n)));     // `n = 7;` on an `i64? n`
-    if (!tk_is_counted(sc_ty_at(li))) return;
+    if (!tk_is_counted(tty)) return;
     tk_rc_at(n);
     i64 dest = tk_addr(nd_name(n));
     if (li < tk_rc_floor) {
@@ -569,6 +588,62 @@ void tk_rc_fn(i64 f) {
     tk_nscope = 0;
 }
 
+// ---- the global's own INITIALIZER (D53) ----
+
+// D33's widen, at a global initializer, is a LITERAL REWRITE rather than a
+// cast. `tk_num_widen` (teko_typeof.tk) writes an `N_CAST`, and mc's core
+// refuses one at file scope -- `f64 g = (f64) 1;` dies with `global
+// initializer must be constant`, measured on mc 0.15.23 -- so the conversion
+// is done where the literal reader itself does it: `fl_dec2bits`
+// (`lib/float.mc`, in scope through teko_float.tk's `#include <float>`), with
+// the significand and exponent widths of the slot's own type, the same 53/11
+// and 24/8 `fl_lit` passes for `1.0` and `1.0f`.
+//
+// The value is ALWAYS a folded `N_INT` by the time this pass sees it: the core
+// folds `-1` and `1 + 2`, and teko_const.tk rebuilds a `const` name into one,
+// which is why `f64 a = 1;`, `f64 b = -1;` and `f64 c = K;` are one case and
+// not three. Nothing else can be there -- a call, a cast and a name are all
+// refused by the core as non-constant, and the only other initializer shape a
+// global has is `N_STR`, which no oracle types, so `tk_num_widens` never
+// answers 1 for it.
+void tk_rc_glb_widen(i64 tty, i64 e) {
+    if (nd_kind(e) != N_INT) return;
+    i64 v = nd_val(e);
+    i64 neg = v < 0;
+    u64 m = v;
+    if (neg) m = 0 - v;
+    i64 mant = 53;
+    i64 ebits = 11;
+    if (tty == ty_f32) {
+        mant = 24;
+        ebits = 8;
+    }
+    set_nd_val(e, fl_dec2bits(neg, m, 0, mant, ebits, 0));
+    set_nd_type(e, tty);
+}
+
+// `T g = e;` at file scope: the same corridor `T g; g = e;` takes one function
+// up, and the same one a local's own initializer takes (`tk_rc_var`). It had
+// NO door at all before D53 -- the two sweeps that walk an `N_GLOBAL`
+// (`tk_garr_collect` and `tk_hg_collect`, teko_array.tk) only record rows --
+// so `i64 gn = 1.5;`, `Color gk = 1;` and `Cell gc = null;` all compiled.
+//
+// Two shapes are NOT slots with an initializer and are skipped: `nd_val != 0`
+// is an array of `nd_val` elements (teko_array.tk's own rule, and the shape
+// every generated global takes -- an enum's element table, a vtable), and
+// `nd_a == 0` is a declaration with nothing to judge. A global initializer is
+// constant by the core's own rule, so the value needs no deferral machinery:
+// `tk_pty_of` (teko_struct.tk) types the folded literal out of the node.
+void tk_rc_global(i64 n) {
+    if (nd_val(n) != 0) return;
+    i64 e = nd_a(n);
+    if (e == 0) return;
+    i64 tty = nd_type(n);
+    i64 ety = tk_pty_of(e);
+    tk_check_compat(tty, ety, e, nd_line(n), nd_file(n));
+    if (tk_num_widens(tty, ety)) tk_rc_glb_widen(tty, e);
+}
+
 // 1 when the program declares something the reclaim has anything to do with:
 // any row of teko_struct.tk's type table `tk_is_counted` answers for -- a
 // class, an interface, or (K1) a delegate
@@ -606,6 +681,7 @@ i64 tk_rc_pass(i64 root) {
     loop {
         if (f == 0) break;
         if (nd_kind(f) == N_FUNC) tk_rc_fn(f);
+        if (nd_kind(f) == N_GLOBAL) tk_rc_global(f);       // D53: the slot at file scope
         f = nd_next(f);
     }
     tk_rc_ret = 0 - 1;
