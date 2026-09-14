@@ -123,11 +123,18 @@ While every primitive was eight bytes wide the only cast a replaced node could c
 lowering's own result, so the deferred `.` (`tk_pend_do`) and the operator rewrite
 (`tk_ops_replace`) were the whole list. A primitive **narrower** than the machine word
 makes every indirect load a cast as well — `tk_ld` (teko_struct.tk), `tk_arr_load` and
-`tk_callp_ret` (teko_array.tk) all write one — and five more doors turned out to copy such
+`tk_callp_ret` (teko_array.tk) all write one — and six more doors turned out to copy such
 a value into a placeholder and drop the record, each of them refusing a `DateOnly` the
-compiler had just built itself: `tk_node_replace` (teko_this.tk, every implicit-`this`
-rewrite), `tk_ref_replace` (teko_ref.tk, a `ref`/`out` pointee read), the two global-array
-reads (teko_array.tk) and the delegate call (teko_deleg.tk). Each carries it now.
+compiler had just built itself: the implicit-`this` rewrite (teko_this.tk), a `ref`/`out`
+pointee read (teko_ref.tk), the two global-array element reads (teko_array.tk), the
+delegate call (teko_deleg.tk) and the forward-resolved static field read (teko_access.tk).
+A **seventh** — the read of a by-reference lambda capture (`tk_lam_walk`, teko_deleg.tk) —
+was found by the verifier after those six had been patched one by one, which is the lesson
+of the entry: the record is handed over inside the single `tk_node_replace`
+([teko_struct.tk](../../teko_struct.tk), [nodes-and-xt.md](nodes-and-xt.md)), which now
+holds the compiler's only `node_assign`, so a door cannot forget what it never writes.
+An `enum : i32` is four bytes too and needs none of this: nothing in the language casts an
+enum, so an enum load never reaches `tk_prim_cast_check` at all.
 
 ## The four sites that read the table
 

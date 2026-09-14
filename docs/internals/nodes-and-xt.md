@@ -131,19 +131,27 @@ number, so the tree above it does not have to be touched. But `node_assign` copi
 through exactly that field. Overwriting it with the replacement's `nd_next` truncates the
 list silently.
 
-Every in-place rewrite therefore goes through a two-line helper that saves the field and
-puts it back — `tk_ref_replace` in [`teko_ref.tk`](../../teko_ref.tk), `tk_node_replace` in
-[`teko_this.tk`](../../teko_this.tk):
+Every in-place rewrite therefore goes through **one** helper, `tk_node_replace` in
+[`teko_struct.tk`](../../teko_struct.tk), beside the node constructors — and that is the
+only `node_assign` in the compiler (D54; three separate copies of it had grown in
+`teko_ref.tk`, `teko_ops.tk` and `teko_deleg.tk`, and the last one was still missing the
+second half below when its own fixture caught it):
 
 ```mc
 void tk_node_replace(i64 n, i64 r) {
     i64 keep = nd_next(n);
     node_assign(n, r);
     set_nd_next(n, keep);
+    tk_prim_own_cast_moved(r, n);       // ...and the mark, see primitives.md
 }
 ```
 
-A bare `node_assign` is correct only for a leaf that is known to stand alone.
+Two things have to survive the copy: `nd_next`, and the record that a cast is the
+**compiler's own** — kept by node index, so a value carrying one arrives under the
+placeholder's number ([primitives.md](primitives.md)). A caller with more to move — a type
+row, an owned store, a deferred call — moves it after the helper returns, onto `n`.
+Writing a bare `node_assign` is how a door forgets one of the two, which is why there is
+no longer a second place to write one.
 
 ## The registration goes on the FINAL node
 

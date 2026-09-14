@@ -111,8 +111,6 @@ void set_rp_node_at(i64 i, i64 v) { st64(rp_node + i * 8, v); }
 void set_rp_kind_at(i64 i, i64 v) { st64(rp_kind + i * 8, v); }
 void set_rp_ty_at(i64 i, i64 v)   { st64(rp_ty + i * 8, v); }
 
-void tk_prim_own_cast_moved(i64 from, i64 to);
-
 void tk_rp_add(i64 pnode, i64 kind, i64 ty) {
     if (tk_nrp == TK_MAXRP) err_at(tk_file, tk_line, "teko: too many `ref`/`out` parameters in one unit");
     set_rp_node_at(tk_nrp, pnode);
@@ -508,21 +506,6 @@ void tk_ref_check_call(i64 n) {
     }
 }
 
-// `node_assign` copies the WHOLE node, `nd_next` included -- fine for a leaf
-// used on its own, but `n` may be one argument of several in a call's own
-// list, threaded through that very field. Every in-place rewrite below goes
-// through here so the list it sits in never loses its tail.
-// The cast a narrow pointee's load carries is the compiler's own and is
-// remembered by node index, so it moves to the node the tree keeps -- the
-// carry `tk_node_replace` (teko_this.tk) and `tk_ops_replace` (teko_ops.tk)
-// make at their own doors (N4a, D54).
-void tk_ref_replace(i64 n, i64 repl) {
-    i64 nx = nd_next(n);
-    node_assign(n, repl);
-    set_nd_next(n, nx);
-    tk_prim_own_cast_moved(repl, n);
-}
-
 void tk_ref_walk(i64 n) {
     loop {
         if (n == 0) break;
@@ -540,7 +523,7 @@ void tk_ref_walk(i64 n) {
             i64 pn = tk_ref_param_named(nd_name(n));
             if (pn >= 0) {
                 i64 pty = tk_param_ty(pn);
-                tk_ref_replace(n, tk_arr_load(pty, tk_id(nd_name(n))));
+                tk_node_replace(n, tk_arr_load(pty, tk_id(nd_name(n))));
                 // the read IS a value of the POINTEE's type, and nothing said
                 // so: the node it becomes is a raw `ld64`, which the oracle
                 // reads as an intrinsic call it cannot type
@@ -572,7 +555,7 @@ void tk_ref_walk(i64 n) {
                 i64 pn = tk_ref_param_named(nd_name(n));
                 if (pn >= 0) {
                     tk_rp_mark_seen(pn);
-                    tk_ref_replace(n, tk_id(nd_name(n)));
+                    tk_node_replace(n, tk_id(nd_name(n)));
                 }
             }
         }
