@@ -5097,7 +5097,8 @@ scripts/check-docs.sh` → `docs ok: 585 links, 30 fragments, 388 diagnostics, 3
 samples`; `mc limits . --config mc.macos.toml` verdict `ok` on both legs, `passes` 15/30,
 `types` 12, `intrin` 8/16, `alias` 19, `syntax` 15 -- every table exactly where the base left
 them, only the size-of-surface-code rows moved (`nodes` 176853 → 177006, `ins` 214500 →
-214683, `heap` used 94225952 → 94934768 on the compiler leg); `./build/teko limits
+214683 on the compiler leg; the `heap` column is not a proof figure -- it reflects the state
+of `build/` at the time of the run, D55's lesson); `./build/teko limits
 tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .`
 `aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
 `0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
