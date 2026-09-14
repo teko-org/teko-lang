@@ -5695,7 +5695,8 @@ aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 598 links, 41
 `globals` 943) and only the size-of-surface-code rows moving with the one function added
 (`nodes` 156565 -> 156598, `ins` 215968 -> 216017, `funcs` 3182 -> 3183, `lowered` 3164 ->
 3165, `symbols` 6263 -> 6264); `mc pkg hash .`
-`d2b86f3b676a4c8b75eb7ca4ccb29cd1fcdea444b4ff6a70b91e5a799fc612ec` (base
-`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: `teko_deleg.tk`,
+`aaca0aa1374363ee36b04626da0a0fac8c0f1eefd947d29c8097fc650dbc00c1`, with
+`origin/main` merged in at `111559fb` (base
+`0f04c593b5aad2ad3bbf45d97ba6427d56a05fe3620bf3f1ca73d4fb7256d6eb`: `teko_deleg.tk`,
 `teko_expr.tk`, `teko_access.tk` and `teko_heaparr.tk` are listed files, so the hash moves
 by design).
