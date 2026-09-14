@@ -2543,8 +2543,8 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in seven passes over
-[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and six Copilot reviews
+*This entry is the whole of D50 as it stands. It was written in eight passes over
+[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and seven Copilot reviews
 — and every earlier wording of it, including the `tk_member_fn` push described below, the
 two-oracle door the third pass removed, the silent `-1` the fourth one turned into a
 refusal, the registration the fourth one gave every call alike and every intermediate proof
@@ -2781,7 +2781,70 @@ parameter answers -1 there — one table for two questions is what that rule was
 against. Deletion over addition: there is no such push, and the 62 pre-existing dumps are
 byte-identical either way.
 
-**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty-one helpers: the
+**A FIXED array's element goes through the one door as well.** The fourth pass sent the
+element of a `T[]` of heap through `tk_field_store_val`; the element of a fixed array —
+`a[i] = e` on a local, `g[i] = e` on a global, and the compound `a[i] += e` behind both —
+was still built as the raw `stW(addr, v)` `tk_arr_store` emits, on all three of its roads
+(`tk_arr_index_of`, `tk_arr_compound` and `tk_array_resolve_write`, teko_array.tk).
+Measured on `5b78af5c` (the seventh head, this paragraph's own "before"): `f64 gf[2];
+gf[0] = 1;` wrote the integer's own eight bytes and read back 5e-324 instead of 1.0, local
+and global alike, `i64 gi[2]; gi[0] = 1.5;` wrote the double's and was not refused, a class
+value landed in an `i64` element (`gi2[0] = c;` compiled) and so did a `null` in an `f64`
+one; after, the two widen to 1.0, the two narrowings are refused
+(`teko: a value of type f64 does not convert to i64`), and the reference and the `null`
+meet `tk_check_compat`'s own wording. The door is a function of teko_array.tk's own
+(`tk_arr_elem_store`) rather than `tk_arr_store` itself, for the very reason `tk_arr_load`
+tags no type: a `ref` parameter's write (teko_ref.tk) and a lambda capture's
+(teko_deleg.tk) go through `tk_arr_store` too, and they are elements of nothing. The
+COMPOUND needed the other half of the same rule — its own load was built by `tk_arr_load`,
+which tags nothing, so `gf[0] += 1;` summed a float no oracle could type and reached the
+judge as an untypable binary; it registers the element type there exactly as `tk_ha_load`
+does, and reads 2.0. Q1b's box has no fixed-array shape to fire on: an array of `i64?`, of
+a class or of any other row is refused at its declaration, `teko: an array of objects is
+not taught yet; use a field array or wait for T[]`, so a fixed element is always a scalar
+and the door's row half is answered before it is asked.
+
+**A subtree the parser PARKED is not in the tree a pass walks.** `tk_array_walk_reads`
+(teko_array.tk) rewrites every `N_INDEX` on a global array it finds IN THE TREE, and three
+subtrees are not there when it runs: the value and the index a deferred global write holds
+(`gd_val`/`gd_idx`, spliced back only by `tk_array_resolve_write`, after the walk) and the
+value a deferred member access holds (`pd_arg`, teko_typeof.tk, rebuilt at pass 6). An
+index inside one of them survived raw and was refused by the check that finds an index
+nothing lowered, ``teko: `[` needs an array: src`` (`tk_pm_check_index`, teko_params.tk).
+Measured on `5b78af5c`: `dst[0] = src[0];` and `dst[src[0]] = 9;` between two global
+`i64[]`s, the same pair between two fixed globals, and `void set(H h) { h.rate = gl[0]; }`
+— four ordinary programs refused for a read the compiler knows how to build. The two
+parked by a WRITE are walked in `tk_array_pass` itself, before the writes resolve
+(`tk_gd_walk_reads`), and the one parked by an ACCESS is walked where it is taken out of
+the table (`tk_pend_field`), each of them nested-safe: the walk is the same recursive one,
+so `h.rate = gl[0] + gx[0];` rewrites both. It is not only a refusal that is fixed: the
+load reaches the field-store door TYPED, which is what the judge then reads.
+
+**The site a store reports is its own, at every one of the six.** `tk_field_store_val`
+builds nodes, and both halves of what it can build move the compiler's current position:
+`tk_num_widen` and `tk_nl_wrap` (teko_typeof.tk, teko_null.tk) set `tk_line`/`tk_file` to
+the VALUE's own node before writing the conversion. `tk_field_use` (teko_expr.tk) has
+always restored the store's own site after the call; the other three parse-time-ish sites
+did not, so the store node they built afterwards carried the value's line. Measured with a
+throwaway `err_at` on the store node, a store written over two lines: the implicit
+`r =`/`3;` reported line 7 and now reports 6 (`tk_this_assign`, teko_this.tk), the static
+`S.total =`/`3;` reported 8 and now reports 7 (`tk_static_use`), and the same store on the
+FORWARD road reported 5 and now reports 4 (`tk_fwd_resolve_static_one`, both
+teko_access.tk). `tk_ha_store` (teko_heaparr.tk) and the fixed element's own door restore
+it for the same reason.
+
+**The row check asks `null` nothing.** `tk_check_field_store` (teko_struct.tk) kept a copy
+of Q1a's rule — `null` lands only in a slot declared `T?` — under a comment that called
+itself "the ELEMENT store's own road to the rule", on the grounds that the element store
+reached no other check. Since the fourth pass it enters by the same door as every other
+site, and that door's scalar half (`tk_check_scalar_compat`) gives the very same verdict
+over the very same node one line earlier: the copy was dead code under a comment that
+contradicted the shared gate. It is deleted, and what is left is the rule the row question
+really has — `null` is silent on it, a reference fits any row — spelled exactly as
+`tk_check_compat` spells it. No verdict moves: the 63 fixtures and the `null` probes are
+unchanged either way.
+
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty-four helpers: the
 constructor's explicit `this.rate = k` and the implicit `rate = k`; a method's
 `this.rate = this.rate + 1`; a `static f64` written and read back; a `Cell?` field boxing
 `null` and a live reference; an `enum` field; `this.rate = k + 1` (an N_BINARY); `rate =
@@ -2803,7 +2866,14 @@ heap and the fixed one — into an `f64` field and into a `Cell?` one; an elemen
 fixed array and an element of an INLINE array field, the two loads the parser resolves on the
 spot, each into an `f64` field; and `rt_live()` back to
 its floor at the end, that floor being the three objects the two global arrays ROOT (a global
-array is never released, `surface_array_global.tk`'s own header). The file exits **71** on
+array is never released, `surface_array_global.tk`'s own header); the element of a FIXED array as the store TARGET,
+global and local, the widening (`f64 gf[2]; gf[0] = 1;`), the compound over its own load
+(`gf[0] += 1;`) and an element whose type already matched, which the door has to leave
+exactly as it found it; a global element as the VALUE and as the INDEX of another global's
+write, on both kinds of global array; and the same parked subtree on the deferred
+RECEIVER's road (`h.rate = gl[0] + gx[0];` through a parameter). The floor `rt_live()`
+returns to is **four** objects with those helpers in: three global arrays and the one
+`Cell` one of them holds. The file exits **71** on
 `c7df7787` (the first head of the PR); on `5ecae153` it is REFUSED at the operator store,
 exits **139** with that helper neutralised (the box segfault) and **131** with the box
 neutralised too (the pick); on `bb05ed0e` (the third head) it is REFUSED at the row pick,
@@ -2815,7 +2885,11 @@ bits the `f64` field kept; with the virtual helper neutralised too it exits **18
 `f64[] fs; fs[0] = 1;` writing the integer's. On `21ca62ae` (the fifth head, and this
 paragraph's own "before") it is REFUSED at `this.rate = gl[0]`, the global element no
 registration reached. On `6a30d158` (the sixth head, and this paragraph's own "before") it is
-REFUSED at `this.rate = a[0]`, the local fixed array's element no registration reached.
+REFUSED at `this.rate = a[0]`, the local fixed array's element no registration reached. On
+`5b78af5c` (the seventh head, and the eighth pass's own "before") it is REFUSED where the
+deferred receiver reads a global element, ``teko: `[` needs an array: gl`` — the first of
+the three parked subtrees it reaches. That every verdict the earlier passes settled is
+unmoved is what the 62 byte-identical dumps say, not this file's own exit.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
 NAME on its left, ``the rule expected a name on the left``, a pre-existing and unrelated gap,
@@ -2836,15 +2910,16 @@ clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of the **62** fix
 predate the crumb, against `da33ebd4` — **62 byte-identical**, since every site this crumb
 touches only changes a program that was previously silently WRONG or wrongly refused;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (63/63 under the
-self-hosted `teko1`); `sh scripts/check-docs.sh` green (570 links, 387 diagnostics, 120
-samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (569 links, 387 diagnostics, 120
+samples; the seventh pass's own wording said 570, one link over what the script counts on
+that head and on this one alike); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
 — `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new
 pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that moves,
 **467824 → 1114992** bytes used against a 33554432-byte reservation (measured in a clean
 `build/`; the floor leg's heap figure follows the state of `build/` and is not a gate — an
 independent run over a used `build/` reads 721776 on both sides), which is the two tables
-raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits:
-`3b494b9d138ad4420f8492f43802cdf7ffaf0cde03b36b9a6df9c8b0a12ab015`.
+raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the eighth pass:
+`6f78bf105bc092c7d5f9846897f9db7a81fed8a6079ec741ac701bc7bb033f8b`.
 
 **What the element's own type bought for free.** With every array element load carrying
 its type (`tk_ha_load`, `tk_arr_index_of`, `tk_array_index`, the fixed-global rewrite), the
