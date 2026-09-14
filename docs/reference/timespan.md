@@ -189,7 +189,10 @@ since the oracle answers a global by its declaration (D48); the fixture reads on
 **array element** is a typed operand too since D50: every load of an element — a fixed
 array's, a `T[]`'s, a global's, an inline array field's — carries the element's own type,
 so `xs[i] + t` and `xs[i] + xs[j]` are claimed by the operator table and checked like any
-other pair, overflow check included. Both were the one gap this page carried: the first was
+other pair, overflow check included — `tests/surface_timespan.tk` reads both shapes with a
+variable index, and the last line of `tests/surface_timespan_overflow.tk` is an element
+operand, which is where the check itself is proven. Both were the one gap this page
+carried: the first was
 refused, ``teko: the type of the left side of `+` is not known here``, and the second ran
 on the core's raw arithmetic.
 
