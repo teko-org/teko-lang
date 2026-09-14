@@ -91,6 +91,7 @@ i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included a
 // scope stack is exactly the table this walk keeps live and reads a bare name
 // in. One oracle for one name (D51, verifier finding).
 i64  tk_ty_scope_or_global(uptr name);
+i64  tk_ty_scope_index(uptr name);
 void tk_ty_scope_var(i64 n);
 void tk_ty_scope_params(i64 p);
 i64  tk_ty_scope_mark();
@@ -368,8 +369,29 @@ i64 tk_rp_named_in(i64 fn, uptr name) {
     return 0 - 1;
 }
 
-// the ref/out parameter of the CURRENT function named `name`, or -1
-i64 tk_ref_param_named(uptr name) { return tk_rp_named_in(tk_ref_cur_fn, name); }
+// the ref/out parameter of the CURRENT function named `name`, or -1 -- and
+// only where that name still BINDS to it. The table of parameters carries no
+// position, so every `x` in the body used to answer with the signature's `x`,
+// whatever a block in between had declared: `void f(ref i64 x) { if (c) {
+// f64 x = 2.0; bumpf(ref x); } }` was CHECKED against the innermost `x` (the
+// `f64` local, `tk_ref_arg_pointee` reading the lexical scope) and then
+// REWRITTEN as a repass of the outer `ref i64` parameter, so the callee wrote
+// a float through the CALLER's own `i64` slot -- silent memory corruption
+// from two oracles disagreeing about one name (D51, tenth pass). One binding
+// answers both halves now: the walk's own scope stack, which holds the
+// parameters at [0, tk_ref_nparams) and every local above them, so an index at
+// or beyond that mark is a declaration shadowing the parameter and the name is
+// NOT a repass. A name the stack cannot answer at all (-1: only a scope table
+// filled past `TK_MAXSCOPE`, or a walk entered outside `tk_ref_fn`) keeps the
+// parameter, which is what it always meant.
+i64 tk_ref_nparams = 0;                // the mark right after this function's parameters
+
+i64 tk_ref_param_named(uptr name) {
+    i64 pn = tk_rp_named_in(tk_ref_cur_fn, name);
+    if (pn < 0) return 0 - 1;
+    if (tk_ty_scope_index(name) >= tk_ref_nparams) return 0 - 1;
+    return pn;
+}
 
 // `x = e;` on a `ref`/`out` parameter of a SCALAR pointee: `x` already IS the
 // caller's slot address, so the store goes straight through it -- a counted
@@ -605,6 +627,7 @@ void tk_ref_fn(i64 f) {
     // repassed `ref x` points at
     tk_ty_scope_cut(0);
     tk_ty_scope_params(nd_a(f));
+    tk_ref_nparams = tk_ty_scope_mark();          // above this mark, a local shadows
     tk_ref_walk(nd_b(f));
     tk_ty_scope_cut(0);
     if (tk_ref_fn_has_refout(f)) {

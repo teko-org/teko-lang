@@ -98,6 +98,16 @@
 //      own local, and the same `ref g_sib` written after both blocks have
 //      closed is the global -- one LEXICAL answer per site, never a body-wide
 //      scan calling the name "ambiguous" (D51, verifier finding).
+//   6b. `refshadowcheck` -- a local shadowing the `ref` PARAMETER itself, which
+//      is the same lexical question asked of the REWRITE rather than of the
+//      check: `tk_ref_param_named` (teko_ref.tk) read a table of parameters
+//      with no position in it, so `bumpf(ref x)` under a `f64 x` declared
+//      inside a block was CHECKED against that local (the lexical scope) and
+//      then REWRITTEN as a repass of the enclosing `ref i64 x`, handing the
+//      callee the caller's own `i64` slot to write a float through. Both
+//      halves read one binding now, and the repass, the write and the read
+//      through the parameter still stand once the block closes (D51, tenth
+//      pass).
 //   7. `addrcheck`      -- a bare `&x` at a parameter that is NOT `ref`/`out`:
 //      the N_ADDR guard `tk_rc_call_args` (teko_rc.tk) grew for D51 skipped
 //      the compatibility rule for EVERY address, where only a `ref`/`out`
@@ -483,6 +493,35 @@ i64 sibcheck(i64 c) {
     return 0;
 }
 
+// ---- 6b. a local shadowing the `ref` PARAMETER itself ----
+
+// The pointee of `ref x` is read at the site, lexically, so inside the block
+// it is the `f64` local -- and the REWRITE that turns a repassed `ref`/`out`
+// parameter into its own value (`x` already IS the caller's slot address) used
+// to read a table of the function's parameters instead, which carries no
+// position: it rewrote this `ref x` as the outer `ref i64` parameter, so
+// `bumpf` wrote 3.0 through the CALLER's `i64` slot and left the local at 2.0
+// -- one name, two oracles, silent memory corruption (D51, tenth pass).
+i64 refshadow(ref i64 x) {
+    if (x > 0) {
+        f64 x = 2.0;
+        bumpf(ref x);                             // the LOCAL, never the parameter
+        if (x != 3.0) return 1;
+    }
+    bumpi(ref x);                                 // the shadow has closed: a repass
+    x = x + 10;                                   // ...a write through the parameter
+    if (x != 18) return 2;                        // ...and a read through it
+    return 0;
+}
+
+i64 refshadowcheck() {
+    i64 a = 7;
+    i64 bad = refshadow(ref a);
+    if (bad != 0) return bad;
+    if (a != 18) return 3;                        // never written as an `f64`
+    return 0;
+}
+
 // ---- 7. a bare `&x` at a parameter that is NOT `ref`/`out` ----
 
 // `tk_rc_call_args` (teko_rc.tk) never widens an N_ADDR -- D51's own segfault
@@ -561,6 +600,9 @@ i64 main() {
     bad = sibcheck(1);
     if (bad != 0) return 60 + bad;
     if (g_sib != 9) return 69;
+
+    bad = refshadowcheck();
+    if (bad != 0) return 130 + bad;
 
     bad = addrcheck();
     if (bad != 0) return 70 + bad;

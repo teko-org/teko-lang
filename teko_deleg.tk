@@ -427,7 +427,26 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
     // (teko_struct.tk) asks the TY_UPTR type `tk_null` alone carries, so a
     // plain `i64` literal `0` (same N_INT kind, same zero value) falls
     // through to the mismatch check below instead of passing as null.
-    if (tk_is_null_lit(e)) return e;
+    //
+    // ...and `null` lands ONLY in a slot declared `T?` (Q1a,
+    // docs/specs/nullable.md rule 1) -- the same words, from the same rule,
+    // `tk_check_field_store` (teko_struct.tk) and `tk_check_scalar_compat`
+    // (teko_typeof.tk) give every other slot. `si` is a DELEGATE row, and a
+    // `T?` is a row of its own (`TK_KNULL`, which `tk_deleg_row` answers -1
+    // for), so a `null` reaching this validator is always one written into a
+    // slot that was not declared to hold it. Returning it unjudged was
+    // harmless only while some later check saw the same store: a store into an
+    // element of an `Op[]` is coerced HERE and nowhere else once it waits for
+    // the walk (`tk_deleg_late_do` below calls this validator alone, and
+    // `tk_check_field_store` is skipped for a late value), so
+    // `ops[0] = flag ? null : null` -- both branches recursed into just below
+    // -- wrote a null into a non-nullable element and paniced at the first
+    // call through it, `teko: call through a null delegate` (D51, tenth pass).
+    if (tk_is_null_lit(e)) {
+        if (!tk_nl_own_null_is(e))
+            err_at(fl, line, tk_join3("teko: null needs a slot declared ", sr_name_at(si), "?"));
+        return e;
+    }
     if (nd_kind(e) == N_CALL && str_eq(nd_name(e), "tk_ternary")) {
         i64 c = nd_a(e);                          // K4c item 3: `c ? a : b`, still the
         i64 a = nd_next(c);                       // raw placeholder here (this pass runs
