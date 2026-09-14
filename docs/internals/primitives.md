@@ -15,8 +15,9 @@ the `enum` statics are meant to land on the same table without a line of their o
 `DateTime` was the second primitive and cost the mechanism three additions, each listed
 below: rows of more than one argument, a row that is refused BY NAME, and the list that
 tells a compiler-written cast from a hand-written one. `DateOnly` was the third and cost it
-a WIDTH — four bytes, where the other two are eight — which is the section at the end of
-this page.
+a WIDTH — four bytes, where the other two are eight. `TimeOnly` was the fourth and cost it
+nothing at all — eight bytes again, and every trick the mechanism already had was enough.
+Both are their own sections further down this page.
 
 ---
 
@@ -228,13 +229,18 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 | `TK_MAXPARG` | 128 | arguments of a primitive or `enum` position, in one unit, whose type only the pass can tell (D48) |
 
 `TimeSpan` uses 1, 30 and 12 of the first three; `DateTime` brings the totals to 2, 66 and
-22, with 41 parameter positions and one late type (`DateTimeKind`); `DateOnly` (N4a) brings
-them to **3, 82 and 28**, with **51** parameter positions and no late type of its own. The
-second and third caps were 96 and 32 until that crumb and are 160 and 48 now — `TimeOnly`
-(N4b) would have overflowed both, and raising a `#define` costs nothing but the array it
-sizes. The `TK_MAXPRIMC` row is per compilation unit and not per registration: it grows
-with how much date arithmetic one program writes, roughly two entries per member access,
-and a unit past it is `teko: too many casts over a primitive in one unit`.
+22, with 41 parameter positions and one late type (`DateTimeKind`); `DateOnly` (N4a) brought
+them to 3, 82 and 28, with 51 parameter positions and no late type of its own. The second
+and third caps were 96 and 32 until that crumb and are 160 and 48 now — `TimeOnly` (N4b)
+would have overflowed both, and raising a `#define` costs nothing but the array it sizes.
+`TimeOnly` itself (N4b) brings the totals to **4, 103 and 35**, with **71** parameter
+positions — twenty of its own rows plus the one N4a's own `DateOnly` table gained
+(`.ToDateTime(TimeOnly)`), seven operator rows, and twenty of its own positions plus one on
+`DateOnly`'s — and still no late type of its own: it is registered BEFORE `DateOnly`, so
+that seventeenth `DateOnly` row's own column reads a live id and neither table needs
+`tk_prim_late`. The `TK_MAXPRIMC` row is per compilation unit and not per registration: it
+grows with how much date arithmetic one program writes, roughly two entries per member
+access, and a unit past it is `teko: too many casts over a primitive in one unit`.
 
 ## What the second primitive actually cost
 
@@ -268,5 +274,29 @@ The refusal a hand-written cast earns also gained a column: the member it names 
 primitive's own reader (`` `.Ticks` ``, `` `.DayNumber` ``), because a message naming a
 member the type does not have would be wrong (D54).
 
-The next primitive — [`decimal`](../specs/decimal.md), sixteen bytes and a derived
-machine — is the one that will ask the mechanism a question it has not answered yet.
+## What the fourth primitive cost: nothing
+
+`TimeOnly` (N4b) is **eight bytes**, `type_new("TimeOnly", 8, 8, TK_SINT)`, back at the
+original width — so neither of `DateOnly`'s two costs repeats. It added twenty rows of its
+own (four statics, four constructors, twelve instance members), seven operator rows, one
+more row on `DateOnly`'s own table (`.ToDateTime(TimeOnly)`, the member N4a left out
+because the argument's type did not exist yet) and the `tk_to_*` half of `lib/time.tk` —
+and asked the mechanism for nothing it did not already have: no new `TK_PM*` kind, no new
+entry in the own-cast list, no pass. Half of its rows do not even call a new function —
+`.Hour`/`.Minute`/`.Second`/`.Millisecond` point straight at `DateTime`'s own
+`tk_dt_hour`/`tk_dt_minute`/`tk_dt_second`/`tk_dt_ms` (masking `Kind` off a value that
+never carried one is a no-op) and the six comparisons plus `.CompareTo`/`.Equals` point at
+`TimeSpan`'s own `tk_ts_eq` … `tk_ts_ge`/`tk_ts_cmp`, the same reuse `DateOnly` made under
+D54. `.Ticks` and `.ToTimeSpan()` are symbol-less identity rows, the mechanism's own trick
+for a member that renames eight bytes rather than computing them, used here for a METHOD
+(`ToTimeSpan()`) for the first time — nothing in `tk_prim_emit` special-cases the row's
+`kind` except `TK_PMCTOR`, so the trick was already general enough.
+
+The ONE thing it did add to `lib/time.tk` is a single new panic, `teko: a time of day is
+out of range` ([runtime.md](../reference/runtime.md#the-time-library)): no existing
+wording reads honestly for an interval that starts at zero, unlike every other range this
+file already guards.
+
+The next primitive to ask the mechanism something new is
+[`decimal`](../specs/decimal.md), sixteen bytes and a derived machine — the fifth
+registration, and the first wider than the machine word rather than narrower.

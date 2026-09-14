@@ -4964,6 +4964,7 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 `mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
 (base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
+
 ### D56 · A STRUCT global is a class global (G-d, 2026-09-14)
 D5 already settled a struct value as a POINTER, eight bytes, so a struct global takes the
 door every other reference-typed global takes, three doors already cut: D48 gives it a ROW
@@ -5033,3 +5034,405 @@ unmoved; `mc limits . --config mc.macos.toml` verdict `ok`, `passes` 15/30, `typ
 `intrin` 8/16, `alias` 18, `syntax` 15 -- every table exactly where D53 left them; `mc pkg
 hash .` `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`, UNMOVED against
 the base (no listed file changed -- `tests/` and `docs/` are not in `mc.toml`'s own list).
+
+### D57 · The arguments of an INDIRECT call are judged like a direct call's (2026-09-14)
+An ordinary call names its callee, so the last pass of all looks the symbol up and judges
+every argument against the declaration (`tk_rc_call_args`, teko_rc.tk). A VIRTUAL call, an
+INTERFACE call and the UNQUALIFIED form of either inside a method name none: all three are
+a `callp`, and the only point that knows which method they reach is the site that BUILDS
+them -- `tk_vcall_args_check` (teko_expr.tk), `tk_ifargs_check` (teko_iface.tk) and
+`tk_this_emit` (teko_this.tk), which built the same `callp` and called **no check at all**.
+
+Those sites ask the oracle they have, the parse-time `tk_pty_of` (teko_struct.tk), whose
+N_IDENT arm is `tk_slv_find` -- the parser's own stack of locals -- and which has no N_ADDR
+arm whatever. `tk_check_compat` and `tk_num_widen` both read its -1 as "do nothing", so the
+argument crossed **unjudged and unconverted**. Eight shapes measured on the base
+(`af2fffad`), every one of them compiling, every one of them refused or converted on the
+identical local through the qualified spelling:
+
+- `Box gb; b.take(gb);` on a `take(Point)` -- exit **7**, the callee reading `Box.w` as
+  `Point.x`. The interface twin the same.
+- `f64 gf; b.takei(gf);` on an `i64` parameter -- accepted, the double's bit pattern in an
+  integer slot. The interface twin the same.
+- `i64 gi; b.bump(ref gi);` on a `ref f64` parameter -- exit 42 and `gi` left holding the
+  bits of 2.0. The interface twin the same, and the LOCAL `ref li` too, where the DIRECT
+  call is refused `teko: a value of type i64 does not convert to f64`.
+- `takei(lf)` written unqualified inside a method, with an `f64` LOCAL -- accepted. This is
+  the road on which even a local crossed unread: it is rewritten from a pass, where the
+  parser's stack is long closed, so `tk_pty_of` answers -1 for every name.
+- `takef(2)` written unqualified, on an `f64` parameter -- exit **1** against 25. The
+  CONVERSION went missing with the check, and that half is silently wrong in a program with
+  no global in it at all.
+
+**ROOT: one oracle, asked at the only point that holds the callee, and too early.** The
+answer is not a second oracle at the site -- the pass-time tables (`tk_ty_global`,
+teko_array.tk, filled at pass 5; `tk_ty_scope_or_global`, teko_typeof.tk) do not exist while
+the parser is running, and reading `tk_ty_global` alone would be wrong twice over: a global
+declared BELOW the body works today, and a LOCAL shadowing a global of another type must
+resolve to the local. So the judgement is DEFERRED, which is D48's own discipline for a
+primitive row's argument and D50's for a field store, one slot over: the argument is PARKED
+(`tk_vca_defer`) and judged at the end of `tk_over_pass` (`tk_vcall_arg_judge`,
+teko_typeof.tk), **no pass of its own** -- `passes` stays 15/30 -- at the one point that has
+the lexical scope live at the site (`tk_ty_pass_walk`), every deferred `.` resolved, every
+user operator lowered and every overload pick committed. It matches by node IDENTITY,
+because the argument was spliced into the `callp`'s own list and nothing at the door knows
+which link it is.
+
+**Two rules at the judge, neither of them new.** By value it is `tk_ty_of` then
+`tk_check_compat` -- the two scalar verdicts and the row one in one call -- followed by the
+conversion C# §10.2.3 owes it; `ref`/`out` is `tk_ref_check_pointee_ty` (teko_ref.tk), the
+IDENTITY rule `tk_rc_call_args` and the delegate call already apply, with a pointee no scope
+and no global table names silently skipped there as here. The conversion is D50's own tail,
+factored out of `tk_fs_do` as `tk_fs_convert` and called from both: the node keeps its
+identity and BECOMES the cast or the box, because the slot it crosses into holds no handle
+on it. No behaviour of the field store moved -- the 94 pre-existing dumps prove it.
+
+**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** What a later
+pass adds to a name is the scope, the global table and the load an unqualified field name
+becomes; a local array's element, an indirect `callp` and an address the source built by hand
+are no better known at pass 14 than at the door, so parking them would turn today's silence
+into a refusal of code with nothing wrong with it. Measured unmoved on both builds: an
+argument that is a field of `this`, a local array's element, an `out` argument, a global
+declared below, a local shadowing a global, and `p.same(v)` on a bare parameter
+(`tests/primitives_float.tk`, the one pre-existing fixture that parks anything -- 1 row,
+judged `i64` against `i64`, no node moved). A top-level `const` never reaches the table at
+all: teko_const.tk rebuilds the name into its `N_INT` before any of the three doors reads it,
+so `b.take(K)` into a `take(Point)` was already refused on the base and `b.takei(K)` runs
+here -- probed in both directions.
+
+**`tk_this_emit` calls `tk_vcall_args_check` on its `slot >= 0` branch**, and on that branch
+only: the direct branch names its callee and the last pass of all looks it up. One body, not
+a third copy of the loop.
+
+**The ceiling is D50's, for D50's reason.** `TK_MAXVCA` 4096 over six columns is 192 KB of
+globals, against a measured peak of **26** (`tests/surface_globals_calls.tk`) and 1
+everywhere else in the tree; `mc limits`' `globals` row moves 935 -> 942, six arrays and a
+counter, against 2530 reserved. Over it,
+`teko: too many deferred call arguments`, the one new literal, documented on the
+diagnostics page's Capacity table.
+
+**FIXTURES** (8). Seven refusals, each measured COMPILING on the base before it was written
+down: `tests/refuse/vcall_global_arg.tk`, `vcall_global_arg_scalar.tk`,
+`ifcall_global_arg.tk`, `ifcall_global_arg_scalar.tk`, `vcall_ref_pointee.tk`,
+`ifcall_ref_pointee.tk` and `thiscall_virtual_arg.tk` -- the last being new ground, an `f64`
+LOCAL through the unqualified road. And the positive `tests/surface_globals_calls.tk` (42):
+globals above and below `main` on all three roads and through the written-out `this.m(x)`,
+the widening of an `i64` global onto an `f64` parameter, a `ref` global with the right
+pointee on both roads, a local shadowing a global of another type, a `const`, and a
+`DateOnly`/`TimeSpan` global -- four bytes and eight (D54) -- crossing the `callp`. It exits
+**14** on the base, section 1's fourth check, and 42 here.
+
+**Proof** (mc 0.15.23, macos/aarch64, written against base `af2fffad` and re-measured on
+`d0fbe9a4`, the merge of D56 and #706 -- neither touches a compiler source, `git diff
+af2fffad d0fbe9a4` over `*.tk`/`lib/`/`*.mc`/`mc.toml`/`teko.toml` being one added fixture):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **70 passed, 33 refused as expected, 0 failed** (69/26 on the base, and
+running the head's `tests/` under the BASE compiler reads `69 passed, 26 refused as
+expected, 8 failed` -- exactly this crumb's eight); `--dump-ast` of all **95** pre-existing
+fixtures (69 `tests/*.tk` + 26 `tests/refuse/*.tk`), the base compiler's output against this
+head's: **byte-identical, 95 of 95** -- the change only parks, refuses and converts, and no
+pre-existing fixture hands an indirect call an argument that needs a conversion;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (the compiler's own
+sources are mc: no class, no interface, so nothing is ever parked there and stage 2 rebuilds
+itself byte-for-byte); `sh scripts/check-docs.sh` green (`docs ok: 587 links, 32 fragments,
+389 diagnostics, 33 refusals, 138 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs -- the `tests/hello.tk` leg has `passes` 15/30, `types` 12, `intrin` 8/16, `alias`
+19 and `syntax` 15 **unmoved**, and `./build/teko limits tests/hello.tk` is byte-identical to
+the base compiler's own output; the compiler leg moves only by the size of the added surface
+code and its tables, `nodes` 155615 -> 155975, `globals` 935 -> 942, `ins` 214500 -> 215007,
+`funcs` 3162 -> 3173, `lowered` 3144 -> 3155; `mc pkg hash .`
+`9b9e6483727e8e0736bfd4dc37db5ef87141bbf76a6f33a729b405b1afd8a8e7` (base
+`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`, the same on `af2fffad`
+and on `d0fbe9a4`: five listed `.tk` modules moved, so the hash moves by design).
+
+**TWO rows of `not-yet.md` are CLOSED by this entry**, not merely amended. The first, older
+one: "an integer argument at a virtual or an interface call, written as a bare parameter
+name (`a.by(n)` inside `g(i64 n)`) -- not converted". Probed both ways: `s.by(n)` on a
+`virtual f64 by(f64)` and `k.take(n)` on an interface `f64 take(f64)`, with an `i64`
+parameter `n`, read the raw bits on the base and read 8.0 here. The second is the row D56
+([#705](https://github.com/teko-org/teko-lang/pull/705)) wrote for this very gap while
+measuring a struct global -- "a virtual or an interface call argument written as a bare
+global name ... not judged AT ALL" -- whose own reproducer is
+`tests/refuse/vcall_global_arg.tk` here. This branch was rebased onto D56 and #706 at the
+end; the merge kept D56 ahead of this entry and removed both rows, since the conversion and
+the judgement they name are what the fixtures now lock. The `switch`-on-an-enum-parameter
+row that cited the first as a sibling limitation is amended to say why it is NOT one: a
+`switch` subject's hidden local is DECLARED at parse time, so there is no later point at
+which its type could still be chosen.
+
+**Left open, found here and NOT touched** -- a call through a DELEGATE slot does not judge a
+by-value argument. `tk_deleg_check_arg_kinds` (teko_deleg.tk) checks the `ref`/`out` KIND and,
+since D51, the `ref` POINTEE, and nothing else: the by-value column `dg_pty_at` is never
+compared. `delegate i64 Op(i64 a); i64 twice(i64 a) { return a + a; } f64 gf = 1.5;
+i64 main() { Op f = twice; f64 lf = 1.5; i64 a = f(lf); i64 b = f(gf); return 64; }` compiles
+on this head exactly as on the base, local and global alike, where the direct `twice(lf)` is
+refused. It is its own crumb -- the door is a different one, in a different module, and the
+rule it needs is the one this entry just wrote down. Recorded as a row of
+`docs/reference/not-yet.md` § "Numeric conversions".
+
+**Copilot findings, second pass -- the door judged a tag it never read, and trusted an
+oracle that answers about the WRONG declaration.** Three findings on the compiler and one
+on the prose, each measured first on `d0fbe9a4` (the base) and on this crumb's head
+(`14502bef`), where every one of them reads the SAME: none is a regression of this branch,
+each is a gap the judge it added does not close. mc 0.15.23, macos/aarch64; `Box` a class
+with `virtual i64 takei(i64)`, `virtual i64 takef(f64)` and `virtual i64 bump(ref f64)`,
+`Sink` the interface declaring the same three, and `pick` an overloaded name:
+
+| probe | `d0fbe9a4` = `14502bef` | now |
+|---|---|---|
+| `b.takef(pick(2))`, `f64 pick(f64)` declared ahead of `i64 pick(i64)` | compiles, **exit 40** (the raw integer 3 read as a double) | runs, **30** -- the direct twin's own answer |
+| `s.takef(pick(2))`, the itab road | compiles, **exit 40** | runs, **30** |
+| `b.takei(pick(2))`, the same pair | **refuses** a legal program, `teko: a value of type f64 does not convert to i64` | runs, 13 |
+| `b.takef(pick(2.5))`, `i64 pick(i64)` declared first | runs, 30 -- the cast the door wrote was `f64` over an `f64` and mc lowered it to nothing | runs, 30, with no cast written at all |
+| `b.takei(ref x)` on a by-value `i64` | compiles, **exit 209** (the low byte of a stack address) | refuses, `teko: argument 2 is not passed by reference` |
+| `s.takei(ref x)`, the itab road | compiles, **exit 209** | the same refusal |
+| `takei(ref x)` unqualified, inside a method | compiles, **exit 177** | the same refusal |
+| `b.bump(x)` on a `ref f64`, no tag at the site | compiles, **SIGSEGV** (the callee's `d = 2.0` written through a value) | refuses, ``teko: argument 2 needs `ref` at the call site`` |
+| `s.bump(x)` / unqualified `bump(x)` | compiles, **SIGSEGV** | the same refusal |
+| the direct twins, `takef(pick(2))`, `takei(ref x)`, `bump(x)` | 30, and the two refusals in exactly those words | unmoved |
+
+1. **An OVERLOADED call's return type is not the first declaration's.** `tk_pty_of`
+   (teko_struct.tk) types an `N_CALL` as `decl_ret(decl_find(name))`, and `decl_find`
+   (mc/src/parse.mc) walks `unit_head` in declaration order and answers with the FIRST --
+   while which overload a site reaches is settled by `tk_ov_pick` at pass 14. Both doors
+   read that answer as final, and it is wrong in both directions at once: against a matching
+   parameter it writes no conversion where the picked overload needs one (the raw integer
+   into an `f64` parameter, exit 40), and against a mismatched one it REFUSES a program
+   whose picked overload fits. It is D49's own finding, one door over: `tk_prim_defers`
+   (teko_prim.tk) defers a call on a float column for exactly this reason. So the park test
+   grows one shape -- `tk_vca_ov_call` (teko_typeof.tk) -- and the whole decision moves into
+   `tk_vca_park`, the one helper both loops now call: it hands back the parse-time answer
+   when that answer is trustworthy and -1, the "check nothing, convert nothing" both readers
+   already understand, when the argument was parked instead. The count is taken from
+   `decl_find`'s own node forward along `nd_next`, because teko_over.tk's `tk_ov_find` is a
+   table built at pass 6 and this door runs while the parser is still inside the body. Only
+   a call to an overloaded name is added: a call to a name declared once is answered
+   correctly today, and a call to a name declared BELOW is left exactly as it was.
+2. **and 3. The `ref`/`out` TAG was never compared with the parameter's kind.** Both loops
+   compared TYPES only, and the tag is not a type: `tk_ref_check_call` (teko_ref.tk) is
+   keyed on a call's SYMBOL and a `callp` has none, so nothing on the three indirect roads
+   ever asked the question. An address crossed into a by-value slot and a value crossed into
+   a `ref` one, the second being the one that writes through what it was handed -- SIGSEGV
+   on every road, where the direct call refuses at the same line. The rule is factored out
+   of `tk_ref_check_call` as `tk_ref_check_kind` and asked FIRST at all three doors, before
+   the compat and the park: nothing that follows means anything when the tag is wrong. The
+   words are the direct call's, and so is the numbering -- the receiver counts as argument
+   1, exactly as it does in the mangled `Owner_method` a non-virtual method call lowers to,
+   so `b.m(ref x)` says "argument 2" whichever road carries it. `tk_ref_check_call` keeps
+   its own behaviour to the letter: the 98 base dumps and its own fixtures prove the
+   factoring is a no-op.
+4. **The diagnostics page's own sentence.** "a `ref`/`out` pointee no scope and no table of
+   globals holds a row for stays silently skipped" is unreadable, and it was also the page's
+   only statement of what this door lets through in silence. Rewritten as two named cases --
+   a `ref`/`out` pointee no scope and no table of globals NAMES (the address was built by
+   the source and its target has no declared type to compare), and a by-value argument that
+   is neither a bare name nor a call to an overloaded one (no later pass knows more about it
+   than the site did) -- with the tag rule and the overload rule stated beside them, and
+   the two `"teko: argument "` completions amended to say that all three indirect roads give
+   them too.
+
+**FIXTURES** (7, for 39 refusals and 71 runs in the tree): `tests/vcall_overloaded_arg.tk`
+(39) drives both directions of finding 1 on the vtable road, the itab road and the
+unqualified one -- refused on the base at its fourth check -- and six refusals name one
+direction on one road each: `tests/refuse/vcall_ref_extra.tk`, `vcall_ref_missing.tk`,
+`ifcall_ref_extra.tk`, `ifcall_ref_missing.tk`, `thiscall_ref_extra.tk` and
+`thiscall_ref_missing.tk`. The unqualified road gets its own pair because its DOOR is
+another one (`tk_this_emit`, teko_this.tk, which runs from a pass where the parser's stack
+of locals is closed), even though the loop it reaches is shared.
+
+**Proof of the second pass** (mc 0.15.23, macos/aarch64): `sh scripts/fixtures.sh
+./build/teko mc.macos.toml` -> **71 passed, 39 refused as expected, 0 failed**;
+`--dump-ast` against the BASE compiler (`d0fbe9a4`) over every fixture that tree holds,
+**98 of 98 byte-identical**, and against this crumb's own head (`14502bef`) over all of
+its, **106 of 106** -- the dump is taken after the passes, checked by the same comparison
+reading `CAST type=f64` where the fix now writes one; `sh scripts/bootstrap.sh --os macos
+--arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` green (`docs ok: 587 links, 32
+fragments, 389 diagnostics, 39 refusals, 138 samples`); `mc limits . --config
+mc.macos.toml` verdict `ok` on both legs, the `tests/hello.tk` leg's table rows
+unmoved against the base's and `14502bef`'s (`passes` 15/30, `types` 12, `intrin` 8/16,
+`alias` 19, `syntax` 15; the `heap` column is not a proof figure, D55's lesson -- the
+verifier measured it moving while every counted row stood) and the compiler leg moving by the added surface alone --
+`nodes` 155975 -> 156097, `ins` 215007 -> 215225, `funcs` 3173 -> 3176, `lowered` 3155 ->
+3158, `globals` **942 unmoved** (no table is added, the park test only widens);
+`mc pkg hash .` `ef81724394452c08172a4a47bfcf2cfd2c463bc6861bcf1c40496a4122831b51`.
+### D58 · `TimeOnly`, the fourth primitive that costs nothing new (2026-09-14)
+*D57 was already taken by a crumb in flight (`fix/vcall-args-judge`, PR #707, D57), the
+same reason D54 gives for its own number: assigned rather than taken in order.*
+
+`docs/specs/datetime-extras.md`'s N4b lands: `TimeOnly`, ticks since midnight,
+`0 .. 863999999999` (`TICKS_PER_DAY - 1`), C#'s own representation, eight bytes —
+`type_new("TimeOnly", 8, 8, TK_SINT)`, twenty member rows of its own, seven operator rows,
+and one MORE row on `DateOnly`'s own table, `.ToDateTime(TimeOnly)`, the member N4a left out
+because the argument's type did not exist yet. Registered in `tk_time_init`
+BETWEEN `tk_dt_operators()` and the `DateOnly` block, so both new columns —
+`TimeOnly.FromDateTime`'s own (naming `DateTime`) and `DateOnly.ToDateTime`'s own (naming
+`TimeOnly`) — read a LIVE id at registration time and neither table needs `tk_prim_late`.
+
+**Eight bytes, and half its rows call no new function at all.** Unlike `DateOnly` (D54),
+`TimeOnly` costs the mechanism nothing: no width, no new `TK_PM*` kind, no new door in the
+own-cast list, no pass.
+
+- `.Hour` `.Minute` `.Second` `.Millisecond` point straight at `DateTime`'s own `tk_dt_hour`
+  / `tk_dt_minute` / `tk_dt_second` / `tk_dt_ms`: masking `DATETIME_TICK_MASK` off a value
+  that never carried a `Kind` above it is a no-op (a `TimeOnly` needs under 40 bits, the mask
+  clears only the top two), so four functions that would repeat the same division and modulo
+  are code not written.
+- The six comparisons, `.CompareTo` and `.Equals` point at `TimeSpan`'s own `tk_ts_eq` …
+  `tk_ts_ge` / `tk_ts_cmp`, the exact reuse `DateOnly` made under D54: a tick count of a time
+  of day is an ordinary non-negative `i64` too.
+- `.Ticks` and `.ToTimeSpan()` are symbol-less identity rows (`tk_prim_emit`'s `sym == 0`
+  path, teko_prim.tk § "the emission"): the same eight bytes read back under the other type,
+  a cast and no call. `.Ticks` repeats `TimeSpan.Ticks`'s own precedent; `.ToTimeSpan()` is
+  the first time the trick is used on a METHOD (`TK_PMFUN`) rather than a property
+  (`TK_PMPROP`) — and needed no change, because nothing in `tk_prim_emit` special-cases the
+  row's `kind` except `TK_PMCTOR`, so the identity path was already general enough for a
+  zero-argument instance method with a receiver.
+
+**What IS new: the wrapping arithmetic, and one panic.** `.Add(TimeSpan)`, `.AddHours(f64)`
+and `.AddMinutes(f64)` never panic — C#'s own rule — wrapping at both ends of the day
+(`tk_to_add`, `lib/time.tk`: the `TimeSpan` operand is reduced mod `TICKS_PER_DAY` FIRST so
+the sum cannot overflow the `i64` itself, since a `TimeSpan` may carry ticks far outside one
+day). `.IsBetween(a, b)` is C#'s own rule too: `a` inclusive, `b` exclusive, and it WRAPS
+when `a` is after `b` (`22:00` to `02:00` covers midnight). The one operator, `t1 - t2`, is
+NEVER negative — the elapsed time from `t2` to `t1`, wrapping FORWARD across midnight when
+`t1` is earlier (`tk_to_sub`); `t + t` has no row and is refused by absence, and so does
+`t + TimeSpan`/`t - TimeSpan` — C# has no such operators either, `.Add` is the form. The one
+new panic, `teko: a time of day is out of range`, fires on `new TimeOnly(ticks)` and
+`TimeOnly.FromTimeSpan(ts)` alone: no existing wording in `lib/time.tk` reads honestly for
+an interval that starts at zero, unlike every other range that file already guards. The
+three calendar-free constructors (`new TimeOnly(h, mi)`, `(h, mi, s)`, `(h, mi, s, ms)`)
+reuse `tk_dt_time_ticks` and so reuse its four existing panics
+(`an hour`/`a minute`/`a second`/`a millisecond is out of range`) — the same function
+`new DateTime(y, m, d, h, mi, s)` panics on.
+
+**Seven amendments to the spec, recorded on that page and not repeated here:** the panic it
+named, `` `that time of day does not exist` ``, does not exist — the landed wordings are the
+five above; a `DateOnly` drift N4a itself left in that page (`` `that date does not exist` ``
+where D54 actually landed `` `a date does not exist` ``) is fixed now, since the page is open
+again; the fixtures landed under `tests/surface_timeonly*.tk`, not the `primitives_*.tk`
+names the page had used; `ToString`/`Parse`/`TryParse` are out of N4b, the same reason N4a's
+own amendment gives; the `(h, mi)` two-argument constructor, missing from the page's own
+table, is added to it; `TimeOnly.ToString()`'s own row is removed from that table for the
+same reason; and § 6's `types +3`/`syntax +3` are the PAGE's total across all three crumbs
+(N4a, N4b, N5), not one crumb's — N4b's own share is `+1`/`+1`, one `type_new` and one type
+word.
+
+**Docs.** `docs/reference/datetime.md` gains `## TimeOnly` (after `## DateOnly`) and its
+"Under the hood" closing note is updated for the fourth primitive and `DateOnly`'s own
+seventeenth row. `docs/reference/types.md` gets the matching short section.
+`docs/reference/diagnostics.md`: the "Primitives with members" heading gains a name, a
+`TimeOnly` example beside the generated cast refusal, a `### TimeOnly (N4b)` subsection
+mirroring `DateOnly`'s, and the panic-list paragraph corrected — `.ToDateTime(t)` is no
+longer "not yet". `docs/reference/runtime.md`: the `tk_to_*` signature table, the
+`DateOnly.ToDateTime` row, `TIMEONLY_MAX_TICKS`, and the panic table's fifteenth row.
+`docs/reference/not-yet.md`: `TimeOnly` and `.ToDateTime(t)` come out of the not-taught
+rows, and a `TimeOnly`-shaped `ToString`/`Parse` row goes in beside `DateOnly`'s.
+`docs/internals/primitives.md`: the ceilings recomputed and a new "What the fourth primitive
+cost: nothing" section. `docs/specs/README.md` row 9b marked landed.
+
+**Proof** (macOS/aarch64, mc 0.15.23, base `d0fbe9a4`):
+- `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **71 passed, 31 refused as
+  expected, 0 failed** (69/26 on the base): `tests/surface_timeonly.tk` at 42 (58 checks: all
+  four constructors, both ends of the range, both other builders agreeing, `.Add` wrapping
+  both ways, `.AddHours`/`.AddMinutes` wrapping, `.ToTimeSpan()`, `.IsBetween` ordinary and
+  wrapping with both inclusive/exclusive edges, the six comparisons plus `.CompareTo`/
+  `.Equals`, `t - t` ordinary and forward-wrapping, `DateOnly.ToDateTime(TimeOnly)`
+  round-tripped through both `FromDateTime`s and `.TimeOfDay`, the spec's own § 2 sample
+  lifted into a real `expect-exit` block, and the value through a local, a field, a global,
+  both shapes of array element and a closure capture — short, since eight bytes needs no
+  width proof) — `tests/surface_timeonly_panic.tk` at 70 (`new TimeOnly(864000000000)`, one
+  tick past the range, after a page of checks that must not fire: both calendar-free ends of
+  a day, the raw-ticks constructor and `FromTimeSpan` at the very top of the range, and
+  wrapping arithmetic that goes nowhere near it) — and `tests/refuse/timeonly_{from_int,
+  to_i64,to_datetime,cast,plus_timeonly}.tk`.
+- `--dump-ast`, `d0fbe9a4`'s own compiler run over both trees (one compiler, two trees —
+  D54's own form): the **57** pre-existing `tests/*.tk` that do not include `lib/time.tk`
+  are byte-identical, 57 of 57; the **12** that do (`surface_dateonly`,
+  `surface_dateonly_panic`, `surface_datetime`, `surface_datetime_kind`,
+  `surface_datetime_kind_panic`, `surface_datetime_panic`, `surface_globals_slot`,
+  `surface_nullable_ops`, `surface_nullable_value`, `surface_overload_ops`,
+  `surface_timespan`, `surface_timespan_overflow`) each differ by exactly **+140 lines, −0**,
+  one insertion point at the end of the dump — the `tk_to_*`/`tk_do_to_datetime` functions
+  `lib/time.tk` gained and nothing else; `d0fbe9a4`'s OLD compiler dumping `lib/time.tk`'s
+  new tail at all is itself a finding worth naming: none of the new functions names
+  `TimeOnly`, so an unmodified base compiler parses and dumps them with no error.
+- `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`.
+- `mc limits`, verdict `ok` on both legs: the `tests/hello.tk` floor `passes` 15/30,
+  `intrin` 8/16 and `syntax` 15/30 **unmoved**, `types` 12 → **13** and `alias` 19 → **20**
+  (the fourth `type_new`'s own alias row); the `tests/surface_dateonly.tk` leg — the SAME
+  source both before and after, only the compiler under it changed — `passes` and `intrin`
+  unmoved, `types` 18 → **19**, `syntax` 19 → **20**, `alias` 25 → **26**.
+- `sh scripts/check-docs.sh` → `docs ok: 593 links, 38 fragments, 388 diagnostics, 31
+  refusals, 140 samples` — one stale `#fragment` link fixed (the "Primitives with members"
+  heading's own slug shifted with the new name), one new `teko: …` literal
+  (`a time of day is out of range`), documented.
+- `mc pkg hash .` → `246d6defa97f3a76094ddf1469e8512c0a815d4d45269f3bb3565fc219c757d3`.
+### D60 · A type word already taught refuses a second `class`/`struct`/`interface`/`delegate` under the same name (2026-09-14)
+`class TimeSpan { public i64 v; }` (a teko primitive, `teko_time.tk`), `class f64 { ... }`
+(mc's own core word, its bundled `<float>` module) and `class usize { ... }` (one of the
+seven `type_alias` words `teko_type.tk` declares) all compiled SILENTLY, with the last
+registration winning program-wide: `class f64 { public i64 v; } f64 x = 1.5;` refused with
+`teko: a value of type f64 does not convert to f64` (both sides of `=` now the class's own
+row), and `class TimeSpan {} ... t.v` refused with `teko: unknown member of TimeSpan: v`
+(the primitive's own row, not the class's). `tk_newname` (`teko_struct.tk`) is the one door
+every one of those four constructs takes for its name, and its duplicate guard
+(`alias_find(p_id()) >= 0`, `teko_struct.tk:1463-1464`, the existing `teko: the name is
+already a type` wording D20 already names) is short-circuited by the `tk_fwd_pending`
+branch just above it: the byte-level forward scan (`tk_fwd_reg_type`, `teko_fwd.tk:353`,
+D50's own pre-pass so a use above its declaration still resolves) calls `type_new(qname, 8,
+8, TK_INT)` BLIND, guarded only by its own table (`tk_fwd_find`, its only guard), so a
+`class TimeSpan` lands a SECOND row under the same word in mc's type table before the real
+declaration is ever read -- `type_new` appending unconditionally is mc's own documented
+contract (`src/hooks.mc:637-639`, read-only, D2), not a defect to report. `enum` has no such
+pre-scan (D216: no `type_new` at all) and was the one construct already refused correctly.
+
+**The fix**, entirely inside `tk_newname`'s own `tk_fwd_pending` branch, on the
+declaration's own line (the pre-scan carries no line number to refuse from,
+`tk_fwd_try_decl`): `tk_type_word_shadowed(qname)` answers 1 when `qname` is a type word
+registered MORE THAN ONCE in mc's type table -- `type_count()`/`type_name(t)` counted, since
+the pre-scan's own blind `type_new` is what put the second row there -- which catches every
+`type_new`-based collision (`TimeSpan`, `DateTime`, `DateOnly`, `ref`, `out`, `params`, `i8`,
+`i16`, and mc's own `f64`/`f32`/`f64raw`/`i32`) with zero new state. The seven
+`type_alias`-based words (`bool`, `char`, `byte`, `isize`, `usize`, `ptr`, `str`,
+`teko_type.tk:74-80`) leave no row in mc's type table for that count to see -- `type_alias`
+appends to the alias table alone -- and mc gives no by-name alias lookup that survives the
+scan (`alias_find` takes a token id and answers only the LAST registration, which after the
+scan's own blind `type_new` is always the scan's own row: measured empirically, not a
+documented gap to report). Teko owns those seven words, so `tk_type_word_shadowed` checks a
+short table beside their declaration instead -- the same corridor, one more list. A
+namespaced type is unaffected either way: `namespace geo { class TimeSpan {} }` qualifies to
+`geo__TimeSpan` (`tk_ns_qualified_name`), a name neither list nor count ever matches, so the
+word stays free per namespace exactly as D-unnumbered (§31 N1, `teko_struct.tk`'s own
+comment) already promised. A genuine duplicate (`class Cell {}` twice, no namespace) never
+reaches this branch at all -- its second occurrence's token is already a reserved word by
+the time it is read, so it falls straight to the pre-existing `alias_find` guard, unchanged.
+
+**Fixtures.** Six refusals, `tests/refuse/type_word_{class,struct,iface,deleg,core,alias}.tk`
+-- one per construct (`class`/`struct`/`interface`/`delegate`) plus the mc-core and the
+`type_alias` collision, each `// expect-refuse: teko: the name is already a type: <name>` at
+the declaration's own line. One positive: `tests/surface_namespace.tk` grows a `geo.TimeSpan`
+class (measured first: the un-fixed compiler already accepted it, silently, the same gap) and
+a `main()` read of its own field, proving the namespaced word still resolves to the class, not
+the primitive, `expect-exit: 42` unmoved (an early `return 9` guards the new check without
+touching the existing sum).
+
+**Docs.** `docs/reference/diagnostics.md`'s `"teko: the name is already a type"` entry widened
+to name the three sources (a teko primitive, mc's own core word, a `type_alias` word) and the
+namespace exception; no `docs/reference/not-yet.md` row named this gap, so none is removed.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d0fbe9a4`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **69 passed, 32 refused as
+expected, 0 failed** (was 69/26: six fixtures added, one grown); `--dump-ast` byte-identical
+against the base compiler for every one of the 68 other pre-existing `tests/*.tk` fixtures (no
+hook module change alters an ACCEPTING parse -- the new code path is reached only when the
+refusal fires); `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh
+scripts/check-docs.sh` → `docs ok: 585 links, 30 fragments, 388 diagnostics, 32 refusals, 137
+samples`; `mc limits . --config mc.macos.toml` verdict `ok` on both legs, `passes` 15/30,
+`types` 12, `intrin` 8/16, `alias` 19, `syntax` 15 -- every table exactly where the base left
+them, only the size-of-surface-code rows moved (`nodes` 176853 → 177006, `ins` 214500 →
+214683 on the compiler leg; the `heap` column is not a proof figure -- it reflects the state
+of `build/` at the time of the run, D55's lesson); `./build/teko limits
+tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .`
+`aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
+`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
+listed file, so the hash moves by design).

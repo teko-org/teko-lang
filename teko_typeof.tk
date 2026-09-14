@@ -833,6 +833,24 @@ void tk_ty_pass_walk(i64 root, uptr visit) {
 // guessing -- and this is the one point that turns the unanswered question
 // into a refusal instead of into machine code (the same sentence D48 gives a
 // primitive row's deferred argument, one slot over).
+// the conversion a JUDGED value owes, written IN PLACE. The slot it crosses
+// into holds no handle on it -- a field store spliced it into the store call's
+// own argument list, an indirect call into the `callp`'s -- so the node keeps
+// its identity and BECOMES the conversion, while a fresh node takes over
+// everything it was (`tk_nd_moved`, teko_prim.tk, D48's own rewrite). A value
+// that converts nothing is left exactly as the parser built it, which is why
+// every `--dump-ast` of a program that already compiled is unmoved.
+void tk_fs_convert(i64 fty, i64 vty, i64 n) {
+    if (!tk_fs_converts(fty, vty, n)) return;
+    i64 inner = tk_nd_moved(n);
+    i64 r = tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, inner));
+    tk_node_replace(n, r);
+    // what was built carries the registrations, and what ends up in the TREE
+    // is the node the slot already points at (`tk_pend_do`'s own rule, above)
+    if (tk_os_has(r)) tk_os_add(n);
+    tk_xt_move(r, n);
+}
+
 void tk_fs_do(i64 i) {
     if (fst_done_at(i)) return;
     st64(fst_done + i * 8, 1);
@@ -858,14 +876,7 @@ void tk_fs_do(i64 i) {
     // a primitive with members, a raw `uptr` and an unrelated class apart from
     // a value that really fits a field of reference type.
     tk_check_compat(fty, vty, n, fst_line_at(i), fst_file_at(i));
-    if (!tk_fs_converts(fty, vty, n)) return;
-    i64 inner = tk_nd_moved(n);
-    i64 r = tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, inner));
-    tk_node_replace(n, r);
-    // what was built carries the registrations, and what ends up in the TREE
-    // is the node the store already points at (`tk_pend_do`'s own rule, above)
-    if (tk_os_has(r)) tk_os_add(n);
-    tk_xt_move(r, n);
+    tk_fs_convert(fty, vty, n);
 }
 
 void tk_fs_pend(i64 n) {
@@ -886,6 +897,184 @@ void tk_fs_pend(i64 n) {
 void tk_field_store_judge(i64 root) {
     if (tk_nfs == 0) return;
     tk_ty_pass_walk(root, &tk_fs_pend);
+}
+
+// ---- the ARGUMENT of an INDIRECT call the site could not type (D57) ----
+// An ordinary call names its callee, so the last pass of all looks the symbol
+// up and judges every argument against the declaration (`tk_rc_call_args`,
+// teko_rc.tk). An indirect one names none: a vtable call and an itab call are
+// a `callp`, and the only point that knows WHICH method they reach is the site
+// that builds them -- teko_expr.tk's `tk_vcall_args_check`, teko_iface.tk's
+// `tk_ifargs_check`, and the unqualified form of either inside a method
+// (teko_this.tk's `tk_this_emit`, which builds the same `callp` and, until
+// this entry, called no check at all).
+//
+// Those two sites ask the oracle they have, the PARSE-TIME one (`tk_pty_of`,
+// teko_struct.tk), and -1 is what it answers for exactly the shapes this table
+// exists for -- `tk_check_compat` and `tk_num_widen` both read -1 as "do
+// nothing", so the argument crossed unjudged and unconverted:
+//
+//   - a bare NAME that is no parse-time local: a GLOBAL (its type is a
+//     pass-time table, `tk_ty_global`/teko_array.tk, filled at pass 5) and, on
+//     the unqualified road, every local and parameter too, since that road runs
+//     from a pass where the parser's own stack is long closed. Measured on
+//     `af2fffad`: `Box gb; b.take(gb);` on a `take(Point)` compiled and read
+//     `Box.w` as `Point.x`; `f64 gf; b.takei(gf);` handed a double's bit
+//     pattern to an `i64` parameter; both are refused on the identical LOCAL
+//     through the qualified road.
+//   - a `ref`/`out` argument, which `tk_pty_of` has no arm for at all:
+//     `i64 gi; b.bump(ref gi);` on a `ref f64` parameter let the callee store
+//     a double through an integer's slot, where the DIRECT call refuses
+//     `a value of type i64 does not convert to f64`.
+//
+// The CONVERSION went missing with the check, and that half is silently wrong
+// in a program with no global in it: `takef(2)` written unqualified inside a
+// method, on an `f64` parameter, passed the raw integer 2 (measured, exit 1
+// where the widened call reads 25).
+//
+// D48's discipline, one slot over, and no pass of its own: the argument is
+// PARKED here and judged at the end of `tk_over_pass` (teko_over.tk), the one
+// point that has the lexical scope live at the site (`tk_ty_pass_walk` above),
+// every deferred `.` resolved, every user operator lowered and every overload
+// pick committed. It is judged by node IDENTITY, because the argument was
+// spliced into the `callp`'s own list and nothing here knows which link it is.
+//
+// The ceiling is D50's, for D50's reason: one row per unjudgeable argument of
+// an indirect call in the unit, live until pass 14. 4096 rows over six columns
+// cost 192 KB, against the largest fixture in this tree at 33.
+#define TK_MAXVCA 4096
+
+i64  vca_node[TK_MAXVCA];             // the argument node, as the call was built over it
+i64  vca_ty[TK_MAXVCA];               // the parameter's own type -- its POINTEE when `ref`/`out`
+i64  vca_ref[TK_MAXVCA];              // 1 when the argument is `ref`/`out`
+i64  vca_line[TK_MAXVCA];
+uptr vca_file[TK_MAXVCA];
+i64  vca_done[TK_MAXVCA];
+i64  tk_nvca = 0;
+
+i64  vca_node_at(i64 i) { return ld64(vca_node + i * 8); }
+i64  vca_ty_at(i64 i)   { return ld64(vca_ty + i * 8); }
+i64  vca_ref_at(i64 i)  { return ld64(vca_ref + i * 8); }
+i64  vca_line_at(i64 i) { return ld64(vca_line + i * 8); }
+uptr vca_file_at(i64 i) { return ld64(vca_file + i * 8); }
+i64  vca_done_at(i64 i) { return ld64(vca_done + i * 8); }
+
+// ...and the one shape the parse-time oracle answers WRONG rather than not at
+// all: a call to an OVERLOADED name. `tk_pty_of` reads `decl_ret(decl_find)`,
+// and `decl_find` (mc/src/parse.mc) answers with the FIRST declaration of the
+// name in the unit, while which one a call site reaches is settled by
+// `tk_ov_pick` at pass 14. The count is taken from that same first
+// declaration, because the core's own walk is over `unit_head` in declaration
+// order and a second declaration of the name is further along the same
+// `nd_next` chain -- teko_over.tk's `tk_ov_find` is the same question, and it
+// cannot be asked here: its table is built at pass 6 and this door runs while
+// the parser is still reading the body.
+i64 tk_vca_ov_call(i64 a) {
+    if (nd_kind(a) != N_CALL) return 0;
+    uptr name = nd_name(a);
+    i64 d = decl_find(name);
+    if (d < 0) return 0;
+    i64 n = nd_next(d);
+    loop {
+        if (n == 0) break;
+        if (decl_valid(n) && str_eq(nd_name(n), name)) return 1;
+        n = nd_next(n);
+    }
+    return 0;
+}
+
+// Called from both doors with the argument the parse-time oracle answered -1
+// for, and it decides for itself whether the argument is one this table can
+// answer LATER. A `ref`/`out` one always is (the pointee is a name, or it is
+// nothing anywhere). A by-value one is parked only when it is a bare NAME or
+// a call to an overloaded one: that is the whole of what a later pass adds --
+// the scope, the global table, the load an unqualified field name becomes, the
+// overload pick -- and everything else the parser
+// could not type (a local array's element, an indirect `callp`, an address the
+// source built by hand) is no better known at pass 14 than it is here, so
+// parking it would only move today's silence into a refusal of code that has
+// nothing wrong with it.
+void tk_vca_defer(i64 pt, i64 a, i64 line, uptr fl) {
+    i64 isref = tk_rfarg_kind(a) != TK_RP_NONE;
+    if (!isref && nd_kind(a) != N_IDENT && !tk_vca_ov_call(a)) return;
+    if (tk_nvca == TK_MAXVCA) err_at(fl, line, "teko: too many deferred call arguments");
+    st64(vca_node + tk_nvca * 8, a);
+    st64(vca_ty + tk_nvca * 8, pt);
+    st64(vca_ref + tk_nvca * 8, isref);
+    st64(vca_line + tk_nvca * 8, line);
+    st64(vca_file + tk_nvca * 8, fl);
+    st64(vca_done + tk_nvca * 8, 0);
+    tk_nvca = tk_nvca + 1;
+}
+
+// The door's whole decision in one call: `at` is what the parse-time oracle
+// answered for the argument, and what comes back is what the door may JUDGE
+// and CONVERT by -- the same answer when it is trustworthy, and -1, the
+// "refuse nothing, convert nothing" both readers already understand, when the
+// argument was parked instead. An overloaded call is parked even though the
+// oracle gave a type, because that type is the first declaration's and not the
+// picked one's: judging by it refuses legal code (`b.takei(pick(2))` with
+// `f64 pick(f64)` declared ahead of `i64 pick(i64)`) and converting by it
+// writes the wrong node or none at all (the mirror pair let the raw integer 3
+// cross into an `f64` parameter -- measured, exit 40 where the direct call
+// reads 30; Copilot on #707, second pass).
+i64 tk_vca_park(i64 pt, i64 a, i64 at, i64 line, uptr fl) {
+    if (at >= 0 && !tk_vca_ov_call(a)) return at;
+    tk_vca_defer(pt, a, line, fl);
+    return 0 - 1;
+}
+
+// Two rules, and neither is this crumb's invention -- each is the one the
+// DIRECT call to the same declaration already applies:
+//
+//   - `ref`/`out`: the pointee must be the parameter's, IDENTICALLY
+//     (`tk_ref_check_pointee_ty`, teko_ref.tk, which `tk_rc_call_args` and the
+//     delegate call both read). A pointee no scope and no global table names
+//     is silently skipped there, and is skipped here for the same reason: the
+//     address was built by the source and its target has no declared type to
+//     compare.
+//   - by value: `tk_check_compat` -- the two scalar verdicts and the row one
+//     in one call -- and then the conversion C# §10.2.3 owes it, an integer
+//     widened onto a float parameter and a value boxed into a `T?` one, in the
+//     same words and the same node the field store's own judge writes.
+//
+// A bare name the PASS cannot type either is refused rather than emitted raw,
+// the invariant D50 states over the same walk: a parked argument is judged, or
+// it is refused; it is never written unread.
+void tk_vca_do(i64 i) {
+    if (vca_done_at(i)) return;
+    st64(vca_done + i * 8, 1);
+    i64 n = vca_node_at(i);
+    i64 pt = vca_ty_at(i);
+    if (vca_ref_at(i)) {
+        tk_ref_check_pointee_ty(pt, n, vca_line_at(i), vca_file_at(i));
+        return;
+    }
+    i64 aty = tk_ty_of(n);
+    if (aty < 0)
+        err_at(vca_file_at(i), vca_line_at(i), "teko: the type of this argument is not known here");
+    tk_check_compat(pt, aty, n, vca_line_at(i), vca_file_at(i));
+    tk_fs_convert(pt, aty, n);
+}
+
+void tk_vca_pend(i64 n) {
+    i64 i = tk_nvca - 1;
+    loop {
+        if (i < 0) break;
+        if (vca_node_at(i) == n) {
+            tk_vca_do(i);
+            return;
+        }
+        i = i - 1;
+    }
+}
+
+// A unit with no indirect call, or none whose arguments the site could not
+// type, walks nothing: the table is this file's own memory and an empty one
+// has no node to visit.
+void tk_vcall_arg_judge(i64 root) {
+    if (tk_nvca == 0) return;
+    tk_ty_pass_walk(root, &tk_vca_pend);
 }
 
 // ---- the deferred member access ----

@@ -31,7 +31,13 @@ with that line in its stderr (D52).
   `struct`, `interface`, `trait` or `enum` inside another type's body. Move it out; there
   is no nested type.
 - `"teko: the name is already a type"` — the name is already a `class`, `struct`,
-  `interface`, `trait` or `delegate` in this namespace.
+  `interface`, `trait` or `delegate` in this namespace — or a primitive's own type word:
+  a teko primitive (`TimeSpan`, `DateTime`, `DateOnly`, `ref`, `out`, `params`, `i8`,
+  `i16`), mc's own core word (`f64`, `f32`, `f64raw`, `i32`) or one of the seven
+  `type_alias` words teko declares (`bool`, `char`, `byte`, `isize`, `usize`, `ptr`,
+  `str`) (D60). A namespaced type keeps the word free for its own namespace
+  (`geo.TimeSpan` beside the primitive `TimeSpan`) — only the exact qualified name
+  collides.
 - `"teko: the name is already a generic"` — the name belongs to a generic declaration.
 - `"teko: name of "` — completed by *`<what>` expected*: a declaration keyword was read and
   what followed is not a usable name.
@@ -300,7 +306,7 @@ with that line in its stderr (D52).
 ### `ToString`, `Parse`, `TryParse`, `IsDefined` (N2b)
 
 Four names, dispatched by the enum's own row rather than by
-[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime-dateonly): registering
+[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime-dateonly-timeonly): registering
 an enum there would make `tk_ty_binary` ask a table its own bitwise/comparison operators
 never populate. The two globals a text-using enum needs (`Color__names`, `Color__vals`)
 are built lazily, the first time one of these four names is spelled on that enum — an enum
@@ -331,7 +337,7 @@ never panics. Both are runtime messages, from `lib/rt.tk`, not a compile-time `t
 refusal, so they carry no entry of their own in this list (D19 scans `teko*.tk`, the
 compiler's own sources, not the runtime library it teaches programs to link).
 
-## Primitives with members (`TimeSpan`, `DateTime`, `DateOnly`)
+## Primitives with members (`TimeSpan`, `DateTime`, `DateOnly`, `TimeOnly`)
 
 A primitive is a type of four or eight bytes with no row in the type table — no field, no vtable,
 no method — whose members come from a lowering table instead
@@ -392,6 +398,9 @@ messages reuse the wordings a declared type already gets; only a handful are its
   primitive's registration since D54 and not one word for every primitive: a `DateOnly` has
   no `.Ticks` at all, so it reads
   ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
+  A `TimeOnly` DOES have `.Ticks` — the same identity `TimeSpan` and `DateTime` read by — so
+  its own reads
+  ``teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it``.
 - `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
   `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
   to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
@@ -592,9 +601,9 @@ i64 main() {
 The `+` is refused because **the table registers no arithmetic row for a `DateOnly` at
 all** — C# declares none either — so `d + t` and `d + 1` reach that wording, `d - d`
 reaches ``teko: no operator `-` takes these operands``, and `d1.DayNumber -
-d2.DayNumber` is the form. `.ToString()`, `DateOnly.Parse` and
-`.ToDateTime(t)` reach `teko: unknown member of DateOnly` and its static twin
-([not-yet.md](not-yet.md)).
+d2.DayNumber` is the form. `.ToString()` and `DateOnly.Parse` reach
+`teko: unknown member of DateOnly` and its static twin ([not-yet.md](not-yet.md));
+`.ToDateTime(t)` is taught now — [`TimeOnly` (N4b)](#timeonly-n4b) below.
 
 The three panics `lib/time.tk` raises for a `TimeSpan` at RUN time (`a time span
 overflowed`, `a time span divided by zero`, `a time span is out of range`) and the eleven it
@@ -605,6 +614,43 @@ range`, `a month count is out of range`, `a year count is out of range`) are exi
 are listed in [runtime.md](runtime.md#the-time-library). A `DateOnly` adds no panic of its
 own: `new DateOnly(2024, 2, 30)` raises the `a date does not exist` of that same list, and
 a day number outside `0 .. 3652058` raises `a date is out of range`.
+
+### `TimeOnly` (N4b)
+
+`TimeOnly` is the same mechanism at the ORIGINAL width — eight bytes, the ticks since
+midnight — so every wording above is its own too, and each of the five has a fixture under
+`tests/refuse/` ([datetime.md § `TimeOnly`](datetime.md#timeonly)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 main() {
+    TimeOnly t = new TimeOnly(13, 45, 30);
+    TimeOnly u = new TimeOnly(1, 0, 0);
+
+    TimeOnly e = 5;          // teko: a value of type i64 does not convert to TimeOnly
+    i64 n = t;               // teko: a value of type TimeOnly does not convert to i64
+    DateTime x = t;          // teko: a value of type TimeOnly does not convert to DateTime
+    i64 c = (i64) t;         // teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it
+    TimeOnly y = t + u;      // teko: no operator `+` takes these operands
+    TimeOnly z = new TimeOnly(864000000000);   // teko: a time of day is out of range, exit 70
+    return 0;
+}
+```
+
+The `+` is refused the same way `DateOnly`'s is: **the table registers only `-` for a
+`TimeOnly`**, C# declares no `operator +` between two times of day either, and `.Add(ts)`
+is the form for advancing one by a `TimeSpan`. `.ToString()`, `TimeOnly.Parse` and
+`TryParse` reach `teko: unknown member of TimeOnly` and its static twin
+([not-yet.md](not-yet.md)).
+
+`TimeOnly` adds **one** panic of its own, `teko: a time of day is out of range`: a raw tick
+count outside `0 .. 863999999999`, whether it arrives through `new TimeOnly(ticks)` or
+`TimeOnly.FromTimeSpan(ts)`. No existing wording in the list above reads honestly for an
+interval that starts at zero — `an hour/minute/second/millisecond is out of range` are what
+the three calendar-free constructors reach instead, the same checks a `DateTime`'s own time
+of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside them.
 
 ## Properties
 
@@ -699,10 +745,14 @@ a day number outside `0 .. 3652058` raises `a date is out of range`.
 - `"teko: unknown function"` — the name given to a delegate is no function.
 - `"teko: argument "` — completed by *N is not passed by reference* or by *N needs
   `ref`/`out`*: a delegate or a function declares that parameter by reference and the site
-  does not say so. The POINTEE is checked beside the kind, by the identity
+  does not say so, or it declares it by value and the site writes `ref`/`out` anyway. The
+  POINTEE is checked beside the kind, by the identity
   rule every `ref`/`out` argument takes (`ref i64` does not fit a `ref f64` slot), and a
   call through a delegate reads it from the delegate's own signature — the same wording a
-  direct call gives, *teko: a value of type i64 does not convert to f64*.
+  direct call gives, *teko: a value of type i64 does not convert to f64*. A VIRTUAL call, an
+  INTERFACE call and the unqualified form of either give the same two sentences, with N
+  counting the RECEIVER as argument 1 exactly as the mangled `Owner_method` a direct
+  method call lowers to does.
 - `"teko: wrong number of arguments for "` — completed by the name: the call's arity does
   not match.
 - `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
@@ -1175,6 +1225,65 @@ i64 main() {
 }
 ```
 
+A VIRTUAL call, an INTERFACE call and the UNQUALIFIED form of either inside a method are
+`callp`s too, and their arguments take the judgement a direct call's take — by type
+identity, by *derives/implements*, with C# §10.2.3's widening of an integer onto a float
+parameter, and with the `ref`/`out` pointee rule above (D57). The site that builds such a
+call is the only point that knows which method it reaches, and until this rule it judged
+only what the parser could type there: a GLOBAL, a `ref`/`out` pointee, and — on the
+unqualified road, which is rewritten from a pass — a plain local too crossed unjudged and
+unconverted. A `const` is folded into its literal before any of the three reads it, so it
+is judged as a literal and never deferred:
+
+```teko
+// no-run
+class Point { public i64 x; public Point(i64 v) { x = v; } }
+class Box {
+    public i64 w;
+    public Box(i64 v) { w = v; }
+    public virtual i64 take(Point p) { return p.x; }
+    public virtual i64 takei(i64 n) { return n; }
+    public virtual i64 bump(ref f64 d) { d = 2.0; return 42; }
+    public virtual i64 mine() {
+        f64 lf = 1.5;
+        return takei(lf);           // teko: a value of type f64 does not convert to i64
+    }
+}
+Box gb;
+f64 gf;
+i64 gi;
+i64 main() {
+    Box b = new Box(9);
+    b.take(gb);                     // teko: a value of type Box does not convert to Point
+    b.takei(gf);                    // teko: a value of type f64 does not convert to i64
+    b.bump(ref gi);                 // teko: a value of type i64 does not convert to f64
+    return 0;
+}
+```
+
+An interface call refuses each of the three in the same words. A name that reaches the
+judge with no type at all is `"teko: the type of this argument is not known here"`, the
+sentence a primitive row's deferred argument already gets.
+
+Two things are skipped in silence here, and on the direct road for the same reason. The
+first is a `ref`/`out` argument whose POINTEE is named by neither the lexical scope nor the
+table of globals: the address was built by the source, its target has no declared type, and
+there is nothing to compare it against — every road reads that one rule
+(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument that is not a
+bare name and not a call to an overloaded one — a local array's element, an indirect
+`callp`, an address written out by hand: no later pass knows more about it than the call
+site did, so it is left alone rather than refused.
+
+The `ref`/`out` TAG itself is not skipped on any road. It is compared with the parameter's
+own kind before anything else, in the direct call's own words — *teko: argument 2 is not
+passed by reference* for `b.takei(ref x)` on a by-value `i64`, *teko: argument 2 needs
+`ref` at the call site* for `b.bump(x)` on a `ref f64`.
+
+An argument that is a CALL to an OVERLOADED name is judged after the pick, never against
+the first declaration of that name: with `f64 pick(f64)` declared ahead of `i64 pick(i64)`,
+`b.takei(pick(2))` is accepted and `b.takef(pick(2))` gets the widening it is owed
+(`tests/vcall_overloaded_arg.tk`).
+
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps
   the C symbol.
@@ -1399,6 +1508,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
 | `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
+| `"teko: too many deferred call arguments"` | 4096 arguments of a VIRTUAL, an INTERFACE or an unqualified virtual call whose type the site that built the `callp` could not read — a global, a `ref`/`out` pointee, a bare name on the unqualified road — waiting for the pass; 26 in `tests/surface_globals_calls.tk`, the busiest fixture, and 1 in `tests/primitives_float.tk` |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |

@@ -1442,14 +1442,55 @@ i64 tk_ctor(uptr name, i64 ty, i64 size, i64 install) {
 // declaration this function ever reads
 i64 tk_di_marker(uptr nm);
 
+// the seven `type_alias` words teko itself declares (teko_type.tk's own
+// `tk_types_init`): an alias leaves no row in mc's type table to count, so
+// a `class`/`struct`/`interface`/`delegate` reusing one of these words is
+// caught against this list instead of the counting check below. Teko owns
+// these words; the list is kept beside their declaration.
+i64 tk_type_alias_word(uptr name) {
+    if (str_eq(name, "bool"))  return 1;
+    if (str_eq(name, "char"))  return 1;
+    if (str_eq(name, "byte"))  return 1;
+    if (str_eq(name, "isize")) return 1;
+    if (str_eq(name, "usize")) return 1;
+    if (str_eq(name, "ptr"))   return 1;
+    if (str_eq(name, "str"))   return 1;
+    return 0;
+}
+
+// 1 when `name` is a type WORD registered more than once in mc's type
+// table: `tk_fwd_reg_type` (teko_fwd.tk) calls `type_new` blind, guarded
+// only by its own forward-scan table (`tk_fwd_find`), so a
+// `class`/`struct`/`interface`/`delegate` that reuses an already-taught
+// primitive's word -- `TimeSpan`, `f64`, `i32`... -- lands a SECOND row
+// under the same word instead of being refused. Counting is the only
+// signal left behind: a name taught once is an ordinary forward
+// reference, taught twice is this shadow.
+i64 tk_type_word_shadowed(uptr name) {
+    if (tk_type_alias_word(name)) return 1;
+    i64 n = 0;
+    i64 t = 0;
+    i64 tc = type_count();
+    loop {
+        if (t >= tc) break;
+        if (str_eq(type_name(t), name)) n = n + 1;
+        if (n > 1) return 1;
+        t = t + 1;
+    }
+    return 0;
+}
+
 uptr tk_newname(uptr what) {
     if (tk_gen_find(p_name()) >= 0)
         err_at2(p_file(), p_line(), "teko: the name is already a generic", p_name());
     if (tk_di_marker(p_name()) >= 0)
         err_at(p_file(), p_line(), tk_join3("teko: ", p_name(), " is the service marker"));
     if (p_id() == T_IDENT) return p_ident();
-    if (tk_fwd_pending(tk_ns_qualified_name(p_name()))) {
+    uptr qname_fwd = tk_ns_qualified_name(p_name());
+    if (tk_fwd_pending(qname_fwd)) {
         uptr nm = p_name();
+        if (tk_type_word_shadowed(qname_fwd))
+            err_at2(p_file(), p_line(), "teko: the name is already a type", nm);
         p_next();
         return nm;
     }

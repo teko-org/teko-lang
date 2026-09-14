@@ -84,6 +84,13 @@ i64 main() {
 }
 ```
 
+A virtual call's **arguments** are judged and converted exactly as a direct call's are — by
+type identity or *derives*, with an integer widened onto a float parameter, and with the
+`ref`/`out` pointee rule — whether the argument is a local, a parameter, a field, a `const`
+or a **global**, and whether the call is written `b.m(x)`, `this.m(x)` or the bare `m(x)`
+inside another method of the class. One that does not fit is refused where it is written
+([diagnostics.md](diagnostics.md#parameters-overloads-ref-out-and-params)).
+
 ---
 
 ## Constructors and destructors
@@ -206,7 +213,10 @@ an interface-typed value walks that table, so two unrelated classes answer the s
 interface and a class implements it at any vtable slot.
 
 Every interface member is public: `private`/`protected` on one is refused, and a method
-that implements an interface has to be `public`.
+that implements an interface has to be `public`. A call through the table judges and
+converts its **arguments** exactly as a direct call does, on the same terms the virtual
+call above states — the interface's own declared parameter list is what answers, which
+every implementer's signature is required to match.
 
 An interface may:
 

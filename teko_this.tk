@@ -37,11 +37,14 @@
 // or a parameter first
 i64 tk_ty_scope_find(uptr name);
 
-// teko_expr.tk is included after this file too; these three are what a call
-// needs to be the same call a written-out `this.m(...)` would have produced
+// teko_expr.tk is included after this file too; these four are what a call
+// needs to be the same call a written-out `this.m(...)` would have produced --
+// the last of them (D57) being the argument check the VIRTUAL shape owes,
+// which is the whole of what a `callp` has instead of a callee to look up
 i64 tk_args(uptr pn);
 i64 tk_fill_defaults(i64 args, i64 na, i64 np, i64 nreq, i64 d0);
 void tk_pick_refuse(i64 mi, uptr m, i64 line, uptr fl);
+i64 tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl);
 
 // teko_access.tk reads the state below and answers the one question every
 // member reached from here has to pass
@@ -340,6 +343,19 @@ i64 tk_this_emit(i64 mi, i64 args) {
         err_at2(tk_file, tk_line, "teko: an instance member is not reachable from a static method", mt_name_at(mi));
     i64 slot = mt_slot_at(mi);
     if (slot < 0) return tk_call(mt_fn_at(mi), list_append(tk_this_recv(), args));
+    // D57: the VIRTUAL form is a `callp`, which names no callee for
+    // `tk_rc_call_args` (teko_rc.tk) to judge its arguments against -- so this
+    // road checked NOTHING, while `this.m(x)` written out routes through the
+    // very function called here. Measured on `af2fffad`: `takef(2)` on an
+    // `f64` parameter passed the raw integer 2 (exit 1 against 25) and
+    // `takei(lf)` on an `f64` local crossed whole, both refused or converted
+    // through the qualified spelling. The DIRECT form above needs none of it:
+    // it names its callee, and the last pass of all looks that name up.
+    i64 line = tk_line;
+    uptr fl = tk_file;
+    args = tk_vcall_args_check(mi, args, line, fl);
+    tk_line = line;                        // the check builds the conversions
+    tk_file = fl;                          // it splices in (`tk_field_use`'s own restore)
     i64 vt = tk_call("ld64", tk_this_recv());
     i64 fnp = tk_call("ld64", tk_bin(K_ADD, vt, tk_int((TK_VT_FIXED + slot) * 8)));
     return tk_callp_ret(mt_ret_at(mi),

@@ -44,7 +44,7 @@ fixes the order.
 | 7 | ~~**C2** `DateTime`~~ **landed**, D41 | `docs/specs/datetime.md` | L | C1 |
 | 8 | ~~**N2c** `DateTimeKind` becomes an `enum`~~ **landed**, D48 | enum.md | S | N2a, C2 |
 | 9a | ~~**N4a** `DateOnly`~~ **landed**, D54 | datetime-extras.md | M | C2 |
-| 9b | **N4b** `TimeOnly` | datetime-extras.md | M | C2 |
+| 9b | ~~**N4b** `TimeOnly`~~ **landed**, D58 | datetime-extras.md | M | C2 |
 | 10 | **C3** the sixteen-byte value and `teko_wide.tk` | `docs/specs/decimal.md` | M | C1 |
 | 11 | **N3** `Guid` | guid.md | M | C3, C1 |
 | 12 | **N5** `DateTimeOffset` | datetime-extras.md | M | C2, C3 |
