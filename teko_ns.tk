@@ -160,9 +160,16 @@ i64  tk_ns_call_cls = 0 - 1;           // the class/struct the walked function i
 i64 tk_method_named_find(i64 ci, uptr name);
 
 // teko_this.tk is included after this file too: it keeps the one table that
-// maps a member function's own mangled symbol back to the class/struct that
-// declared it (methods, constructors, destructors and accessors alike)
+// maps a member function's own mangled symbol back to its METHOD row
+// (methods, constructors, destructors and accessors alike), and
+// teko_class.tk's `mt_cls_at` reads the class/struct off that row.
 i64 tk_method_of_fn(uptr fn);
+i64 mt_cls_at(i64 i);
+
+// teko_deleg.tk is included after this file: the delegate row a field's type
+// names, or -1 -- a field of that kind is CALLED by its bare name (D65) and
+// so guards the rewrite exactly as a method does.
+i64 tk_deleg_row(i64 ty);
 
 // teko_access.tk is included after this file: the short word and the segment
 // word both dispatch through its existing machinery. §50 O2: a qualified
@@ -859,15 +866,32 @@ i64 tk_ns_call_try_usings(uptr name, uptr fl, i64 line) {
     return found;
 }
 
+// the MEMBER half of the resolution order, for a name that is CALLED: a
+// field of delegate type is called by its bare name exactly as a method is
+// (D65), so it has to stop the namespace rewrite for the same reason a
+// method does -- the rewrite renames the node before `tk_this_call` /
+// `tk_this_deleg_call` ever read it, and a renamed node is a direct call to
+// the namespace's free function with no member left to find. The guard is
+// deliberately the DELEGATE field only, and the caller restricts it to an
+// `N_CALL`: a bare `n(1)` on an `i64` field is no call teko builds, and
+// `&cb` keeps naming the free function it names outside a namespace.
+i64 tk_ns_deleg_field(i64 cls, uptr name) {
+    i64 fi = tk_field_find(cls, name);
+    if (fi < 0) return 0;
+    return tk_deleg_row(fd_ty_at(fi)) >= 0;
+}
+
 // the call/address-of `n`, rewritten to the symbol its own namespace or a
 // `using` of its file names -- but only when nothing closer to the site
 // already answers for `name` (N3c, the resolution order §35 states in full):
 // a LOCAL or a PARAMETER in scope at the site always wins (never rewritten --
 // `teko_typeof.tk`'s own scope table, `tk_ty_scope_find`, reused exactly as
 // `teko_rc.tk` reuses it for its own later pass); failing that, a MEMBER
-// (method, incl. one inherited from a base) of the class/struct the walked
-// function belongs to -- `tk_ns_call_cls`, read off `teko_class.tk`'s own
-// method table, the C# rule that a bare name inside a method reaches the
+// (a method, incl. one inherited from a base, and -- D65, third pass -- a
+// FIELD of delegate type, which is called by its bare name too) of the
+// class/struct the walked function belongs to -- `tk_ns_call_cls`, read off
+// `teko_class.tk`'s own method table and `teko_struct.tk`'s own field table,
+// the C# rule that a bare name inside a method reaches the
 // type before it reaches the enclosing namespace; failing that, the site's
 // own namespace and its prefixes outward (D31.6, closest namespace wins,
 // unchanged); failing THAT, a plain top-level declaration of the exact bare
@@ -883,6 +907,7 @@ i64 tk_ns_rewrite_call(i64 n, uptr ns, i64 cls, uptr fl) {
     uptr name = nd_name(n);
     if (tk_ty_scope_find(name) >= 0) return 0;
     if (cls >= 0 && tk_method_named_find(cls, name) >= 0) return 0;
+    if (cls >= 0 && nd_kind(n) == N_CALL && tk_ns_deleg_field(cls, name)) return 0;
     i64 d = tk_ns_call_try_prefixes(name, ns);
     if (d < 0 && decl_find(name) >= 0) return 0;
     if (d < 0) d = tk_ns_call_try_usings(name, fl, nd_line(n));
@@ -986,6 +1011,19 @@ void tk_ns_walk_calls_in(i64 n) {
     }
 }
 
+// the CLASS the walked function is a member of, or -1: `tk_method_of_fn`
+// answers the METHOD's own row, and `tk_ns_call_cls` is read as a struct
+// index by both rewrites below -- a method row number standing in for a
+// struct row number answered for whatever type happened to sit at that
+// index, so the member guard held only where the two numbers coincided (one
+// class, its methods declared first). `teko_this.tk` reads the same pair
+// this way for its own `tk_pass_class`.
+i64 tk_ns_cls_of_fn(uptr fn) {
+    i64 mi = tk_method_of_fn(fn);
+    if (mi < 0) return 0 - 1;
+    return mt_cls_at(mi);
+}
+
 // sweep 2 (§31 (d), crumb N2): every top-level function's own namespace is
 // read straight off its (already renamed, by sweep 1) name -- `geo__area`
 // answers `geo` without a second table -- and every bare call inside its
@@ -1006,7 +1044,7 @@ void tk_ns_scan_calls(i64 root) {
         if (f == 0) break;
         if (nd_kind(f) == N_FUNC) {
             tk_ns_call_site = tk_ns_of_name(nd_name(f));
-            tk_ns_call_cls = tk_method_of_fn(nd_name(f));
+            tk_ns_call_cls = tk_ns_cls_of_fn(nd_name(f));
             tk_nscope = 0;
             tk_ty_scope_params(nd_a(f));
             tk_ns_walk_calls_in(nd_b(f));
