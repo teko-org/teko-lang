@@ -62,7 +62,21 @@ printf '%s\n%s\n' README.md CONTRIBUTING.md >> "$tmp/live_mdfiles"
 # A fenced block is code, not prose: `ops[0](3, 4)` in a ```teko sample reads exactly like
 # a markdown link and is not one, and a sample is checked by compiling it (check 5), not by
 # resolving its punctuation.
-strip_fences() { awk '/^[ \t]*```/ { fenced = !fenced; next } !fenced'; }
+# A fence is what mcsite's md_fence_len says it is: a line whose first non-blank
+# run is three or more backticks or tildes (an info string may follow); it closes
+# on a line whose run is the same character, at least as long, and alone on the
+# line. `~~~` and ```` are fences too, and a ``` line does not close a ~~~ block.
+strip_fences() {
+    awk '
+        { line = $0; sub(/^[ \t]+/, "", line) }
+        fenced {
+            if (match(line, /^`+|^~+/) && substr(line, 1, 1) == fch && RLENGTH >= flen \
+                && substr(line, RLENGTH + 1) ~ /^[ \t]*$/) fenced = 0
+            next
+        }
+        match(line, /^`+|^~+/) && RLENGTH >= 3 { fch = substr(line, 1, 1); flen = RLENGTH; fenced = 1; next }
+        { print }'
+}
 
 # ------------------------------------------------------------------- 1. links
 : > "$tmp/badlinks"
