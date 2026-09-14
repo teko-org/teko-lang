@@ -157,6 +157,47 @@ i64 dfcheck() {
     return 0;
 }
 
+// ---- D62, the door's other callers ----
+// `tk_field_store_val` is entered from more than the four stores `dfcheck`
+// covers, and a detection AT the door reaches every one of them. These are the
+// three that had no fixture: a receiver the parser cannot type yet (a class
+// declared BELOW the function that takes one, resolved in `tk_pend_field`,
+// teko_typeof.tk), an element of an ARRAY FIELD (`tk_array_index`,
+// teko_struct.tk) and a STATIC field reached before its own type is read
+// (`tk_fwd_resolve_static_one`, teko_access.tk). All three answered
+// `teko: the type of this value is not known here` on the base compiler.
+void set_late(LateH h) {                          // `h` is typed at PASS time
+    h.cb = add;
+}
+
+i64 set_late_static() {
+    LateH.scb = mul;                              // the forward-referenced static store
+    return 0;
+}
+
+class LateH {
+    public Op cb;
+    public Op cbs[2];
+    public static Op scb;
+}
+
+i64 dfcheck2() {
+    LateH h = new LateH;
+
+    set_late(h);                                  // the deferred receiver
+    if (h.cb(2, 3) != 5) return 1;
+
+    h.cbs[0] = mul;                               // an element of an array FIELD
+    Op e = h.cbs[0];                              // (the call through it is not taught:
+    if (e(2, 3) != 6) return 2;                   //  docs/reference/not-yet.md)
+
+    set_late_static();
+    Op s = LateH.scb;
+    if (s(2, 3) != 6) return 3;
+
+    return 0;
+}
+
 i64 ncheck() {
     Op? maybe = null;
     if (maybe == null) return 0;
@@ -182,6 +223,22 @@ i64 fdcheck() {
     return 0;
 }
 
+// ---- D62, the namespace half: which `col` a bare name wraps ----
+// `col` is declared BOTH flat and inside `geo`, with the same signature and a
+// different answer, so the road that picks the wrong one is visible in the
+// exit code rather than silent. Every road that wraps a bare function name
+// goes through one resolver (`tk_deleg_resolve_fn`, teko_deleg.tk), which
+// reads the order `tk_ns_rewrite_call` (teko_ns.tk) gives a CALL: the site's
+// own namespace and its prefixes outward first, a flat declaration of the
+// exact name only when the namespace has none.
+i64 col(i64 a, i64 b) {                           // the FLAT one
+    return a + b + 1000;
+}
+
+i64 takes_op(Op f) {                              // a call argument's own road
+    return f(2, 3);
+}
+
 namespace geo {
     delegate i64 GOp(i64 a, i64 b);
 
@@ -192,6 +249,43 @@ namespace geo {
     i64 use_gop() {
         GOp f = gadd;
         return f(10, 20);
+    }
+
+    i64 col(i64 a, i64 b) {                       // `geo__col`, the namespaced one
+        return a * b;
+    }
+
+    Op ret_col() {
+        return col;                               // a `return` of a bare name
+    }
+
+    // every road the shared resolver serves, from INSIDE `geo`: 6 is the
+    // namespaced `col`, 1005 the flat one, 5 the flat `add` no namespaced
+    // twin competes with
+    i64 ns_roads() {
+        Op a = col;                               // a local initializer
+        if (a(2, 3) != 6) return 1;
+
+        Op b = add;                               // no `geo__add`: the FLAT one
+        if (b(2, 3) != 5) return 2;
+
+        b = col;                                  // an assignment
+        if (b(2, 3) != 6) return 3;
+
+        if (takes_op(col) != 6) return 4;         // a call argument
+
+        Op c = ret_col();                         // a `return`
+        if (c(2, 3) != 6) return 5;
+
+        Op[] ops = new Op[1];
+        ops[0] = col;                             // an element of an `Op[]`
+        if (ops[0](2, 3) != 6) return 6;
+
+        H h = new H;
+        h.cb = col;                               // a FIELD -- D62's own road
+        if (h.cb(2, 3) != 6) return 7;
+
+        return 0;
     }
 }
 
@@ -285,6 +379,14 @@ i64 main() {
     bad = dfcheck();
     if (bad != 0) return 140 + bad;
     if (rt_live() != 1) return 150;               // the STATIC field's own delegate
+
+    bad = dfcheck2();
+    if (bad != 0) return 160 + bad;
+    if (rt_live() != 2) return 170;               // ...and this helper's own static
+
+    bad = geo.ns_roads();
+    if (bad != 0) return 180 + bad;
+    if (rt_live() != 2) return 190;
 
     return 42;
 }

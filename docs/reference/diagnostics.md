@@ -928,8 +928,21 @@ no slot table, so the oracle every field store reads types it -1 and the general
 refused what no one could name. The name is handed to the delegate's own validator instead,
 at the ONE door every field store passes through (`tk_field_store_val`,
 [teko_typeof.tk](../../teko_typeof.tk)), and judged in `tk_deleg_pass` where names have
-types — so the four field-store sites give one verdict: `h.cb = add;`, `this.cb = add;` and
-the implicit `cb = add;` of a constructor, and `H.scb = add;` on a STATIC field. A
+types. The detection sits at the door, so every caller of the door gets the same verdict —
+these are all of them:
+
+| the store | the caller of the door |
+|---|---|
+| `h.cb = add;` and `this.cb = add;` | `tk_field_use`, [teko_expr.tk](../../teko_expr.tk) |
+| the implicit `cb = add;` of a method or constructor | `tk_this_assign`, [teko_this.tk](../../teko_this.tk) |
+| `H.scb = add;` on a STATIC field | `tk_static_use`, [teko_access.tk](../../teko_access.tk) |
+| the same, on a type declared BELOW the store | `tk_fwd_resolve_static_one`, [teko_access.tk](../../teko_access.tk) |
+| `h.cbs[0] = add;`, an element of an ARRAY FIELD | `tk_array_index`, [teko_struct.tk](../../teko_struct.tk) |
+| `h.cb = add;` through a receiver typed at pass time (a parameter of a class declared below) | `tk_pend_field`, [teko_typeof.tk](../../teko_typeof.tk) |
+| `a[i] = e` on a FIXED array | `tk_arr_elem_store`, [teko_array.tk](../../teko_array.tk) — no element of delegate type reaches it: ``teko: an array of this type is not taught yet`` refuses the declaration |
+| `xs[i] = e` on a `T[]` | `tk_ha_store`, [teko_heaparr.tk](../../teko_heaparr.tk) — a bare name there never reaches the door at all: the element road's own validator judges it (D51) |
+
+All six that can carry one are exercised by `tests/surface_delegate.tk`. A
 signature that is not the delegate's is refused in the delegate's own words, the same
 sentence the local slot gives:
 
