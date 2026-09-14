@@ -6,6 +6,8 @@
 #                    pages that link into them (README.md, CONTRIBUTING.md), resolves to a
 #                    file that exists. Fenced code is skipped: `ops[0](3, 4)` inside a
 #                    ```teko block is a call, not a link.
+#   1b. fragments   every `#slug` on a link names a heading of the page it lands on, by the
+#                    id mcsite gives it (u_slug + md_unique_id) -- the site's own --check rule.
 #   2. legacy       no page under docs/ names a path of the retired standalone compiler:
 #                    `ngen/`, `.tks`, `teko.tkp`, `fetch_teko.sh`, `bootstrap/teko.c`, or
 #                    a bare `src/` that is not `mc`'s own (a line naming `mc` is read as
@@ -87,6 +89,53 @@ if [ -s "$tmp/badlinks" ]; then
     fail "unresolved links" "$(cat "$tmp/badlinks")"
 else
     echo "ok links: $nlinks relative links resolve"
+fi
+
+# --------------------------------------------------------------- 1b. fragments
+# A `#slug` on a link -- in-page or on another page -- has to name a heading of
+# the page it lands on, by the id the site generator gives that heading: the
+# text lowercased, every run of characters outside [a-z0-9_] one dash, no dash
+# at either end, and a repeated id numbered -2, -3, ... in page order (mcsite's
+# u_slug and md_unique_id). The site's own `--check` fails on a fragment with no
+# target; this is the same rule, run before the site is rendered.
+heading_ids() {
+    strip_fences < "$1" | awk '
+        /^#+[ \t]/ {
+            t = $0; sub(/^#+[ \t]+/, "", t); sub(/[ \t]+#*[ \t]*$/, "", t)
+            id = ""; dash = 0
+            for (i = 1; i <= length(t); i++) {
+                c = substr(t, i, 1)
+                if (c ~ /[a-z0-9_]/)      { id = id c; dash = 0 }
+                else if (c ~ /[A-Z]/)     { id = id tolower(c); dash = 0 }
+                else if (id != "" && !dash) { id = id "-"; dash = 1 }
+            }
+            sub(/-+$/, "", id); if (id == "") id = "section"
+            if (id in seen) { k = 2; while ((id "-" k) in seen) k++; id = id "-" k }
+            seen[id] = 1; print id
+        }'
+}
+: > "$tmp/badfrags"
+nfrags=0
+while read -r md; do
+    [ -f "$md" ] || continue
+    d=$(dirname "$md")
+    strip_fences < "$md" | grep -oE '\]\([^)]*#[^)]+\)' | sed -E 's/^\]\(//; s/\)$//' > "$tmp/ftargets"
+    while read -r target; do
+        case "$target" in http://*|https://*|mailto:*) continue ;; esac
+        path="${target%%#*}"; frag="${target#*#}"
+        if [ -z "$path" ]; then p="$md"; else
+            case "$path" in /*) p=".$path" ;; *) p="$d/$path" ;; esac
+        fi
+        case "$p" in *.md) ;; *) continue ;; esac
+        [ -f "$p" ] || continue
+        nfrags=$((nfrags + 1))
+        heading_ids "$p" | grep -qx -- "$frag" || echo "$md -> $target" >> "$tmp/badfrags"
+    done < "$tmp/ftargets"
+done < "$tmp/live_mdfiles"
+if [ -s "$tmp/badfrags" ]; then
+    fail "fragments with no target heading" "$(cat "$tmp/badfrags")"
+else
+    echo "ok fragments: $nfrags #slug links land on a heading"
 fi
 
 # -------------------------------------------------------------- 2. legacy paths
@@ -292,7 +341,7 @@ echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
 # ------------------------------------------------------------------- verdict
 if [ "$fails" -eq 0 ]; then
-    echo "docs ok: $nlinks links, $ndiag diagnostics, $nrefuse refusals, $nblocks samples"
+    echo "docs ok: $nlinks links, $nfrags fragments, $ndiag diagnostics, $nrefuse refusals, $nblocks samples"
     exit 0
 fi
 echo "$fails documentation check(s) failed"

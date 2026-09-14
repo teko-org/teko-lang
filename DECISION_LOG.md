@@ -4815,3 +4815,15 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 `mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
 (base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
+
+**The fragment check, one step later still.** The site's own `mcsite --check` refused two
+pull requests in a row on something `scripts/check-docs.sh` had passed: a relative link
+leaving `docs/` (#700) and a `#slug` whose heading had been renamed (#703,
+`docs/reference/diagnostics.md:303` pointing at `#primitives-with-members-timespan-datetime`
+after the heading gained `DateOnly`). Step 1b now applies the generator's own rule to every
+`#slug` on a link, in-page or cross-page: a heading's id is its text lowercased, every run of
+characters outside `[a-z0-9_]` one dash, no dash at either end, and a repeated id numbered
+`-2`, `-3`, ... in page order (`u_slug` and `md_unique_id` in mc's `site/gen`). Drills: the
+#703 rename fails naming the page and the slug; a cross-page fragment with one letter added
+fails the same way; restored, `docs ok: 575 links, 26 fragments, 388 diagnostics, 21
+refusals, 133 samples`.
