@@ -53,9 +53,9 @@ Nothing that blocks a 1.0. The list this section used to carry has closed or mov
 | the registry's **R2** (the taught compiler built from `[package].modules` and `[deps]` before validating) and **R3** (`language = "teko"`, derived from `[deps] teko`) | **delivered and proved**: `teko_std` 0.7.2 is on the index, its `check` unit compiled by a compiler the validator built from `<teko/teko.tk>` and `<teko/user.mc>` (D43's manifest shape) |
 | a wall clock, an entropy source, `<i128>` on x86-64 | **teko's own** (the owner's ruling of 2026-09-08): an `extern` per target host, a `bcrypt.def` in teko's own Windows sysroot, a machine module for a primitive — the tooling `mc` already gives. Nothing is asked of `mc` for them |
 | **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool; until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
-| **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | one include line here (`[deps] stdlib`, `<stdlib/float.mc>`) when it ships |
+| **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | superseded: mc 0.16.0 (M52) shipped the library as `lib/mc/v<ver>/` beside the binary, no `stdlib` package and no include line to change; the release ships that tree with the taught compiler (D64) |
 | the hook API | **stable**: `mc` no longer changes it and works on real core defects only (the owner, 2026-09-08). teko treats the API pinned since 0.15.18 as the surface it builds on, proves every pin raise by the whole recipe (D29, D35, D37), and reports a core defect with a pure-mc reproducer — never a feature request |
-| a minimum `mc` a package declares (`[package].mc`) | the owner's topic with the `mc` project directly; not a teko ask |
+| a minimum `mc` a package declares (`[package].mc`) | landed on mc's side: `mc.toml` declares `mc = "0.16.1"`, a bare minimum (D64) |
 
 Everything teko is, is hooks: fifteen passes, fourteen `syntax` registrations, a
 `source_claim`, an `on_source`, a `syntax_param`, a `syntax_type`. That is why a pin is

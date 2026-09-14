@@ -6176,7 +6176,7 @@ release canary machinery, which is the mechanism that unblocked this entry below
 **`mc.toml` gains `[package].mc = "0.16.1"`, a bare MINIMUM (not a cap).** R2, the
 registry's own validator, moved off its 0.15.20 pin once 0.16.0 shipped and now reads
 version constraints, so the manifest can finally say which mc a build of this package
-needs — `docs/reference/packages.md § The minimum mc version` is mc's own prescription: a
+needs — mc `docs/reference/packages.md § The minimum mc version` is mc's own prescription: a
 bare/`>=` value is the normal form, a `^`/`~`/`=` CAPS the compiler and is written only
 against a future break already known, which this package has none of. `teko.toml` stays
 bare — it is a build config, not a manifest, and carries no `[package]` table to begin
