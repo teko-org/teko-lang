@@ -57,6 +57,15 @@
 i64 tk_lambda_build(i64 si, i64 line, uptr fl);
 i64 tk_lam_escapes(i64 e);
 
+// D67: `new Op(f)` resolves `f` LATE, at the same walk the contextual road
+// already runs at (`tk_deleg_pass`) -- these three need `tk_deleg_root`,
+// defined further down (alongside the pass's own cursor globals), so they
+// are forward-declared here for `tk_deleg_thunk` and `tk_new_deleg`, which
+// run ahead of it in the file.
+i64  tk_deleg_target_count(uptr fn);
+i64  tk_deleg_pick_target(i64 si, uptr fn, i64 line, uptr fl);
+void tk_deleg_new_defer(i64 n, i64 si, uptr fname, i64 ns, i64 line, uptr fl);
+
 i64 dg_ret[TK_MAXSTRUCT];             // the declared return type
 i64 dg_np[TK_MAXSTRUCT];              // how many parameters
 i64 dg_pty[TK_MAXSTRUCT * TK_DGMAX];  // the parameter types, flattened
@@ -178,20 +187,31 @@ i64 tk_deleg_find(uptr name) {
     return si;
 }
 
-// `d`'s signature has to match `si`'s exactly: same arity, same return, same
-// parameter types in order -- `add does not match the delegate Op(i64, i64)`
-void tk_deleg_check_sig(i64 si, uptr fn, i64 d) {
+// 1 when `d`'s signature equals delegate row `si`'s own exactly: same arity,
+// same return, same parameter type AND `ref`/`out` kind, in order -- the ONE
+// question both `tk_deleg_check_sig` (a name declared once) and `tk_deleg_
+// pick_target` (D67, a name declared more than once) ask, factored out so
+// the two agree by construction rather than by two copies of the loop.
+i64 tk_deleg_sig_matches(i64 si, i64 d) {
     i64 np = dg_np_at(si);
-    i64 ok = decl_nparams(d) == np && decl_ret(d) == dg_ret_at(si);
+    if (decl_nparams(d) != np) return 0;
+    if (decl_ret(d) != dg_ret_at(si)) return 0;
     i64 i = 0;
     loop {
-        if (!ok) break;
         if (i >= np) break;
-        if (tk_decl_param_ty(d, i) != dg_pty_at(si, i)) ok = 0;
-        if (tk_rp_kind(tk_decl_param_node(d, i)) != dg_pk_at(si, i)) ok = 0;
+        if (tk_decl_param_ty(d, i) != dg_pty_at(si, i)) return 0;
+        if (tk_rp_kind(tk_decl_param_node(d, i)) != dg_pk_at(si, i)) return 0;
         i = i + 1;
     }
-    if (ok) return;
+    return 1;
+}
+
+// `d`'s signature has to match `si`'s exactly -- `add does not match the
+// delegate Op(i64, i64)`. Kept for a name declared exactly ONCE: an
+// overloaded target (D67) is judged by `tk_deleg_pick_target` instead, whose
+// own two refusals name the overload set rather than the single candidate.
+void tk_deleg_check_sig(i64 si, uptr fn, i64 d) {
+    if (tk_deleg_sig_matches(si, d)) return;
     err_at(tk_file, tk_line,
            tk_join(tk_join(tk_join("teko: ", fn), " does not match the delegate "),
                    tk_deleg_sig_str(si)));
@@ -268,9 +288,20 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
         if (dgi_row_at(i) == si && str_eq(dgi_fn_at(i), fn)) return dgi_alloc_at(i);
         i = i + 1;
     }
-    i64 d = decl_find(fn);
-    if (d < 0 || !decl_valid(d)) err_at2(tk_file, tk_line, "teko: unknown function", fn);
-    tk_deleg_check_sig(si, fn, d);
+    // D67: `decl_find` answers about the FIRST declaration of `fn` alone --
+    // exact for a name declared once (unmoved below), wrong or missing for
+    // one declared MORE than once. `tk_deleg_target_count` asks the whole
+    // unit rather than trust that single answer, so a genuinely overloaded
+    // target is judged by its own signature pick instead of whichever
+    // declaration happened to come first.
+    i64 d;
+    if (tk_deleg_target_count(fn) > 1) {
+        d = tk_deleg_pick_target(si, fn, tk_line, tk_file);
+    } else {
+        d = decl_find(fn);
+        if (d < 0 || !decl_valid(d)) err_at2(tk_file, tk_line, "teko: unknown function", fn);
+        tk_deleg_check_sig(si, fn, d);
+    }
     uptr base = sr_name_at(si);
     uptr allocname = tk_join(tk_join(base, "__new_"), fn);
     uptr thunkname = tk_join(tk_join(base, "__thunk_"), fn);
@@ -338,10 +369,41 @@ i64 tk_deleg_wrap(i64 si, uptr fname, i64 line, uptr fl) {
     return n;
 }
 
+// D67: the placeholder `new Op(f)` parks instead of resolving `f` at PARSE
+// time -- an ordinary `N_CALL` naming `f` itself, with no argument (the same
+// 0-arg shape the resolved allocator call ends up wearing), so a program that
+// never reaches this thunk before it is patched sees nothing odd about it:
+// `tk_ref_check_call`'s own argument loop is a no-op over an empty list
+// whatever `f` turns out to mean, and `tk_ns_pass`'s bare-call rewrite ahead
+// of this one is free to rename the placeholder's OWN `nd_name` however it
+// likes -- this function never reads it back, only the name it captured here
+// at parse time (`dl_fname`, teko_deleg.tk's late table). Tagged right away
+// (`tk_xt_put`) so every consumer that asks the node's TYPE between here and
+// the walk that resolves it -- `tk_ty_of`, `tk_pty_of`, a nested delegate
+// call's own argument judge -- answers `si`, exactly as the eventual
+// allocator call would.
+i64 tk_deleg_new_placeholder(i64 si, uptr fname, i64 line, uptr fl) {
+    i64 n = tk_call(fname, 0);
+    tk_xt_put(n, si, sr_ty_at(si), 0, TK_OWNED);
+    tk_deleg_new_defer(n, si, fname, tk_ns_current(), line, fl);
+    return n;
+}
+
 // `new Op(add)`: valid anywhere `new` is, including a function-livre argument
 // (D221 decision 19's explicit form). A `(` right after the outer one opens a
 // lambda's own parameter list (K4, §41): `new Op((i64 a, i64 b) => a + b)`,
 // never a plain function name, which is a bare identifier here.
+//
+// D67: a bare TARGET no longer resolves right here. `decl_find`, what
+// `tk_deleg_wrap` used to call straight from this site, answers about the
+// FIRST declaration of a name alone -- wrong when `f` is OVERLOADED, missing
+// when `f` is declared BELOW this line (the parser has not read it yet), and
+// blind to a namespace or a `using` altogether, the road D62 measured and
+// left open ("the road still out is the seventh, `new Op(col)`"). A
+// PLACEHOLDER is built instead (`tk_deleg_new_placeholder`) and the walk that
+// already resolves the contextual form (`tk_deleg_coerce`) patches it in
+// place once the whole unit is read and the site's own namespace/usings are
+// live.
 i64 tk_new_deleg(i64 si, i64 line, uptr fl) {
     tk_check_type_use(si, line, fl);
     p_expect(K_LPAR, "expected ( after the delegate name");
@@ -351,7 +413,7 @@ i64 tk_new_deleg(i64 si, i64 line, uptr fl) {
         i64 e = parse_expr(0);
         if (nd_kind(e) != N_IDENT)
             err_at(fl, line, "teko: `new Op(...)` takes the name of a function or a lambda");
-        r = tk_deleg_wrap(si, nd_name(e), line, fl);
+        r = tk_deleg_new_placeholder(si, nd_name(e), line, fl);
     }
     p_expect(K_RPAR, "expected ) after the delegate target");
     return r;
@@ -481,6 +543,69 @@ i64 tk_deleg_root = 0;                 // the unit, for the same decl-count guar
 
 i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
 
+// D67: 1 when `f` names a PROTOTYPE, never a real declaration -- excluded
+// from both counts below the way `tk_ov_dup_def` (teko_over.tk) already
+// excludes one from its own "occupies the name" check ("A prototype ahead of
+// its own definition ... declares the signature, it does not occupy it").
+// `decl_valid` answers 1 for an `N_FUNC`, an `N_PROTO` AND an `N_EXTERN`
+// alike, so a plain forward-declared function -- a prototype above its own
+// body, one declaration in the program's own words -- would otherwise count
+// as TWO candidates sharing a name and be judged as if it were genuinely
+// overloaded.
+i64 tk_deleg_is_def(i64 f) {
+    if (!decl_valid(f)) return 0;
+    return nd_kind(f) != N_PROTO;
+}
+
+// D67: how many DEFINITIONS of `fn` this unit carries, over the WHOLE tree --
+// `decl_find` only ever answers about the FIRST one, so a genuinely
+// overloaded target (`i64 f(i64)` beside `i64 f(i64, i64)`) needs every
+// candidate in hand before a delegate's own signature can pick between them.
+// `tk_deleg_thunk` asks this to decide which of its two roads a name takes:
+// unmoved (`decl_find` + `tk_deleg_check_sig`, the single-decl wording) when
+// the answer is 1, `tk_deleg_pick_target` below when it is more.
+i64 tk_deleg_target_count(uptr fn) {
+    i64 c = 0;
+    i64 f = tk_deleg_root;
+    loop {
+        if (f == 0) break;
+        if (tk_deleg_is_def(f) && str_eq(nd_name(f), fn)) c = c + 1;
+        f = nd_next(f);
+    }
+    return c;
+}
+
+// D67: the ONE definition of `fn` whose signature -- arity, return, every
+// parameter's type AND `ref`/`out` kind, in order -- equals delegate row
+// `si`'s own (`tk_deleg_sig_matches`, the identical rule the single-
+// declaration road already enforces): C# §10.2.3's method group conversion,
+// exact match, no widening. `m` counts every candidate whose SIGNATURE also
+// fits, not merely whose name does, which is what tells "none of the
+// overloads fit" apart from "more than one does" -- the second is not
+// reachable through any overload set the rest of the compiler lets stand
+// (two definitions of the identical signature, return type included, are
+// `function declared twice` at the core's own hand before any pass runs),
+// kept as the defensive twin of the first rather than trusted to be dead
+// code by construction.
+i64 tk_deleg_pick_target(i64 si, uptr fn, i64 line, uptr fl) {
+    i64 pick = 0 - 1;
+    i64 m = 0;
+    i64 f = tk_deleg_root;
+    loop {
+        if (f == 0) break;
+        if (tk_deleg_is_def(f) && str_eq(nd_name(f), fn) && tk_deleg_sig_matches(si, f)) {
+            pick = f;
+            m = m + 1;
+        }
+        f = nd_next(f);
+    }
+    if (m == 0)
+        err_at(fl, line, tk_join(tk_join3("teko: ", fn, " has no overload matching "), tk_deleg_sig_str(si)));
+    if (m > 1)
+        err_at(fl, line, tk_join(tk_join3("teko: ambiguous overload for ", tk_deleg_sig_str(si), ": "), fn));
+    return pick;
+}
+
 // `gadd`, named bare inside `namespace geo { ... }`, is not this pass's own
 // call/const rewrite (teko_ns.tk's `tk_ns_pass` ran first and only touches an
 // `N_CALL`/`N_ADDR`/a const `N_IDENT`) -- a plain function reference is left
@@ -494,15 +619,23 @@ i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included a
 // way round, so inside `namespace geo` a bare `col` wrapped the flat `col`
 // while `col(2, 3)` one line over called `geo__col` -- the same name, two
 // different functions, silently, with no diagnostic anywhere (D62, the
-// namespace pass; measured on `441be45a` too, where every road that reaches
-// this resolver -- a local initializer, an assignment, `new Op(f)`, a call
-// argument, a `return`, an element of an `Op[]` -- already carried it, so the
-// field road only inherited it). The steps ahead of the namespace one in
-// `tk_ns_rewrite_call` are already answered before this function is reached:
-// a LOCAL, a PARAMETER or a GLOBAL of the name is exactly what
-// `tk_deleg_coerce`'s own guard (`tk_ty_scope_or_global`) refuses to wrap.
-uptr tk_deleg_resolve_fn(uptr fname, i64 line, uptr fl) {
-    i64 d = tk_ns_call_try_prefixes(fname, tk_deleg_cur_ns);
+// namespace pass; measured on `441be45a` too, where every OTHER road that
+// reaches this resolver -- a local initializer, an assignment, a call
+// argument, a `return`, an element of an `Op[]` -- already carried it). The
+// steps ahead of the namespace one in `tk_ns_rewrite_call` are already
+// answered before this function is reached: a LOCAL, a PARAMETER or a GLOBAL
+// of the name is exactly what `tk_deleg_coerce`'s own guard
+// (`tk_ty_scope_or_global`) refuses to wrap.
+//
+// D67: `ns` travels as a PARAMETER now rather than reading `tk_deleg_cur_ns`
+// straight off the global. The explicit `new Op(f)` road (below) calls this
+// from its OWN late table's backstop sweep (`tk_deleg_late_rest`), which runs
+// AFTER that global is reset to 0 for the whole unit -- so the namespace it
+// resolves against has to be the one the SITE itself stood in, frozen at
+// PARSE time (`tk_ns_current`), not whatever the walk happens to be pointed
+// at when the row is finally read.
+uptr tk_deleg_resolve_fn(uptr fname, i64 ns, i64 line, uptr fl) {
+    i64 d = tk_ns_call_try_prefixes(fname, ns);
     if (d < 0 && decl_find(fname) >= 0) return fname;
     if (d < 0) d = tk_ns_call_try_usings(fname, fl, line);
     if (d < 0) return fname;
@@ -566,7 +699,7 @@ i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
     // function's own name is in no slot table at all, global or local, so it
     // still answers -1 here and is still wrapped.
     if (nd_kind(e) == N_IDENT && tk_ty_scope_or_global(nd_name(e)) < 0)
-        return tk_deleg_wrap(si, tk_deleg_resolve_fn(nd_name(e), line, fl), line, fl);
+        return tk_deleg_wrap(si, tk_deleg_resolve_fn(nd_name(e), tk_deleg_cur_ns, line, fl), line, fl);
     if (tk_ty_of(e) == sr_ty_at(si)) return e;
     err_at(fl, line, tk_deleg_mismatch_msg(si));
     return e;
@@ -622,7 +755,15 @@ i64  dl_line[TK_MAXDGLATE];
 uptr dl_file[TK_MAXDGLATE];
 i64  dl_done[TK_MAXDGLATE];
 i64  dl_esc[TK_MAXDGLATE];            // ...and whose ESCAPE is unjudged as well
-i64  dl_val[TK_MAXDGLATE];            // 1 = `dl_node` IS the value (a FIELD store's, D62)
+i64  dl_val[TK_MAXDGLATE];            // 1 = `dl_node` IS the value (a FIELD store's, D62);
+                                      // 2 = `dl_node` is a PENDING `new Op(f)` placeholder (D67)
+i64  dl_ns[TK_MAXDGLATE];             // D67: the namespace at a `dl_val` 2 row's own site,
+                                      // frozen at PARSE time (`tk_ns_current`) -- the backstop
+                                      // sweep (`tk_deleg_late_rest`) runs after `tk_deleg_cur_ns`
+                                      // is reset to 0 for the whole unit, so the row carries its
+                                      // own answer rather than trust that global to still hold it
+uptr dl_fname[TK_MAXDGLATE];          // D67: ...and the name written after `new Op(`, for the
+                                      // same rows
 i64  tk_ndglate = 0;
 
 // D51 (eighth pass), the walk's own cost: `tk_deleg_late_pend` runs at EVERY
@@ -682,6 +823,8 @@ uptr dl_file_at(i64 i) { return ld64(dl_file + i * 8); }
 i64  dl_done_at(i64 i) { return ld64(dl_done + i * 8); }
 i64  dl_esc_at(i64 i)  { return ld64(dl_esc + i * 8); }
 i64  dl_val_at(i64 i)  { return ld64(dl_val + i * 8); }
+i64  dl_ns_at(i64 i)    { return ld64(dl_ns + i * 8); }
+uptr dl_fname_at(i64 i) { return ld64(dl_fname + i * 8); }
 
 // ---- a store built where NOTHING can be judged (D51, fourth pass) ----
 // A GLOBAL `T[]`'s own element store is assembled inside `tk_array_pass`
@@ -792,6 +935,30 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
     tk_ndglate = tk_ndglate + 1;
 }
 
+// ---- D67: `new Op(f)` waits here instead of resolving `f` at PARSE time ----
+// `n` is the PLACEHOLDER node itself, already tagged with the delegate row
+// by the caller (`tk_deleg_new_placeholder`) so every consumer of its TYPE
+// answers correctly before this row is ever read. `dl_val` 2 marks it: never
+// a store (`dl_node` is the CALL that stands for the whole `new Op(f)`
+// expression, not a value spliced into one), and never a field-store WRAP
+// either (`dl_val` 1) -- its own two columns, `dl_ns`/`dl_fname`, are what
+// `tk_deleg_new_do` needs and the other two `dl_val` shapes do not.
+void tk_deleg_new_defer(i64 n, i64 si, uptr fname, i64 ns, i64 line, uptr fl) {
+    if (tk_ndglate == TK_MAXDGLATE)
+        err_at(fl, line, "teko: too many delegate targets awaiting resolution");
+    st64(dl_node + tk_ndglate * 8, n);
+    st64(dl_si + tk_ndglate * 8, si);
+    st64(dl_line + tk_ndglate * 8, line);
+    st64(dl_file + tk_ndglate * 8, fl);
+    st64(dl_done + tk_ndglate * 8, 0);
+    st64(dl_esc + tk_ndglate * 8, 0);
+    st64(dl_val + tk_ndglate * 8, 2);
+    st64(dl_ns + tk_ndglate * 8, ns);
+    st64(dl_fname + tk_ndglate * 8, fname);
+    tk_dg_bucket_insert(tk_ndglate, n);
+    tk_ndglate = tk_ndglate + 1;
+}
+
 // ---- D62: a bare NAME stored into a FIELD of delegate type ----
 // The one door every field store is built by (`tk_field_store_val`,
 // teko_typeof.tk) hands the value here BEFORE it parks it as "type not known":
@@ -856,6 +1023,21 @@ void tk_deleg_val_do(i64 i) {
     tk_xt_move(nv, v);
 }
 
+// D67: the placeholder `new Op(f)` built at parse time, patched IN PLACE now
+// that the site's own namespace and every `using` of the file are live --
+// `tk_deleg_resolve_fn`'s own order (D62/D67), over `tk_deleg_thunk`'s
+// overload-aware pick, rather than the single `decl_find` the parse-time road
+// took. The node that ends up in the tree is `n`, not the fresh call `tk_
+// deleg_wrap` builds -- the same identity move `tk_deleg_val_do` makes just
+// above, and for the same reason: nothing here holds a handle to re-point.
+void tk_deleg_new_do(i64 i) {
+    i64 n = dl_node_at(i);
+    uptr resolved = tk_deleg_resolve_fn(dl_fname_at(i), dl_ns_at(i), dl_line_at(i), dl_file_at(i));
+    i64 nv = tk_deleg_wrap(dl_si_at(i), resolved, dl_line_at(i), dl_file_at(i));
+    tk_node_replace(n, nv);
+    tk_xt_move(nv, n);
+}
+
 // the value is the SECOND argument of the store (`tk_call2`, teko_struct.tk),
 // read from the list rather than remembered, so a pass that rewrote the node
 // in between is judged as it stands now. A wrap hands back a new node, and the
@@ -878,6 +1060,7 @@ void tk_deleg_val_do(i64 i) {
 void tk_deleg_late_do(i64 i) {
     if (dl_done_at(i)) return;
     st64(dl_done + i * 8, 1);
+    if (dl_val_at(i) == 2) { tk_deleg_new_do(i); return; }
     if (dl_val_at(i)) { tk_deleg_val_do(i); return; }
     i64 a = nd_a(dl_node_at(i));
     if (a == 0) return;
