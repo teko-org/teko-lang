@@ -1542,7 +1542,7 @@ truncation; the fix is to split the unit.
 |---|---|
 | `"teko: too many type declarations"` | 256 structs, classes and interfaces in one source (D69; was 32, raised to match `TK_MAXFWD`) |
 | `"teko: too many fields"` | 256 fields, summed |
-| `"teko: too many methods"` | 128 methods, summed |
+| `"teko: too many methods"` | 1024 methods, summed (D69; was 128) |
 | `"teko: too many virtual slots"` | 128 slots, summed |
 | `"teko: too many constructors"` | 32, summed |
 | `"teko: too many default arguments"` | 64, summed across all signatures |
@@ -1581,7 +1581,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
 | `"teko: too many deferred call arguments"` | 4096 arguments of a VIRTUAL, an INTERFACE or an unqualified virtual call whose type the site that built the `callp` could not read — a global, a `ref`/`out` pointee, a bare name on the unqualified road — waiting for the pass; 26 in `tests/surface_globals_calls.tk`, the busiest fixture, and 1 in `tests/primitives_float.tk` |
 | `"teko: too many declarations in one unit"` | 8192 |
-| `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
+| `"teko: too many generated declarations in one unit"` | 4096 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals (D69; was 512); 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |
 | `"teko: too many free-function declarations with parameters"` | 4096 |
 | `"teko: too many arguments"` | 64 at one call of an overloaded name |

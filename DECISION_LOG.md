@@ -6482,12 +6482,12 @@ macos/aarch64, this crumb's build):**
 No `TK_MAXIFACE` or `TK_MAXVT` constant exists in this codebase: an interface's own count is
 `TK_MAXSTRUCT` (the shared type table, D69's own finding above), its methods are
 `TK_MAXIFMETH`, and a virtual slot is `TK_MAXVSLOT` (128, unmoved, not probed here -- no
-probe above declared a `virtual` method). `TK_MAXEMIT` is the most pressing of these: a
-program of plain classes alone -- no fields beyond one, no methods, no interfaces -- already
-needs a raise past 128 classes to grow further, a considerably lower ceiling than
-`TK_MAXSTRUCT`'s new 256. Out of scope here (the task named `TK_MAXSTRUCT` only): the next
-crumb to raise capacity for "many classes" should measure `TK_MAXEMIT` first, not
-`TK_MAXSTRUCT` again.
+probe above declared a `virtual` method). `TK_MAXEMIT` was the most pressing of these at write
+time: a program of plain classes alone -- no fields beyond one, no methods, no interfaces --
+already needed a raise past 128 classes to grow further, a considerably lower ceiling than
+`TK_MAXSTRUCT`'s new 256. It was probed and recorded here but out of scope for THIS pass (the
+task named `TK_MAXSTRUCT` only); the second follow-up below closes it, together with the
+`TK_MAXMETHOD` row in the table above.
 
 **Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `59652293`: `sh scripts/
 fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 62 refused as expected, 0 failed**,
@@ -6506,6 +6506,71 @@ hash .` `ac4870f1846bf46d66f7a76a80b7d7904a6f46a94325d55ff5d2f2e7107f8304` (base
 `f7ef6013d75a654878e132765963b6bd288ca718575a5b10481d623a36298f30` -- `teko_struct.tk` is a
 listed file, so the hash moves by design; `DECISION_LOG.md` and the two docs edits are not
 listed files and move the hash not at all).
+
+**Second follow-up (merged forward past D61/D62/D63/D66/D71): `TK_MAXMETHOD` (teko_class.tk,
+128) raised to 1024 and `TK_MAXEMIT` (teko_struct.tk, 512) raised to 4096, closing the two
+sibling ceilings the table above named and left out of scope.** Every array either constant
+sizes is a plain `[TK_MAXMETHOD]` or `[TK_MAXEMIT]` literal, so raising the `#define` grows
+every one of them without a second edit: `grep -n TK_MAXMETHOD teko*.tk lib/*.tk` finds 13
+one-column arrays, all in `teko_class.tk` (`mt_name` through `mt_abst`), no other module;
+`grep -n TK_MAXEMIT teko*.tk lib/*.tk` finds 2, both in `teko_struct.tk` (`tk_emit_name`,
+`tk_emit_node`), no other module. Every loop that walks either table bounds itself by the
+RUNNING count (`i >= tk_nmethod`, `i >= tk_nemit`), never by a hardcoded literal, so no
+secondary table can fall out of step with either cap: `grep -rn tk_nmethod teko*.tk lib/*.tk`
+and `grep -rn tk_nemit teko*.tk lib/*.tk` show every read site is one of those two guards, a
+constructor-time count snapshot (`tk_own_methods = tk_nmethod`, a trait's own copy,
+unaffected), or a `!= 0` used-at-all test.
+
+**Cost, from the source, never from `mc limits`' `heap` column.** Both tables are all-`i64`/
+`uptr` columns, 8 B each, on both macos/aarch64 and linux/x86_64:
+
+| table | file | arrays | columns | bytes/row | before (rows) | after (rows) | delta (rows) | delta (bytes) |
+|---|---|---|---|---|---|---|---|---|
+| `TK_MAXMETHOD` | `teko_class.tk` | `mt_name`, `mt_cls`, `mt_sig`, `mt_fn`, `mt_np`, `mt_nreq`, `mt_d0`, `mt_ret`, `mt_slot`, `mt_vis`, `mt_static`, `mt_prop`, `mt_abst` (13) | 1 | 104 B | 128 | 1024 | 896 | +93184 B |
+| `TK_MAXEMIT` | `teko_struct.tk` | `tk_emit_name`, `tk_emit_node` (2) | 1 | 16 B | 512 | 4096 | 3584 | +57344 B |
+
+Combined: **+150528 B (147 KB)**, far under the "a few MB" this codebase already spent on
+`TK_MAXSTRUCT`'s own raise a paragraph up, and on `TK_MAXFIELD` before it.
+
+**Proof, throwaway probes in scratch (not fixtures, same reasoning as D69's own first
+paragraph), each run on the base compiler (`origin/main` `409bc8c0`, caps 128/512) and on
+this crumb's build (1024/4096), mc 0.15.23, macos/aarch64:**
+
+| probe | shape | base (`409bc8c0`) | this crumb |
+|---|---|---|---|
+| 129 methods, one class, no fields, no interface (`class C { public i64 m0() {...} ... m128() {...} }`) | one row per method, the SAME table whether the class is one or many | refused `teko: too many methods` at the 129th declaration (line 132) | compiles, runs 42 |
+| 1025 methods, same shape | 1025 rows | (not run; already known refused past 128) | refused `teko: too many methods` at the 1025th declaration (line 1028) — the new ceiling (1024) is honored, exact boundary: methods 1..1024 all land, the 1025th trips |
+| 129 lambda literals stored into one instance field (`delegate i64 Op(i64 x); class H { public Op cb; } … h.cb = (i64 x) => x + N;`, D66's field road, 129 times) — each lambda literal is 4 fresh `tk_top_emit` calls (the function, its vtable, its release, its allocator; `H`'s own declaration spends 4 more, measured directly against the boundary below) | 4 emits/lambda + 4 for `H` itself | refused `teko: too many generated declarations in one unit` at the 129th store (line 136): 4 (H) + 127×4 = 512 exactly, the 128th store (0-indexed 127) is the one that would spend row 513 | compiles, runs 42 |
+| 1025 of the same | 4 emits/lambda + 4 for `H` | (not run) | refused `teko: too many generated declarations in one unit` at the 1025th store (line 1032): 4 (H) + 1023×4 = 4096 exactly, the 1024th store (0-indexed 1023) is the one that would spend row 4097 — the new ceiling (4096) is honored at the identical arithmetic boundary |
+
+The two `129` rows share the shape of D69's own "Sibling ceilings" probes above (methods
+count is class-count-agnostic). The emit probe stores LAMBDA LITERALS, not `new Op(fn)`
+thunks: a literal is never memoized, so each written occurrence is its own fresh
+`tk_top_emit_as` quartet, where a named function forwarded through D63's thunk table would
+have undercounted (one thunk serves every caller). The store also has to be a FIELD, not a
+bare local reassigned by name — `Op f; f = (i64 x) => ...;` repeated is one of D66's own
+CLOSED roads (bare-name assignment still needs `new Op(...)`) — so the probe declares one
+field (`H.cb`) and stores a fresh lambda into it repeatedly, exactly the road D66 opened.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `origin/main` `409bc8c0` (this
+crumb also carries D61/D62/D63/D66/D71, merged forward before this pass): `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **74
+passed, 71 refused as expected, 0 failed**, identical count to the merged base; `--dump-ast`
+byte-identical against a `build/teko` built from base `409bc8c0` in a separate worktree for
+**all 145** `tests/*.tk` (74) and `tests/refuse/*.tk` (71) — 4937127 bytes of dump, neither
+ceiling moves any accepted or refused program already in the tree; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` -> `FIXPOINT OK` (74/74, 90.1s, `teko1.o == teko2.o` on the first
+turn, `--dump-asm` of `teko2`/`teko3` empty diff over 219327 lines); `sh scripts/
+check-docs.sh` -> `docs ok: 614 links, 42 fragments, 389 diagnostics, 71 refusals, 144
+samples`; `mc build . --config mc.macos.toml --limits` verdict `ok` with `grow` 0 on both
+legs, `globals` unmoved and identical to the base build on both (compiler leg 945/2548
+reserved, `hello.tk`-by-`build/teko` leg 0/32 reserved) — the two `#define`s move no
+DECLARATION count, only the reserved bytes behind each one, confirmed directly against a
+`409bc8c0` build rather than assumed; `mc pkg hash .`
+`d614aa95490bf97ab93959b31e4a9761ce02d5301acc41418e9668b3387e7460` (base `409bc8c0`:
+`6252f75a4f9f261365d651c6b318d6a1985cf4330c9605c8fcb4d1aee95dd1a6` — `teko_class.tk`,
+`teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
+design).
 
 ### D71 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
 mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one
