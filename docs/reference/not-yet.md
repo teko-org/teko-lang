@@ -67,7 +67,8 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | a **fixed** array of a class or struct type (an `enum` element is taught, N2a: it owns no object slot for `teko_rc.tk` to walk) | `teko: an array of objects is not taught yet; use a field array or wait for T[]` |
 | reading a `ref T[]` / `out T[]` inside the callee | `expression with no codegen`, from the core — the parameter carries the caller's slot, and the array is not reachable through it |
 | `.Length` on a **global fixed** array | `teko: unknown member: Length` — a local fixed array and any `T[]` answer |
-| an index whose base is not an array the parse can name | ``teko: `[` needs an array`` |
+| an index whose base is not an array the parse can name, a **local shadowing a global array** included | ``teko: `[` needs an array`` (the base's own name follows it) |
+| a **parameter** that shadows a **global array** (`f(i64 src)` beside a global `i64[] src`) | not refused: the index is rewritten into a read of the GLOBAL, while the name under it is still the parameter's — the program compiles and runs wrong (measured, exit 139). A parameter is in no parse-time scope, which is where the binding is known; shadow it with a LOCAL and the site is refused instead. Rename one of the two |
 | an inline array field by its bare name | ``teko: an array field is reached through `this.``` |
 | an inline array field of a type declared **below** | `teko: an array field on a type declared below is not taught yet` |
 | a heap array as the element of another heap array | not taught |

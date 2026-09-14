@@ -346,15 +346,19 @@ messages reuse the wordings a declared type already gets; only a handful are its
   claims every binary and unary with a primitive operand and refuses the ones with no row
   (`t % t`, `t & t`, `t * t`, `t / t`, `t + 1`, `~t`, `!t`, `+t`).
 - ``"teko: the type of the left side of `+` is not known here"`` (also *right*) — the other
-  operand of an operator over a primitive is an expression the oracle cannot type, such as
-  an array element. Bind it to a local first; a primitive operand is exactly where leaving
-  the node to the core's raw arithmetic would answer a wrong number.
+  operand of an operator over a primitive is an expression the oracle cannot type. A
+  primitive operand is exactly where leaving the node to the core's raw arithmetic would
+  answer a wrong number, so the site is refused rather than guessed at; bind the value to a
+  local first. An **array element** was this message's one shape until D50 and is one no
+  longer: every element load carries the element's own type now, so `xs[i] + t` and
+  `xs[i] + xs[j]` are ordinary operand pairs.
 - `"teko: the type of this argument is not known here"` — the same rule one position over:
   an argument landing on a parameter of primitive or `enum` type, in a row of the member
-  table, whose type nothing can tell even after the oracle has run — a local array's
-  element (`new DateTime(t, a[0])`, `d.CompareTo(a[0])`) is today's one shape. That
-  position converts with a cast, so an unread value would cross under the column's name
-  instead of being refused. Bind it to a local first.
+  table, whose type nothing can tell even after the oracle has run. That position converts
+  with a cast, so an unread value would cross under the column's name instead of being
+  refused. Bind it to a local first. An array element reaches this one no longer either
+  (D50): `new DateTime(1, a[0])` on an `i64 a[2]` is judged by the type the element has,
+  `teko: a value of type i64 does not convert to DateTimeKind`.
 - `"teko: this primitive has no constructor"` — `new` on a primitive whose table declares
   no constructor row. `TimeSpan` declares one, so nothing in v0.4.0 reaches this; it is the
   mechanism's own guard for the primitives the specs still have coming.
@@ -414,7 +418,7 @@ i64 main() {
     DateTime b = new DateTime(1, seven());  // teko: a value of type i64 does not convert to DateTimeKind
     i64 arr[2];
     arr[0] = 7;
-    DateTime c = new DateTime(1, arr[0]);   // teko: the type of this argument is not known here
+    DateTime c = new DateTime(1, arr[0]);   // teko: a value of type i64 does not convert to DateTimeKind
     return 0;
 }
 ```
@@ -660,7 +664,22 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - `"teko: the left side of = is not a place"` — the target of the assignment is not a
   variable, a field or an element.
 - ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
-  know to be one. Bind it to a local of the right type first.
+  know to be one. Bind it to a local of the right type first. The name the base spells is
+  appended when it has one, and a LOCAL that shadows a global array is the shape that
+  reads oddest: the global's own index is rewritten by a pass that matches by name alone,
+  so the refusal is raised where the parser still knows the binding is the local's.
+
+```teko
+// no-run
+i64[] src;                    // a GLOBAL array...
+i64[] dst;
+
+i64 f() {
+    i64 src = 3;              // ...shadowed by a local of another type
+    dst[0] = src[0];          // teko: `[` needs an array: src
+    return dst[0];
+}
+```
 
 ## The nullable `T?`
 

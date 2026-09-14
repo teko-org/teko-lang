@@ -2543,8 +2543,8 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in eight passes over
-[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and seven Copilot reviews
+*This entry is the whole of D50 as it stands. It was written in nine passes over
+[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and eight Copilot reviews
 — and every earlier wording of it, including the `tk_member_fn` push described below, the
 two-oracle door the third pass removed, the silent `-1` the fourth one turned into a
 refusal, the registration the fourth one gave every call alike and every intermediate proof
@@ -2820,6 +2820,65 @@ the table (`tk_pend_field`), each of them nested-safe: the walk is the same recu
 so `h.rate = gl[0] + gx[0];` rewrites both. It is not only a refusal that is fixed: the
 load reaches the field-store door TYPED, which is what the judge then reads.
 
+**EVERY subtree a deferred access parked goes through the same walk, at the one point
+every road out of the table passes.** The eighth pass walked ONE of them — the value of a
+deferred store (`pd_arg`, from inside `tk_pend_field`) — and the table parks three:
+`pd_recv` (the receiver), `pd_na` (the receiver's own INDEX for the two `p.items[i]`
+forms, and a call's argument COUNT for every other form, an integer that is no node at
+all) and `pd_arg` (a store's value AND a call's argument list). `tk_pend_do`'s own
+receiver line rewrote the top node of `pd_recv` alone (`tk_array_maybe_rewrite_index`),
+which is not a walk: a NESTED index under it was left raw. Measured on `a9e0b0d7`, three
+ordinary programs refused for a read the compiler knows how to build, ``teko: `[` needs an
+array: gl``: `void set(H h) { h.items[gl[1]] = 1; }` (the receiver's index, Copilot on
+#698, pass 9), `h.rate = 1 + h.mul(gl[1]);` — a member call NESTED in the value, whose own
+arguments the inner row parks and which is resolved through this very function — and
+`gc[gl[1] - 1].v`, the index inside the receiver's index. `tk_pend_park_reads`
+(teko_typeof.tk) walks all three in `tk_pend_do`, before the receiver's type is asked for,
+and `pd_na` is walked only in the two forms where it is a node; the per-emitter call in
+`tk_pend_field` is deleted, one walk taking its place.
+
+**The rewrite of a global array's reads may not match by NAME ALONE.** `g[i]` on a global
+array is a bare `N_INDEX` while the body is parsed and a pass replaces it afterwards
+(`tk_array_maybe_rewrite_index`), keyed by the base's name against the two global tables —
+and a LOCAL of another type that shadows that name was rewritten just the same, while the
+base identifier under the rewrite still resolved lexically to the local. Measured on
+`a9e0b0d7`: with a global `i64[] src` and a local `i64 src = 3;`, `dst[0] = src[0];`
+compiled and ran off the local's own value, exit **139** — an invalid program that neither
+compiled correctly nor was refused; the same through a parked subtree
+(`h.rate = src[0];`), and the same on the WRITE side, which never asks the question at all
+(`tk_arr_defer_write` parks any `N_IDENT[...] =` for the pass to claim). The root is
+LEXICAL and is known at PARSE TIME and nowhere later, so the refusal is written there:
+`tk_bracket` (teko_params.tk) already answers every array shape a local can have —
+`tk_ax_find`, `tk_arr_find`, `tk_hp_find`, `tk_struct_of_expr` — so a base that is still a
+name the parser has seen DECLARED as a local of this scope (`tk_slv_find`, the parser's own
+scoped lookup) indexes nothing, and it is refused with the wording `tk_pm_check_index`
+gives an index no road lowered, ``teko: `[` needs an array: src``. Measured after: the
+shadowing program is refused at its own line, the same program WITHOUT the shadow reads the
+global as it always did (exit 77 over both kinds of global array), and a shadow that ends at
+a `}` leaves the global readable again below it (exit 70). A PARAMETER that shadows a global
+array is the same defect and is NOT closed here: a parameter is in no parse-time scope at
+all (`tk_slv_add`'s own rule, D33, and the reason this entry rejects pushing one there),
+and the only table that could answer — K3's `tk_hp` — is not reset for a free function with
+no parameters at all, so widening it would refuse a correct program. It is
+[not-yet.md](docs/reference/not-yet.md)'s own row, measured (exit 139), and a crumb of its
+own.
+
+**The element store REPORTS the store it built.** `tk_arr_elem_store` (teko_array.tk), the
+door the eighth pass gave a fixed array's element, returned `tk_arr_store`'s raw node — no
+`tk_os_mark` — while the five sibling doors all mark, and a store the reclaim pass never
+heard of keeps the raw `stW` where `rt_store_own` belongs (teko_rc.tk). The global road
+needed the other half: `tk_array_resolve_write` copies the built node into the tree's own
+placeholder (`node_assign`), so the mark has to be re-made under the identity the reclaim
+walks — the re-mark `tk_hg_resolve_write` beside it already makes for a `T[]` of heap, asked
+here as `tk_os_has(r)` so the two halves cannot drift apart. No fixed element is counted
+TODAY and the refusal that makes it so is three files away: `Cell cs[2];`, `i64? xs[2];` and
+`P ps[2];` are each refused at the DECLARATION, ``teko: an array of objects is not taught
+yet; use a field array or wait for T[]`` (measured, all three, on this head), and an `enum`
+element is the exempt one `tk_is_counted` answers "no" for — so the mark fires on no program
+that compiles today and the 62 dumps are byte-identical with and without it. What it buys is
+that "every element store is reported" is a property of the DOOR rather than a coincidence
+of that refusal.
+
 **The site a store reports is its own, at every one of the six.** `tk_field_store_val`
 builds nodes, and both halves of what it can build move the compiler's current position:
 `tk_num_widen` and `tk_nl_wrap` (teko_typeof.tk, teko_null.tk) set `tk_line`/`tk_file` to
@@ -2873,8 +2932,12 @@ array is never released, `surface_array_global.tk`'s own header); the element of
 global and local, the widening (`f64 gf[2]; gf[0] = 1;`), the compound over its own load
 (`gf[0] += 1;`) and an element whose type already matched, which the door has to leave
 exactly as it found it; a global element as the VALUE and as the INDEX of another global's
-write, on both kinds of global array; and the same parked subtree on the deferred
-RECEIVER's road (`h.rate = gl[0] + gx[0];` through a parameter). The floor `rt_live()`
+write, on both kinds of global array; the same parked subtree on the deferred
+RECEIVER's road (`h.rate = gl[0] + gx[0];` through a parameter); and the three OTHER
+subtrees that same access parks (helper 23) — the receiver's own index
+(`h.items[gl[1]] = 7;`), the arguments of a member call NESTED in the value
+(`h.rate = 1 + h.mul(gl[1]);`) and an index nested inside the receiver's index
+(`gc[gl[1] - 1].v`), none of which allocates, so the floor below is unmoved. The floor `rt_live()`
 returns to is **four** objects with those helpers in: three global arrays and the one
 `Cell` one of them holds. The file exits **71** on
 `c7df7787` (the first head of the PR); on `5ecae153` it is REFUSED at the operator store,
@@ -2891,7 +2954,12 @@ registration reached. On `6a30d158` (the sixth head, and this paragraph's own "b
 REFUSED at `this.rate = a[0]`, the local fixed array's element no registration reached. On
 `5b78af5c` (the seventh head, and the eighth pass's own "before") it is REFUSED where the
 deferred receiver reads a global element, ``teko: `[` needs an array: gl`` — the first of
-the three parked subtrees it reaches. That every verdict the earlier passes settled is
+the three parked subtrees it reaches. On `a9e0b0d7` (the eighth head, and the ninth pass's
+own "before") it is REFUSED at `h.items[gl[1]] = 7;`, the deferred receiver's own INDEX;
+with that helper neutralised, at the member call NESTED in the value; with that one
+neutralised too, at the index nested inside the receiver's index — the three subtrees of
+helper 23, in the order the file writes them — after which it exits **42**, every other
+verdict of the file unmoved. That every verdict the earlier passes settled is
 unmoved is what the 62 byte-identical dumps say, not this file's own exit.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
@@ -2910,19 +2978,21 @@ wording every mismatched value already gets.
 
 **Proof**, mc **0.15.23** (`MC_VERSION`), macos/aarch64: `mc build . --config mc.macos.toml`
 clean; **63/63** fixtures at their `expect-exit`; `--dump-ast` of the **62** fixtures that
-predate the crumb, against `da33ebd4` — **62 byte-identical**, since every site this crumb
-touches only changes a program that was previously silently WRONG or wrongly refused;
+predate the crumb, against `da33ebd4` — **62 byte-identical**, re-proved on the ninth head
+against a compiler built from `da33ebd4` itself, since every site this crumb touches only
+changes a program that was previously silently WRONG or wrongly refused;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (63/63 under the
-self-hosted `teko1`); `sh scripts/check-docs.sh` green (569 links, 387 diagnostics, 120
-samples; the seventh pass's own wording said 570, one link over what the script counts on
-that head and on this one alike); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (567 links, 387 diagnostics, 121
+samples on the ninth head, the shadowed index being the sample that pass added; the seventh
+pass's own wording said 570 links, over what the script counts on that head and on this one
+alike); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
 — `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new
 pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that moves,
 **467824 → 1114992** bytes used against a 33554432-byte reservation (measured in a clean
 `build/`; the floor leg's heap figure follows the state of `build/` and is not a gate — an
 independent run over a used `build/` reads 721776 on both sides), which is the two tables
-raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the eighth pass:
-`a08d052371169f1d0ab1015a413bfc8028847de1eb07f304932b8722a22bff4b`.
+raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits, after the ninth pass:
+`a7a71e9d612096bdde88457911dbc05c5e27f857547449cbfb0baf392587c9e3`.
 
 **What the element's own type bought for free.** With every array element load carrying
 its type (`tk_ha_load`, `tk_arr_index_of`, `tk_array_index`, the fixed-global rewrite), the
