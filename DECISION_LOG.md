@@ -6895,14 +6895,50 @@ same two calls `tk_lam_check_name` already opens with, before either member tabl
 local answers before a member, C#'s own rule, unchanged for the read half and now honoured
 for the call half too.
 
-**Out of scope, measured and recorded as an adjacent finding, not fixed here**: the WRITE
-twin of the read bug -- `(i64 x) => { n = x; }` inside `arm()`, `n` a field shadowed by a
-same-named global -- silently writes the global too (`tk_lam_walk`'s `N_ASSIGN` branch
-checks a by-reference capture and nothing else; a plain field/global write target is never
-asked `tk_lam_check_name` at all). A field with no colliding global already dies `unknown
-name` from the core today, so nothing currently PASSES on the strength of the bug; closing
-it needs `tk_field_store_val`'s own coercion gate (D33/D43/Q1b) threaded through a SECOND
-site, which is a write-side crumb of its own, not this read-and-call door.
+**The WRITE twin, closed on the same PR before merge (2026-09-15).** The first pass above
+recorded, and left open, the write half of the identical bug: `(i64 x) => { n = x; }` inside
+`arm()`, `n` a field shadowed by a same-named global, silently wrote the GLOBAL too --
+`tk_lam_walk`'s `N_ASSIGN` branch checked a by-reference capture and nothing else; a plain
+field/global write target was never asked anything at all. Measured directly against
+`origin/main` `bcee28f2` (pre-D70 entirely, so the READ half was broken too): a probe with
+`this.cb = new Op((i64 x) => { n = x; return n; });` returned the encoding for "wrote the
+global, field untouched" on both the base and this branch's own first pass, instance AND
+static alike.
+
+`tk_lam_member_store` (new, `teko_deleg.tk`) is the write door: asked by `tk_lam_walk`'s
+`N_ASSIGN` case for every target that is not a real local, a parameter or a by-value capture
+(`tk_ty_scope_find`, the identical local-answers-first order the read side already opens
+with) and not a by-reference capture (the existing branch, unchanged), it reads the same
+four tables `tk_lam_member` reads for a bare NAME and builds the STORE `tk_this_assign`
+builds for the method itself: a STATIC field stores through `tk_field_store_val`, the
+identical coercion gate `tk_static_use`/`tk_fwd_resolve_static_one` take; a member CONST is
+refused `teko: a constant is not assigned or called`, factored into `tk_const_assign_refuse`
+(`teko_access.tk`) so the qualified `Type.C = e` door and this one ask the same string, never
+a second copy of it; a STATIC property with a `set` calls it with no receiver, the exact call
+`tk_prop_static_use` builds; every INSTANCE road -- field, property, method name -- reads
+`tk_lam_not_captured`, unchanged from the read side (D11 stands: `this` is not implicitly
+captured, so nothing a lambda can WRITE through an instance member exists). `n += x;`/`n++;`
+reach the identical door as `n = x;` does: `<teko-loop-prelude>`'s own `#rule` lowers both to
+`n = n + x;` at PARSE time, ahead of this walk, so only the assignment TARGET is this
+function's own business -- the RHS is an ordinary expression `tk_lam_walk` already walks
+first, and the READ of `n` inside it resolves through `tk_lam_member` like any other.
+
+**A second, narrower gap found while wiring the write door, not measured on the base
+independently but blocking it outright:** `tk_lam_member`'s own field and STATIC-property
+branches replaced a bare NAME with a load (`tk_ld`/`tk_call`) and never tagged it
+(`tk_xt_put`) the way `tk_this_ident`/`tk_this_prop_read` (`teko_this.tk`) already tag their
+own identical loads. A plain READ never needed the tag -- nothing downstream asked
+`tk_fs_vty` of it -- but the WRITE door does, the moment the read of `n` sits inside `n`'s
+own store (`sn += y;` lowers to a STORE whose VALUE reads the same field): `tk_fs_vty`
+answers -1 for an untagged `N_CALL`/`N_BINARY` and defers the judgement to a later pass that
+can never settle it for a raw `ld64`/`st64` call (no declaration owns that name, so
+`decl_find`/`tk_ty_of`'s own `N_CALL` arms answer -1 for it at ANY pass), and the store died
+`teko: the type of this value is not known here` on a program that types clearly at the
+point the load is built. Measured directly: `H.sn += y; H.sn++;` inside a lambda refused with
+that sentence before the tag was added, and resolved (`H.sn` 0 -> 3 -> 4) once it was. Both
+branches now carry the identical `tk_xt_put` their `teko_this.tk` siblings already carry --
+an addition to a SEPARATE side table, not to the node itself, so `--dump-ast` (which prints
+node fields, not this table) is unmoved by it.
 
 **Fixtures.** `tests/refuse/lambda_field_name.tk`: an instance FIELD read bare, the exact
 repro at the top of this entry. `tests/refuse/lambda_deleg_field_call.tk`: an instance
@@ -6911,33 +6947,43 @@ name answering on the base. `tests/refuse/lambda_prop_name.tk`: an instance PROP
 bare. `tests/refuse/lambda_method_call.tk`: an instance METHOD called bare. `tests/refuse/
 lambda_method_name.tk`: an instance METHOD named bare, with no call around it -- the
 `N_IDENT` twin of the call one, `tk_lam_member`'s own method branch, which no earlier
-fixture exercised. `tests/surface_lambda.tk`'s `member_check`: a lambda naming only a
-global with no colliding member (`armGlobal`, unchanged), one naming a STATIC field and a
-STATIC method (`armStatic`), and one naming a member CONST and a STATIC property
-(`armConstProp`) -- every one of the three set beside an IDENTICALLY SPELLED global,
-proving the member wins. `member_deleg_check`, kept apart because its own STATIC delegate
-field outlives the function's scope exactly as `slot_roads_check`'s own `St.cb` does: a
-STATIC method's own lambda calling a STATIC delegate field bare (`sarmDeleg`), also beside
-an identically spelled global.
+fixture exercised. `tests/refuse/lambda_field_name_write.tk`: the WRITE twin of the first
+fixture, `n = x;` on an instance field inside a lambda's own block body. `tests/
+surface_lambda.tk`'s `member_check`: a lambda naming only a global with no colliding member
+(`armGlobal`, unchanged), one naming a STATIC field and a STATIC method (`armStatic`), and
+one naming a member CONST and a STATIC property (`armConstProp`) -- every one of the three
+set beside an IDENTICALLY SPELLED global, proving the member wins. `member_deleg_check`,
+kept apart because its own STATIC delegate field outlives the function's scope exactly as
+`slot_roads_check`'s own `St.cb` does: a STATIC method's own lambda calling a STATIC
+delegate field bare (`sarmDeleg`), also beside an identically spelled global.
+`member_write_check` (new): `D70Member.armWrite` sets its own STATIC field `wfield` bare
+(`=`), then bumps it bare (`+=`/`++`), each from inside a lambda the STATIC method builds;
+the same-named global `wfield` stays exactly where it started, proving the member won on
+both statement shapes and the global was never touched at all.
 
-**Proof** (mc 0.15.23, macos/aarch64, base `bcee28f2`, merged forward past D61/D62/D63/D65/
-D66/D69): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
-mc.macos.toml` -> **75 passed, 79 refused as expected, 0 failed** (74 refused on the base,
-five refusals added; 75 passed unmoved, `surface_lambda.tk` grown in place); `--dump-ast`
-byte-identical against the base compiler for every one of the **149** pre-existing
-`tests/*.tk` and `tests/refuse/*.tk`, each compiled with its ORIGINAL `bcee28f2` source by
-both binaries; `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
-`sh scripts/check-docs.sh` -> `docs ok: 616 links, 45 fragments, 390 diagnostics, 79
-refusals, 144 samples`; `mc limits . --config mc.macos.toml` verdict `ok` with `grow` 0 on
-every row of both legs, `passes` 15, `types` 13, `intrin` 8, `alias` 20, `syntax` 15,
-`rules` 6, `on_stmt` 4, and `globals` **945** all exactly where the base left them -- only
-the size-of-surface-code rows moved (`nodes` 157320 -> 157745, `funcs` 3193 -> 3197,
-`lowered` 3175 -> 3179, `strings` 2138 -> 2139, `symbols` 6276 -> 6281, `ins` 217118 ->
-217930, identical on both legs); `mc pkg hash .`
-`d37dac7f4321ebaeaaacfc70ed444abe39b7cc526f104ad9e9854546956f78c4` (base
-`2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: `teko_deleg.tk` is a
-listed file (`mc.toml`), so the hash moves by design; `docs/` and `tests/` are not listed
-and do not affect it).
+**Proof, the write door landed** (mc 0.15.23, macos/aarch64, base `origin/main` `bcee28f2`,
+merged forward past D61/D62/D63/D65/D66/D69, this branch's own read-and-call door already on
+top of it): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **75 passed, 80 refused as expected, 0 failed** (74 refused on `bcee28f2`,
+six refusals added across the whole PR, one of them this crumb's own
+`lambda_field_name_write.tk`; 75 passed unmoved, `surface_lambda.tk` grown in place again);
+`--dump-ast` byte-identical against a `build/teko` built from `bcee28f2` in a separate
+worktree, for all **149** pre-existing `tests/*.tk` (75, `tests/parts/*.tk` excluded -- those
+are `#include`-only, not fixtures) and `tests/refuse/*.tk` (74), each compiled with its
+ORIGINAL `bcee28f2` source by both binaries -- the `tk_xt_put` addition above touches a side
+table `--dump-ast` never prints, so it moves nothing here either; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 616
+links, 45 fragments, 390 diagnostics, 80 refusals, 144 samples` (the diagnostics count is
+UNMOVED: the write door's own two new sentences -- `a constant is not assigned or called`
+and the `not captured`/`the property has no set` reuse -- are extensions of entries already
+on the page, not new ones); `mc limits . --config mc.macos.toml` verdict `ok` with `grow` 0
+on every row of both legs and `globals` **945** exactly where the base left them -- only the
+size-of-surface-code rows moved (`nodes` 157320 -> 158004, `funcs` 3193 -> 3199, `lowered`
+3175 -> 3181, `strings` 2138 -> 2139, `symbols` 6276 -> 6283, `ins` 217118 -> 218369); `mc pkg
+hash .` `d980fe76b4325dd54284332968829d60be3374aaeda50019032f399e43c97e14` (base
+`2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: `teko_deleg.tk` and
+`teko_access.tk` are listed files (`mc.toml`), so the hash moves by design; `docs/` and
+`tests/` are not listed and do not affect it).
 
 ### D71 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
 mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one

@@ -305,6 +305,17 @@ name already gets, `X is not captured; add it to use (...)`, except a bare metho
 which has a sentence of its own, `a method is not reachable from a lambda` — `use (...)`
 captures a value, never a method (D70).
 
+The WRITE side — a bare name on the LEFT of `=` (and `+=`/`++`, which lower to `=` before
+this judge ever runs) — reads the identical table, before falling through as an ordinary
+local or global assignment. A STATIC field or a STATIC property's `set` needs no receiver
+and stores through it, the same coercion a plain static store already takes; a member
+`const` has no slot to store into and is refused the const's own sentence,
+`a constant is not assigned or called`. Every INSTANCE road — a field, a property, a method
+name — needs `this`, not implicitly captured (D11), so it reads the identical
+`X is not captured; add it to use (...)`: `(i64 x) => { n = x; }` inside a method, `n` a
+field the class declares and a global of the same name standing beside it, used to write
+the GLOBAL silently (D70's own adjacent finding, closed on the write door too).
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"
