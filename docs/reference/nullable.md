@@ -38,6 +38,11 @@ an argument of a free, method, virtual or interface call, an element of a `param
 element of a `T[]`, a field store, a constructor argument, a delegate initializer and a
 parameter default.
 
+**A raw `uptr`/`ptr` slot is the one exception**, and is not written `T?`: `uptr` is the very
+type `null` carries, so `0` is an ordinary value of it and `uptr p = null;` — a local, a
+parameter or a field — is accepted as it always was. `T?` is for the types the language
+counts; a raw pointer it does not count.
+
 **A comparison against `null` stays legal on a slot that is not nullable**, and must: the
 rule is about declarations, not a proof about values. A `null` still reaches a
 non-nullable slot by three roads, all of them still open on purpose:

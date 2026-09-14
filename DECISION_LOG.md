@@ -2667,13 +2667,15 @@ the same defect:
   (Copilot on #698, pass 12). A DIRECT call registers its ROW
   alone, exactly as it always did: it names its callee, `tk_ty_of` reads the declared return
   off that symbol, and a scalar row there answers nothing the oracle did not already have
-  while spending one of `TK_MAXXT`'s 256 per call in the unit. The fourth pass registered
-  every call alike, and a body with enough of them began refusing `teko: too many expressions
-  whose type is known` where it used to compile: measured by bisection on one body of direct
-  calls, **253** calls was the ceiling it left, against **2000** before the crumb and 2000
-  again after this pass (Copilot on #698, pass 5). The worst fixture is unmoved by that
-  narrowing — `surface_nullable_ops` needs **239** rows of 256, where the crumb found 238 —
-  since what it registers is boxes and indirect returns, not direct calls;
+  while spending one of `TK_MAXXT`'s rows per call in the unit — 256 rows then, **4096** since
+  the sixth pass below raised the ceiling. The fourth pass registered every call alike, and a
+  body with enough of them began refusing `teko: too many expressions whose type is known`
+  where it used to compile: measured by bisection on one body of direct calls, **253** calls
+  was the ceiling it left, against **2000** before the crumb and 2000 again after this pass
+  (Copilot on #698, pass 5). The worst fixture is unmoved by that narrowing —
+  `surface_nullable_ops` needs **239** rows of the 256 that were the ceiling then (**4096**
+  today), where the crumb found 238 — since what it registers is boxes and indirect returns,
+  not direct calls;
 - a cast written DIRECTLY over a `callp` is how mc's core is TOLD what an indirect call
   returns (`tk_callp_ret`'s own contract, mc src/gen_resolve.mc), so the widening cast
   `tk_num_widen` writes was read as that declaration instead of as a conversion — the core
@@ -3163,3 +3165,63 @@ bisection from both sides — `TK_MAXFS` **34** (`surface_field_store` trips a m
 `TK_MAXXT` **239** (`surface_nullable_ops` trips a mark of 238), both unmoved by this pass.
 `mc pkg hash .` over the source tree of this pass's code and fixture commits:
 `0c49cc1ddb4d6e6c91f44c17320fcf5bc2ba7518b70f3f8cbed11cfe9eecaafe`.
+
+**The thirteenth pass: a bare name stands for THREE members, and the guard answered one.**
+The eleventh pass shut the FIELD half of "the rewrite of a global array's reads may not match
+by NAME ALONE"; `tk_this_ident` (teko_this.tk) resolves a bare name to a field, then to a
+member `const` (`tk_this_const`), then to a PROPERTY (`tk_this_prop_read`), and the guard in
+`tk_bracket` (teko_params.tk) asked `tk_field_find` alone — so the last two names still took
+the global road. Measured on `b48d465c`, with a global `i64[] src` beside the member: a
+`const i64 src = 5;` read the CONSTANT as the array's handle, exit **139**, the eleventh
+pass's own shape; a scalar PROPERTY `src` read the GETTER's result as the handle and exited
+**70**, `teko: index into a null array`, the run-time trap catching by luck what nothing had
+refused. Both are now refused where the parser still knows the binding, with the sentence the
+local and the field already get, ``teko: `[` needs an array: src``, and in `tk_this_ident`'s
+own order — const before property — so the name resolves at the door to exactly what it
+resolves to in the pass. A `const` is always a scalar value (`tk_mconst_use`, teko_const.tk),
+so it only ever indexes nothing; a property CAN be declared `T[]`, and that one is READ
+rather than refused: `tk_ha_index` over a base the pass turns into the getter call, the
+implicit form of `h.xs[0]`, which already compiled. On `b48d465c` the implicit `xs[0]` on a
+`T[]` property was refused ``teko: `[` needs an array`` with no name at all — it fell past
+every road to `tk_pm_check_index` — and reads **7** now. An INLINE array is no property's
+type (only a field is laid out that way), so `tk_this_reject_array` gains no second site. A
+member declared BELOW the method that reads it is still not closed, and the
+[not-yet.md](docs/reference/not-yet.md) row the eleventh pass wrote for a field now names the
+`const` and the property beside it: the parse-time guard rests on the member being READ
+already, and the pass that could answer later (`tk_array_pass`, teko_array.tk) walks the unit
+root with no class in hand.
+
+Two documentation claims were corrected in place by this pass, both measured against the
+compiler rather than reasoned about:
+
+- `TK_MAXXT`'s ceiling is quoted **twice** in the fourth/fifth pass paragraph above as
+  **256**, the figure of the head those passes measured; the sixth pass raised it to
+  **4096**. Both sentences now say which is history and which is today.
+- **`null` in a raw `uptr`/`ptr` slot is accepted**, and the field-store rule in
+  [types.md](docs/reference/types.md) stated "`null` only in a `T?` field" with no exception.
+  `tk_check_scalar_compat` (teko_typeof.tk) has said so since Q1a — `uptr` is the very type
+  `null` carries, `0` is an ordinary value of it, and `ti < 0` for a raw pointer leaves the
+  `T?` clause unreached. Measured: `uptr a = null;`, `ptr b = null;` and the field forms all
+  compile and read `0`. The rule page ([nullable.md](docs/reference/nullable.md)) carried the
+  same absolute sentence and gains the same exception.
+
+**Proof**, mc **0.15.23**, macos/aarch64: `mc build . --config mc.macos.toml` clean;
+**63/63** fixtures at their `expect-exit`; `--dump-ast` of all **63** fixtures under the
+compiler of `b48d465c` and under this one, over the same sources — **62 byte-identical**, the
+one that moves being `surface_field_store.tk`, the fixture this pass edits; against the base
+`da33ebd4`, **59** of the **62** fixtures that exist on both are byte-identical and the three
+that move are the three this PR edits (`surface_datetime.tk`, `surface_timespan.tk`,
+`surface_timespan_overflow.tk`), `surface_field_store.tk` being new;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (63/63 under the
+self-hosted `teko1`); `sh scripts/check-docs.sh` green (**567** links, **387** diagnostics,
+**122** samples — the no-run block on ``teko: `[` needs an array`` growing two classes and no
+new sample); `mc limits . --config mc.macos.toml` verdict `ok`, every table unmoved —
+`passes` 15/30, `syntax` 15, `alias` 18, `types` 11, `intrin` 8/16, `heap` 1114992 of
+33554432 — no new pass and no new intrinsic (D2, D21). The refusals and the reads above were
+measured one program at a time outside `tests/`, before the fix and after; the `T[]` property
+is a committed regression instead, in `surface_field_store.tk`'s `mbindexcheck` (26): class
+`X` gains a `T[]` property named `gl`, the name of a global `T[]` of the same file, written
+and read through the implicit `gl[0]` and asserted against `x.gl[0]` and against the global's
+own untouched `gl[0]` — and `rccheck`'s floor is unmoved at **4**, the new array dying with
+its object. `mc pkg hash .` over the source tree of this pass's code and fixture commit:
+`87e627f70123afa56da2f314ba445066e265890594029cc694fecfbbb28f9595`.

@@ -668,8 +668,10 @@ are listed in [runtime.md](runtime.md#the-time-library).
   appended when it has one, and a name that SHADOWS a global array is the shape that
   reads oddest: the global's own index is rewritten by a pass that matches by name alone,
   so the refusal is raised where the parser still knows what the binding really is. A
-  LOCAL and a FIELD of the class being parsed both shadow that way; a field that IS an
-  array is read as the field, index and all.
+  LOCAL and a FIELD of the class being parsed both shadow that way, and so do the other two
+  members a bare name stands for — a member `const` and a PROPERTY. A field or a property
+  that IS an array is read as the member instead, index and all: the field through its own
+  load, the property through its getter.
 
 ```teko
 // no-run
@@ -693,6 +695,31 @@ class H {
     public i64 h() {
         xs[0] = 8;            // ...while a field that IS an array reads the field
         return xs[0];
+    }
+}
+
+class K {
+    public const i64 src = 5; // ...and shadowed by a member CONST
+
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+}
+
+class L {
+    private i64  n;
+    private i64[] back;
+    public i64 src { get { return n; } set { n = value; } }
+    public i64[] ys { get { return back; } set { back = value; } }
+
+    // ...and by a scalar PROPERTY, the third member a bare name resolves to
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+
+    public i64 h() {
+        ys[0] = 8;            // ...while a `T[]` PROPERTY is read by its getter
+        return ys[0];
     }
 }
 ```

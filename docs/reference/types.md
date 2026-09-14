@@ -216,7 +216,9 @@ i64 main() {
 spelling. A comparison against `null` stays legal on any reference-shaped slot. It is not a
 number either, so it does not land in a numeric slot at all —
 `teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
-carries.
+carries. A **raw `uptr`/`ptr`** slot is the one exception, local or field: `0` is an ordinary
+value of a raw pointer, the type `null` already carries, so `uptr p = null;` is accepted and
+no `?` is written on it.
 
 **Every type on this page has a `T?`**, the scalars included: `i64?`, `f64?`, `bool?`,
 `char?`, `i8?`, an `enum?`, `TimeSpan?` and `DateTime?` are the same one mechanism, over a
@@ -267,9 +269,10 @@ literal above) is judged here.
 **A field store is one rule, at every site that writes one.** `p.f = e`, `this.f = e`, the
 implicit `f = e` inside a method or a constructor, a `static` field `T.f = e` (through its
 type, whether or not the type is already known where the store is written) and an ELEMENT
-of a `T[]`, `xs[i] = e`, all pass through the same check: the widening above, the narrowing refusal, `null` only in a `T?`
-field ([nullable.md](nullable.md)), an `enum` field converting from nothing but itself, and
-the reference/number mismatch (D34), in both directions.
+of a `T[]`, `xs[i] = e`, all pass through the same check: the widening above, the narrowing
+refusal, `null` only in a `T?` field ([nullable.md](nullable.md)) with the raw `uptr`/`ptr`
+slot above excepted, an `enum` field converting from nothing but itself, and the
+reference/number mismatch (D34), in both directions.
 
 ```teko
 // no-run
