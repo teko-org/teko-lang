@@ -755,8 +755,14 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
   method call lowers to does.
 - `"teko: wrong number of arguments for "` — completed by the name: the call's arity does
   not match.
-- `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
-  delegate `Op(...)`*, *`Op` takes a function, another `Op`, or null*, *`X` is not
+- `"teko: "` — completed by one of the delegate-shaped messages:
+  `" does not match the delegate "` (the target's own name on the left and the delegate's
+  signature on the right, `teko: byval does not match the delegate Mut(ref f64)` — the
+  arity, the return, the parameter types AND the `ref`/`out` kind of each all have to
+  match, on the contextual road and on `new Op(...)` alike, which share one thunk; the
+  POINTEE is part of the type, so `void fillc(ref Cell c)` on a `Fill(ref Box)` is refused
+  here and nowhere later),
+  *`Op` takes a function, another `Op`, or null*, *`X` is not
   captured; add it to use (...)*, and *`X` is used but never declared*.
 
 An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
@@ -1419,7 +1425,14 @@ the first declaration of that name: with `f64 pick(f64)` declared ahead of `i64 
 
 - ``"teko: the type of the left side of `.` is not known here"`` — the receiver's type could
   not be determined at that site. Bind it to a local of the right type.
-- `"teko: unknown member of "` — completed by the type's name.
+- `"teko: unknown member of "` — completed by the type's name. Since D61 a receiver that
+  is a CALL is among them — `mk().Nope`, `pick(1, 2).Nope` and `f().Nope` through a
+  delegate slot all read `teko: unknown member of DateOnly: Nope`, the type named, where
+  a call through a slot used to be refused by the member's name alone. The type named is
+  the one the PICK returns, on a row type as much as on a primitive one: with
+  `Cell cpick(i64)` declared ahead of `Box cpick(i64, i64)`, `cpick(1, 2).pad` reads
+  `teko: unknown member of Box: pad` (`tests/refuse/call_member_unknown.tk`), where the
+  first declaration of the name used to answer for the call and let the line compile.
 - `"teko: unknown member"` — the same, where the type has no name to print.
 - `"teko: the member is a field, not a method"` — drop the `()`.
 - `"teko: the member is a method; call it with ()"` — add them.
@@ -1563,7 +1576,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |
 | `"teko: too many locals of struct type"` | 256 |
 | `"teko: too many expressions whose type is known"` | 4096 expressions the parser typed in one unit — every load of a field, of an array element and of a `T[]`, every box and every indirect return spends one; 239 in `tests/surface_nullable_ops.tk`, the busiest fixture |
-| `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
+| `"teko: too many member accesses on a value of unknown type"` | 4096 member accesses waiting for the pass — a `.` on a receiver the parser cannot type (a parameter, a global, a type declared below) and, since D61, a `.` on any CALL the node itself carries no type for, `mkday().Day` included. It was 128 while only the first kind waited here |
 | `"teko: too many stores into a slot of class type"` | 4096 (D69; was 128) |
 | `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
 | `"teko: too many deferred call arguments"` | 4096 arguments of a VIRTUAL, an INTERFACE or an unqualified virtual call whose type the site that built the `callp` could not read — a global, a `ref`/`out` pointee, a bare name on the unqualified road — waiting for the pass; 26 in `tests/surface_globals_calls.tk`, the busiest fixture, and 1 in `tests/primitives_float.tk` |

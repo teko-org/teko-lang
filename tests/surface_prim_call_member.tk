@@ -1,0 +1,221 @@
+// surface_prim_call_member.tk -- the `.` whose RECEIVER is a CALL, on a
+// primitive-with-members or an enum (D61). One door, two defects that met on
+// it:
+//
+//   1. a call THROUGH a delegate slot had no `.` at all. `f()` is typed by the
+//      slot's row, and `tk_ty_of` (teko_typeof.tk, the sixth pass's oracle)
+//      had no arm for it -- `decl_find` owns no such name until the eighth
+//      pass rewrites the call into a `callp` -- so the deferred member was
+//      resolved by its name alone and `DOp f = mk; f().DayNumber` was refused
+//      `teko: unknown member: DayNumber` on a legal program. A local, a
+//      parameter, a global slot and a lambda bound to a slot all took it;
+//      binding the call to a local first was the only way through.
+//
+//   2. an OVERLOADED callee gave the wrong member. `tk_dot` (teko_expr.tk)
+//      typed a call receiver with `tk_pty_of`, which is `decl_ret(decl_find)`
+//      -- the FIRST declaration of the name, the guess D49 had already taken
+//      out of the pass-time oracle. With `DateTime pick(i64)` ahead of
+//      `DateOnly pick(i64, i64)`, `pick(1, 2).Day` lowered the DateOnly value
+//      through the DateTime row and answered 1 instead of 29: a SILENT wrong
+//      result. In the other order, a legal program was refused
+//      `teko: unknown member of TimeSpan: Day`.
+//
+// Both are the same fix on the same door: a call the parser cannot type from
+// the node itself is DEFERRED, and the pass-time oracle -- which asks the
+// delegate table first and `tk_ov_pick` second -- answers it.
+//
+// A receiver of CLASS, STRUCT or ENUM type came through the very same door,
+// with the very same guess one line earlier: `tk_struct_of_expr`
+// (teko_struct.tk) has an N_CALL arm of its own, `decl_ret(decl_find(name))`,
+// and it stood AHEAD of the deferral until Copilot's read of #718. Measured on
+// the branch's own head before the check moved: `Cell cpick(i64)` ahead of
+// `Box cpick(i64, i64)` read `cpick(1, 2).w` at CELL's offset for `w` (8) on a
+// Box object (whose `w` is at 0) and answered 0 instead of 7; where only one of
+// the two declares the name, the legal program was refused
+// `teko: unknown member of Cell: w` (and `of Box: pad` in the mirror order);
+// the struct pair answered 0 instead of 7 the same way; and two enums handed
+// `.ToString()` the wrong name table, in both orders.
+//
+// The shapes that already worked are anchored below, because the fix moves
+// every call receiver onto the deferred road: a direct call, a static, a
+// method, a virtual, an interface, a delegate FIELD and a chain -- and, since
+// the check moved ahead of `tk_struct_of_expr`, a direct call returning a
+// class, a struct or an enum with no overload anywhere near it.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+delegate DateOnly DOp();
+delegate DateTime DTOp();
+delegate TimeSpan TSOp();
+delegate DateTimeKind KOp();
+
+DateOnly mkday()   { return new DateOnly(2024, 2, 29); }
+DateTime mkstamp() { return new DateTime(2024, 2, 29, 13, 45, 30); }
+TimeSpan mkspan()  { return new TimeSpan(1234); }
+DateTimeKind mkkind() { return DateTimeKind.Utc; }
+
+DOp g_day;                                       // a GLOBAL slot of delegate type
+
+// ---- the overloaded callee: the pick decides which member the `.` reads ----
+DateTime pick(i64 a)          { return new DateTime(2024, 1, 1); }   // .Day == 1
+DateOnly pick(i64 a, i64 b)   { return new DateOnly(2024, 2, 29); }  // .Day == 29
+
+// ...and the mirror order, the one that used to REFUSE a legal program: the
+// first declaration of the name is a `TimeSpan`, which has no `Day` at all.
+TimeSpan mirror(i64 a)        { return new TimeSpan(7); }
+DateOnly mirror(i64 a, i64 b) { return new DateOnly(2024, 2, 29); }
+
+// ---- the overloaded callee whose return is a ROW: class, struct, enum ----
+// `w` sits at a DIFFERENT offset in each class, so reading the pick through
+// the wrong row is a silent wrong answer rather than a refusal; `pad`/`v` are
+// the names only ONE of the two declares, the refusal half of the same defect.
+class Cell { public i64 pad; public i64 w; public Cell() { pad = 100; w = 1; } }
+class Box  { public i64 w;  public i64 v; public Box()  { w = 7; v = 9; } }
+
+Cell cpick(i64 a)          { return new Cell(); }    // `w` at offset 8
+Box  cpick(i64 a, i64 b)   { return new Box(); }     // `w` at offset 0
+Box  cmirror(i64 a)        { return new Box(); }
+Cell cmirror(i64 a, i64 b) { return new Cell(); }
+
+struct SPad { public i64 pad; public i64 w; }
+struct SBare { public i64 w; }
+
+SPad  spick(i64 a)          { SPad s = new SPad; s.pad = 100; s.w = 1; return s; }
+SBare spick(i64 a, i64 b)   { SBare s = new SBare; s.w = 7; return s; }
+SBare smirror(i64 a)        { SBare s = new SBare; s.w = 7; return s; }
+SPad  smirror(i64 a, i64 b) { SPad s = new SPad; s.pad = 100; s.w = 1; return s; }
+
+enum Hue  { Red, Green, Blue }
+enum Mood { Calm, Wild }
+
+Hue  epick(i64 a)          { return Hue.Blue; }
+Mood epick(i64 a, i64 b)   { return Mood.Wild; }
+Mood emirror(i64 a)        { return Mood.Calm; }
+Hue  emirror(i64 a, i64 b) { return Hue.Green; }
+
+// the same three returns with NO overload at all: the shapes the moved check
+// carries from the parse road onto the deferred one
+Box   mkbox()  { return new Box(); }
+SPad  mkpad()  { SPad s = new SPad; s.pad = 100; s.w = 1; return s; }
+Hue   mkhue()  { return Hue.Green; }
+
+// ---- the anchors: the receivers that always worked ----
+class Clock {
+    public DateTime at;
+    public DOp cb;                               // a delegate FIELD, filled from outside
+                                                 // (a bare function name does not reach a
+                                                 // field store; surface_delegate.tk's own
+                                                 // `h.cb = cb` is the road)
+    public Clock() { at = new DateTime(2024, 2, 29); }
+    public virtual DateOnly stamp() { return new DateOnly(2024, 2, 29); }
+}
+
+class Tower : Clock {
+    public Tower() { }
+    public override DateOnly stamp() { return new DateOnly(2024, 3, 1); }
+}
+
+interface Ticker {
+    TimeSpan every();
+}
+
+class Beat : Ticker {
+    public Beat() { }
+    public TimeSpan every() { return TimeSpan.FromMinutes(1.0); }
+}
+
+// a delegate as a PARAMETER, called and read in one expression
+i64 day_of(DOp f) {
+    return f().Day;
+}
+
+i64 year_of(DOp f) {
+    return f().Year;
+}
+
+i64 main() {
+    // ---- 1. a delegate LOCAL ----
+    DOp f = mkday;
+    if (f().DayNumber != 738944) return 1;
+    if (f().Year != 2024) return 2;
+    if (f().Month != 2) return 3;
+    if (f().AddDays(1).Day != 1) return 4;       // a chain out of the call
+    if (f().AddDays(1).Month != 3) return 5;
+
+    // ---- 2. a delegate PARAMETER ----
+    if (day_of(f) != 29) return 6;
+    if (year_of(mkday) != 2024) return 7;        // contextual wrap at the call
+
+    // ---- 3. a GLOBAL slot ----
+    g_day = mkday;
+    if (g_day().DayNumber != 738944) return 8;
+    if (g_day().Day != 29) return 9;
+
+    // ---- 4. a LAMBDA bound to a slot ----
+    DateOnly src = new DateOnly(2024, 2, 28);
+    DOp lam = () use (src) => src.AddDays(1);
+    if (lam().Day != 29) return 10;
+    if (lam().Month != 2) return 11;
+
+    // ---- 5. the other three types through a slot ----
+    TSOp ts = mkspan;
+    if (ts().Ticks != 1234) return 12;
+    DTOp dt = mkstamp;
+    if (dt().Day != 29) return 13;
+    if (dt().Hour != 13) return 14;
+    if (dt().Date.Day != 29) return 15;          // a primitive member of a member
+    KOp k = mkkind;
+    if (!tk_str_eq(k().ToString(), "Utc")) return 16;
+
+    // ---- 6. the OVERLOADED receiver, in both orders ----
+    if (pick(1).Day != 1) return 17;
+    if (pick(1, 2).Day != 29) return 18;         // was 1: the DateOnly read as a DateTime
+    if (pick(1, 2).Month != 2) return 19;
+    if (mirror(1).Ticks != 7) return 20;
+    if (mirror(1, 2).Day != 29) return 21;       // was refused: `unknown member of TimeSpan: Day`
+    if (mirror(1, 2).DayNumber != 738944) return 22;
+
+    // ---- 7. the anchors ----
+    if (mkday().DayNumber != 738944) return 23;              // a direct call
+    if (mkstamp().Minute != 45) return 24;
+    if (DateOnly.FromDayNumber(738944).Day != 29) return 25; // a static
+    if (TimeSpan.FromHours(2.0).Hours != 2) return 26;
+    if (new DateOnly(2024, 2, 29).Year != 2024) return 27;   // a constructor
+    Clock c = new Clock();
+    c.cb = f;
+    if (c.stamp().Day != 29) return 28;                      // a virtual, base row
+    if (c.cb().Day != 29) return 29;                         // a delegate FIELD
+    Clock t = new Tower();
+    if (t.stamp().Month != 3) return 30;                     // a virtual, derived row
+    if (t.stamp().Day != 1) return 31;
+    Ticker tick = new Beat();
+    if (tick.every().Minutes != 1) return 32;                  // an interface call
+    if (mkstamp().Date.AddDays(1).Day != 1) return 33;       // the whole chain
+
+    // ---- 8. the receiver whose return is a ROW, both orders ----
+    if (cpick(1).w != 1) return 34;              // Cell: `w` at offset 8
+    if (cpick(1, 2).w != 7) return 35;           // was 0: the Box read at Cell's offset
+    if (cpick(1, 2).v != 9) return 36;           // was refused: `unknown member of Cell: v`
+    if (cmirror(1).v != 9) return 37;
+    if (cmirror(1, 2).w != 1) return 38;         // was 7: the Cell read at Box's offset
+    if (cmirror(1, 2).pad != 100) return 39;     // was refused: `unknown member of Box: pad`
+    if (spick(1).w != 1) return 40;              // the struct pair, same two orders
+    if (spick(1, 2).w != 7) return 41;
+    if (smirror(1).w != 7) return 43;
+    if (smirror(1, 2).w != 1) return 44;
+    if (smirror(1, 2).pad != 100) return 45;
+    if (!tk_str_eq(epick(1).ToString(), "Blue")) return 46;    // two enums, the pick's
+    if (!tk_str_eq(epick(1, 2).ToString(), "Wild")) return 47; // own name table
+    if (!tk_str_eq(emirror(1).ToString(), "Calm")) return 48;
+    if (!tk_str_eq(emirror(1, 2).ToString(), "Green")) return 49;
+
+    // ---- 9. the same three returns with no overload: the road that moved ----
+    if (mkbox().w != 7) return 50;
+    if (mkbox().v != 9) return 51;
+    if (mkpad().pad != 100) return 52;
+    if (!tk_str_eq(mkhue().ToString(), "Green")) return 53;
+
+    return 42;
+}
