@@ -1909,8 +1909,8 @@ members as `switch` labels through a parameter and a local, both explicit casts,
 from a call's return, from a field and from an array element, `.ToString()` on a member/a
 property/a value outside the set, `Parse`/`TryParse` with `out`/`IsDefined`, a ternary over
 two enum arms and a by-value capture; and `tests/surface_datetime_kind_panic.tk` (70), the
-run-time kind guard `(DateTimeKind) 7` still reaches. The refusals above have no harness
-(D33) and are in `diagnostics.md` behind a `// no-run` fence.
+run-time kind guard `(DateTimeKind) 7` still reaches. The refusals above had no harness at
+the time (D33) and were in `diagnostics.md` behind a `// no-run` fence — landed, D52.
 
 **`--dump-ast`, and the two diffs that are NOT the accepted code moving.** 53 of the 59
 existing fixtures are byte-identical to `37417b63`. The six that are not are exactly the
@@ -3225,3 +3225,74 @@ and read through the implicit `gl[0]` and asserted against `x.gl[0]` and against
 own untouched `gl[0]` — and `rccheck`'s floor is unmoved at **4**, the new array dying with
 its object. `mc pkg hash .` over the source tree of this pass's code and fixture commit:
 `87e627f70123afa56da2f314ba445066e265890594029cc694fecfbbb28f9595`.
+
+### D52 · A refusal has a harness (2026-09-14)
+D33 closed the integer-to-float narrowing refusal and, in the same entry, named the gap:
+`tests/` held only programs that compile and run, judged by `// expect-exit`, and a
+refusal — a `teko:` message and the line it is raised at — had no oracle of its own. Every
+crumb since has paid the same tax: a `docs/reference/diagnostics.md` or `docs/specs/*.md`
+entry fenced `// no-run`, a claim in prose ("measured on `b48d465c`") that nothing after
+that commit re-checks, and a growing set of throwaway probes outside `tests/` that a scout
+has to re-measure by hand every time. This crumb closes it, in the harness's own words
+rather than a new one.
+
+**One corridor, one script.** `scripts/fixtures.sh <compiler> <config-base> [exe-suffix]`
+is what four call sites used to repeat with small, driftable variations —
+CONTRIBUTING.md's own recipe, `scripts/bootstrap.sh`'s criterion 3, and the CI leg's
+"primitives, types and surface fixtures" step, itself a THIRD glob
+(`tests/primitives_*.tk tests/types_*.tk tests/surface_*.tk`) that silently skipped
+`tests/order_*.tk` — the two `order_*` fixtures ran under `scripts/bootstrap.sh`'s
+`tests/*.tk` loop (the `fixpoint` job) but never in the five-leg `ngen (<os>/<arch>)` job
+itself, the only one the `main` ruleset's aggregator actually requires. The script now
+reads every fixture directly under `tests/` (no glob, no exclusion) and both fixture kinds
+through the same loop shape derive/build/judge already had.
+
+**The second kind.** `tests/refuse/*.tk` carries a two-line header —
+`// expect-refuse: teko: <the exact message>` and `// expect-refuse-line: <the exact
+line>` — and the script demands the build FAIL (a build that succeeds where a refusal was
+named is itself the failure) with that exact `:<line>: teko: <message>` substring in the
+compiler's own stderr, CR-stripped for the Windows legs and matched with `grep -F` so a
+message carrying `?`, `[` or `.` is read literally rather than as a pattern. Message and
+line are BOTH checked, deliberately: measuring a handful of constructs beforehand showed
+the two can move independently — the same wording at a line the source did not raise it on
+is as wrong a proof as the right line with stale words, and a diagnostic completed by an
+appended name (`` "teko: method of `" `` + `I` + `" not implemented"` ) only reads right as
+the ONE literal line the compiler actually writes, not the two halves `diagnostics.md`
+quotes apart. A `.tk` under either directory missing its header(s) fails the run outright
+instead of being silently skipped — a harness that can be starved of its own oracle by a
+typo is not a harness.
+
+**Fifteen fixtures, one per permanent law**, deliberately NOT the two provisional
+restrictions `docs/reference/not-yet.md` still lists as "for now"
+(`i64? == 5`, `items[0]` with no `this`) — a harness fixture is a regression lock, and
+locking a restriction the language intends to lift is exactly the debt this crumb should
+not add. The fifteen, each measured against `build/teko` at `13b3c38a` before being
+written down: an `f64` narrowed into `i64` by assignment (`narrow_assign.tk`), `null` into
+a plain reference slot (`null_nonnullable.tk`), a non-null reference into a numeric slot
+(`ref_into_numeric.tk`, D34), a plain integer into an `enum` slot (`enum_from_int.tk`),
+`+` over two `enum` members (`enum_plus.tk`), a global `T?` over a value type
+(`nullable_global_value.tk`, D44), a field declared `void` (`field_void.tk`), a `struct`
+local read through before `new` (`struct_no_new.tk`, D46 — the same rule a plain scalar
+local gets), a `void` call's result stored into a typed field (`field_store_void.tk`,
+D50), narrowing through a static field (`static_field_narrow.tk`), through `this`
+(`this_field_narrow.tk`) and through a heap array element (`array_elem_narrow.tk`) — three
+fixtures over the one gate D50 unified, each proving a different call site still reaches
+it — narrowing through `return` (`return_narrow.tk`), instantiating an `abstract class`
+(`abstract_new.tk`) and a class declaring an interface it does not fully implement
+(`interface_missing.tk`).
+
+**Proof:** `scripts/fixtures.sh ./build/teko mc.macos.toml` → **63 passed, 15 refused as
+expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`,
+the same corridor under the self-hosted `teko1`; `sh scripts/check-docs.sh` green (570
+links, 387 diagnostics, 122 samples); `mc limits . --config mc.macos.toml` verdict `ok`,
+every table unmoved (`passes` 15/30, `types` 11, `intrin` 8/16, `alias` 18); `--dump-ast`
+of all 63 `tests/*.tk` fixtures byte-identical between `13b3c38a` and this head — no
+`teko*.tk` module touched, so the proof is trivial by construction and confirmed instead
+of assumed; `mc pkg hash .` unchanged
+(`87e627f70123afa56da2f314ba445066e265890594029cc694fecfbbb28f9595`) — `mc.toml`'s `files`
+lists no script, test or doc. A mutation drill on the harness itself: the message, then the
+line, then the whole diagnostic of one refuse fixture were each corrupted in turn, and
+`scripts/fixtures.sh` failed the corridor each time with the exact stderr it read printed
+alongside — the third mutation (swapping the `teko:` refusal for an unrelated core error,
+`unknown name`) is the harness proving it does not accept ANY build failure as a pass, only
+one whose stderr carries the named diagnostic.

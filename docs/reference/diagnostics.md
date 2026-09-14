@@ -16,6 +16,12 @@ not documented here fails the `docs` gate. Some messages end mid-sentence in thi
 because the compiler appends a name to them — the quoted part is the fixed text, and the
 entry says what completes it.
 
+A refusal has its own harness: [`tests/refuse/`](../../tests/refuse/), run by
+[`scripts/fixtures.sh`](../../scripts/fixtures.sh) beside `tests/*.tk`. Each fixture there
+carries a two-line header naming the exact message and the exact line —
+`// expect-refuse: teko: <message>` / `// expect-refuse-line: N` — and the build has to fail
+with that line in its stderr (D52).
+
 ---
 
 ## Declarations and types
