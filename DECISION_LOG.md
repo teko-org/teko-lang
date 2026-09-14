@@ -2543,8 +2543,8 @@ samples). `mc limits` verdict `ok` on both legs with every table unmoved from th
 of this entry's code commits, after the eighth pass: `1a4edc3dc140c8270a2c8fa29940b8aebf1dab673298b8026453e1a336560e62`.
 
 ### D50 · Every field store is one gate, and one judgement (G-e, 2026-09-13)
-*This entry is the whole of D50 as it stands. It was written in six passes over
-[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and five Copilot reviews
+*This entry is the whole of D50 as it stands. It was written in seven passes over
+[#698](https://github.com/teko-org/teko-lang/pull/698) — the crumb and six Copilot reviews
 — and every earlier wording of it, including the `tk_member_fn` push described below, the
 two-oracle door the third pass removed, the silent `-1` the fourth one turned into a
 refusal, the registration the fourth one gave every call alike and every intermediate proof
@@ -2703,6 +2703,55 @@ registers the element type itself: `tk_arr_load` cannot do it for both, being sh
 the NARROWING it is; `Cell[] gc; this.c = gc[0]` and a fixed `i64 gx[2]` the same. Before the
 crumb all four compiled and wrote the raw eight bytes.
 
+**The loads the PARSER itself resolves carry their type too.** A FIXED array's element is
+lowered where it is read — `a[0]` on a local (`tk_arr_index_of`, teko_array.tk) and
+`this.items[0]` on an inline array field (`tk_array_index`, teko_struct.tk) — so no pass ever
+revisits either one and the tag has to be written at the site. Neither wrote one for a SCALAR
+element: `tk_arr_index_of` tagged nothing at all and `tk_array_index` registered a ROW alone,
+the same half-registration the indirect call had. Measured on `6a30d158`: with `f64 rate`,
+`i64 a[2]; this.rate = a[0];` and `this.rate = this.items[0];` on an `i64 items[2]` were both
+REFUSED, `teko: the type of this value is not known here`; after, both read back **6.0** and
+**4.0**, and the mirrors (`i64 n; this.n = fa[0]` on an `f64 fa[2]`, and the inline twin)
+refuse the NARROWING they are instead of the type they have. Each writes
+`tk_xt_put(r, tk_struct_by_ty(ety), ety, ...)` — the row when the element has one and the
+type id in every case — which is exactly `tk_ha_load`'s own registration one slot over, and
+what `tk_arr_load` may not do for either: a `ref` parameter's read and a lambda capture's go
+through it too, and they are elements of nothing.
+
+**The type table is METADATA FOR THE UNIT, and its ceiling has to fit a real program.**
+`TK_MAXXT` (teko_struct.tk) was **256** rows and `TK_MAXFS` (teko_typeof.tk) **512**, figures
+inherited from a table that only a struct load wrote to. This crumb made the marking UNIFORM
+— every load of a field, of an array element, of a `T[]` and of a fixed array, every box and
+every non-`void` indirect return spends one row, and a row is never released — so 257 valid
+scalar reads in one unit met `teko: too many expressions whose type is known` where the
+program was correct: measured, a body of **300** field stores from a global `i64[]` was
+refused at the 260th on `6a30d158`. Both become **4096**: 5 columns × 4096 × 8 B = 160 KB
+each, 320 KB in all, against a 33554432-byte reservation whose floor leg (`tests/hello.tk`)
+moves from **467824** to **1114992** bytes used, `mc limits` verdict `ok` with every other
+table unmoved. Measured with a throwaway counter printed at the last pass, the busiest
+fixture spends **239** of `TK_MAXXT` (`surface_nullable_ops`) and **28** of `TK_MAXFS`
+(`surface_field_store`), so the new ceiling is sixteen times the worst case either table has
+ever seen; the boundary is proved from both sides — 300 reads compile, 4200 are refused with
+the table's own message, the fixed-array road on `TK_MAXXT` and the global one on `TK_MAXFS`.
+
+**One rule, not a policy per shape.** A narrower marking was weighed and REJECTED: an
+indirect return of `f64` or of a sub-word integer already carries `tk_callp_ret`'s declaring
+cast, and `tk_ty_of` could read the type off that cast instead of off a row. It saves rows
+only for calls whose return is one of those two shapes, it is a second answer for a question
+that has one, and it makes "is this value marked?" depend on the value's own type — the
+condition every defect in this entry came from. The uniform rule is the cheap one at 4096
+rows: what the parser knows and no pass recovers is MARKED, everywhere, and the capacity is
+what pays for it.
+
+**A direct call with ONE declaration is still deferred, on purpose.** `tk_fs_vty` answers -1
+for every `N_CALL`, and `tk_pty_of` could type the single-declaration case off `decl_ret`
+with no ambiguity at all. It would be wrong for the same reason the overloaded case is: the
+declaration count is a fact about the file READ SO FAR, and a second declaration of the same
+name BELOW the store turns the answer the door already gave into the wrong one — D49's own
+limit, and the reason a call is judged after the pick is committed (pass 14) rather than
+where it is written. The deferral costs one row of `TK_MAXFS`, which is what the paragraph
+above just paid for.
+
 **An ELEMENT of a `T[]` of heap goes through the one door.** `tk_ha_store` called
 `tk_check_field_store` directly, which is the ROW half judged with the PARSE-TIME oracle and
 nothing else: `Cell[] xs; xs[0] = rick(1, 2);` was refused — `teko: a value of type i64 does
@@ -2732,7 +2781,7 @@ parameter answers -1 there — one table for two questions is what that rule was
 against. Deletion over addition: there is no such push, and the 62 pre-existing dumps are
 byte-identical either way.
 
-**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty helpers: the
+**Coverage.** `tests/surface_field_store.tk` (`expect-exit: 42`), twenty-one helpers: the
 constructor's explicit `this.rate = k` and the implicit `rate = k`; a method's
 `this.rate = this.rate + 1`; a `static f64` written and read back; a `Cell?` field boxing
 `null` and a live reference; an `enum` field; `this.rate = k + 1` (an N_BINARY); `rate =
@@ -2750,7 +2799,9 @@ the float return beside them, which never had the bug; an ELEMENT of a `T[]` of 
 four shapes (the pick that returns a row, the compound over a load nobody typed, the
 widening an `f64[]` writes, the box an `i64?[]` wraps) with `rt_live()` back to its floor
 inside the helper; an element of a GLOBAL array in a field store, both kinds — the `T[]` of
-heap and the fixed one — into an `f64` field and into a `Cell?` one; and `rt_live()` back to
+heap and the fixed one — into an `f64` field and into a `Cell?` one; an element of a LOCAL
+fixed array and an element of an INLINE array field, the two loads the parser resolves on the
+spot, each into an `f64` field; and `rt_live()` back to
 its floor at the end, that floor being the three objects the two global arrays ROOT (a global
 array is never released, `surface_array_global.tk`'s own header). The file exits **71** on
 `c7df7787` (the first head of the PR); on `5ecae153` it is REFUSED at the operator store,
@@ -2763,7 +2814,8 @@ declaration; with that one neutralised it exits **171**, the virtual `i64 M()` w
 bits the `f64` field kept; with the virtual helper neutralised too it exits **181**,
 `f64[] fs; fs[0] = 1;` writing the integer's. On `21ca62ae` (the fifth head, and this
 paragraph's own "before") it is REFUSED at `this.rate = gl[0]`, the global element no
-registration reached.
+registration reached. On `6a30d158` (the sixth head, and this paragraph's own "before") it is
+REFUSED at `this.rate = a[0]`, the local fixed array's element no registration reached.
 
 Compound assignment on a field (`this.rate += 2;`) is not taught: the `+=` sugar takes a bare
 NAME on its left, ``the rule expected a name on the left``, a pre-existing and unrelated gap,
@@ -2775,7 +2827,7 @@ receiver, and the narrowing a PICK asks for — are `// no-run` samples in
 [types.md](docs/reference/types.md) and [diagnostics.md](docs/reference/diagnostics.md),
 reusing the wording every mismatched value already gets. Two `teko: ...` strings are new in
 the whole crumb: the deferral table's own ceiling, `teko: too many field stores of unknown
-type` (512), and the judgement's own refusal, `teko: the type of this value is not known
+type` (4096), and the judgement's own refusal, `teko: the type of this value is not known
 here`, both documented with the judgement itself; the element store's refusals reuse the
 wording every mismatched value already gets.
 
@@ -2785,16 +2837,22 @@ predate the crumb, against `da33ebd4` — **62 byte-identical**, since every sit
 touches only changes a program that was previously silently WRONG or wrongly refused;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (63/63 under the
 self-hosted `teko1`); `sh scripts/check-docs.sh` green (570 links, 387 diagnostics, 120
-samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table unmoved — `passes`
-15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new pass, no new
-intrinsic (D2, D21). `mc pkg hash .` over the source tree of this entry's code commits:
-`4f17b27134763dbbc70911197d4e5814b6a99858b6aa834da5d24f52925221b7`.
+samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
+— `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new
+pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that moves,
+**467824 → 1114992** bytes used against a 33554432-byte reservation, which is the two tables
+raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits:
+`3b494b9d138ad4420f8492f43802cdf7ffaf0cde03b36b9a6df9c8b0a12ab015`.
 
 A throwaway instrumentation after the judgement — every row of the deferral table asserted
 `done` — proved that no deferred store survives it, over the 63 fixtures and the whole
 bootstrap; re-run on every later pass, where a row the judge cannot type is a refusal rather
 than a silent store, it also proves that no store is ACCEPTED with `-1`: every fixture
-compiles and none of them trips the refusal. The `TK_MAXXT` ceilings quoted above are
-bisections: the constant is lowered, the compiler rebuilt and all 63 fixtures compiled, and
-the smallest value none of them trips is the worst case. Probe matrices outside `tests/`
-(not committed) measured each defect above before its fix and its absence after.
+compiles and none of them trips the refusal. The `TK_MAXXT` and `TK_MAXFS` figures quoted
+above are a throwaway counter printed at the LAST pass, `tk_rc_pass`, on both of its exits —
+the two tables are per unit and never reset, so their final value is the unit's cost — run
+over all 63 fixtures; the 253-call ceiling of the fifth pass, and the 2000 beside it, are
+bisections, the constant lowered and every fixture recompiled until one trips. Probe matrices
+outside `tests/` (not committed) measured each defect above before its fix and its absence
+after, and the two capacity boundaries from both sides: 300 scalar reads compile, 4200 are
+refused with the tripped table's own message.

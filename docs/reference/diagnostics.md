@@ -1036,10 +1036,10 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `T[]` parameters in one declaration"`` | 32 |
 | `"teko: too many locals in one unit"` | 8192 |
 | `"teko: too many locals of struct type"` | 256 |
-| `"teko: too many expressions whose type is known"` | 256 |
+| `"teko: too many expressions whose type is known"` | 4096 expressions the parser typed in one unit — every load of a field, of an array element and of a `T[]`, every box and every indirect return spends one; 239 in `tests/surface_nullable_ops.tk`, the busiest fixture |
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
-| `"teko: too many field stores of unknown type"` | 512 field stores whose value no oracle types at the site, waiting for the pass |
+| `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 28 in `tests/surface_field_store.tk`, the busiest fixture |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |
