@@ -5488,19 +5488,26 @@ argument the SOURCE writes draws on. Measured, one generated unit, 30 delegate t
 parameters) plus N `src(ref x)` calls, the same text compiled by the base compiler
 (`441be45a`) and by seat (i) (`cd844c2a`):
 
-| N source `ref` arguments | base `441be45a` | seat (i) `cd844c2a` | seat (iv) |
+| N source `ref` arguments | base `441be45a` | seat (i) `cd844c2a` | seat (iv) `0ef92adc` |
 |---|---|---|---|
 | 272 | accepted | accepted | accepted |
-| 273 | accepted | **refused** | accepted |
-| 500 | accepted | refused | accepted |
-| 512 | accepted | refused | accepted |
-| 513 | refused (the table's real ceiling) | refused | refused |
+| 273 | accepted | **segfault (139)** | accepted |
+| 500 | accepted | segfault (139) | accepted |
+| 512 | accepted | segfault (139) | accepted |
+| 513 | segfault (139) | segfault (139) | refused (the table's real ceiling) |
+
+The overflow is a SEGMENTATION FAULT everywhere the guard below is still the swapped
+`err_at`, which is every column but the last: exhausting `TK_MAXRFARG` crashed the compiler,
+it did not refuse. The word "refused" belongs to seat (iv)'s tree alone, where the same
+overflow finally speaks — ``teko: too many `ref`/`out` arguments in one unit``, with the file
+and the line (re-measured on the third pass, mc 0.15.23, macos/aarch64; the probe is
+regenerated per N and no row is quoted from an earlier run).
 
 Seat (i) cost the unit 240 of its 512 rows — code no one wrote — and a legitimate 273rd
-source `ref` argument then died where the base compiler takes 512. Seat (iv) puts the whole
-budget back: 512 on both roads, `new` and contextual alike, which is more than the base
-manages, since the base cannot compile the `new` road at all (that is this decision's own
-bug).
+source `ref` argument then crashed the compiler where the base compiler takes 512. Seat (iv)
+puts the whole budget back: 512 on both roads, `new` and contextual alike, which is more than
+the base manages, since the base cannot compile the `new` road at all (that is this
+decision's own bug).
 
 **Why seat (iv) is the root and not a hole punched in a check.** A thunk is not a body the
 program wrote and then had exempted; it is a body the COMPILER wrote, argument by argument,
@@ -5550,7 +5557,7 @@ refusal gate matches the compiler's own string, and the phrase was split across 
 naming the kind as part of what has to match. No new `teko: …` refusal was added by either
 pass.
 
-**Proof** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
+**Proof, second pass** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config mc.macos.toml`
 clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **73 passed, 51 refused as
 expected, 0 failed** (was 73/50); `--dump-ast` byte-identical against the base compiler for
 **all 73** pre-existing `tests/*.tk` — `tests/surface_globals.tk` included, the two
@@ -5567,3 +5574,83 @@ tests/surface_delegate.tk` both byte-identical to the base compiler's; `mc pkg h
 `b3b40c5aa0985d1205838560f11107624da2f78471934ea5afec518185e5dbad` (base
 `571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
 `teko_ref.tk` are listed files, so the hash moves by design).
+
+**Third pass, verifier finding: the RECLAIM's argument check judged the same forwarding.**
+The `ref` pass was not the only pass asking a question about the thunk's body. `tk_rc_call_args`
+(`teko_rc.tk`, D226's compat crumb) checks every `N_CALL`'s arguments against the callee's
+declared parameter types, and it routes a `ref`/`out` parameter to the rule that owns pointees
+(`tk_ref_check_pointee`) only when the ARGUMENT node is an `N_ADDR` — the shape `f(ref x)` has
+at the surface. A thunk forwards the caller's address as the bare name of a slot declared
+`uptr` (`tk_id(pn)` over `dg_pslot_at`, K2w), which is not an `N_ADDR`, so the argument fell to
+the ordinary `tk_check_compat(pt, at)` with `pt` = the POINTEE and `at` = `uptr`. Permissive
+for a scalar pointee — `uptr` against `f64` or `i64` has no row to fit and passes — and a hard
+row-fit refusal for a class or a struct one:
+
+```teko
+class Box { public i64 v; public Box(i64 x) { v = x; } }
+delegate void Fill(ref Box b);
+void fill(ref Box b) { b.v = 3; }
+
+i64 main() {
+    Box b = new Box(1);
+    Fill f = fill;                                // ...and `new Fill(fill)` alike
+    f(ref b);
+    return b.v;
+}
+```
+
+``teko: a value of type uptr does not convert to Box``, at the line of the delegate's own
+declaration, on BOTH roads — measured on the base compiler (`441be45a`) and on the second
+pass (`7aae5261`), for `ref Box`, `ref DateOnly` (a four-byte primitive), a `ref` struct and
+`out Cell`, eight programs in all. Not a regression against `main`: the base refuses the same
+eight, six of them in these very words and the two `new` ones with the ``argument 1 needs
+`ref` at the call site`` this decision's first pass removed. It IS a regression inside the
+branch — seat (i) (`cd844c2a`) compiled all eight, by accident: the `(uptr)` cast it wrapped
+the forwarded name in made the node something `tk_ty_of` answered with the TAG's pointee, so
+the compat question came out right for the wrong reason. The budget probe killed that seat,
+and the accident with it.
+
+**The fix is the rule already in force, applied to the second pass that breaks it.**
+`tk_rc_call_args` returns at once when the function it is walking is a thunk
+(`tk_deleg_is_thunk(tk_rc_cur_fn)` — the pass already keeps the enclosing `N_FUNC` in
+`tk_rc_cur_fn` for K2's own `ref`/`out` exception, and it is the same identity `tk_ref_pass`
+skips under). One line, one file. There is nothing there to judge — `tk_deleg_check_sig`
+proves the target identical to the delegate parameter by parameter, type AND kind, before any
+thunk exists — and nothing to rewrite: with `pt` equal to `at` at every by-value position, the
+widen (`tk_num_widen`) and the box (`tk_nl_wrap`) the walk also performs are no-ops inside a
+thunk, which is why no dump of a thunk body moves. The reclaim's own work is untouched: this
+is one call's argument check, not the pass, and a `ref` argument carries no count in the first
+place (the park, the own and the releases all live in `tk_rc_walk`/`tk_rc_store`, which still
+walk the thunk exactly as before — `Mut__thunk_bumpf`'s dump is byte-identical). D63's rule,
+restated once more and now pass-agnostic: **no pass judges the compiler's own forwarding.**
+
+**Fixtures, third pass.** `tests/surface_delegate.tk` grows `pcheck`, the seventh helper:
+`delegate void Fill(ref Box b)` over a class, `delegate void Move(ref Pt p)` over a struct and
+`delegate void Mk(out Cell c)` over a counted class, each on BOTH roads, with the target both
+WRITING through the reference (`b.v = 3`) and REBINDING the caller's slot (`b = new Box(7)`,
+the prior reference released), `expect-exit: 42` unmoved. `rt_live()` is 1 rather than 0 after
+it: the one `Pt` a struct allocates carries no count and is live for the run, `lib/rt.tk`'s own
+declared debt — and `cell_dtors` reaches 8, the two `out` rebinds plus the slot itself, which
+is what says the thunk road neither leaks nor double-frees. `tests/surface_dateonly.tk` carries
+the four-byte pointee (`delegate void SetDay(ref DateOnly d)`, `nextday` through both roads,
+`return 84` through `return 87`), where `lib/time.tk` is already in scope. One refusal,
+`tests/refuse/deleg_new_ref_pointee.tk`: `new Fill(fillc)` over `void fillc(ref Cell c)` is
+refused by `tk_deleg_check_sig` for the POINTEE, `teko: fillc does not match the delegate
+Fill(ref Box)`. No new `teko: …` message on this pass either — both fixtures' before-states
+are existing refusals.
+
+**Proof, third pass** (mc 0.15.23, macos/aarch64, base `441be45a`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **73 passed, 52
+refused as expected, 0 failed** (was 73/51); the eight programs above compile and run to 0 on
+both roads and refuse on `441be45a` and on `7aae5261` alike; `--dump-ast` byte-identical
+against the base compiler for **all 73** pre-existing `tests/*.tk` with their original
+sources, `tests/surface_globals.tk` and its two thunks included — the skip removes no node,
+because the check it skips wrote none; `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK` (133.3s); `sh scripts/check-docs.sh` → 598 links, 41 fragments, 389 diagnostics,
+52 refusals, 142 samples, all green; `mc build . --config mc.macos.toml --limits` verdict
+`ok`, every COUNTED table where the second pass left it — `passes` 15/30, `syntax` 15/30,
+`alias` 20/40, `types` 13/26, `intrin` 8/16 — with `funcs`/`lowered` 3819, `globals` 1273 and
+`symbols` 7760 unmoved and only `nodes` 179140 → 179259 and `ins` 216116 → 216125 on the
+compiler leg; `./build/teko limits tests/hello.tk` byte-identical to the base compiler's; `mc
+pkg hash .` `c9f8692f8bfdba896b329d634fa10357cff0f936e1195111549082d66799501b` (`teko_rc.tk`
+is a listed file, so the hash moves by design).
