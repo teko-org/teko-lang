@@ -6902,6 +6902,18 @@ program's tree); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOIN
 samples`; `mc limits . --config mc.macos.toml` verdict **ok** on every row but `heap` (never
 cited, per this crumb's own gate).
 
+**Copilot on #724, pass 1.** `word_is_taught` also answers 1 for punctuation with a registered
+infix handler (`+`, and member access's own `.`/`[`/`?`), so the helper accepted `i64 +;` as a
+member name. `tk_member_word_ok` (teko_struct.tk) now restricts the widening to a WORD — an
+identifier, or a taught token whose lexeme starts with a letter or `_` — and `tk_loop`'s
+`foreach (... in x.m)` guard reads the same predicate; `i64 +;` is `name expected` again, from
+the core. The fixture grew the seats with a parser of their own: an interface member (`when`),
+a member const read through the type (`scope`), `ref b.match` into a `ref` parameter, `foreach`
+over an inline array field (`switch`), and `base.type()` from an override — every one keyed to a
+`syntax` word the base compiler refuses. Measured while probing: `loop` is mc's OWN keyword
+(refused everywhere, rightly), and a member named `namespace` dies `mc: empty lexeme` in the
+core — recorded in `not-yet.md`, not worked around.
+
 ### D69 · Five capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256, `TK_MAXEMIT` 512 -> 4096, `TK_MAXMETHOD` 128 -> 1024 (2026-09-14)
 
 (D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
