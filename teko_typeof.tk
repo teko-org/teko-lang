@@ -752,6 +752,25 @@ void tk_fs_do(i64 i) {
     i64 vty = tk_ty_of(n);
     if (vty < 0)
         err_at(fst_file_at(i), fst_line_at(i), "teko: the type of this value is not known here");
+    // ...and a value the pass types `void` is no value at all. The judge below
+    // has no clause for it -- `TY_VOID` names no row, it is not a float and it
+    // is not one of `tk_is_int_ty`'s words, so a field of NUMBER type took it
+    // in silence -- and the core caught only the calls it can see: a DIRECT
+    // `this.rate = v();` is refused by mc's own `value of type void`, while a
+    // VIRTUAL or an INTERFACE one is a `callp` the core types `TY_I64` by
+    // itself, so `i64 n; this.n = b.M();` on a `void M()` compiled and stored
+    // whatever the call had left in the return register (measured: exit 64,
+    // and the interface twin the same; Copilot on #698, pass 11). The three
+    // indirect sites now register their declared return, `void` included
+    // (teko_expr.tk), and this is where that answer becomes the refusal --
+    // in the wording every mismatched value already gets, which a field of
+    // reference type was already getting from `tk_check_compat` below.
+    if (vty == TY_VOID) {
+        uptr fname = type_name(fty);
+        i64 fi2 = tk_struct_by_ty(fty);
+        if (fi2 >= 0) fname = sr_name_at(fi2);
+        tk_reject_compat(type_name(TY_VOID), fname, fst_line_at(i), fst_file_at(i));
+    }
     // the SAME judge every other slot of the language uses -- the two scalar
     // verdicts and the row one, in one call -- which is what tells an `enum`,
     // a primitive with members, a raw `uptr` and an unrelated class apart from
