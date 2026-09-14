@@ -6927,6 +6927,169 @@ DECLARATION count, only the reserved bytes behind each one, confirmed directly a
 `teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
 design).
 
+### D70 · A lambda inside a method reads the CLASS's own member, never a same-named global, silently (2026-09-14)
+`i64 n = 100; class Holder { public i64 n; public i64 direct() { return n; } public void
+arm() { this.cb = new Op((i64 x) => x + n); } }` -- `direct()` read the field (1,
+`tk_this_ident`); `arm()`'s own lambda read the GLOBAL instead (100), for the identical bare
+name, neither refused. `tk_lam_check_name` (teko_deleg.tk) asked scope, capture,
+`decl_find` (functions only) and `tk_struct_find` (types only) -- never the enclosing
+class's own members -- so a global that only happened to share a field's name silently won
+the door `tk_this_field` already guards for the method itself.
+
+D11 stands: a lambda captures nothing implicitly, `this` included, and giving it one is a
+design of its own -- a closure holding a counted `this` opens a reference cycle the reclaim
+does not break on its own, an open fork rather than a patch here (recorded in
+`docs/reference/not-yet.md`). So the fix is the refusal a field with no colliding global
+already gave: `tk_lam_member` (new, teko_deleg.tk), asked right before `decl_find` for
+every bare `N_IDENT`, checks `tk_field_find`/`tk_mconst_find`/`tk_prop_find`/
+`tk_method_named_find` against `tk_body_class` -- the PARSE-time class the lambda's own
+`tk_lambda_finish` still runs inside (the generated function is only promoted to a
+top-level `N_FUNC` afterwards, past every later pass's own reach). An INSTANCE member reads
+`teko: X is not captured; add it to use (...)`, the same sentence a plain field already
+answered with; a STATIC one takes no receiver and resolves right there, the same road
+`tk_this_field_addr`/`tk_mconst_use`/`tk_prop_static_use` already open for the method
+itself -- measured: it did not resolve before this fix either (a static field/method named
+bare inside a lambda answered the SAME "not captured", or a raw core error for a call --
+never a working read), so nothing regresses by making it work now.
+
+The CALL twin of the same door: `go(x)` inside a lambda, `go` a method of the class.
+`tk_lam_walk` only ever looked at `N_IDENT`; a call's own name was never checked, so it fell
+straight to the core's own resolver (`gen_resolve.mc`), which knows no function literally
+named `go` (a method's real symbol is always mangled) and refused `call to unknown
+function` -- the core's wording, never teko's -- and a FREE function of the identical name
+would have silently answered in `go`'s place, the same silent-shadow bug for a call instead
+of a read (measured). `tk_lam_check_call` (new) asks `tk_method_named_find` the same way,
+before `tk_lam_walk` even reaches the call's arguments; a STATIC method resolves (the
+mangled symbol takes the call node's own name, `tk_fill_defaults` filling what the site
+left out); an INSTANCE one is refused by a literal of its own, `teko: a method is not
+reachable from a lambda`, completed by the name -- `use (...)` captures a VALUE, never a
+method, so the field's own sentence would read false here.
+
+**A third door, found once D65 landed on top of this crumb: a delegate FIELD, called
+bare.** `class H { public Op cb; } i64 cb(i64 a) { return a + 100; }` -- `direct()`'s own
+`cb(x)` reads the FIELD (D65, `tk_this_deleg_call`), and a lambda's own bare `cb(x)` read
+the FREE function instead, silently -- the identical silent-shadow this crumb already
+closed for a plain field and a method, on the one road D65 could not reach: its own
+`tk_this_deleg_call` runs at PASS time (`tk_this_fix`, pass 6), by which point a lambda's
+generated body is no longer inside any method at all (`tk_lambda_finish` promotes it to a
+top-level `N_FUNC` at PARSE time, well before pass 6 ever starts), and `tk_field_deleg_call`
+(teko_expr.tk), the one builder every other delegate-call door funnels through, is itself
+PARSE-time and reads its arguments off the TOKEN STREAM (`tk_args`) -- a lambda's own
+`N_CALL` already carries its arguments PARSED, as `nd_a(n)`, so neither existing builder
+fits as written. `tk_lam_deleg_call` (new, teko_deleg.tk) is the third: asked by
+`tk_lam_check_call` when the name is no method, it reads `tk_field_find` against
+`tk_body_class` and, on a delegate row, calls `tk_deleg_build` directly over the field's own
+load and the call node's own `nd_a(n)` -- the same builder `tk_this_deleg_call` and
+`tk_static_deleg_call` each wrap for their own PASS/PARSE shape, so D59's argument judge
+(arity, `ref`/`out` kind, the pointee, C# widening) rides along here exactly as it does on
+every other delegate-call road. A STATIC field needs no receiver and resolves the same way
+`tk_static_deleg_call` (teko_access.tk) resolves the type's own qualified spelling; an
+INSTANCE one reads the crumb's own sentence, `is not captured`, an array field is excluded
+(`fd_nel_at`, D65's own guard on every other door), and `tk_check_member` rides along on the
+STATIC road exactly as `tk_static_deleg_call` already asks it.
+
+**A guard added at the same door, not measured on the base but a genuine gap in this
+crumb's own first draft:** `tk_lam_check_call` asked the method table and (now) the field
+table before ever asking whether the CALLED name was a local, a parameter or a capture of
+the lambda's own scope -- unlike `tk_lam_check_name`'s `N_IDENT` road, which already asks
+`tk_ty_scope_find`/`tk_lc_find` first, `tk_lam_check_call` asked neither, so `use (cb) =>
+cb(2)` where `cb` is a captured delegate PARAMETER, inside a class that also happens to
+declare a member of that name, would have been hijacked into the member's own call instead
+of the capture's. `tk_lam_check_call` now asks `tk_ty_scope_find`/`tk_lc_find` first, the
+same two calls `tk_lam_check_name` already opens with, before either member table -- a
+local answers before a member, C#'s own rule, unchanged for the read half and now honoured
+for the call half too.
+
+**The WRITE twin, closed on the same PR before merge (2026-09-15).** The first pass above
+recorded, and left open, the write half of the identical bug: `(i64 x) => { n = x; }` inside
+`arm()`, `n` a field shadowed by a same-named global, silently wrote the GLOBAL too --
+`tk_lam_walk`'s `N_ASSIGN` branch checked a by-reference capture and nothing else; a plain
+field/global write target was never asked anything at all. Measured directly against
+`origin/main` `bcee28f2` (pre-D70 entirely, so the READ half was broken too): a probe with
+`this.cb = new Op((i64 x) => { n = x; return n; });` returned the encoding for "wrote the
+global, field untouched" on both the base and this branch's own first pass, instance AND
+static alike.
+
+`tk_lam_member_store` (new, `teko_deleg.tk`) is the write door: asked by `tk_lam_walk`'s
+`N_ASSIGN` case for every target that is not a real local, a parameter or a by-value capture
+(`tk_ty_scope_find`, the identical local-answers-first order the read side already opens
+with) and not a by-reference capture (the existing branch, unchanged), it reads the same
+four tables `tk_lam_member` reads for a bare NAME and builds the STORE `tk_this_assign`
+builds for the method itself: a STATIC field stores through `tk_field_store_val`, the
+identical coercion gate `tk_static_use`/`tk_fwd_resolve_static_one` take; a member CONST is
+refused `teko: a constant is not assigned or called`, factored into `tk_const_assign_refuse`
+(`teko_access.tk`) so the qualified `Type.C = e` door and this one ask the same string, never
+a second copy of it; a STATIC property with a `set` calls it with no receiver, the exact call
+`tk_prop_static_use` builds; every INSTANCE road -- field, property, method name -- reads
+`tk_lam_not_captured`, unchanged from the read side (D11 stands: `this` is not implicitly
+captured, so nothing a lambda can WRITE through an instance member exists). `n += x;`/`n++;`
+reach the identical door as `n = x;` does: `<teko-loop-prelude>`'s own `#rule` lowers both to
+`n = n + x;` at PARSE time, ahead of this walk, so only the assignment TARGET is this
+function's own business -- the RHS is an ordinary expression `tk_lam_walk` already walks
+first, and the READ of `n` inside it resolves through `tk_lam_member` like any other.
+
+**A second, narrower gap found while wiring the write door, not measured on the base
+independently but blocking it outright:** `tk_lam_member`'s own field and STATIC-property
+branches replaced a bare NAME with a load (`tk_ld`/`tk_call`) and never tagged it
+(`tk_xt_put`) the way `tk_this_ident`/`tk_this_prop_read` (`teko_this.tk`) already tag their
+own identical loads. A plain READ never needed the tag -- nothing downstream asked
+`tk_fs_vty` of it -- but the WRITE door does, the moment the read of `n` sits inside `n`'s
+own store (`sn += y;` lowers to a STORE whose VALUE reads the same field): `tk_fs_vty`
+answers -1 for an untagged `N_CALL`/`N_BINARY` and defers the judgement to a later pass that
+can never settle it for a raw `ld64`/`st64` call (no declaration owns that name, so
+`decl_find`/`tk_ty_of`'s own `N_CALL` arms answer -1 for it at ANY pass), and the store died
+`teko: the type of this value is not known here` on a program that types clearly at the
+point the load is built. Measured directly: `H.sn += y; H.sn++;` inside a lambda refused with
+that sentence before the tag was added, and resolved (`H.sn` 0 -> 3 -> 4) once it was. Both
+branches now carry the identical `tk_xt_put` their `teko_this.tk` siblings already carry --
+an addition to a SEPARATE side table, not to the node itself, so `--dump-ast` (which prints
+node fields, not this table) is unmoved by it.
+
+**Fixtures.** `tests/refuse/lambda_field_name.tk`: an instance FIELD read bare, the exact
+repro at the top of this entry. `tests/refuse/lambda_deleg_field_call.tk`: an instance
+delegate FIELD called bare, the third door's own repro, a FREE function of the identical
+name answering on the base. `tests/refuse/lambda_prop_name.tk`: an instance PROPERTY read
+bare. `tests/refuse/lambda_method_call.tk`: an instance METHOD called bare. `tests/refuse/
+lambda_method_name.tk`: an instance METHOD named bare, with no call around it -- the
+`N_IDENT` twin of the call one, `tk_lam_member`'s own method branch, which no earlier
+fixture exercised. `tests/refuse/lambda_field_name_write.tk`: the WRITE twin of the first
+fixture, `n = x;` on an instance field inside a lambda's own block body. `tests/
+surface_lambda.tk`'s `member_check`: a lambda naming only a global with no colliding member
+(`armGlobal`, unchanged), one naming a STATIC field and a STATIC method (`armStatic`), and
+one naming a member CONST and a STATIC property (`armConstProp`) -- every one of the three
+set beside an IDENTICALLY SPELLED global, proving the member wins. `member_deleg_check`,
+kept apart because its own STATIC delegate field outlives the function's scope exactly as
+`slot_roads_check`'s own `St.cb` does: a STATIC method's own lambda calling a STATIC
+delegate field bare (`sarmDeleg`), also beside an identically spelled global.
+`member_write_check` (new): `D70Member.armWrite` sets its own STATIC field `wfield` bare
+(`=`), then bumps it bare (`+=`/`++`), each from inside a lambda the STATIC method builds;
+the same-named global `wfield` stays exactly where it started, proving the member won on
+both statement shapes and the global was never touched at all.
+
+**Proof, the write door landed** (mc 0.15.23, macos/aarch64, base `origin/main` `bcee28f2`,
+merged forward past D61/D62/D63/D65/D66/D69, this branch's own read-and-call door already on
+top of it): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **75 passed, 80 refused as expected, 0 failed** (74 refused on `bcee28f2`,
+six refusals added across the whole PR, one of them this crumb's own
+`lambda_field_name_write.tk`; 75 passed unmoved, `surface_lambda.tk` grown in place again);
+`--dump-ast` byte-identical against a `build/teko` built from `bcee28f2` in a separate
+worktree, for all **149** pre-existing `tests/*.tk` (75, `tests/parts/*.tk` excluded -- those
+are `#include`-only, not fixtures) and `tests/refuse/*.tk` (74), each compiled with its
+ORIGINAL `bcee28f2` source by both binaries -- the `tk_xt_put` addition above touches a side
+table `--dump-ast` never prints, so it moves nothing here either; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 616
+links, 45 fragments, 390 diagnostics, 80 refusals, 144 samples` (the diagnostics count is
+UNMOVED: the write door's own two new sentences -- `a constant is not assigned or called`
+and the `not captured`/`the property has no set` reuse -- are extensions of entries already
+on the page, not new ones); `mc limits . --config mc.macos.toml` verdict `ok` with `grow` 0
+on every row of both legs and `globals` **945** exactly where the base left them -- only the
+size-of-surface-code rows moved (`nodes` 157320 -> 158004, `funcs` 3193 -> 3199, `lowered`
+3175 -> 3181, `strings` 2138 -> 2139, `symbols` 6276 -> 6283, `ins` 217118 -> 218369); `mc pkg
+hash .` `d980fe76b4325dd54284332968829d60be3374aaeda50019032f399e43c97e14` (base
+`2773f2b5af7d1e2edc5120df5b1536c6cededd6365515a7c82f5858c17acb332`: `teko_deleg.tk` and
+`teko_access.tk` are listed files (`mc.toml`), so the hash moves by design; `docs/` and
+`tests/` are not listed and do not affect it).
+
 ### D71 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
 mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one
 thing of the language it compiles: **that a release be proved by teko before it is a release

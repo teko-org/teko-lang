@@ -128,7 +128,9 @@ with that line in its stderr (D52).
 - `"teko: a type name reaches its static members"` — a type name in expression position was
   not followed by `.`.
 - `"teko: a constant is not assigned or called"` — a member `const` was written as the
-  target of `=` or of a call.
+  target of `=` or of a call, through its type (`Type.C = e` / `Type.C(...)`) or, since D70's
+  own write door, through a bare NAME on the LEFT of `=` inside a lambda — one string, asked
+  from both doors (`tk_const_assign_refuse`, `teko_access.tk`).
 - `"teko: unknown static member of "` — completed by the type's name: no static field,
   method, property or `const` of that name.
 - `"teko: an array field on a type declared below is not taught yet"` — reaching an inline
@@ -763,7 +765,26 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
   POINTEE is part of the type, so `void fillc(ref Cell c)` on a `Fill(ref Box)` is refused
   here and nowhere later),
   *`Op` takes a function, another `Op`, or null*, *`X` is not
-  captured; add it to use (...)*, and *`X` is used but never declared*.
+  captured; add it to use (...)*, and *`X` is used but never declared*. A MEMBER of the
+  enclosing class (a field, a delegate field, a member const, a property, or a bare method
+  NAME with no call around it) reads the same *X is not captured; add it to use (...)*
+  when it is an INSTANCE one, judged before any global of the same name ever gets a look —
+  a lambda captures nothing implicitly (D11), `this` included, so a global that only
+  happens to share the name is never silently read or called in its place (D70,
+  `tests/refuse/lambda_field_name.tk`, `tests/refuse/lambda_deleg_field_call.tk`,
+  `tests/refuse/lambda_prop_name.tk`, `tests/refuse/lambda_method_name.tk`). A static
+  member needs no receiver and still resolves. The WRITE side — a bare NAME on the LEFT of
+  `=` (and `+=`/`++`, `<teko-loop-prelude>`'s own lowering to `=`) — is judged through the
+  identical table before falling through as an ordinary local or global assignment: an
+  INSTANCE field, an INSTANCE property with a `set`, or a method name reads the same
+  sentence (D70, `tests/refuse/lambda_field_name_write.tk`); a STATIC field or a STATIC
+  property's `set` needs no receiver and stores through it, the same `tk_field_store_val`
+  coercion gate a plain static store already takes.
+- `"teko: a method is not reachable from a lambda"` — completed by the method's name: a
+  METHOD of the enclosing class, called bare inside a lambda (D70,
+  `tests/refuse/lambda_method_call.tk`). `use (...)` captures a VALUE, never a method, so
+  the wording above would read false here — this is its own sentence. A static method
+  takes no receiver and still resolves.
 
 An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
 of that type, and a GLOBAL array's element is judged exactly as a local array's. The store

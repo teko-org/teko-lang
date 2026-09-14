@@ -295,7 +295,26 @@ value and the closure holds a reference of its own — the object outlives the d
 local and is released when the closure is. A capture **by reference** cannot leave the
 scope that declared it: returning such a lambda, or storing it into a field, is refused.
 
-A global, a `const` and a free function are read **live** and need no `use` at all.
+A global, a `const` and a free function are read **live** and need no `use` at all — and so
+is a **member** of the enclosing class, judged BEFORE any global of the same name ever gets
+a look: a STATIC field, a member `const` and a STATIC property resolve with no `use` and no
+receiver, exactly as they do for the method itself. An INSTANCE one — a field, a delegate
+field called bare, a property, or a method (called or named bare) — needs `this`, which is
+not implicitly captured (D11), so it is refused by the same sentence a plain global-shadowed
+name already gets, `X is not captured; add it to use (...)`, except a bare method CALL,
+which has a sentence of its own, `a method is not reachable from a lambda` — `use (...)`
+captures a value, never a method (D70).
+
+The WRITE side — a bare name on the LEFT of `=` (and `+=`/`++`, which lower to `=` before
+this judge ever runs) — reads the identical table, before falling through as an ordinary
+local or global assignment. A STATIC field or a STATIC property's `set` needs no receiver
+and stores through it, the same coercion a plain static store already takes; a member
+`const` has no slot to store into and is refused the const's own sentence,
+`a constant is not assigned or called`. Every INSTANCE road — a field, a property, a method
+name — needs `this`, not implicitly captured (D11), so it reads the identical
+`X is not captured; add it to use (...)`: `(i64 x) => { n = x; }` inside a method, `n` a
+field the class declares and a global of the same name standing beside it, used to write
+the GLOBAL silently (D70's own adjacent finding, closed on the write door too).
 
 ```teko
 // expect-exit: 42
