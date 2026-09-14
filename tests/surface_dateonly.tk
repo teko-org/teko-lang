@@ -18,8 +18,9 @@
 // instruction at all; here they are a sign extension and a narrowing store,
 // so the value is walked through EVERY slot it can live in -- a local, a
 // parameter, a return, a field, a global, a fixed array element, a `T[]`
-// element and a closure's captured copy. A width the core got wrong in any one
-// of them reads back as a wrong date here, not as a crash somewhere else.
+// element, a closure's captured copy and a closure's by-REFERENCE capture. A
+// width the core got wrong in any one of them reads back as a wrong date here,
+// not as a crash somewhere else.
 //
 // Every number is exact and most only come out right with the real calendar:
 // 2024-02-29 is day 738944, a Thursday, the 60th day of its year; 2024-01-31
@@ -38,6 +39,8 @@ class Booking {
 DateOnly g_day;                                     // a global of primitive type
 
 delegate DateOnly DOp();
+delegate void VOp();                                // a write through a capture
+delegate DateTimeKind KOp();                        // the OTHER four-byte value
 
 // the receiver the PARSER cannot type: a parameter, deferred to the oracle's
 // own pass and lowered there against the very same table
@@ -200,6 +203,39 @@ i64 main() {
                                                  // `DateTime` too, N4a's report)
     if (num_of(big) != 3652058) return 73;
     if (later(big, leap).Year != 9999) return 74;
+
+    // ---- a lambda's BY-REFERENCE capture, read and written ----
+    // `use (&x)` derefs the captured local through the address its prologue
+    // loaded (`tk_arr_load`/`tk_arr_store`, teko_deleg.tk), and over four
+    // bytes that load IS a cast the compiler wrote -- the seventh door of
+    // D54, which lost the mark and refused this very program with
+    // `teko: a DateOnly does not cast`.
+    DateOnly ref_src = new DateOnly(2024, 2, 29);
+    DOp ref_rd = () use (&ref_src) => ref_src;
+    DateOnly ref_got = ref_rd();
+    if (ref_got.DayNumber != 738944) return 75;
+    if (ref_got.Month != 2 || ref_got.Day != 29) return 76;
+    VOp ref_wr = () use (&ref_src) => { ref_src = ref_src.AddDays(1); };
+    ref_wr();                                        // the write is the SAME
+    if (ref_src.DayNumber != 738945) return 77;      // local, seen from outside
+    if (ref_src.Month != 3 || ref_src.Day != 1) return 78;
+    ref_got = ref_rd();                              // ...and the read follows it
+    if (ref_got.DayNumber != 738945) return 79;
+    DateOnly ref_big = DateOnly.MaxValue;            // the widest day number,
+    DOp ref_bigrd = () use (&ref_big) => ref_big;    // through the same road
+    DateOnly ref_bigv = ref_bigrd();
+    if (ref_bigv.DayNumber != 3652058) return 80;
+
+    // The other four-byte value of the language, an `enum : i32` (D38), takes
+    // the same road and was never refused: nothing casts an enum, so its loads
+    // never reach the primitive cast check at all (D54, verifier's first pass).
+    DateTimeKind kind = DateTimeKind.Utc;
+    KOp kind_rd = () use (&kind) => kind;
+    if (kind_rd() != DateTimeKind.Utc) return 81;
+    VOp kind_wr = () use (&kind) => { kind = DateTimeKind.Local; };
+    kind_wr();
+    if (kind != DateTimeKind.Local) return 82;
+    if (kind_rd() != DateTimeKind.Local) return 83;
 
     return 42;
 }
