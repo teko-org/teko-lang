@@ -5515,6 +5515,36 @@ run of that comparison failed on all 123 for a reason worth recording: the 0.16.
 fixture refused at `lib/rt.tk:40: unknown bundled include: sys`. That failure is the
 measurement the packaging fix above is built on, not an mc defect.
 
-**Nothing to report to `minicompiler/mc`.** No behaviour in the range broke anything here;
-the one break was this repository's own packaging assuming a library that no longer travels
-inside the binary.
+**BLOCKED on `minicompiler/mc`, and this entry does not take force until it is unblocked.**
+The local recipe above is green; CI's `windows/x86_64` leg is not, and the cause is on mc's
+side. mc 0.16.0 added a **direct PE executable backend for windows/x86_64** (M42 step 2),
+so `drv_teach` now takes the `tgt_exe_at(ht) != 0` branch on that host and writes
+`build/teko.exe` with mc's own PE writer, ignoring the `[linker]` (lld-link) the leg
+declares — a road that did not exist at 0.15.23, where Windows had no direct executable and
+the product was always linked. The PE that writer produces **is not loadable** as soon as
+the program imports anything from `kernel32`, so `build/teko.exe` exits 127 on every
+invocation, and `mc build` reports it as `driver.mc:862`'s silent `return 1`: the leg prints
+`compiler build/teko.mc -> build/teko.exe` and dies with no diagnostic.
+
+The reproducer is two lines of pure `mc`, measured on `windows-latest` with
+`mc-0.16.0-windows-x86_64`:
+
+| source | road | result |
+|---|---|---|
+| `i64 main() { return 42; }` | `mc --exe` | runs, **42** |
+| `#include <sys>` + the same `main` | `mc --exe` | **127** — the loader refuses the image |
+| `#include <sys>` + the same `main` | `--backend=coff-obj-x86_64` + `lld-link` | runs, **42** |
+
+The object is sound on both roads; only the image mc's own writer lays out is refused. The
+same contrast holds at scale: `build/teko.mc` compiled to a COFF object and linked by hand
+with lld-link gives a `teko.exe` whose `--version` and `--entry-only` both exit 0, while the
+one `mc build` wrote with `--exe` exits 127. `windows/aarch64` is unaffected — it has no
+direct executable backend, so it still links and still passes. `llvm-readobj` on the refused
+image: `SectionCount 4`, `SizeOfImage 0x5000`, `ImportTableRVA 0x4000`, `IATRVA 0x4068`,
+`AddressOfEntryPoint 0x3000` against `BaseOfCode 0x1000`/`SizeOfCode 1536`,
+`IMAGE_FILE_RELOCS_STRIPPED`.
+
+This is reported to `minicompiler/mc` and never worked around here (D2): there is no flag
+that makes `mc build` prefer the declared `[linker]` over the direct backend, and inventing
+one in this tree would be exactly the patch D2 forbids. The pin lands when a released `mc`
+builds a loadable PE on windows/x86_64.
