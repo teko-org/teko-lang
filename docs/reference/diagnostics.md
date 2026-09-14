@@ -628,10 +628,12 @@ are listed in [runtime.md](runtime.md#the-time-library).
   **by value**; the closure then holds a reference of its own.
 - `"teko: a lambda that captures by reference cannot leave its scope"` — such a closure
   cannot be returned, nor stored in a field, a static field, a GLOBAL of delegate type or
-  an ELEMENT of a `T[]`, whether the array is a local or a global. A ternary is read BRANCH
-  BY BRANCH at every one of those slots: `c ? held : other` is refused when either branch
-  carries the capture, since either branch is what the slot ends up holding. Handing it to
-  another LOCAL is allowed: the scope that owns the capture is still the one holding it.
+  an ELEMENT of a `T[]`, whether the array is a local or a global. A slot declared `T?` is
+  one of those slots too: a `?` says the slot may hold nothing, never that it lives less
+  long. A ternary is read BRANCH BY BRANCH at every one of them: `c ? held : other` is
+  refused when either branch carries the capture, since either branch is what the slot ends
+  up holding. Handing it to another LOCAL is allowed: the scope that owns the capture is
+  still the one holding it.
 - ``"teko: a delegate declared below `new` is not taught yet"`` — move the `delegate`
   declaration above the `new` that names it.
 - `"teko: an array of this type is not taught yet"` — a fixed array whose element is a type
@@ -643,7 +645,10 @@ are listed in [runtime.md](runtime.md#the-time-library).
 - `"teko: unknown function"` — the name given to a delegate is no function.
 - `"teko: argument "` — completed by *N is not passed by reference* or by *N needs
   `ref`/`out`*: a delegate or a function declares that parameter by reference and the site
-  does not say so.
+  does not say so. The POINTEE is checked beside the kind, by the identity
+  rule every `ref`/`out` argument takes (`ref i64` does not fit a `ref f64` slot), and a
+  call through a delegate reads it from the delegate's own signature — the same wording a
+  direct call gives, *teko: a value of type i64 does not convert to f64*.
 - `"teko: wrong number of arguments for "` — completed by the name: the call's arity does
   not match.
 - `"teko: "` — completed by one of the delegate-shaped messages: *`X` does not match the
@@ -692,6 +697,31 @@ i64 f() {
     return copy(1);
 }
 ```
+
+A slot declared `T?` takes that verdict on the same terms — the plain global and the
+element of a `T[]` alike. `Op?` is a row of its own, so the two sites that ask whether a
+slot is of delegate type used to answer "no" for it and leave the rule unasked, where the
+`Op`/`Op[]` beside it is refused (D51, twelfth pass). What a `?` changes is the value the
+slot may take, not how long the slot lives:
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+Op? g_maybe;
+Op?[] g_maybes;
+i64 f() {
+    i64 acc = 0;
+    g_maybe = new Op((i64 x) use (&acc) => acc + x);
+                  // teko: a lambda that captures by reference cannot leave its scope
+    g_maybes = new Op?[1];
+    g_maybes[0] = new Op((i64 x) use (&acc) => acc + x);
+                  // teko: a lambda that captures by reference cannot leave its scope
+    return 0;
+}
+```
+
+`g_maybe = new Op((i64 x) => x + 1);` and `g_maybes[0] = null;` are unaffected: no capture
+leaves anything, and `null` is the value a `?` slot is declared for.
 
 And a value the store is written at cannot TYPE waits for the same walk whether the array
 is global or local: `ops[0] = chooser(1)`, with `chooser` a local delegate that answers
@@ -1067,6 +1097,29 @@ types the argument downstream, which is what keeps the check and the conversion 
 disagreeing (D51, verifier finding: they disagreed, and an ADDRESS was widened into a
 float). The one pointee still read as "not known here", refusing nothing, is a name neither
 the scope open at the site nor the table of globals holds a row for.
+
+A call through a DELEGATE is judged by the same rule, from the delegate's own signature.
+That call is a `callp`, built after the `ref` pass and naming no callee, so nothing
+downstream ever reads its arguments: the delegate's own argument check
+(`tk_deleg_check_arg_kinds`, [teko_deleg.tk](../../teko_deleg.tk)) is the only door, and it
+compared the `ref`/`out` TAG alone — an `i64`'s address reached a callee that writes a
+double through it, and the integer came back holding that double's bits (D51, twelfth
+pass). A delegate LOCAL, PARAMETER or GLOBAL called by name is judged whole; the two roads
+whose `callp` is built while the file is still being parsed, a delegate FIELD and an `Op[]`
+ELEMENT, stand where neither the scope nor the table of globals is filled, so the pointee
+there is a name no oracle holds a row for and the check stays silent on it:
+
+```teko
+// no-run
+delegate void Mut(ref f64 x);
+void bumpf(ref f64 x) { x = x + 1.0; }
+i64 main() {
+    Mut m = bumpf;
+    i64 g = 7;
+    m(ref g);                       // teko: a value of type i64 does not convert to f64
+    return 0;
+}
+```
 
 - ``"teko: `main` takes one signature"`` — the entry point is not overloaded.
 - ``"teko: an `extern` name owns its symbol and cannot be overloaded"`` — an `extern` keeps

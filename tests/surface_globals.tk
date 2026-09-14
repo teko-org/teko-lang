@@ -625,6 +625,77 @@ i64 addrcheck() {
     return 0;
 }
 
+// ---- 8. a `ref` parameter through a DELEGATE call ----
+
+// A call through a delegate slot is a `callp`, built after `tk_ref_pass` and
+// naming no callee, so neither that pass's own call check nor
+// `tk_rc_call_args` (teko_rc.tk) ever sees its arguments: the delegate's own
+// check (`tk_deleg_check_arg_kinds`, teko_deleg.tk) is the only door, and it
+// compared the `ref`/`out` TAG alone -- the pointee TYPE behind it was never
+// read, so an `i64`'s address handed to a `ref f64` parameter came back
+// holding a double's bit pattern, through a LOCAL slot and through a GLOBAL
+// one alike (D51, twelfth pass). What runs below is the accepted side: the
+// pointee the signature declares, over both kinds of slot. The mismatch has no
+// exit code and is a `// no-run` sample in docs/reference/diagnostics.md.
+delegate void Mut(ref f64 x);
+delegate void MutI(ref i64 x);
+
+Mut g_mut;
+MutI g_muti;
+f64 g_mf = 1.0;
+i64 g_mi = 1;
+
+i64 delegrefcheck() {
+    Mut m = bumpf;                                // a LOCAL delegate slot
+    f64 v = 1.0;
+    m(ref v);
+    if (v != 2.0) return 1;
+    g_mut = bumpf;                                // ...and a GLOBAL one
+    g_mut(ref g_mf);
+    if (g_mf != 2.0) return 2;
+    MutI mi = bumpi;                              // the integer pointee beside it
+    i64 n = 1;
+    mi(ref n);
+    if (n != 2) return 3;
+    g_muti = bumpi;
+    g_muti(ref g_mi);
+    if (g_mi != 2) return 4;
+    return 0;
+}
+
+// ---- 9. a delegate slot declared `T?` ----
+
+// D221 decision 21's first escape asks how long the SLOT lives; a `?` says
+// only that it may hold nothing. Both sites that guarded the rule by the
+// slot's type read `tk_deleg_row`, which answers -1 for the `TK_KNULL` row
+// `Op?` is -- so an `Op?` global and an `Op?[]` element took a by-reference
+// capture that dies before they do, where the `Op`/`Op[]` beside them are
+// refused (D51, twelfth pass). The accepted side is below -- no capture, and
+// the `null` the `?` is declared for -- with the refusals in
+// docs/reference/diagnostics.md.
+Op? g_maybe;
+Op?[] g_maybes;
+
+// A `T?` delegate is READ back through `== null`/`!= null` and nothing else
+// here: calling one, and unwrapping one with `??`, are not taught yet (both
+// measured on this head, docs/reference/not-yet.md), so what the fixture can
+// assert is that the store landed and that a `null` store is still a `null`.
+i64 nulldelegcheck() {
+    g_maybe = new Op((i64 x) => x + 1);           // a GLOBAL `Op?`: no capture
+    if (g_maybe == null) return 1;
+    g_maybes = new Op?[2];
+    g_maybes[0] = new Op((i64 x) => x + 2);       // a GLOBAL `Op?[]` element
+    g_maybes[1] = null;                           // ...and the value a `?` is for
+    Op?[] xs = new Op?[2];
+    xs[0] = new Op((i64 x) => x + 3);             // the same on a LOCAL `Op?[]`
+    xs[1] = null;
+    if (g_maybes[0] == null) return 2;
+    if (g_maybes[1] != null) return 3;
+    if (xs[0] == null) return 4;
+    if (xs[1] != null) return 5;
+    return 0;
+}
+
 // ---- 5. regression: an enum global and `T?` over a reference global (D48) ----
 
 enum Color { Red, Green, Blue }
@@ -697,6 +768,12 @@ i64 main() {
 
     bad = addrcheck();
     if (bad != 0) return 70 + bad;
+
+    bad = delegrefcheck();
+    if (bad != 0) return 160 + bad;
+
+    bad = nulldelegcheck();
+    if (bad != 0) return 170 + bad;
 
     return 42;
 }

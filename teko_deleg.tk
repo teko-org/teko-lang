@@ -117,6 +117,25 @@ i64 tk_deleg_row(i64 ty) {
     return si;
 }
 
+// the same row with a `?` peeled off first: `Op?` is a row of its OWN
+// (`TK_KNULL`, teko_struct.tk), which `tk_deleg_row` answers -1 for, and that
+// -1 was reading as "this slot holds no delegate at all" at the two sites
+// that guard D221 decision 21's first ESCAPE by the slot's type -- the plain
+// global (`tk_deleg_assign`) and the element of a `T[]` (`tk_ha_index`,
+// teko_heaparr.tk). So `Op? g; g = new Op((i64 x) use (&acc) => acc + x);`
+// and `Op?[] xs; xs[0] = ...` parked the ADDRESS of a dead local in a slot
+// that outlives it, where the very same write into an `Op`/`Op[]` is refused
+// (D51, twelfth pass). A `?` says the slot may hold nothing; it says nothing
+// about how long the slot LIVES, which is the only question the escape rule
+// asks. Everything else about a `T?` -- `null`, the box, the coercion -- is
+// the nullable row's own and keeps reading `tk_deleg_row`, which is what
+// leaves `xs[0] = null` on an `Op?[]` accepted and on an `Op[]` refused.
+i64 tk_deleg_row_under(i64 ty) {
+    i64 si = tk_deleg_row(ty);
+    if (si >= 0) return si;
+    return tk_deleg_row(tk_nl_of(ty));
+}
+
 // the delegate row named `name`, or -1 for a plain type/no type at all: the
 // early branch `tk_new()` takes before its own struct/class lookup. §50 O2
 // ressalva 3: a row a use materialized ahead of its real declaration
@@ -302,7 +321,27 @@ i64 tk_new_deleg(i64 si, i64 line, uptr fl) {
 // a delegate call's own arguments against the KIND its signature declares:
 // a `ref`/`out` slot is an ADDRESS (K2w), so an argument that carries a value
 // would be written through as if it were one -- the same two diagnostics
-// `tk_ref_check_call` (teko_ref.tk) gives a direct call
+// `tk_ref_check_call` (teko_ref.tk) gives a direct call.
+//
+// ...and against the POINTEE it declares, which is the third diagnostic that
+// call gets and the one this check had none of: the TAG matched and the TYPE
+// behind it was never read, so `delegate void Mut(ref f64 x); Mut m = bumpf;
+// i64 g; m(ref g);` handed an `i64`'s address to a callee that writes a
+// double through it -- the integer came back holding 8.0's bit pattern, on a
+// LOCAL slot and on a GLOBAL one alike, where `bumpf(ref g)` written DIRECTLY
+// is refused `teko: a value of type i64 does not convert to f64` (D51,
+// twelfth pass). The `callp` this function guards is built AFTER
+// `tk_ref_pass` and names no callee, so neither that pass's own call check
+// nor `tk_rc_call_args` (teko_rc.tk) ever sees it: this is the only door the
+// argument passes. It reads the one oracle every pointee is read by
+// (`tk_ref_arg_pointee`, inside `tk_ref_check_pointee_ty`: the lexical scope
+// live at the site, then the globals), so a call rewritten in
+// `tk_deleg_pass` -- a delegate LOCAL, PARAMETER or GLOBAL called by name --
+// is judged whole. The two roads that build their `callp` at PARSE time, a
+// delegate FIELD (`tk_field_use`, teko_expr.tk) and an `Op[]` ELEMENT
+// (`tk_ha_deleg_call`, teko_heaparr.tk), stand where neither table is filled
+// yet, so the pointee answers -1 there and is skipped in silence -- the same
+// answer `tk_ref_check_pointee` gives any pointee no oracle names.
 void tk_deleg_check_arg_kinds(i64 si, i64 args, i64 line, uptr fl) {
     i64 a = args;
     i64 i = 0;
@@ -317,6 +356,7 @@ void tk_deleg_check_arg_kinds(i64 si, i64 args, i64 line, uptr fl) {
                    tk_join(tk_join3("teko: argument ", tk_num(i + 1), " needs `"),
                            tk_join(tk_ref_kindname(pk), "` at the call site")));
         }
+        if (pk != TK_RP_NONE) tk_ref_check_pointee_ty(dg_pty_at(si, i), a, line, fl);
         i = i + 1;
         a = nd_next(a);
     }
@@ -699,6 +739,12 @@ void tk_deleg_store_defer(i64 st, i64 si, i64 line, uptr fl) {
 // the store (`tk_cur_fn_name`, read by `tk_taint_owner`). A local store's
 // escape was already judged where it was written, and judging it again here
 // would read a taint the site itself could not see yet.
+//
+// `dl_si` is -1 for the one entry that waits for the ESCAPE alone: a global
+// `Op?[]`'s element, whose `null` and whose type the door already judged
+// where the store was built (`tk_ha_store`, teko_heaparr.tk), and whose row
+// is a nullable one no delegate validator may be handed -- `tk_deleg_coerce`
+// would refuse the very `null` that element is declared to hold.
 void tk_deleg_late_do(i64 i) {
     if (dl_done_at(i)) return;
     st64(dl_done + i * 8, 1);
@@ -709,6 +755,7 @@ void tk_deleg_late_do(i64 i) {
     if (dl_esc_at(i) && tk_lam_escapes(v))
         err_at(dl_file_at(i), dl_line_at(i),
                "teko: a lambda that captures by reference cannot leave its scope");
+    if (dl_si_at(i) < 0) return;
     i64 nv = tk_deleg_coerce(dl_si_at(i), v, dl_line_at(i), dl_file_at(i));
     if (nv == v) return;
     set_nd_next(nv, nd_next(v));
@@ -783,11 +830,22 @@ void tk_deleg_var(i64 n) {
 // none. A LOCAL target keeps the taint PROPAGATION it always had
 // (`tk_lam_taint_stmt` above) and no refusal: `Op local2 = local;` and
 // `local2 = local;` stay inside the scope that owns the capture.
+//
+// The escape asks `tk_deleg_row_under`, not `tk_deleg_row`: an `Op?` global
+// is a `TK_KNULL` row of its own, so the guard that used to leave before
+// reaching the rule left every `Op? g; g = new Op(... use (&acc) ...)`
+// accepted while the `Op` beside it was refused -- a dangling capture in a
+// slot the caller outlives (D51, twelfth pass). The COERCION stays on
+// `tk_deleg_row`, which is what keeps `Op? g = null;` the nullable row's own
+// business.
 void tk_deleg_assign(i64 n) {
-    i64 si = tk_deleg_row(tk_ty_scope_or_global(nd_name(n)));
-    if (si < 0) return;
+    i64 tty = tk_ty_scope_or_global(nd_name(n));
+    i64 esi = tk_deleg_row_under(tty);
+    if (esi < 0) return;
     if (tk_ty_scope_find(nd_name(n)) < 0 && tk_lam_escapes(nd_a(n)))
         err_at(nd_file(n), nd_line(n), "teko: a lambda that captures by reference cannot leave its scope");
+    i64 si = tk_deleg_row(tty);
+    if (si < 0) return;
     set_nd_a(n, tk_deleg_coerce(si, nd_a(n), nd_line(n), nd_file(n)));
 }
 
