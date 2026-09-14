@@ -197,15 +197,29 @@ parse position for (D66):
 | a declaration | `Op f = (i64 x) => x * 2;` |
 | an instance field | `h.cb = (i64 x) => x * 2;` |
 | a field, inside a constructor | `this.cb = (i64 x) => x * 2;` |
-| a **static** field | `St.cb = (i64 x) => x * 2;` |
-| an element of a `T[]` | `fs[0] = (i64 x) => x * 2;` |
-| an argument of a **method** | `h.relay((i64 x) => x - 1, 43)` |
+| a **static** field of a type declared **above** | `St.cb = (i64 x) => x * 2;` |
+| an element of a **local** or field `T[]` | `fs[0] = (i64 x) => x * 2;` |
+| an argument of a **method**, overloaded or not | `h.relay((i64 x) => x - 1, 43)` |
 
-An `Op?` slot takes one exactly as an `Op` slot does. Three positions still need the
-explicit `new Op(...)`, because mc's own parser owns them and reads the `(` as a cast with
-no fallback: a `return`, an argument of a **free** function, and an assignment to a bare
-name (a global, or a field written without `this.`). `docs/reference/not-yet.md` carries
-them with the reason.
+An `Op?` slot takes one exactly as an `Op` slot does — a declaration, a field, an element
+and a **parameter** alike. At a method call the parameter's type is read per position, so
+an OVERLOADED name takes one too wherever every candidate signature that could reach that
+position spells the same delegate there; where they disagree (`mix(Op)` beside `mix(i64)`),
+which signature applies is decided by the argument count, which the parser does not have
+yet, and the argument needs the explicit `new Op(...)`.
+
+Three positions still need the explicit `new Op(...)`, because mc's own parser owns them
+and reads the `(` as a cast with no fallback: a `return`, an argument of a **free**
+function, and an assignment to a bare name (a global, or a field written without `this.`).
+
+Two more need it for a reason of teko's own: the value is parsed before the slot's TYPE is
+known, so there is no delegate row to read the lambda against. A static field of a type
+declared **below** the write (`LateH.scb = ...`) is read by the deferred reader the forward
+pre-scan leaves behind — that scan reserves the type's WORD and never a row, so the type
+has no fields yet — and an element of a **global** `T[]` (`Op[] g; g[0] = ...`) is read by
+the deferred array write, since a global array may be declared below its own write and the
+element type is only collected in a later pass. `docs/reference/not-yet.md` carries all
+five with the reason.
 
 ### `use (...)` — captures are explicit
 

@@ -5861,3 +5861,72 @@ aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 598 links, 41
 `0f04c593b5aad2ad3bbf45d97ba6427d56a05fe3620bf3f1ca73d4fb7256d6eb`: `teko_deleg.tk`,
 `teko_expr.tk`, `teko_access.tk` and `teko_heaparr.tk` are listed files, so the hash moves
 by design).
+
+**Copilot on #719, four roads measured again on `95e157cb`.** Each of the four was
+reproduced first, and each answer is the same question asked once: does a READER of teko's
+own hold the slot's TYPE at the moment the value is parsed?
+
+| road | measured on `95e157cb` | became |
+|---|---|---|
+| `H.cb = (i64 x) => e;` with `class H` declared BELOW | `expected ) in cast` | a documented limit |
+| `h.take_q((i64 x) => e, 42)` on a `void take_q(Op? f, i64 k)` | `expected ) in cast` | **opened** |
+| `Op[] g; g[0] = (i64 x) => e;` (a GLOBAL array) | `expected ) in cast` | a documented limit |
+| `h.pick((i64 x) => e, 21)` on an OVERLOADED `pick` | `expected ) in cast` | **opened** |
+
+**Two opened, one reader.** Both are the same site: `tk_call_method_args` (teko_expr.tk)
+asked the callee's SINGLE declaration for the parameter's type, through `tk_deleg_row` and
+a `tk_method_name_count(si, m) != 1` guard, so an `Op?` parameter answered -1 and an
+overloaded name never asked at all. It asks per POSITION now --
+`tk_method_param_deleg(si, m, n)`: the level of the chain that declares the name (the one
+`tk_method_pick` picks from, a class's own declarations hiding the base's overloads), every
+signature there long enough to reach position `n`, the row taken with the `?` peeled off
+(`tk_deleg_row_under`), and -1 the moment two candidates disagree or one is not a delegate
+there. `tk_args_typed` folded into that loop, which is why `funcs` does not move. Three
+roads came with it, measured: the `Op?` parameter (the coercion still sees the nullable
+type and boxes for it -- READING one back inside the callee is untaught, `call to unknown
+function`, and the fixture only proves the parse), an overloaded name at either arity, and
+a method INHERITED from a base, whose name the derived class declares zero times and which
+the old `!= 1` guard sent to the untyped `tk_args`. An overload whose candidates DISAGREE
+at that position (`mix(Op)` beside `mix(i64)`) still needs `new Op(...)`: which signature
+applies is decided by the argument COUNT, which the parser does not have yet.
+
+**Two documented, and the reason is the same one.** The value is parsed BEFORE the slot's
+type exists, so there is no row to read a lambda against and no later pass can re-read
+what the parser already refused. A static field of a type declared below the write goes
+through `tk_fwd_defer_static` (teko_access.tk): the forward pre-scan reserves the type's
+WORD -- `type_new` plus the syntax registrations -- and never a row of the type table,
+because materializing rows at scan time would reorder every interface's vtable slot
+(teko_fwd.tk's own header), so the field has no declared type at that point;
+`tk_fwd_resolve_static_one` learns it one pass too late. A global `T[]` element goes
+through `tk_arr_defer_write` (teko_array.tk), deferred because a global array may be
+declared BELOW its own write -- measured, and accepted today -- so the element type is only
+collected by `tk_hg_collect` in pass 5. Reading the lambda against a row materialized on
+the spot would mean replaying a whole declaration from inside an expression
+(`tk_fwd_materialize` is a source push written for the `:` list) and moving row indices the
+`--dump-ast` gate pins; opening only the declared-above half would make the guarantee
+depend on declaration order, which is the same limit in a fuzzier shape. So the claim is
+narrowed instead: `docs/reference/delegates.md` qualifies the static-field row to a type
+declared ABOVE and the element row to a LOCAL or field `T[]`, and
+`docs/reference/not-yet.md` carries both -- plus the disagreeing overload -- with the
+reason. Its stale D62 row ("a LAMBDA written straight into a FIELD ... `expected ) in
+cast`") is deleted: D66 opened that road and the row was measured false; the row for
+calling an `Op?` says "local or PARAMETER" now, the new road's own untaught half.
+
+**Proof of this pass** (mc 0.15.23, macos/aarch64, head `95e157cb`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed,
+67 refused as expected, 0 failed** (`tests/surface_lambda.tk` grows item 23,
+`arg_roads_check`: the `Op?` parameter, an overloaded name at both arities, a method of the
+base, and a GROUP at a delegate argument with a CAST at the position beside it, so the
+per-position reader is measured not to have claimed a `(` that opens neither; no refusal
+added, no diagnostic new); `--dump-ast` **byte-identical on all 73** pre-existing
+`tests/*.tk` with their ORIGINAL sources (4715223 bytes of dump), `59652293`'s compiler
+against this one; `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 612 links, 41 fragments, 389 diagnostics, 67
+refusals, 143 samples`; `mc limits . --config mc.macos.toml` verdict `ok` on both legs,
+every counted table exactly where `95e157cb` left it (`passes` 15/30, `syntax` 15/30,
+`types` 13, `intrin` 8/16, `alias` 20/40, `on_stmt` 4, `syntax_type` 2, `globals` 944,
+`funcs` 3186, `lowered` 3168, `symbols` 6268) and only the size-of-surface-code rows moving
+(`nodes` 156737 -> 156807, `ins` 216225 -> 216334); `mc pkg hash .`
+`cc220d3c617a15396d75a872947ca825f19bc6c0ec0f71c70cccf5a86bb2969e`, against
+`014f902503d1510e450ba4422be5b5a5d76bd58c73b678e98ed1b5e843c6106d` on `95e157cb`:
+`teko_expr.tk` is a listed file, so the hash moves by design.
