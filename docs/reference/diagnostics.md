@@ -300,7 +300,7 @@ with that line in its stderr (D52).
 ### `ToString`, `Parse`, `TryParse`, `IsDefined` (N2b)
 
 Four names, dispatched by the enum's own row rather than by
-[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime): registering
+[teko_prim.tk's lowering table](#primitives-with-members-timespan-datetime-dateonly): registering
 an enum there would make `tk_ty_binary` ask a table its own bitwise/comparison operators
 never populate. The two globals a text-using enum needs (`Color__names`, `Color__vals`)
 are built lazily, the first time one of these four names is spelled on that enum — an enum
