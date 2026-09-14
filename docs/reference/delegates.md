@@ -30,6 +30,47 @@ Anything else is `teko: Op takes a function, another Op, or null`, and a functio
 signature does not match is refused by name. The thunk is generated once per (delegate,
 function) pair.
 
+### Which function a bare name names
+
+A bare name on a delegate slot is resolved exactly as a **call** to that name would be
+([namespaces.md](namespaces.md)): a local or a parameter in scope wins (and is never
+wrapped — it is already a value), then the site's own namespace and its prefixes outward,
+then a plain top-level declaration of the exact name, then the `using`s of the file. So
+inside `namespace geo`, `Op f = col;` wraps `geo.col` when `geo` declares one, and the flat
+`col` only when it does not — the same function `col(2, 3)` written one line over would
+call.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+delegate i64 Op(i64 a, i64 b);
+
+i64 col(i64 a, i64 b) {                          // the flat one
+    return a + b + 1000;
+}
+
+namespace geo {
+    i64 col(i64 a, i64 b) {                      // geo.col, same signature
+        return a * b;
+    }
+
+    i64 pick() {
+        Op f = col;                              // geo.col, not the flat one
+        return f(2, 3);
+    }
+}
+
+i64 main() {
+    if (geo.pick() != 6) return 1;
+    return 42;
+}
+```
+
+`new Op(name)` is the one form this order does **not** reach: its thunk is built while the
+file is still being read, before namespaces are mangled, so the name it takes has to be one
+that is already flat ([not-yet.md](not-yet.md)).
+
 `Op g;` at top level is a **global** slot, and every form above works on it exactly as it
 does on a local: `g = add;`, `g = new Op(mul);`, and `g(3, 4)` from any function of the
 unit, the declaring one included (D51). It reads the same on the RIGHT of every slot that
@@ -112,6 +153,8 @@ i64 main() {
     H h = new H;
     h.cb = f;
     if (h.cb(2, 3) != 5) return 6;               // called where it is read
+    h.cb = mul;                                  // a bare function name into a field (D62)
+    if (h.cb(2, 3) != 6) return 8;
 
     Op? maybe = null;
     if (maybe != null) return 7;
