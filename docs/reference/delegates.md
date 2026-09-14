@@ -145,9 +145,24 @@ A lambda builds the same object at the site that writes it.
 | block body | `Op f = new Op((i64 x) => { i64 y = x * 2; return y + 1; });` |
 | with captures | `Op f = new Op((i64 x) use (k, &acc) => { acc = acc + x * k; return acc; });` |
 
-A lambda is written wherever a value of its delegate type is expected: an initializer, an
-assignment, a `return`, and an argument of a free function or of a method. `return
-(i64 x) => e;` is not taught — write `return new Op((i64 x) => e);`.
+A **contextual** lambda — one with no `new Op(...)` around it — is written wherever the
+reader of the value is teko's own, which is every slot of delegate type the language has a
+parse position for (D66):
+
+| road | written |
+|---|---|
+| a declaration | `Op f = (i64 x) => x * 2;` |
+| an instance field | `h.cb = (i64 x) => x * 2;` |
+| a field, inside a constructor | `this.cb = (i64 x) => x * 2;` |
+| a **static** field | `St.cb = (i64 x) => x * 2;` |
+| an element of a `T[]` | `fs[0] = (i64 x) => x * 2;` |
+| an argument of a **method** | `h.relay((i64 x) => x - 1, 43)` |
+
+An `Op?` slot takes one exactly as an `Op` slot does. Three positions still need the
+explicit `new Op(...)`, because mc's own parser owns them and reads the `(` as a cast with
+no fallback: a `return`, an argument of a **free** function, and an assignment to a bare
+name (a global, or a field written without `this.`). `docs/reference/not-yet.md` carries
+them with the reason.
 
 ### `use (...)` — captures are explicit
 
