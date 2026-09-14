@@ -2835,7 +2835,12 @@ arguments the inner row parks and which is resolved through this very function �
 `gc[gl[1] - 1].v`, the index inside the receiver's index. `tk_pend_park_reads`
 (teko_typeof.tk) walks all three in `tk_pend_do`, before the receiver's type is asked for,
 and `pd_na` is walked only in the two forms where it is a node; the per-emitter call in
-`tk_pend_field` is deleted, one walk taking its place.
+`tk_pend_field` is deleted, one walk taking its place. A throwaway counter over every
+rewrite of a global array's index, split by whether `tk_array_pass` had already finished,
+says how much of the work only this walk reaches: `surface_field_store` rewrites **17**
+indexes, **6** of them from a parked subtree — the two of `h.rate = gl[0] + gx[0];` and the
+four of helper 23 — and `surface_array_global` rewrites 10 with 1 parked, the receiver of
+`cs[i].area()` the eighth pass's own line already had.
 
 **The rewrite of a global array's reads may not match by NAME ALONE.** `g[i]` on a global
 array is a bare `N_INDEX` while the body is parsed and a pass replaces it afterwards
