@@ -222,12 +222,35 @@ not the identity cast `TimeSpan.Ticks` is:
 | `i64 tk_dt_eq(i64, i64)` `tk_dt_ne` `tk_dt_lt` `tk_dt_le` `tk_dt_gt` `tk_dt_ge` | the six comparisons, `Kind` masked off |
 | `i64 tk_dt_cmp(i64, i64)` | `.CompareTo()`: `-1`, `0` or `1` |
 
+...and the `DateOnly` half (N4a), whose value is the DAY NUMBER since `0001-01-01` and not
+a tick count. Nothing is packed above it, so the four bytes the compiler hands in are the
+number itself; the calendar is not rewritten here, it is the `tk_dt_*` half above reached
+by multiplying that number back into the ticks of its own midnight:
+
+| signature | is |
+|---|---|
+| `i64 tk_do_min()` `tk_do_max()` | `DateOnly.MinValue`, `MaxValue`: day `0` and day `3652058` |
+| `i64 tk_do_ymd(i64 y, i64 m, i64 d)` | `new DateOnly(y, m, d)`, through `tk_dt_days_from_ymd` — where a date that does not exist panics |
+| `i64 tk_do_from_daynum(i64 n)` | `DateOnly.FromDayNumber`, range-checked |
+| `i64 tk_do_from_datetime(i64 d)` | `DateOnly.FromDateTime`: the date half, time of day and `Kind` dropped |
+| `i64 tk_do_year(i64)` `tk_do_month(i64)` `tk_do_day(i64)` `tk_do_doy(i64)` | the civil components, through `tk_dt_part` |
+| `i64 tk_do_dow(i64)` | `.DayOfWeek`, `(n + 1) % 7`: 0 is Sunday, and `0001-01-01` was a Monday |
+| `i64 tk_do_add_days(i64, i64)` | `.AddDays`, overflow-checked before the range check |
+| `i64 tk_do_add_months(i64, i64)` `i64 tk_do_add_years(i64, i64)` | `.AddMonths`/`.AddYears`, through `tk_dt_add_months` and its clamp |
+
+`.DayNumber` is in no row: it is the four bytes themselves, the identity read
+`TimeSpan.Ticks` is. Neither are the comparisons — `d < e`, `.CompareTo` and `.Equals`
+lower to `tk_ts_lt`, `tk_ts_cmp` and `tk_ts_eq` above, because a day number is an ordinary
+non-negative `i64` and those functions already answer exactly this (D54; the spec had
+named a `tk_do_eq` … `tk_do_ge` family, and six wrappers that forward and nothing else are
+what this does not write).
+
 Five constants come with the file, and a program may read them: `TICKS_PER_MILLISECOND`,
 `TICKS_PER_SECOND`, `TICKS_PER_MINUTE`, `TICKS_PER_HOUR`, `TICKS_PER_DAY`, plus
 `TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS` — and the date half adds
 `DATETIME_MAX_TICKS`, `UNIX_EPOCH_TICKS`, `DATETIME_TICK_MASK`, `DAYS_PER_YEAR`,
-`DAYS_PER_4_YEARS`, `DAYS_PER_100_YEARS`, `DAYS_PER_400_YEARS` and the four `DT_*`
-selectors. They are ordinary top-level `const i64`, so
+`DAYS_PER_4_YEARS`, `DAYS_PER_100_YEARS`, `DAYS_PER_400_YEARS`, the four `DT_*`
+selectors and `DATEONLY_MAX_DAYNUM`. They are ordinary top-level `const i64`, so
 a program that declares one of those names itself collides with it.
 
 Fourteen panics live here, all exit **70**:

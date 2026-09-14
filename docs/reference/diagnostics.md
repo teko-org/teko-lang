@@ -331,9 +331,9 @@ never panics. Both are runtime messages, from `lib/rt.tk`, not a compile-time `t
 refusal, so they carry no entry of their own in this list (D19 scans `teko*.tk`, the
 compiler's own sources, not the runtime library it teaches programs to link).
 
-## Primitives with members (`TimeSpan`, `DateTime`)
+## Primitives with members (`TimeSpan`, `DateTime`, `DateOnly`)
 
-A primitive is a type of eight bytes with no row in the type table — no field, no vtable,
+A primitive is a type of four or eight bytes with no row in the type table — no field, no vtable,
 no method — whose members come from a lowering table instead
 ([timespan.md](timespan.md), [datetime.md](datetime.md),
 [the internals note](../internals/primitives.md)). The
@@ -388,7 +388,10 @@ messages reuse the wordings a declared type already gets; only a handful are its
   A cast is the one syntax that would convert what converts to nothing but itself, and over
   a `DateTime` it would answer a wrong number rather than refuse — the `Kind` sits in the
   two bits above the ticks. The compiler writes both casts itself, in the lowering, and
-  knows its own.
+  knows its own. **The member the message names is the type's own reader**, a column of the
+  primitive's registration since D54 and not one word for every primitive: a `DateOnly` has
+  no `.Ticks` at all, so it reads
+  ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
 - `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
   `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
   to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
@@ -562,13 +565,46 @@ The message `"teko: unknown static member of DateTimeKind"` is gone with the han
 raised it: a member the enum does not declare now reads as
 `teko: DateTimeKind has no member Nope`, the wording every enum shares.
 
+### `DateOnly` (N4a)
+
+`DateOnly` is the same mechanism one width down — four bytes, the day number since
+`0001-01-01` — so every wording above is its own. Five of them are what the type is, and
+each has a fixture under `tests/refuse/` ([datetime.md § `DateOnly`](datetime.md#dateonly)):
+
+```teko
+// no-run
+#include "../lib/time.tk"
+
+i64 main() {
+    DateOnly d = new DateOnly(2024, 2, 29);
+    DateTime t = new DateTime(2024, 2, 29);
+
+    DateOnly e = 5;         // teko: a value of type i64 does not convert to DateOnly
+    i64 n = d;              // teko: a value of type DateOnly does not convert to i64
+    DateTime x = d;         // teko: a value of type DateOnly does not convert to DateTime
+    i64 c = (i64) d;        // teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it
+    DateTime y = d + t;     // teko: no operator `+` takes these operands
+    DateOnly z = new DateOnly(2024, 2, 30);   // teko: a date does not exist, exit 70
+    return 0;
+}
+```
+
+The `+` is refused because **the table registers no arithmetic row for a `DateOnly` at
+all** — C# declares none either — so `d + t` and `d + 1` reach that wording, `d - d`
+reaches ``teko: no operator `-` takes these operands``, and `d1.DayNumber -
+d2.DayNumber` is the form. `.ToString()`, `DateOnly.Parse` and
+`.ToDateTime(t)` reach `teko: unknown member of DateOnly` and its static twin
+([not-yet.md](not-yet.md)).
+
 The three panics `lib/time.tk` raises for a `TimeSpan` at RUN time (`a time span
 overflowed`, `a time span divided by zero`, `a time span is out of range`) and the eleven it
 raises for a `DateTime` (`a date does not exist`, `a date is out of range`, `a year is out
 of range`, `a month is out of range`, `an hour is out of range`, `a minute is out of
 range`, `a second is out of range`, `a millisecond is out of range`, `a date kind is out of
 range`, `a month count is out of range`, `a year count is out of range`) are exit 70 and
-are listed in [runtime.md](runtime.md#the-time-library).
+are listed in [runtime.md](runtime.md#the-time-library). A `DateOnly` adds no panic of its
+own: `new DateOnly(2024, 2, 30)` raises the `a date does not exist` of that same list, and
+a day number outside `0 .. 3652058` raises `a date is out of range`.
 
 ## Properties
 
