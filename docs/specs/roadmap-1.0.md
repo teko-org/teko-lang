@@ -6,8 +6,10 @@
 > with `mc` 1.0.0**, which is also when the port is considered closed. Everything below is a
 > proposal for what "ready" should mean, not a commitment and not a schedule.
 
-The release before it is **v0.4.0**, and it is not a step towards this list: it is a cut of
-what runs today ([`../reference/`](../reference/README.md)).
+The releases before it are the **0.12.x** line — `v0.12.6` is the newest — and they are not
+steps towards this list: each is a cut of what runs today
+([`../reference/`](../reference/README.md)), tagged from a green `main`, one per landed
+decision.
 
 ## What teko owes
 
@@ -81,6 +83,6 @@ Two additions this page proposes, both **pending agreement with the mc project**
 
 ## Cadence
 
-`vX.Y.Z`, mc's own three-part format. Publication only from a stable version. The next
-release is v0.4.0; between it and 1.0.0 the shape of the intermediate cuts is not decided
-here — that is part of what this draft is waiting on.
+`vX.Y.Z`, mc's own three-part format. Publication only from a stable version. The line is
+0.12.x and a tag is cut per landed decision; between it and 1.0.0 the shape of the
+intermediate cuts is not decided here — that is part of what this draft is waiting on.

@@ -80,5 +80,7 @@ questions only mc can answer, go through the mc project's own notices file.
 
 ## Versioning
 
-`vX.Y.Z`, mc's own three-part format. The next release is **v0.4.0**; **v1.0.0 ships only
-together with mc 1.0.0**.
+`vX.Y.Z`, mc's own three-part format. A tag is cut from a green `main`, one per landed
+decision; the line today is **0.12.x** (`v0.12.6` is the newest, and `teko` 0.12.5 and 0.12.6
+are registered). Publication only from a stable version, and **v1.0.0 ships only together
+with mc 1.0.0**.
