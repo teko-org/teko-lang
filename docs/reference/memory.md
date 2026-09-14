@@ -86,7 +86,7 @@ reference field reads as null.
 | a **field** of counted type | released when the object holding it dies, and when the field is overwritten |
 | an **element** of a `T[]` | the same |
 | a **capture by value** in a closure | released with the closure |
-| a **global**, a **static field**, a **Singleton** | never released: it is a root |
+| a **global**, a **static field**, a **Singleton** | releases the value it held when it is overwritten, and is never released at program end: it is a root |
 | a **parameter** of class type | **borrows** — it carries no count of its own, and reassigning it is refused |
 
 "Counted" means a class, an interface, a delegate or a `T[]` -- and a `T?` over any of
@@ -176,7 +176,7 @@ with classes sees a floor above zero rather than a wrong answer.
 | a `struct` allocation | a struct has no vtable, so there is no release function to reach and no count to keep |
 | a `struct?` | the same: a nullable answers for the row it encloses, and a struct is not counted |
 | a `static` field of class type | it holds its reference correctly, and lives for the whole run |
-| a global, and a global `T[]` | a root by construction |
+| a global, and a global `T[]` | a root by construction: the value it holds at the end of the run is never released. An overwritten one IS released, at the store that overwrote it |
 | a Singleton service | a root by design ([di.md](di.md)) |
 
 ---

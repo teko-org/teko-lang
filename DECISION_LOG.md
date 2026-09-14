@@ -4691,6 +4691,7 @@ lowering itself run for a global, which moves the dumps of `surface_globals.tk:6
 `surface_nullable_ref.tk:331/342` and needs a ruling on whether that lands before the
 release; it is its own crumb. Recorded for the user in
 `docs/reference/not-yet.md` § "Types and declarations".
+CLOSED by D55 below: the crumb was cut, the leave is `tty < 0` and the not-yet row is gone.
 
 **Proof** (mc 0.15.23, macos/aarch64, base `84c63025`): `mc build . --config mc.macos.toml`
 clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **65 passed, 21 refused as
@@ -4716,4 +4717,96 @@ force; `sh scripts/check-docs.sh` green (`docs ok: 575 links, 388 diagnostics, 2
 same file; `mc pkg hash .`
 `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`
 (base `93fab590c5fd29dc2ceaabab56ba296e39d41044b3b6e38bd6ee36861d45ed6e`: `teko_rc.tk` is a
+listed file, so the hash moves by design).
+
+### D55 · A store into a COUNTED global slot goes through `rt_store` (G-c, 2026-09-14)
+D53 left one half of `tk_rc_assign` (teko_rc.tk) still shut: the CHECK reached a global,
+the RC LOWERING did not. `Cell gc; void fill(){ Cell c = new Cell(42); gc = c; }
+void churn(){ Cell a = new Cell(7); Cell b = new Cell(9); } i64 main(){ fill(); churn();
+churn(); return gc.v; }` exited **7** against 42 on the base (`e0129ba6`): `fill`'s own
+`rc_dec(c)` at the `}` freed the object the global still pointed at, and the two `churn`
+calls wrote over the block the free list had handed back. A delegate global
+(`Op g_op = addOne;`) and a `T[]` one (`g = new i64[n];`) were unowned the same way.
+
+**ROOT: `if (li < 0) return;`, one line above the lowering.** `tk_rc_index` answers -1 for
+a name no pass-time scope holds, which is every global, so the function left before
+`tk_is_counted(tty)` was ever asked. The lowering itself needs nothing a global cannot
+give: `tk_addr(name)` builds `&g`, an address mc's core takes at any scope (it is what
+`ref g_mf` on a global already passes, `tests/surface_globals.tk`), and `rt_store` /
+`rt_store_own` are chosen by `tk_rc_own(nd_a(n))` exactly as on a local. So the leave
+becomes `tty < 0` -- the name is neither a local nor a global, the only case with no slot
+to judge -- and the BORROWED-parameter guard, a rule about parameters and nothing else,
+asks for a scope slot first: `li >= 0 && li < tk_rc_floor`, since a global's `li` is -1,
+which is below the floor and is not a parameter. Two lines of surface code; no new pass,
+no new intrinsic, `passes` 15/30 unmoved.
+
+**The owned/borrowed split needed no line of its own.** `new C(..)`, `new T[n]` and a
+call result are `TK_OWNED` (teko_expr.tk, teko_heaparr.tk, `tk_rc_call_owned`), so they
+take `rt_store_own` and move their single reference in -- no double-own. Everything else
+-- a local, a parameter, a field, a ternary arm -- is borrowed and takes `rt_store`, which
+increments before it releases, so `g = g;` cannot free the object between the two steps
+(lib/rt.tk) and the source stays alive. `null` is the handle `0`, which `rc_inc`/`rc_dec`
+already treat as a no-op, so `gq = null;` on a `Cell?` global is a plain `rt_store` that
+releases the old value and stores nothing.
+
+**The RULING is one half of the slot rule, not a change to the other half.** A global is
+still a ROOT: the value it holds at the end of the run is never released (§50 decision 16,
+`teko_array.tk`, `tests/surface_array_global.tk`). What it gains is the rule every other
+slot already had -- it releases its OLD value when it is overwritten
+(`docs/reference/memory.md`), whose two rows are amended here; the `not-yet.md` row D53
+wrote for the defect is deleted, and D53's own OPEN paragraph carries a pointer to this
+entry. No refusal is added or moved, so `docs/reference/diagnostics.md` is untouched.
+
+**BLAST RADIUS, measured, not assumed.** Of the 86 `--dump-ast` outputs of the tree's
+fixtures (65 `tests/*.tk` and 21 `tests/refuse/*.tk`), **81 are byte-identical** to the
+base compiler's. The five that move hold **27 stores into a counted global** between them,
+and the diff is exactly those 27 statements, each `ASSIGN name=<g>` becoming
+`EXPRSTMT · CALL rt_store[_own] · ADDR <g>` with its value subtree unchanged: with the
+27 head lines accounted for, the residual of the diff in both directions is EMPTY.
+**24** are `rt_store_own` -- every `new` and every call result -- and **3** are `rt_store`,
+the three `= null` stores (`surface_globals_slot.tk`, `surface_globals.tk`,
+`surface_nullable_ref.tk`). By fixture: `surface_globals.tk` 13 (`g_op` 4, `g_cell` 2,
+`g_ops`, `g_ops2`, `g_many`, `g_mut`, `g_muti`, `g_maybe`, `g_maybes`),
+`surface_array_global.tk` 5, `surface_globals_slot.tk` 4, `surface_field_store.tk` 3,
+`surface_nullable_ref.tk` 2. The generated `N_ASSIGN` sites that must NOT start firing --
+`teko_di.tk`'s `TY_UPTR` local, teko_loop.tk's four, teko_ternary.tk's temporary -- are
+proved untouched by the same enumeration: they carry no counted global name, and the 81
+identical dumps cover every fixture that builds one. The live-count oracles
+(`surface_field_store.tk`'s `rt_live() != 4`, `surface_array_global.tk`,
+`surface_nullable_ref.tk`) all still hold, unedited: no raw alias survived an overwrite,
+so no double-free was introduced.
+
+A STATIC field was already counted and is unmoved: it lowers to an 8-byte buffer global
+and its store goes through the field-store path, which emitted
+`rt_store(holder_s, c)` before this crumb and emits it after (measured on the same
+reproducer written with `public static Cell s;` -- exit 42 on both builds).
+
+**FIXTURE** `tests/surface_globals_rc.tk` (`// expect-exit: 42`, 9 helpers, `rt_live()`
+and a `~Cell()` counter as the oracle of every claim): the reproducer; the overwrite that
+leaves ONE object alive and runs ONE destructor; `= null` back to the floor; `Cell?`
+beside `Cell`, read through `.HasValue`/`.Value`; the four sources of the value -- a
+parameter, a field, a call result and a ternary arm, each with its own `rt_live()`
+assertion and each borrowed source proved alive; a store written inside a LAMBDA body,
+read back after two rounds of allocation (`tk_rc_pass` walks every top-level `N_FUNC`, and
+a lambda is lifted into one); a delegate global assigned and re-assigned, the first
+delegate object released by the second store; a `T[]` global re-assigned, the old array
+and the element it owned both gone; and a global read after a loop of a thousand
+allocations. It exits **11** on the base build -- the reproducer's own helper -- against
+42 here.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `e0129ba6`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **66 passed, 21 refused as
+expected, 0 failed** (was 65/21); the dump enumeration above;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` -- the compiler's own
+sources are mc, which has no class, no interface, no delegate and no `T[]` of heap, so
+`tk_is_counted` answers 0 for every global they declare and stage 2 rebuilds itself
+byte-for-byte; `sh scripts/check-docs.sh` green (`docs ok: 575 links, 388 diagnostics,
+21 refusals, 133 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on both legs,
+every table unmoved except the size of the added surface code itself
+(`nodes` used 155529 → 155533, `ins` 214246 → 214257, `heap` +12128 on the compiler leg;
+the `tests/hello.tk` leg byte-identical), with `passes` 15/30, `types` 11, `intrin` 8/16,
+`alias` 18 and `syntax` 15 exactly where D53 left them, and
+`./build/teko limits tests/hello.tk` byte-identical to the base compiler's own output;
+`mc pkg hash .` `698450587e6e7addee68b51ce72bc4a34d0427b84fe6375cb3ded46de40271cd`
+(base `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`: `teko_rc.tk` is a
 listed file, so the hash moves by design).
