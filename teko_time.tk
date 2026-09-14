@@ -39,6 +39,7 @@
 
 i64 tk_ty_timespan = 0;
 i64 tk_ty_datetime = 0;
+i64 tk_ty_dateonly = 0;
 
 // the include the lowering symbols live in, named in the refusal a program
 // that forgot it gets (docs/specs/datetime.md § 9)
@@ -236,6 +237,64 @@ void tk_dt_operators() {
 // but itself, so `DateTimeKind k = 7;` and `i64 n = d.Kind;` are refused where
 // they used to compile.
 
+// ---- `DateOnly` (crumb N4a) ----
+// FOUR bytes, not eight, and C#'s own representation: the value IS the day
+// number since `0001-01-01`, an `int` there and a width-4 `TK_SINT` here. That
+// is the one thing this type brings that `TimeSpan` and `DateTime` did not --
+// the compiler's own two casts are a sign extension in and a narrowing store
+// out (teko_prim.tk § "the two casts") -- and it costs no line anywhere else:
+// an `enum : i32` already travels every slot a value has (`DateTimeKind`,
+// lib/time.tk), and `tests/surface_dateonly.tk` walks the same set for this
+// one.
+//
+// There is no `Kind` above the number, so the raw four bytes ARE `.DayNumber`
+// and that row carries no symbol: it is the identity cast `TimeSpan.Ticks` is.
+void tk_do_statics() {
+    i64 dy = tk_ty_dateonly;
+    tk_prim_member(dy, "MinValue", TK_PMSVAL, 0 - 1, "tk_do_min", dy);
+    tk_prim_member(dy, "MaxValue", TK_PMSVAL, 0 - 1, "tk_do_max", dy);
+    tk_prim_member(dy, "FromDayNumber", TK_PMSFUN, TY_I64, "tk_do_from_daynum", dy);
+    // the one column naming ANOTHER primitive, which is why `DateOnly` is
+    // registered after `DateTime`: the id has to be live when the row is
+    // written. The site casts the argument to its raw `i64` (`tk_prim_conv`),
+    // exactly as it does for the receiver of an instance row.
+    tk_prim_member(dy, "FromDateTime", TK_PMSFUN, tk_ty_datetime, "tk_do_from_datetime", dy);
+}
+
+void tk_do_members() {
+    i64 dy = tk_ty_dateonly;
+    tk_prim_membern(dy, "new", TK_PMCTOR, 3, TY_I64, "tk_do_ymd", dy);
+    // the identity row: the four bytes under the other type, no call
+    tk_prim_member(dy, "DayNumber", TK_PMPROP, 0 - 1, 0, TY_I64);
+    tk_prim_member(dy, "Year",      TK_PMPROP, 0 - 1, "tk_do_year",  TY_I64);
+    tk_prim_member(dy, "Month",     TK_PMPROP, 0 - 1, "tk_do_month", TY_I64);
+    tk_prim_member(dy, "Day",       TK_PMPROP, 0 - 1, "tk_do_day",   TY_I64);
+    tk_prim_member(dy, "DayOfWeek", TK_PMPROP, 0 - 1, "tk_do_dow",   TY_I64);
+    tk_prim_member(dy, "DayOfYear", TK_PMPROP, 0 - 1, "tk_do_doy",   TY_I64);
+    tk_prim_member(dy, "AddDays",   TK_PMFUN, TY_I64, "tk_do_add_days",   dy);
+    tk_prim_member(dy, "AddMonths", TK_PMFUN, TY_I64, "tk_do_add_months", dy);
+    tk_prim_member(dy, "AddYears",  TK_PMFUN, TY_I64, "tk_do_add_years",  dy);
+    // ...and the two that compare, which are the `TimeSpan` functions and not
+    // two wrappers around them: a day number is an ordinary non-negative
+    // `i64`, so `tk_ts_cmp` and `tk_ts_eq` already answer exactly this.
+    tk_prim_member(dy, "CompareTo", TK_PMFUN, dy, "tk_ts_cmp", TY_I64);
+    tk_prim_member(dy, "Equals",    TK_PMFUN, dy, "tk_ts_eq",  TY_I64);
+}
+
+// The six comparisons and NOTHING else: C# declares no arithmetic operator on
+// a `DateOnly`, so `d + t` and `d - d` have no row and are refused where they
+// are written; `d1.DayNumber - d2.DayNumber` is the form, there and here.
+// Every row names a `tk_ts_*` function, for the reason `CompareTo` does.
+void tk_do_operators() {
+    i64 dy = tk_ty_dateonly;
+    tk_prim_op(K_EQ, 2, dy, dy, "tk_ts_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, dy, dy, "tk_ts_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, dy, dy, "tk_ts_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, dy, dy, "tk_ts_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, dy, dy, "tk_ts_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, dy, dy, "tk_ts_ge", TY_I64, 0);
+}
+
 // Called from teko.tk's `teko_init()` AFTER `tk_float_init()`: the `From*` and
 // `Add*` rows name `ty_f64`, the id `<float>`'s own registration returns, so
 // the float library has to be wired before this table is written.
@@ -243,7 +302,7 @@ void tk_time_init() {
     tk_ty_timespan = type_new("TimeSpan", 8, 8, TK_SINT);
     syntax_expr("TimeSpan", &tk_prim_expr);
     syntax_stmt("TimeSpan", &tk_prim_stmt);
-    tk_prim_type(tk_ty_timespan, "TimeSpan", tk_time_include());
+    tk_prim_type(tk_ty_timespan, "TimeSpan", tk_time_include(), "`.Ticks`");
     tk_ts_statics();
     tk_ts_members();
     tk_ts_operators();
@@ -251,9 +310,20 @@ void tk_time_init() {
     tk_ty_datetime = type_new("DateTime", 8, 8, TK_SINT);
     syntax_expr("DateTime", &tk_prim_expr);
     syntax_stmt("DateTime", &tk_prim_stmt);
-    tk_prim_type(tk_ty_datetime, "DateTime", tk_time_include());
+    tk_prim_type(tk_ty_datetime, "DateTime", tk_time_include(), "`.Ticks`");
     tk_dt_statics();
     tk_dt_ctors();
     tk_dt_members();
     tk_dt_operators();
+
+    // AFTER `DateTime`: `DateOnly.FromDateTime(d)`'s own column carries that
+    // id, and a column is read where it is written and not late by name
+    // (`tk_prim_late` is for a type the very include declares).
+    tk_ty_dateonly = type_new("DateOnly", 4, 4, TK_SINT);
+    syntax_expr("DateOnly", &tk_prim_expr);
+    syntax_stmt("DateOnly", &tk_prim_stmt);
+    tk_prim_type(tk_ty_dateonly, "DateOnly", tk_time_include(), "`.DayNumber`");
+    tk_do_statics();
+    tk_do_members();
+    tk_do_operators();
 }

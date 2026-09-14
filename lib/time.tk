@@ -440,3 +440,82 @@ i64 tk_dt_gt(i64 a, i64 b) { return tk_dt_ticks(a) >  tk_dt_ticks(b); }
 i64 tk_dt_ge(i64 a, i64 b) { return tk_dt_ticks(a) >= tk_dt_ticks(b); }
 
 i64 tk_dt_cmp(i64 a, i64 b) { return tk_ts_cmp(tk_dt_ticks(a), tk_dt_ticks(b)); }
+
+// ============================================================================
+// `DateOnly` (docs/specs/datetime-extras.md, crumb N4a)
+// ============================================================================
+//
+// FOUR bytes, and the value IS the day number: the count of days since
+// `0001-01-01`, C#'s own `int` representation. Nothing is packed above it --
+// there is no `Kind` on a `DateOnly` -- so the raw four bytes ARE `.DayNumber`
+// and that member is the identity row, the way `TimeSpan.Ticks` is.
+//
+// Every function below still takes and answers an ordinary `i64`, like the
+// rest of this file: the compiler writes `(i64) d` on the way in, which is a
+// sign extension of the four bytes, and `(DateOnly) r` on the way out, which
+// is a narrowing store (teko_prim.tk § "the two casts"). A day number is
+// non-negative and needs 22 bits, so neither cast can lose one.
+//
+// THE CALENDAR IS NOT REWRITTEN HERE. Every component, every clamp and every
+// range check is the `DateTime` half above, reached by multiplying the day
+// number back into ticks -- which is exactly what a date at midnight is.
+
+// `DateOnly.MaxValue`, `9999-12-31`: DATETIME_MAX_TICKS / TICKS_PER_DAY
+const i64 DATEONLY_MAX_DAYNUM = 3652058;
+
+i64 tk_do_min() { return 0; }
+i64 tk_do_max() { return DATEONLY_MAX_DAYNUM; }
+
+// the three ways to build one. `tk_dt_days_from_ymd` is where
+// `new DateOnly(2024, 2, 30)` panics, and it is the same check
+// `new DateTime(2024, 2, 30)` takes.
+i64 tk_do_ymd(i64 y, i64 m, i64 d) { return tk_dt_days_from_ymd(y, m, d); }
+
+i64 tk_do_from_daynum(i64 n) {
+    if (n < 0 || n > DATEONLY_MAX_DAYNUM) panic("a date is out of range");
+    return n;
+}
+
+// C#'s `DateOnly.FromDateTime`: the date half of the value, the time of day
+// dropped and the `Kind` with it.
+i64 tk_do_from_datetime(i64 d) { return tk_dt_ticks(d) / TICKS_PER_DAY; }
+
+// ---- the components ----
+// The day number back into the ticks of that midnight, which is the shape
+// `tk_dt_part` reads. No `Kind` is packed, so no mask is needed on the way in.
+i64 tk_do_year(i64 n)  { return tk_dt_part(n * TICKS_PER_DAY, DT_YEAR); }
+i64 tk_do_month(i64 n) { return tk_dt_part(n * TICKS_PER_DAY, DT_MONTH); }
+i64 tk_do_day(i64 n)   { return tk_dt_part(n * TICKS_PER_DAY, DT_DAY); }
+i64 tk_do_doy(i64 n)   { return tk_dt_part(n * TICKS_PER_DAY, DT_DOY); }
+
+// `tk_dt_dow` without the multiply and the mask: 0 is Sunday, and
+// `0001-01-01` was a Monday.
+i64 tk_do_dow(i64 n) { return (n + 1) % 7; }
+
+// ---- the arithmetic ----
+// C# raises `ArgumentOutOfRangeException` where the answer is not a date, so
+// each of these panics; the sign test is `tk_ts_add`'s, because `n + days` on
+// an `i64` wraps before the range check could see it.
+i64 tk_do_add_days(i64 n, i64 days) {
+    i64 r = n + days;
+    if (((n ^ r) & (days ^ r)) < 0) panic("a date is out of range");
+    return tk_do_from_daynum(r);
+}
+
+// ...and the two that need the calendar: `tk_dt_add_months` carries C#'s own
+// clamp to the length of the target month, so `2024-01-31` plus one month is
+// `2024-02-29` here for the same reason it is there.
+i64 tk_do_add_months(i64 n, i64 months) {
+    return tk_dt_ticks(tk_dt_add_months(n * TICKS_PER_DAY, months)) / TICKS_PER_DAY;
+}
+
+i64 tk_do_add_years(i64 n, i64 years) {
+    return tk_dt_ticks(tk_dt_add_years(n * TICKS_PER_DAY, years)) / TICKS_PER_DAY;
+}
+
+// ---- the comparisons ----
+// There are none of its own: a day number is an ordinary non-negative `i64`,
+// so `d < e` IS `tk_ts_lt` over the two numbers and `.CompareTo` IS
+// `tk_ts_cmp`. The rows in teko_time.tk name those six functions directly
+// rather than six wrappers that would forward and nothing else (the spec's
+// § 3 named them `tk_do_eq` … `tk_do_ge`; this is that amendment).
