@@ -70,7 +70,8 @@
 //      first row is not the one the call picks by the row it is not --
 //      `teko: a value of type Boxed does not convert to Op` on two legal
 //      programs. The mirror image was worse: a first row answering `Op` over
-//      a pick that does not settled the store unchecked. Every call waits for
+//      a pick that answers something else settled the store, and the value
+//      the pick returns went into the element unchecked. Every call waits for
 //      the walk now (D51, seventh pass).
 //   3g. the store validator's `null` branch itself (`tk_deleg_store_late`,
 //      `tk_deleg_coerce`, teko_deleg.tk) used to ask `nd_kind(v) == N_INT &&
@@ -84,6 +85,18 @@
 //      `ops[i]`/`g_ops[i]` write in `delegarrcheck`/`delegarrglobalcheck`
 //      still round-trips a real function through the same validator
 //      (D51, eighth pass).
+//   3h. `delegovcallcheck` -- an OVERLOADED call whose own argument is a call
+//      through a delegate slot: which row is picked depends on typing that
+//      argument, and the walk has not rewritten the nested call yet when the
+//      pick is asked, so `tk_ov_arg_ty` (teko_over.tk) answered -1 and
+//      `ops[0] = make(chooser(1))` was refused `teko: Op takes a function,
+//      another Op, or null` on a legal program. The matcher asks the delegate
+//      oracle now (D51, eleventh pass).
+//   3i. `osceilcheck`   -- the store table's own ceiling: a GLOBAL element
+//      store took TWO rows of `TK_MAXOS`, one of them on the node
+//      `tk_hg_resolve_write` had already dropped, so 65 stores were refused
+//      `teko: too many stores into a slot of class type` where 128 local ones
+//      compile. The row is moved, not added (D51, eleventh pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -411,6 +424,78 @@ i64 delegcallcheck() {
     return 0;
 }
 
+// ---- 3h. an OVERLOADED call whose argument is a call through a delegate
+// slot (D51, eleventh pass) ----
+
+// a third row of `make`, and the one an `Op` argument picks. Which row it is
+// depends on typing that argument, and the argument here is `chooser(1)` -- a
+// call through a LOCAL delegate that `tk_deleg_walk` has not rewritten yet
+// when the pick is asked, because the walk stands on the store before it
+// descends into the value. `tk_ov_arg_ty` (teko_over.tk) read `tk_ty_of`
+// alone there, which asks `decl_find` about a name no declaration owns: -1,
+// no row matched, and every store below was refused `teko: Op takes a
+// function, another Op, or null` on a legal program, in either order of the
+// rows. It asks the delegate oracle now (`tk_deleg_expr_ty`), which is the
+// same peek the validator one frame up already takes.
+Op make(Op o) { return o; }
+
+i64 delegovcallcheck() {
+    Chooser chooser = pickOp;
+
+    Op[] ops = new Op[1];
+    ops[0] = make(chooser(1));                    // at a LOCAL element store
+    if (ops[0](10) != 12) return 1;
+
+    Op h = make(chooser(0));                      // ...at a local initializer
+    if (h(10) != 11) return 2;
+
+    g_ops2[1] = make(chooser(1));                 // ...and at a GLOBAL one
+    Op b1 = g_ops2[1];
+    if (b1(10) != 12) return 3;
+    return 0;
+}
+
+// ---- 3i. what a GLOBAL element store spends of the store table: one row,
+// never two (D51, eleventh pass) ----
+
+// `tk_hg_resolve_write` (teko_array.tk) copies the store it has built into the
+// placeholder node the tree holds and then MARKED that placeholder as a second
+// store into a counted slot, leaving the row `tk_ha_store` had already written
+// pointing at the orphan it dropped. Two rows of `TK_MAXOS` (128,
+// teko_struct.tk) per global element store: the 65th of the stores below was
+// refused `teko: too many stores into a slot of class type` on a program with
+// no error in it, where 128 stores into a LOCAL `Op[]` compile. The row is
+// MOVED now, so 65 is an ordinary number of stores and the ceiling is the one
+// the table says it is.
+Op[] g_many;
+
+i64 osceilcheck() {
+    g_many = new Op[65];
+    g_many[0] = addOne; g_many[1] = addOne; g_many[2] = addOne; g_many[3] = addOne; g_many[4] = addOne;
+    g_many[5] = addOne; g_many[6] = addOne; g_many[7] = addOne; g_many[8] = addOne; g_many[9] = addOne;
+    g_many[10] = addOne; g_many[11] = addOne; g_many[12] = addOne; g_many[13] = addOne; g_many[14] = addOne;
+    g_many[15] = addOne; g_many[16] = addOne; g_many[17] = addOne; g_many[18] = addOne; g_many[19] = addOne;
+    g_many[20] = addOne; g_many[21] = addOne; g_many[22] = addOne; g_many[23] = addOne; g_many[24] = addOne;
+    g_many[25] = addOne; g_many[26] = addOne; g_many[27] = addOne; g_many[28] = addOne; g_many[29] = addOne;
+    g_many[30] = addOne; g_many[31] = addOne; g_many[32] = addOne; g_many[33] = addOne; g_many[34] = addOne;
+    g_many[35] = addOne; g_many[36] = addOne; g_many[37] = addOne; g_many[38] = addOne; g_many[39] = addOne;
+    g_many[40] = addOne; g_many[41] = addOne; g_many[42] = addOne; g_many[43] = addOne; g_many[44] = addOne;
+    g_many[45] = addOne; g_many[46] = addOne; g_many[47] = addOne; g_many[48] = addOne; g_many[49] = addOne;
+    g_many[50] = addOne; g_many[51] = addOne; g_many[52] = addOne; g_many[53] = addOne; g_many[54] = addOne;
+    g_many[55] = addOne; g_many[56] = addOne; g_many[57] = addOne; g_many[58] = addOne; g_many[59] = addOne;
+    g_many[60] = addOne; g_many[61] = addOne; g_many[62] = addOne; g_many[63] = addOne; g_many[64] = addOne;
+    i64 t = 0;
+    i64 i = 0;
+    loop {
+        if (i >= 65) break;
+        Op e = g_many[i];
+        t = t + e(1);
+        i = i + 1;
+    }
+    if (t != 130) return 1;                       // 65 elements, each `addOne`
+    return 0;
+}
+
 // ---- 4. `params` over a global scalar element ----
 
 i64 sumall(params i64[] xs) {
@@ -587,6 +672,12 @@ i64 main() {
 
     bad = delegcallcheck();
     if (bad != 0) return 120 + bad;
+
+    bad = delegovcallcheck();
+    if (bad != 0) return 140 + bad;
+
+    bad = osceilcheck();
+    if (bad != 0) return 150 + bad;
 
     bad = paramscheck();
     if (bad != 0) return 40 + bad;

@@ -57,7 +57,13 @@
 // runs over every unit, because a local read before it is assigned is wrong in a
 // program with no deferred `.` exactly as it is in one with a hundred.
 
-#define TK_MAXSCOPE 256               // names of one function: parameters and locals
+// names of one function: parameters, locals and the temporaries the compiler
+// declares beside them. It is the PARSER's own ceiling (`TK_MAXSLV`,
+// teko_struct.tk), not a smaller number of this pass's own: one function can
+// hold at most as many locals as the unit it is written in, so a body the
+// parser accepted has a row here for every name it declares. Two ceilings for
+// one thing is how a name goes missing -- see `tk_ty_scope_add` below.
+#define TK_MAXSCOPE TK_MAXSLV
 #define TK_MAXPEND  128               // member accesses waiting for the pass
 
 // what the deferred access still has to become
@@ -154,8 +160,22 @@ void set_pd_done_at(i64 i, i64 v)  { st64(pd_done + i * 8, v); }
 // of the same name only while that block is open -- and, once it closes, the
 // parameter answers with its own type again instead of being poisoned by a name
 // it has nothing to do with.
+//
+// A name that does not fit is a REFUSAL, never a silent stop. Returning here
+// left the table short of exactly the declaration the source wrote last, and
+// every oracle reading it then answered about the WRONG one: past 255 locals,
+// `void f(ref i64 x) { ...; { f64 x = 2.0; bumpf(ref x); } }` read the
+// shadowing `f64 x` as the outer `ref i64` parameter -- the check refused a
+// legal call, `teko: a value of type i64 does not convert to f64`, and the
+// repass rewrite behind it (`tk_ref_param_named`, teko_ref.tk) would have
+// handed the callee the caller's own slot. The ceiling above is the parser's
+// own now, so a body the parser accepted always fits and this refusal is
+// reachable only through the temporaries the compiler declares itself
+// (teko_null.tk, teko_ternary.tk) -- which is the one thing a capacity
+// refusal may say out loud, rather than answering -1 about a name that is
+// right there (D51, eleventh pass).
 void tk_ty_scope_add(uptr name, i64 ty) {
-    if (tk_nscope == TK_MAXSCOPE) return;        // beyond the table: answers -1
+    if (tk_nscope == TK_MAXSCOPE) err_at(tk_file, tk_line, "teko: too many locals in one function");
     set_sc_name_at(tk_nscope, name);
     set_sc_ty_at(tk_nscope, ty);
     tk_nscope = tk_nscope + 1;

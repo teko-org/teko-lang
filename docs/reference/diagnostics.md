@@ -762,7 +762,7 @@ carries rule 1 for every element store decided at its own site, is skipped for a
 site cannot type (seventh pass, above) — and that validator returned every `null` unjudged.
 A ternary is taken apart branch by branch, so an all-`null` one had no check at all in front
 of it: both branches came back unchanged, the lowering saw two arms of the same `uptr` type,
-and the element held a null until the first call through it paniced, *teko: call through a
+and the element held a null until the first call through it panicked, *teko: call through a
 null delegate*, exit 70. The rule is the one every other slot reads, in the same words: a
 `null` branch at an `Op[]` element is a refusal, and an `Op?[]` is the array that takes one
 (its element type answers `tk_deleg_row` with -1 and never reaches this validator at all):
@@ -1132,6 +1132,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many array-field accesses"` | 128 |
 | ``"teko: too many `T[]` parameters in one declaration"`` | 32 |
 | `"teko: too many locals in one unit"` | 8192 |
+| `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |
 | `"teko: too many locals of struct type"` | 256 |
 | `"teko: too many expressions whose type is known"` | 256 |
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
