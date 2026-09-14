@@ -944,9 +944,15 @@ void tk_field_store_judge(i64 root) {
 // cost 192 KB, against the largest fixture in this tree at 33.
 #define TK_MAXVCA 4096
 
+// What the judge does with the row, and it is the column that used to be a
+// `ref`/`out` flag: the third value costs no array and no `globals` row.
+#define TK_VCA_VAL  0                 // by value, a shape a pass may legitimately not type
+#define TK_VCA_REF  1                 // `ref`/`out`: judged by the POINTEE rule
+#define TK_VCA_NAME 2                 // by value, a shape the pass OWES an answer for
+
 i64  vca_node[TK_MAXVCA];             // the argument node, as the call was built over it
 i64  vca_ty[TK_MAXVCA];               // the parameter's own type -- its POINTEE when `ref`/`out`
-i64  vca_ref[TK_MAXVCA];              // 1 when the argument is `ref`/`out`
+i64  vca_kind[TK_MAXVCA];             // TK_VCA_VAL / TK_VCA_REF / TK_VCA_NAME
 i64  vca_line[TK_MAXVCA];
 uptr vca_file[TK_MAXVCA];
 i64  vca_done[TK_MAXVCA];
@@ -954,7 +960,7 @@ i64  tk_nvca = 0;
 
 i64  vca_node_at(i64 i) { return ld64(vca_node + i * 8); }
 i64  vca_ty_at(i64 i)   { return ld64(vca_ty + i * 8); }
-i64  vca_ref_at(i64 i)  { return ld64(vca_ref + i * 8); }
+i64  vca_kind_at(i64 i) { return ld64(vca_kind + i * 8); }
 i64  vca_line_at(i64 i) { return ld64(vca_line + i * 8); }
 uptr vca_file_at(i64 i) { return ld64(vca_file + i * 8); }
 i64  vca_done_at(i64 i) { return ld64(vca_done + i * 8); }
@@ -984,23 +990,32 @@ i64 tk_vca_ov_call(i64 a) {
 }
 
 // Called from both doors with the argument the parse-time oracle answered -1
-// for, and it decides for itself whether the argument is one this table can
-// answer LATER. A `ref`/`out` one always is (the pointee is a name, or it is
-// nothing anywhere). A by-value one is parked only when it is a bare NAME or
-// a call to an overloaded one: that is the whole of what a later pass adds --
-// the scope, the global table, the load an unqualified field name becomes, the
-// overload pick -- and everything else the parser
-// could not type (a local array's element, an indirect `callp`, an address the
-// source built by hand) is no better known at pass 14 than it is here, so
-// parking it would only move today's silence into a refusal of code that has
-// nothing wrong with it.
+// for, and EVERY one of them is parked: the pass is the only reader that can
+// still say something about the argument, and a row it cannot answer for costs
+// one `tk_ty_of` call and nothing else. D57 parked only a bare NAME and a call
+// to an overloaded one -- what a later pass adds to a NAME is the scope, the
+// global table, the load an unqualified field name becomes, the overload pick
+// -- and left every composite shape at the door, where the -1 both readers
+// understand as "refuse nothing, convert nothing" let it cross RAW:
+// `delegate f64 F(f64); F f = half; f(1 + 2);` handed the integer 3's own bits
+// to a double parameter, where `half(1 + 2)` widens it, and the same on the
+// vtable, itab, unqualified and `this.` roads (D59, second pass).
+//
+// The reason D57 gave for the restriction was a FALSE REFUSAL -- a shape the
+// pass cannot type either would turn today's silence into a refusal of code
+// with nothing wrong with it -- and that is answered at the judge instead of
+// at the door: a row the pass still cannot type is skipped when it is a shape
+// no pass owes an answer for (TK_VCA_VAL), and refused only for the shapes
+// D57 parked (TK_VCA_NAME), where a name the pass cannot type is a name
+// nothing declares.
 void tk_vca_defer(i64 pt, i64 a, i64 line, uptr fl) {
-    i64 isref = tk_rfarg_kind(a) != TK_RP_NONE;
-    if (!isref && nd_kind(a) != N_IDENT && !tk_vca_ov_call(a)) return;
+    i64 kind = TK_VCA_VAL;
+    if (tk_rfarg_kind(a) != TK_RP_NONE) kind = TK_VCA_REF;
+    else if (nd_kind(a) == N_IDENT || tk_vca_ov_call(a)) kind = TK_VCA_NAME;
     if (tk_nvca == TK_MAXVCA) err_at(fl, line, "teko: too many deferred call arguments");
     st64(vca_node + tk_nvca * 8, a);
     st64(vca_ty + tk_nvca * 8, pt);
-    st64(vca_ref + tk_nvca * 8, isref);
+    st64(vca_kind + tk_nvca * 8, kind);
     st64(vca_line + tk_nvca * 8, line);
     st64(vca_file + tk_nvca * 8, fl);
     st64(vca_done + tk_nvca * 8, 0);
@@ -1038,21 +1053,31 @@ i64 tk_vca_park(i64 pt, i64 a, i64 at, i64 line, uptr fl) {
 //     widened onto a float parameter and a value boxed into a `T?` one, in the
 //     same words and the same node the field store's own judge writes.
 //
-// A bare name the PASS cannot type either is refused rather than emitted raw,
-// the invariant D50 states over the same walk: a parked argument is judged, or
-// it is refused; it is never written unread.
+// A bare NAME the PASS cannot type either is refused rather than emitted raw,
+// the invariant D50 states over the same walk: the scope, the global table and
+// the field load are exactly what this walk has, so a name still unanswered
+// here is a name nothing declares. A composite shape is the other case and is
+// skipped silently, which is what the door itself did before D59 parked it:
+// its type is genuinely unknowable to every reader teko has -- a `.` on a
+// receiver no pass could type, an indirect `callp` -- and refusing it would
+// refuse code with nothing wrong with it, which is the very risk D57 named
+// when it restricted the park.
 void tk_vca_do(i64 i) {
     if (vca_done_at(i)) return;
     st64(vca_done + i * 8, 1);
     i64 n = vca_node_at(i);
     i64 pt = vca_ty_at(i);
-    if (vca_ref_at(i)) {
+    i64 kind = vca_kind_at(i);
+    if (kind == TK_VCA_REF) {
         tk_ref_check_pointee_ty(pt, n, vca_line_at(i), vca_file_at(i));
         return;
     }
     i64 aty = tk_ty_of(n);
-    if (aty < 0)
-        err_at(vca_file_at(i), vca_line_at(i), "teko: the type of this argument is not known here");
+    if (aty < 0) {
+        if (kind == TK_VCA_NAME)
+            err_at(vca_file_at(i), vca_line_at(i), "teko: the type of this argument is not known here");
+        return;
+    }
     tk_check_compat(pt, aty, n, vca_line_at(i), vca_file_at(i));
     tk_fs_convert(pt, aty, n);
 }

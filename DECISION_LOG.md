@@ -5087,7 +5087,13 @@ factored out of `tk_fs_do` as `tk_fs_convert` and called from both: the node kee
 identity and BECOMES the cast or the box, because the slot it crosses into holds no handle
 on it. No behaviour of the field store moved -- the 94 pre-existing dumps prove it.
 
-**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** What a later
+**Only a bare NAME is parked by value, and that is a rule, not a shortcut.** *(Superseded
+in part by D59's second pass: the rule below refused nothing, but it let every COMPOSITE
+expression -- a binary, a ternary, a negation -- cross unjudged and unwidened on all three
+roads, which the skip this entry documented is exactly the record of. Every by-value
+argument is parked now, and the false-refusal risk this paragraph names is answered at the
+judge instead: a parked row the pass still cannot type is refused only when it is a bare
+name.)* What a later
 pass adds to a name is the scope, the global table and the load an unqualified field name
 becomes; a local array's element, an indirect `callp` and an address the source built by hand
 are no better known at pass 14 than at the door, so parking them would turn today's silence
@@ -5469,6 +5475,69 @@ unmoved; `mc pkg hash .`
 `64615adc8c576867df94b79f1193d40dbe96f3ea3cf0a197921ffe870d9be6be` (base
 `14b54b7d0a7175813638eb7fb8bbeacf8c9f4be1fa9b912ce29d6b2cdcfbc73f`: `teko_deleg.tk` is a
 listed file, so the hash moves by design).
+
+**Copilot finding, second pass: the park read two shapes, and every other one crossed
+raw.** `delegate f64 F(f64); F f = half; f(1 + 2);` compiled and the integer 3 never
+reached the parameter at all -- `tk_pty_of` answers -1 for a BINARY, `tk_vca_park` parked
+only an `N_IDENT` and a call to an overloaded name, so the door took its `at < 0` path,
+converted nothing, and the callee read the FP register instead of the integer one. The
+direct `half(1 + 2)` widens. The same gate stood on D57's three roads, where D57's own
+second pass had DOCUMENTED it as a silent skip -- "a by-value argument that is neither a
+bare name nor an overloaded call" -- and a silent wrong result is worse than a refusal.
+Measured on `9b6c4180`, one shape at a time, each on six roads (direct, delegate, vtable,
+itab, unqualified, `this.`), the argument's value 3 onto an `f64` parameter:
+
+| argument shape | direct | the five indirect roads |
+|---|---|---|
+| `1 + 2` | widened | **all five wrong** |
+| `x + 2` | widened | **all five wrong** |
+| `x > 0 ? 3 : 4` | widened | **all five wrong** |
+| `0 - (x - 4)` | widened | **all five wrong** |
+| `arr[0]`, `h.n` | widened | right (the xt table tags an element load and a field load) |
+| `(i64) y` | widened | right (`tk_pty_of` has an `N_CAST` arm) |
+
+...and the narrowing mirror, `f(lf * 2.0)` into a `delegate i64 Op(i64)` and
+`b.takei(lf * 2.0)` into a `virtual i64 takei(i64)`: both compiled, exits 64 and 16, where
+the direct call is refused.
+
+**ROOT: the restriction was at the wrong end.** D57's reason for parking only a name was a
+FALSE REFUSAL -- a shape the pass cannot type either would turn today's silence into a
+refusal of code with nothing wrong with it -- and that is a question for the JUDGE, which
+knows the answer, not for the door, which does not. So `tk_vca_defer` now parks EVERY
+by-value argument the parse-time oracle could not type, and `tk_vca_do` decides on what
+`tk_ty_of` gives back: a type means `tk_check_compat` + `tk_fs_convert`, exactly as before;
+-1 is refused for the shapes D57 parked (a bare NAME, where the scope, the global table and
+the field load are precisely what this walk has, so a name still unanswered is a name
+nothing declares -- D57's invariant, unmoved) and skipped SILENTLY for the rest, which is
+what the door itself did before. The three-way distinction is the column that used to be a
+`ref`/`out` flag (`TK_VCA_VAL`/`TK_VCA_REF`/`TK_VCA_NAME`): no new array, `globals`
+**943** unmoved.
+
+**FIXTURES** (2 refusals, 2 positives grown). `tests/refuse/deleg_arg_expr_narrow.tk` and
+`vcall_arg_expr_narrow.tk`, both measured COMPILING on `9b6c4180`. `tests/surface_delegate.tk`
+`argcheck()` grows seven rows -- a binary over two literals, a binary over a name, a ternary
+and a negation on the LOCAL road, then the FIELD, ELEMENT and PARAMETER roads -- and exits
+**152** on that head (row 12, the first of them). `tests/surface_globals_calls.tk` gains
+section 9, `exprcheck()`, the same four shapes on the vtable, itab, unqualified and `this.`
+roads, each road first passing 2.0 so that a row which crossed RAW reads that 2.0 back
+instead of its own 3.0: **102** on that head, 42 here.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `9b6c4180`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 61 refused as
+expected, 0 failed** (73/59 on the base); `--dump-ast` against the base compiler for all 73
+pre-existing `tests/*.tk` -- **byte-identical on 71**, and the two this crumb grew move by
+exactly 7 and 12 inserted `CAST type=f64` lines and nothing else (both dumps compare equal
+once those lines and the indentation they add are removed), every one of them on a call that
+computed the wrong bits before; `sh scripts/bootstrap.sh --os macos --arch aarch64` ->
+`FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 598 links, 41 fragments, 389
+diagnostics, 61 refusals, 141 samples`; `mc limits . --config mc.macos.toml` verdict `ok` on
+both legs, the `tests/hello.tk` leg byte-identical to the base's (`passes` 15/30, `types` 13,
+`intrin` 8/16, `alias` 20, `syntax` 15) and the compiler leg moving only by the added surface
+code -- `nodes` 156549 -> 156565, `ins` 215960 -> 215968, with `globals` 943, `funcs` 3182,
+`lowered` 3164, `strings` 2138 and `symbols` 6263 all unmoved; `mc pkg hash .`
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e` (base
+`f2a456cbe8da2786a861d66ae62c2587a90c95812c80b4c3e5b09a8545ba88f8`: `teko_typeof.tk`, `teko_expr.tk` and `teko_deleg.tk` are
+listed files, so the hash moves by design).
 ### D60 · A type word already taught refuses a second `class`/`struct`/`interface`/`delegate` under the same name (2026-09-14)
 `class TimeSpan { public i64 v; }` (a teko primitive, `teko_time.tk`), `class f64 { ... }`
 (mc's own core word, its bundled `<float>` module) and `class usize { ... }` (one of the

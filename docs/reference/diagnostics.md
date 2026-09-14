@@ -1272,14 +1272,21 @@ An interface call refuses each of the three in the same words. A name that reach
 judge with no type at all is `"teko: the type of this argument is not known here"`, the
 sentence a primitive row's deferred argument already gets.
 
+An argument that is a COMPOSITE EXPRESSION — a binary, a ternary, a negation — is judged
+and widened exactly like a bare name, on all four roads: `b.takef(1 + 2)` on an `f64`
+parameter gets C# §10.2.3's widening, and `b.takei(lf * 2.0)` is refused *teko: a value of
+type f64 does not convert to i64*, in the direct call's own words
+(`tests/refuse/vcall_arg_expr_narrow.tk`, `deleg_arg_expr_narrow.tk`).
+
 Two things are skipped in silence here, and on the direct road for the same reason. The
 first is a `ref`/`out` argument whose POINTEE is named by neither the lexical scope nor the
 table of globals: the address was built by the source, its target has no declared type, and
 there is nothing to compare it against — every road reads that one rule
-(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument that is not a
-bare name and not a call to an overloaded one — a local array's element, an indirect
-`callp`, an address written out by hand: no later pass knows more about it than the call
-site did, so it is left alone rather than refused.
+(`tk_ref_check_pointee_ty`, teko_ref.tk). The second is a by-value argument no reader teko
+has can type even at the last pass — a `.` on a receiver no pass resolved, an indirect
+`callp` — where refusing would refuse code with nothing wrong with it. That second case was
+a wider hole until D59's second pass: it read "not a bare name and not a call to an
+overloaded one", which covered every composite expression and let each one cross unjudged.
 
 The `ref`/`out` TAG itself is not skipped on any road. It is compared with the parameter's
 own kind before anything else, in the direct call's own words — *teko: argument 2 is not
