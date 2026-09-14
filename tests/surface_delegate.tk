@@ -29,13 +29,30 @@
 //      `1.0 + d(2.0)` is 5.0 and not the 3.0 the untyped `callp` left in the
 //      register; the same by `new Scale(dbl)`, from a class field, and in
 //      `f32`, where the value travels in the single-precision half.
-//   7. `dfcheck` -- D62, the three other field-store sites a bare function
+//   7. `argcheck` -- D59, every argument of an indirect call judged and
+//      widened exactly as a direct call's, over all four roads;
+//   8. `pfcheck` -- D65, a delegate FIELD reached on the roads that had no
+//      call at all: a receiver only the PASS can type (a parameter, and a
+//      field of a field under one), and the BARE name inside a method;
+//   9. `shadowcheck` -- D65's precedence, both halves: a bare name inside a
+//      method is the class's own member -- method, then delegate field --
+//      before any FREE function of that name, and from outside the class
+//      that free function still answers. `shd.NShad` is the same pair inside
+//      a NAMESPACE, where the free function is the namespace's own, and
+//      `nsh.cgo()` is the CONST road the same index fix repaired.
+//  10. `dfcheck` -- D62, the three other field-store sites a bare function
 //      name reaches: `this.cb = add;` and the implicit `made = mul;` inside a
 //      CONSTRUCTOR, and a STATIC field (`D62H.scb = add;`). Plus the name that
 //      is NOT a function: `setcb` stores its PARAMETER `p` into the field
 //      while a free function `p` stands right above it, and the call
 //      afterwards proves the parameter is what landed there.
-//   8. `pcheck` -- a `ref`/`out` delegate whose POINTEE is a CLASS (`ref Box`,
+//  11. `dfcheck2` -- D62, the same door's other callers: a receiver the parser
+//      cannot type yet, an element of an ARRAY FIELD, and a STATIC field
+//      reached before its own type is read.
+//  12. `sfcheck` -- D65 on the two slots that OUTLIVE the helper: a STATIC
+//      field (`PH.scb(20, 1)`, and its bare name from a static method) and a
+//      GLOBAL receiver (`g_ph.cb(3, 4)`).
+//  13. `pcheck` -- a `ref`/`out` delegate whose POINTEE is a CLASS (`ref Box`,
 //      `out Cell`) or a STRUCT (`ref Pt`), on both roads (D63, third pass).
 //      The thunk forwards the caller's address as a bare name of a slot
 //      declared `uptr`, and the reclaim's own argument check asked the
@@ -47,12 +64,13 @@
 //
 // `rt_live()` is back to its floor after every helper returns: the reclaim
 // (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
-// reference, teko_struct.tk's `tk_is_counted` the only line that changed. Three
-// helpers raise that floor and all three run last: `dfcheck` and `dfcheck2` each
-// leave a STATIC field alive by definition, and `pcheck` allocates the one `Pt`
-// -- a struct carries no count and is live for the run (`lib/rt.tk`). So the
-// floor is 0 up to `rcheck`, 1 after `dfcheck`, 2 after `dfcheck2` and 3 after
-// `pcheck`, each asserted to be exactly those objects.
+// reference, teko_struct.tk's `tk_is_counted` the only line that changed. Four
+// helpers raise that floor and all four run last, so the floor is 0 through
+// `shadowcheck`: `dfcheck` and `dfcheck2` each leave a STATIC field alive by
+// definition, `sfcheck` leaves a static delegate plus a global object holding
+// one of its own, and `pcheck` allocates the one `Pt` -- a struct carries no
+// count and is live for the run (`lib/rt.tk`). `main` asserts the exact count
+// each of those four leaves rather than the floor.
 //
 // expect-exit: 42
 
@@ -462,7 +480,189 @@ i64 argcheck() {
     return 0;
 }
 
-// ---- 8. a `ref`/`out` delegate whose POINTEE is a class or a struct ----
+// ---- D65: a delegate FIELD is callable on every road it can be READ ----
+// The parse-time road (`fcheck`, above) was the only one with a call. Three
+// had none: a receiver the PARSER cannot type defers to teko_typeof.tk's
+// pass and came out `teko: the member is a field, not a method`; the bare
+// name inside a method reached no rewrite and was left to the core, `call to
+// unknown function`; and `PH.scb(...)` on a STATIC field came out
+// `teko: unknown member`.
+class PH {
+    public Op cb;
+    public static Op scb;
+
+    // the BARE name -- `this.cb(a, b)` written without the receiver
+    public i64 go(i64 a, i64 b) {
+        return cb(a, b);
+    }
+
+    // ...and from a STATIC method, where the field is a global of its own
+    public static i64 sgo(i64 a, i64 b) {
+        return scb(a, b);
+    }
+}
+
+class PA {
+    public PH inner;
+}
+
+PH g_ph;                                          // the GLOBAL receiver road
+
+i64 use_ph(PH h) {                                // a PARAMETER receiver
+    return h.cb(2, 3);
+}
+
+i64 use_pa(PA a) {                                // ...a field of a field under one
+    return a.inner.cb(4, 5);
+}
+
+i64 pfcheck() {
+    PH h = new PH;
+    h.cb = new Op(add);
+
+    if (use_ph(h) != 5) return 1;                 // a receiver only the pass types
+    if (h.go(6, 7) != 13) return 2;               // the bare name inside a method
+
+    PA a = new PA;
+    a.inner = h;
+    if (use_pa(a) != 9) return 3;                 // `a.inner.cb`, root a parameter
+
+    return 0;
+}
+
+// ---- D65: a member of the class shadows a free function of the same name ----
+// A bare name inside a method resolves to the class's OWN member -- method
+// first, then a delegate field -- before any free function of that name.
+// That is C#'s rule for the nearest form it has (a static method of an
+// enclosing class, a top-level local function): the member wins, silently.
+// The METHOD half was already so before D65 (`tag` below answers +1, not
+// +100, on the base compiler too); the FIELD half is what D65 added, and it
+// is the same rule written at the one door that did not have it.
+//
+// From OUTSIDE the class the free function is untouched: `cb(5)` in `main`
+// is still the free `cb`, and `sh.cb(5)` through the receiver is the field.
+//
+// The same rule holds INSIDE a namespace (`shd` below), and that is the door
+// D65 first missed: the namespace rewrite (teko_ns.tk's `tk_ns_rewrite_call`)
+// renames a bare call to the namespace's own free function BEFORE
+// `tk_this_deleg_call` can see it, so `shd.NShad.go` ran `shd__cb` and
+// answered +100. It now stops on a delegate field exactly as it already
+// stopped on a method, and the class index it reads that member table with is
+// the class's, not the method row's. A namespaced free function with no
+// member of its name is untouched (`plain`), and so is a call written outside
+// the class but inside the namespace (`shd.outside`).
+delegate i64 Op1(i64 a);
+
+i64 add1(i64 a) {
+    return a + 1;
+}
+
+i64 cb(i64 a) {                                   // a FREE function named like
+    return a + 100;                               // Shad's delegate field
+}
+
+i64 tag(i64 a) {                                  // ...and like Shad's method
+    return a + 100;
+}
+
+class Shad {
+    public Op1 cb;
+
+    public i64 tag(i64 a) {
+        return a + 1;
+    }
+
+    public i64 go(i64 x) {                        // the FIELD shadows free `cb`
+        return cb(x);
+    }
+
+    public i64 tgo(i64 x) {                       // the METHOD shadows free `tag`
+        return tag(x);
+    }
+}
+
+namespace shd {
+    i64 cb(i64 a) {                               // a free function of the NAMESPACE,
+        return a + 100;                           // named like NShad's delegate field
+    }
+
+    i64 tag(i64 a) {                              // ...and like NShad's method
+        return a + 100;
+    }
+
+    i64 lone(i64 a) {                             // ...and named like no member at all
+        return a + 100;
+    }
+
+    const i64 CX = 105;                           // ...and named like NShad's own const
+
+    class NShad {
+        public Op1 cb;
+
+        public const i64 CX = 6;
+
+        public i64 tag(i64 a) {
+            return a + 1;
+        }
+
+        public i64 cgo() {                        // the CONST road of the same rewrite
+            return CX;
+        }
+
+        public i64 go(i64 x) {                    // the FIELD shadows `shd.cb`
+            return cb(x);
+        }
+
+        public i64 tgo(i64 x) {                   // the METHOD shadows `shd.tag`
+            return tag(x);
+        }
+
+        public i64 plain(i64 x) {                 // no member named `lone`: the free fn
+            return lone(x);
+        }
+    }
+
+    i64 outside(i64 x) {                          // outside the class: the free fn
+        return cb(x);
+    }
+}
+
+i64 shadowcheck() {
+    Shad sh = new Shad;
+    sh.cb = new Op1(add1);
+
+    if (sh.go(5) != 6) return 1;                  // the field, not the free `cb`
+    if (sh.tgo(5) != 6) return 2;                 // the method, not the free `tag`
+    if (sh.cb(5) != 6) return 3;                  // the field through a receiver
+
+    shd.NShad nsh = new shd.NShad;
+    nsh.cb = new Op1(add1);
+
+    if (nsh.go(5) != 6) return 4;                 // the field, not `shd__cb`
+    if (nsh.tgo(5) != 6) return 5;                // the method, not `shd__tag`
+    if (nsh.plain(5) != 105) return 6;            // no member of that name: the free fn
+    if (shd.outside(5) != 105) return 7;          // outside the class, inside the namespace
+    if (nsh.cgo() != 6) return 8;                 // the member const, not `shd__CX`
+
+    return 0;
+}
+
+// the two slots that OUTLIVE the helper -- a static field and a global -- so
+// the live count after this one is not the floor, and `main` asserts what it
+// is instead
+i64 sfcheck() {
+    PH.scb = new Op(add);
+    if (PH.scb(20, 1) != 21) return 1;            // `Type.field(...)`
+    if (PH.sgo(30, 2) != 32) return 2;            // ...and its bare name
+
+    g_ph = new PH;
+    g_ph.cb = new Op(mul);
+    if (g_ph.cb(3, 4) != 12) return 3;            // a GLOBAL receiver
+
+    return 0;
+}
+
+// ---- 13. a `ref`/`out` delegate whose POINTEE is a class or a struct ----
 
 class Box {
     public i64 v;
@@ -564,22 +764,38 @@ i64 main() {
     if (rt_live() != 0) return 100;
     if (cell_dtors != 5) return 110 + cell_dtors;
 
+    bad = pfcheck();
+    if (bad != 0) return 161 + bad;
+    if (rt_live() != 0) return 165;               // borrowed by the call, not kept
+
+    bad = shadowcheck();
+    if (bad != 0) return 166 + bad;
+    if (rt_live() != 0) return 175;
+    if (cb(5) != 105) return 176;                 // outside the class, the FREE
+    if (tag(5) != 105) return 177;                // functions still answer
+
     bad = dfcheck();
-    if (bad != 0) return 140 + bad;
-    if (rt_live() != 1) return 150;               // the STATIC field's own delegate
+    if (bad != 0) return 178 + bad;
+    if (rt_live() != 1) return 183;               // the STATIC field's own delegate
 
     bad = dfcheck2();
-    if (bad != 0) return 160 + bad;
-    if (rt_live() != 2) return 170;               // ...and this helper's own static
+    if (bad != 0) return 184 + bad;
+    if (rt_live() != 2) return 188;               // ...and this helper's own static
 
     bad = geo.ns_roads();
-    if (bad != 0) return 180 + bad;
-    if (rt_live() != 2) return 190;
+    if (bad != 0) return 189 + bad;
+    if (rt_live() != 2) return 197;
+
+    bad = sfcheck();
+    if (bad != 0) return 198 + bad;
+    if (rt_live() != 5) return 202;               // the two statics above, plus
+                                                  // `PH.scb`, `g_ph` and the
+                                                  // delegate `g_ph` holds
 
     bad = pcheck();
-    if (bad != 0) return 200 + bad;
-    if (rt_live() != 3) return 210;                // the two statics, plus the one `Pt`
-    if (cell_dtors != 8) return 220 + cell_dtors;  // the two `out` rebinds, then the slot
+    if (bad != 0) return 203 + bad;
+    if (rt_live() != 6) return 212;                // ...plus the one `Pt`
+    if (cell_dtors != 8) return 213 + cell_dtors;  // the two `out` rebinds, then the slot
 
     return 42;
 }

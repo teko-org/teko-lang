@@ -632,6 +632,14 @@ i64  fst_line_at(i64 i) { return ld64(fst_line + i * 8); }
 uptr fst_file_at(i64 i) { return ld64(fst_file + i * 8); }
 i64  fst_done_at(i64 i) { return ld64(fst_done + i * 8); }
 
+// teko_deleg.tk is included after this file: D65's own road for a delegate
+// FIELD called through a receiver only this pass can type -- the row the
+// field's type names, the one builder of a delegate `callp`, and that row's
+// declared return
+i64 tk_deleg_row(i64 ty);
+i64 tk_deleg_build(i64 si, i64 obj, i64 args, i64 na, i64 line, uptr fl);
+i64 dg_ret_at(i64 i);
+
 // teko_prim.tk is included after this file: the in-place rewrite D48 already
 // owns -- the node keeps its identity and BECOMES the conversion, while a
 // fresh node takes over everything it was -- which is what a deferred store
@@ -1223,6 +1231,30 @@ i64 tk_pend_field(i64 pi, i64 fi, uptr pty, uptr ppure, uptr pown) {
     i64 fty = fd_ty_at(fi);
     i64 nel = fd_nel_at(fi);
     i64 addr = tk_bin(K_ADD, pd_recv_at(pi), tk_int(fd_off_at(fi)));
+    // D65: a field of DELEGATE type is callable wherever it is read, and this
+    // emitter is the pass-time twin of `tk_field_use` (teko_expr.tk) -- whose
+    // own delegate branch had no counterpart here, so every receiver the
+    // PARSER cannot type (a parameter, a global, a `TK_PFWD` type, a field of
+    // any of them) was refused the call outright. `tk_deleg_build` is the one
+    // builder of a delegate `callp` and it carries D59's own argument judge,
+    // which parks what it cannot type here for pass 14 -- later than this
+    // pass, so the park is read where it is written.
+    //
+    // Reported through `pty`/`ppure`/`pown`, never through `tk_xt_put`: the
+    // node that ends up in the TREE is `tk_pend_do`'s placeholder, not what is
+    // built for it, and that is the split `tk_deleg_build`'s own contract
+    // (teko_deleg.tk) leaves to its caller.
+    if (form == TK_PCALL && nel == 0) {
+        i64 di = tk_deleg_row(fty);
+        if (di >= 0) {
+            i64 r = tk_deleg_build(di, tk_ld(fty, addr), pd_arg_at(pi), pd_na_at(pi),
+                                   tk_line, tk_file);
+            st64(pty, dg_ret_at(di));
+            st64(ppure, 0);
+            st64(pown, TK_OWNED);
+            return r;
+        }
+    }
     if (form == TK_PCALL)
         err_at2(tk_file, tk_line, "teko: the member is a field, not a method", m);
     if ((form == TK_PIXLOAD || form == TK_PIXSTORE) && nel == 0)

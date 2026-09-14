@@ -134,6 +134,18 @@ i64 main() {
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
 called is a panic with exit 70, never a segfault ([memory.md](memory.md)).
 
+A delegate **field** is called wherever it can be read: through a receiver the parser
+already types (`h.cb(x)` on a local), through one only the pass can type (a parameter, a
+global, a field of either), by its bare name inside a method of the declaring type
+(`cb(x)`, the unqualified spelling of `this.cb(x)`) and, for a `static` one, through the
+type (`H.cb(x)`). A method of the same name still answers first on the bare-name and the
+`Type.` roads, as it does in C#, and the class's own member — method, then field — answers
+before any FREE function of that name, **in or out of a namespace**: inside `go`, `cb(x)`
+is the field both when a top-level `i64 cb(i64)` is declared and when the class's own
+namespace declares one. Outside the class that free function is untouched — including a
+call written in the namespace but not in the class — and a local or a parameter named `cb`
+still answers before either.
+
 The call's **result carries the delegate's own return type wherever it is read** — an
 initializer, an operand, an argument, and a `.` on it: `DOp f = mk; f().DayNumber` reads
 `DateOnly`'s member, on a local, a parameter, a global slot, a field and a lambda bound to

@@ -114,7 +114,8 @@ qualified (`class Rhomb : geo.IShape`, `use geo.Loud;`) or bare under a `using`.
 In this order, first match wins:
 
 1. a **local or a parameter** of the enclosing function;
-2. a **member of the current type** — declared by it, inherited from a base, or static;
+2. a **member of the current type** — declared by it, inherited from a base, or static; a
+   method, or a delegate field called by its bare name;
 3. the **current namespace** and its prefixes, outermost last;
 4. a **plain top-level declaration** of that exact name;
 5. the file's **`using`** directives.

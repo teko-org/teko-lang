@@ -6156,6 +6156,256 @@ because the check it skips wrote none; `sh scripts/bootstrap.sh --os macos --arc
 compiler leg; `./build/teko limits tests/hello.tk` byte-identical to the base compiler's; `mc
 pkg hash .` `c9f8692f8bfdba896b329d634fa10357cff0f936e1195111549082d66799501b` (`teko_rc.tk`
 is a listed file, so the hash moves by design).
+
+### D65 · A delegate FIELD is callable on every road it can be read (2026-09-14)
+D59 closed the argument gap on the four `callp` roads that HAD a call. This entry is about
+the roads that had none. `class H { public Op cb; }` with `delegate i64 Op(i64 a, i64 b)`
+answered `h.cb(2, 3)` only where the PARSER itself could type the receiver. Measured on
+`d028a7a0`:
+
+| the site | before |
+|---|---|
+| `h.cb(21)` on a LOCAL, `this.cb(x)`, `hs[0].cb(21)`, `mk().cb(21)`, `Op f = h.cb; f(21)` | ran |
+| `i64 f(H h) { return h.cb(21); }` — a PARAMETER receiver | `teko: the member is a field, not a method: cb` |
+| `H gh; ... gh.cb(21)` — a GLOBAL receiver | the same |
+| `i64 f(A a) { return a.b.cb(21); }` — a field of a field under a parameter | the same |
+| `cb(x)` UNQUALIFIED inside a method of `H` | `call to unknown function`, from the core |
+| `H.cb(21)` on a `static Op cb` | `teko: unknown member: cb` |
+| `LateH.scb(1)` on a `static Op scb` of a type declared BELOW the call | the same |
+
+The fourth row broke the refusal law on its own: a diagnostic with no `teko:` prefix, from
+mc's own resolver, for a construct teko taught.
+
+**ROOT: one rule, written at one door out of five.** `tk_field_use` (teko_expr.tk) reads
+`tk_deleg_row(fty)` and, on a `(`, hands the field's load to `tk_field_deleg_call` ->
+`tk_deleg_build`, the single builder of a delegate `callp`. The four other doors a field
+is reached through never asked the question:
+
+  - `tk_pend_field` (teko_typeof.tk) is `tk_field_use`'s PASS-TIME twin — the emitter for
+    every receiver the parser cannot type, which is a parameter, a global, a `TK_PFWD`
+    type and a field of any of them (teko_expr.tk's `tk_dot` defers all four). Its first
+    statement was `if (form == TK_PCALL) err_at2(..., "teko: the member is a field, not a
+    method", m);`. It now asks `tk_deleg_row` first, exactly as its parse-time twin does,
+    and reports the return through `pty`/`ppure`/`pown` rather than through `tk_xt_put` —
+    the node that ends up in the TREE is `tk_pend_do`'s placeholder, not what was built
+    for it, which is the split `tk_deleg_build`'s own contract leaves to its caller.
+  - `tk_this_call` (teko_this.tk) rewrites `area(2)` into `this.area(2)` when the class
+    declares a METHOD of that name, and leaves the node alone otherwise — so a free
+    function of that name still answers, which is the rule that stays. A FIELD of delegate
+    type was never one of its cases, so the bare name reached no rewrite at all.
+    `tk_this_deleg_call` is the new one: the field of `this` under that name
+    (`tk_this_field`, which lets a local or a parameter answer first, C#'s own rule), its
+    row, and `tk_deleg_build` over `tk_ld(fty, tk_this_field_addr(fi))` — the very load
+    `this.cb` builds, and the static field's own global when the field is `static`.
+  - `tk_static_member` (teko_access.tk) decided on `(` BEFORE it ever looked at the field
+    table: `if (p_id() == K_LPAR) return tk_static_call(si, m, line, fl);`, whose
+    `tk_method_pick` answered -1 and gave `unknown member`. It now asks
+    `tk_static_deleg_field` first — a field of that name, `static`, not an array, of a type
+    that names a delegate row — and takes `tk_field_deleg_call` with the field's own global
+    as the address. The lookup is deliberately NOT `tk_static_field_of`: that one refuses an
+    INSTANCE member in words of its own, and `H.n(1)` on an instance field is a mistake
+    whose report belongs where it already was (measured unmoved).
+  - `tk_ns_rewrite_call` (teko_ns.tk), the fifth door, found by the second verifier: inside
+    a NAMESPACE a bare call is rewritten to the namespace's own free function by pass 2,
+    BEFORE `tk_this_call`/`tk_this_deleg_call` ever read the node, and the member guard it
+    stopped on was `tk_method_named_find(cls, name)` alone — so `namespace geo { i64 cb(i64);
+    class H { public Op1 cb; i64 go(i64 x) { return cb(x); } } }` compiled to a direct call
+    to `geo__cb` (`--dump-ast`: `FUNC geo__h_go` -> `CALL geo__cb`) and answered 105 where
+    the same program outside a namespace answers 6. It now also stops on a FIELD whose type
+    names a delegate row (`tk_field_find` + `tk_deleg_row`), which is exactly what
+    `tk_this_deleg_call` then builds — and only on a delegate one, and only for an `N_CALL`:
+    a bare `n(1)` on an `i64` field keeps the fork below, and `&cb` keeps naming the free
+    function it names outside a namespace. Its twin `tk_ns_rewrite_ident` already asked
+    `tk_field_find`.
+    The same door carried a second defect of its own: `tk_ns_call_cls` was filled with
+    `tk_method_of_fn(...)`, a METHOD row number, and read by both rewrites as a STRUCT row
+    number — so the member guard answered for whatever type happened to sit at that index
+    and held only where the two numbers coincided (one class, its methods declared first).
+    With three classes ahead of it, even the METHOD half failed: a namespaced free `tag`
+    won over the class's own `tag`, 105 on `d028a7a0`. `tk_ns_cls_of_fn` reads `mt_cls_at`
+    off the row, the same pair `teko_this.tk` reads for its own `tk_pass_class`.
+
+**What does NOT move, and it is the larger half.** A method named `cb` still answers ahead
+of the field on both the bare-name road and the `Type.` road, as it does in C#. A
+non-delegate field keeps every wording it had: `h.n(1)` through a parameter receiver is
+still `teko: the member is a field, not a method: n`, `H.n(1)` on a `static i64` is still
+`teko: unknown member: n`, and an instance field reached through its type is still the
+instance-member refusal. An ARRAY field is excluded at both new doors (`fd_nel_at > 0`),
+so the two `p.items[i]` forms are untouched. And `n(1)` on an `i64` field by its bare name
+is STILL `call to unknown function` — a surface fork left alone, recorded in
+`docs/reference/not-yet.md`: a bare name becomes a call only where it can become one, and
+widening that into a teko refusal would have to decide what `n(1)` means for every
+non-callable member, which is a design and not this crumb.
+
+**D59's judge rides along, unasked.** All three new roads go through `tk_deleg_build`, so
+`tk_deleg_check_arg_kinds` fires on them from the first day: the count, the `ref`/`out`
+kind, the pointee, the by-value type and C# §10.2.3's widening. The deferred road parks
+what it cannot type at PASS 6 (`tk_typeof_pass`) and the park is judged at the end of
+`tk_over_pass`, pass 14 — later, so nothing is read before it is written. `tests/refuse/
+deleg_pend_arg_narrow.tk` is the row for it. **No pass of its own and no table of its own**:
+`passes` stays 15/30 and `globals` 943.
+
+**Fixtures** (3 refusals, 1 positive grown). `tests/refuse/deleg_pend_not_deleg.tk` and
+`deleg_static_not_deleg.tk` hold the two wordings that must NOT move;
+`deleg_pend_arg_narrow.tk` is an `f64` local through a deferred `Op(i64)` field call.
+`tests/surface_delegate.tk` grows `pfcheck` — a parameter receiver, a field of a field under
+one, and the bare name inside a method, with `rt_live()` back to its floor, the delegate
+being borrowed by the call and not kept — and `sfcheck`, the two slots that OUTLIVE the
+helper: a `static Op` reached as `PH.scb(20, 1)` and by its bare name from a static method,
+and a GLOBAL receiver. `main` asserts `rt_live() == 3` after that one rather than the floor,
+which is what a static field and a global holding an object holding a delegate come to.
+`expect-exit: 42` unmoved; the grown fixture is refused by the base compiler at `PH.scb`.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d028a7a0`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64 refused as
+expected, 0 failed** (73/61 on the base); `--dump-ast` against the base compiler for **all
+73** pre-existing `tests/*.tk` with their ORIGINAL sources — **byte-identical on all 73**,
+every new branch being reached only where the program did not compile before;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 600 links, 43 fragments, 389 diagnostics, 64
+refusals, 141 samples` (no new literal: every message these three doors give was already
+documented); `mc limits . --config mc.macos.toml` verdict `ok` on both legs, the
+`tests/hello.tk` leg unmoved on every counted row (`passes` 15/30, `types` 13, `intrin`
+8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0) and the compiler leg
+moving only by the added surface code — `nodes` 156565 -> 156854, `ins` 215968 -> 216382,
+`funcs` 3182 -> 3185, `lowered` 3164 -> 3167, `symbols` 6263 -> 6266, with `globals` **943**
+and `strings` **2138** both unmoved; `mc pkg hash .` `e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe` (base
+`15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: `teko_typeof.tk`,
+`teko_this.tk` and `teko_access.tk` are listed files, so the hash moves by design).
+
+**The precedence is written out, because this crumb moved it.** A verifier measured a
+shape the entry above did not name: a FREE function and a delegate FIELD sharing a name,
+the bare name called inside a method.
+
+```teko
+delegate i64 Op1(i64 a);
+i64 add1(i64 a) { return a + 1; }
+i64 cb(i64 a) { return a + 100; }         // a FREE function named `cb`
+class H {
+    public Op1 cb;                        // ...and a delegate FIELD named `cb`
+    public i64 go(i64 x) { return cb(x); }
+}
+i64 main() { H h = new H; h.cb = new Op1(add1); return h.go(5); }
+```
+
+`d028a7a0` exits **105** — the free function — and this crumb exits **6**, the field, with
+no diagnostic either way. The twin with a METHOD instead of a field (a free `i64 m(i64)`
+returning `a + 100`, a method `m` returning `a + 1`, `m(x)` inside a sibling method) exits
+**6 on the base as well**: `tk_this_call` (teko_this.tk:414) asks
+`tk_method_named_find(tk_pass_class, m)` FIRST and rewrites the site into `this.m(...)`,
+so a member has shadowed a free function of its name since long before D65.
+
+**The rule, and it is C#'s.** A bare name inside a method resolves to the class's own
+member — method, then field — before any free function of that name. C# has no free
+functions; its nearest forms, a static method of the enclosing (or a static) class and a
+top-level local function, are both shadowed by a same-named member of the class whose body
+reads the name, silently. teko already did that for the method half, so the head's
+behaviour is the consistent one and the base's was the outlier: the field half simply had
+no door (the name reached no rewrite and fell through to the core's resolver, which knows
+only the free function). A program that read a free function through a same-named delegate
+field changed meaning with this crumb, **deliberately**. From outside the class nothing
+moves — `cb(5)` in `main` is still 105 — and a local or a parameter of that name still
+answers before the member, which is `tk_this_field`'s own rule.
+
+**The honest alternative was measured and rejected.** A REFUSAL at the collision —
+`teko: cb is both a field of H and a function; write this.cb(...) or H's own name` — reads
+well, but it refuses what C# accepts, and it would have to refuse the METHOD twin too, or
+teko would refuse the field collision while silently shadowing the method one. Widening it
+to both halves breaks working programs for a shape C# has never complained about. Member
+wins, no refusal.
+
+`tests/surface_delegate.tk` grows `shadowcheck` for it: a free `cb` and a free `tag`, a
+class `Shad` with a delegate field `cb` and a method `tag`, `cb(5)` and `tag(5)` inside its
+methods both answering **6** (the members), `sh.cb(5)` = 6 through the receiver, and
+`main` reading both free functions at **105**. `docs/reference/delegates.md` (the
+precedence sentence) and `docs/reference/classes.md` ("The receiver is not written") carry
+the rule.
+
+**Proof, second pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`, only `tests/` and
+`docs/` moved — no module of the compiler changed in this pass):
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64 refused as
+expected, 0 failed**, `tests/surface_delegate.tk` still `expect-exit: 42` with
+`shadowcheck` inside it and still refused by the base compiler (at `PH.scb`, line 429);
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **72 byte-identical**, `tests/surface_delegate.tk` a pure INSERTION (the
+base's dump plus `shadowcheck`'s own nodes, nothing else moved), unchanged from the first
+pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (the link and the fragment are `classes.md` -> `delegates.md#calling`;
+no new diagnostic, because the ruling is that nothing is refused); `mc limits . --config
+mc.macos.toml` verdict `ok` on both legs with every counted row unmoved from the first pass
+— compiler leg `nodes` 156854, `ins` 216382, `funcs` 3185, `lowered` 3167, `symbols` 6266,
+`globals` 943, `strings` 2138, and the `tests/hello.tk` leg `passes` 15/30, `types` 13,
+`intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4, `on_stmt` 4, `globals` 0; `mc pkg hash .`
+`e6e74b374d956ea95810ba0654ed2789426dbde6d5ba6dc8236f889e8aa3dcfe`, unmoved — a fixture,
+the log and two reference pages are not listed files.
+
+**The fifth door, measured** (mc 0.15.23, macos/aarch64, base `d028a7a0`). Every shape is
+written inside `namespace geo` except the fourth, where the namespace holds only the free
+function and the class is top level under a `using geo;`; `delegate i64 Op1(i64 a);` and
+`i64 add1(i64 a)` are top level throughout, and the exit code is what `main` returns:
+
+| the shape | base | head |
+|---|---|---|
+| a delegate FIELD `cb` vs the namespace's free `cb`, bare `cb(x)` in a method | 105 | **6** |
+| a METHOD `tag` vs the namespace's free `tag`, bare `tag(x)` in a sibling method | 6 | 6 |
+| the namespace's free `lone` with NO member of that name, `lone(x)` in a method | 105 | 105 |
+| a `using`-imported free `cb` vs a delegate field of a top-level class | 105 | **6** |
+| `cb(5)` in a namespace FUNCTION, outside the class | 105 | 105 |
+| the METHOD twin with three classes declared ahead of it (the index defect) | 105 | **6** |
+
+Row 2 held on the base only by the coincidence row 6 breaks: `tk_ns_call_cls` carried a
+method row number where a struct row number was read.
+
+**Proof, third pass** (mc 0.15.23, macos/aarch64, base `d028a7a0`):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **73 passed, 64 refused as expected, 0 failed**, `tests/surface_delegate.tk`
+still `expect-exit: 42` with `shadowcheck` grown by the namespaced pair (`shd.NShad`) and
+exiting **214** on the pre-fix compiler — row 210 + 4, the field shape;
+`--dump-ast` against the base compiler over all **73** pre-existing `tests/*.tk` with their
+ORIGINAL sources — **byte-identical on all 73**, and byte-identical on all 73 of the branch's
+own sources as they stood before this pass grew the fixture, compiler `cc43ad53` against the
+fixed one: this door fires only for a class that declares a delegate field named like a free
+function reachable from its namespace, and no fixture had one before this pass;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 601 links, 44 fragments, 389 diagnostics, 64
+refusals, 141 samples` (no new literal: the ruling is still that nothing is refused);
+`mc limits . --config mc.macos.toml` verdict `ok` on both legs, the `tests/hello.tk` leg
+unmoved (`passes` 15/30, `types` 13, `intrin` 8/16, `alias` 20, `syntax` 15, `rules` 4,
+`on_stmt` 4, `globals` 0) and the compiler leg moving only by the added surface code —
+`nodes` 156854 -> 156917, `ins` 216382 -> 216486, `funcs` 3185 -> 3187, `lowered` 3167 ->
+3169, `symbols` 6266 -> 6268, with `globals` **943** and `strings` **2138** both unmoved;
+`mc pkg hash .`
+`a0ef8936de1773c578ee8c9800524caef98a9837499b16f6e50b74f40af0e221` (`teko_ns.tk` is a
+listed file, so the hash moves by design).
+
+**A silent-wrong repaired as a side effect: the CONST road.** The third-pass verifier owes
+this entry a paragraph it did not have. `tk_ns_cls_of_fn`'s index fix is read by BOTH
+rewrites of teko_ns.tk, and the second one is `tk_ns_rewrite_ident`, whose member guard is
+`tk_field_find || tk_mconst_find || tk_method_named_find` on that same class index. So a
+namespaced `const X` standing beside a MEMBER `const X`, the bare `X` read inside a method
+of that class, answered the NAMESPACE const wherever the two row numbers did not coincide.
+Measured on `409bc8c0` with three classes declaring methods ahead of the one under test,
+`namespace nsc { const i64 X = 7; ... class NC { public const i64 X = 1; i64 go() { return
+X; } } }`: the base exits **7**, the head exits **1**. No diagnostic either way — a
+silent-wrong, and the same C# rule D65 wrote out for the field: the class's own member
+answers before anything the namespace declares. It costs no fixture of its own: the row is
+`nsh.cgo()` in `tests/surface_delegate.tk`'s `shadowcheck`, a `const i64 CX = 105` in
+`namespace shd` against `NShad`'s own `public const i64 CX = 6`.
+
+**Copilot on #716, pass 4 — the forward road and the array guard.** `LateH.scb(1)` with
+`LateH` declared below the call goes through `tk_fwd_resolve_static_one` (teko_access.tk),
+whose `TK_STCALL` branch picked methods only and refused `teko: unknown member: scb`. The
+branch now asks `tk_static_deleg_field` first and builds the delegate `callp` with
+`tk_deleg_build` over the arguments the site recorded (`st_arg_at`/`st_na_at`) — no re-parse,
+the same builder the known-type road takes; measured with a LOCAL argument (`go(k)` calling
+`LateH.scb(k, 2)`), the judged `callp` runs. And `tk_ns_deleg_field` (teko_ns.tk) now excludes
+an ARRAY field — `fd_ty_at` carries the element type, so `public Op cb[2]` looked like a
+callable delegate field and stopped the namespace rewrite of a bare `cb(5)` that names the
+namespace's free function; every other delegate-call door already excluded arrays.
+`tests/surface_delegate_fwd.tk` carries both.
+
 ### D66 · A contextual lambda is read on every slot of delegate type teko's own parser reaches (2026-09-14)
 `(i64 x) => x * 2` with no `new Op(...)` around it needs a READER that looks ahead before
 mc's core does: `parse_primary` sees `(`, asks `type_of_token` for a cast and otherwise
