@@ -5120,28 +5120,30 @@ globals above and below `main` on all three roads and through the written-out `t
 the widening of an `i64` global onto an `f64` parameter, a `ref` global with the right
 pointee on both roads, a local shadowing a global of another type, a `const`, and a
 `DateOnly`/`TimeSpan` global -- four bytes and eight (D54) -- crossing the `callp`. It exits
-**14** on the base, section 1's fourth check, and 42 here; running the head's `tests/` under
-the BASE compiler reads `68 passed, 26 refused as expected, 8 failed`, the eight being
-exactly these.
+**14** on the base, section 1's fourth check, and 42 here.
 
-**Proof** (mc 0.15.23, macos/aarch64, base `af2fffad`): `mc build . --config mc.macos.toml`
-clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **69 passed, 33 refused as
-expected, 0 failed** (68/26 on the base); `--dump-ast` of all **94** pre-existing fixtures
-(68 `tests/*.tk` + 26 `tests/refuse/*.tk`), the base compiler's output against this head's:
-**byte-identical, 94 of 94** -- the change only parks, refuses and converts, and no
+**Proof** (mc 0.15.23, macos/aarch64, written against base `af2fffad` and re-measured on
+`d0fbe9a4`, the merge of D56 and #706 -- neither touches a compiler source, `git diff
+af2fffad d0fbe9a4` over `*.tk`/`lib/`/`*.mc`/`mc.toml`/`teko.toml` being one added fixture):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **70 passed, 33 refused as expected, 0 failed** (69/26 on the base, and
+running the head's `tests/` under the BASE compiler reads `69 passed, 26 refused as
+expected, 8 failed` -- exactly this crumb's eight); `--dump-ast` of all **95** pre-existing
+fixtures (69 `tests/*.tk` + 26 `tests/refuse/*.tk`), the base compiler's output against this
+head's: **byte-identical, 95 of 95** -- the change only parks, refuses and converts, and no
 pre-existing fixture hands an indirect call an argument that needs a conversion;
 `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (the compiler's own
 sources are mc: no class, no interface, so nothing is ever parked there and stage 2 rebuilds
-itself byte-for-byte); `sh scripts/check-docs.sh` green (`docs ok: 587 links, 389
-diagnostics, 33 refusals, 138 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on
+itself byte-for-byte); `sh scripts/check-docs.sh` green (`docs ok: 587 links, 32 fragments,
+389 diagnostics, 33 refusals, 138 samples`); `mc limits . --config mc.macos.toml` verdict `ok` on
 both legs -- the `tests/hello.tk` leg has `passes` 15/30, `types` 12, `intrin` 8/16, `alias`
 19 and `syntax` 15 **unmoved**, and `./build/teko limits tests/hello.tk` is byte-identical to
 the base compiler's own output; the compiler leg moves only by the size of the added surface
 code and its tables, `nodes` 155615 -> 155975, `globals` 935 -> 942, `ins` 214500 -> 215007,
 `funcs` 3162 -> 3173, `lowered` 3144 -> 3155; `mc pkg hash .`
 `9b9e6483727e8e0736bfd4dc37db5ef87141bbf76a6f33a729b405b1afd8a8e7` (base
-`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: five listed `.tk`
-modules moved, so the hash moves by design).
+`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`, the same on `af2fffad`
+and on `d0fbe9a4`: five listed `.tk` modules moved, so the hash moves by design).
 
 **TWO rows of `not-yet.md` are CLOSED by this entry**, not merely amended. The first, older
 one: "an integer argument at a virtual or an interface call, written as a bare parameter

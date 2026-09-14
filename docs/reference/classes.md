@@ -89,7 +89,7 @@ type identity or *derives*, with an integer widened onto a float parameter, and 
 `ref`/`out` pointee rule — whether the argument is a local, a parameter, a field, a `const`
 or a **global**, and whether the call is written `b.m(x)`, `this.m(x)` or the bare `m(x)`
 inside another method of the class. One that does not fit is refused where it is written
-([diagnostics.md](diagnostics.md#parameters-overloads-refout-and-params)).
+([diagnostics.md](diagnostics.md#parameters-overloads-ref-out-and-params)).
 
 ---
 
