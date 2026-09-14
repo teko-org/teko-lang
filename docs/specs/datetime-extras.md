@@ -1,10 +1,12 @@
 # `DateOnly`, `TimeOnly` and `DateTimeOffset`
 
-**Designed, partly built: `DateOnly` (N4a) has landed, D54.** What it does today is
-[datetime.md § `DateOnly`](../reference/datetime.md#dateonly), and the fixtures are
-`tests/surface_dateonly.tk`, `tests/surface_dateonly_panic.tk` and the five under
-`tests/refuse/`. `TimeOnly` (N4b) and `DateTimeOffset` (N5) are still design and nothing
-more, so every sample that names one carries `// no-run`.
+**Designed, partly built: `DateOnly` (N4a) landed under D54, `TimeOnly` (N4b) under D58.**
+What each does today is [datetime.md § `DateOnly`](../reference/datetime.md#dateonly) and
+[§ `TimeOnly`](../reference/datetime.md#timeonly); the fixtures are
+`tests/surface_dateonly.tk`, `tests/surface_dateonly_panic.tk`,
+`tests/surface_timeonly.tk`, `tests/surface_timeonly_panic.tk` and the ten under
+`tests/refuse/` the two crumbs share. `DateTimeOffset` (N5) is still design and nothing
+more, so every sample that names it carries `// no-run`.
 
 **Four amendments N4a made to this page as written**, each marked where it appears below:
 `DateOnly` registers **no arithmetic operator at all** and its six comparisons lower to
@@ -15,6 +17,22 @@ names the type's **own** reader, `` `.DayNumber` ``, and its own builder,
 `new DateOnly(...)`, because the message is generated from a per-primitive column (§ 2);
 and the fixtures landed under the names `tests/surface_dateonly*.tk`, beside the
 `surface_*` family the rest of the tree uses (§ 7).
+
+**Seven more amendments N4b made**, each marked where it appears: the panic § 2/§ 4 named
+`` `that time of day does not exist` `` does not exist — a time of day out of range panics
+on one of FOUR wordings, `an hour`/`a minute`/`a second`/`a millisecond is out of range`,
+`DateTime`'s own, because `new TimeOnly(h, mi, s[, ms])` panics on the very
+`tk_dt_time_ticks` a `DateTime`'s own time of day panics on; a drift N4a itself left in
+this page — `` `that date does not exist` `` where D54 actually landed
+`` `a date does not exist` `` — is fixed at the same two places while this page is open
+again (§ 2, § 4); the fixtures landed under `tests/surface_timeonly*.tk`, not the
+`primitives_timeonly*.tk` names this page had used (§ 7); `ToString`/`Parse`/`TryParse` are
+**out of N4b**, for the reason N4a's own amendment above already gives (§ 4); the
+`(h, mi)` two-argument constructor, C#'s own and missing from this page's table, is added
+to it (§ 4); `TimeOnly.ToString()`'s own row is removed from that same table for the
+`ToString`/`Parse` amendment's own reason; and § 6's `types +3`/`syntax +3` are this PAGE's
+total across all three crumbs, not one crumb's — N4b's own share of it is `+1`/`+1`, one
+`type_new` and one type word.
 
 **This page is a proposed section of [datetime.md](datetime.md)**, not a design of its own.
 That page designs `DateTime` and `TimeSpan` and lists
@@ -123,8 +141,8 @@ i64 main() {
     DateTime x = d;               // teko: a value of type DateOnly does not convert to DateTime
     DateOnly f = d + t;           // teko: no operator `+` takes these operands
     i64 c = (i64) d;              // N4a: teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it
-    DateOnly g = new DateOnly(2024, 2, 30);   // teko: that date does not exist  (exit 70)
-    TimeOnly h = new TimeOnly(24, 0, 0);      // teko: that time of day does not exist  (exit 70)
+    DateOnly g = new DateOnly(2024, 2, 30);   // teko: a date does not exist  (exit 70)
+    TimeOnly h = new TimeOnly(24, 0, 0);      // teko: an hour is out of range  (exit 70)
     return 0;
 }
 ```
@@ -136,8 +154,9 @@ i64 main() {
 | a `DateOnly` in a `DateTime` slot, or the reverse | `teko: a value of type DateOnly does not convert to DateTime` — `.ToDateTime(t)` and `DateOnly.FromDateTime(d)` are the two roads |
 | `d + t` | ``teko: no operator `+` takes these operands`` — C# has no such operator either; `d.ToDateTime(t)` is the form |
 | `(i64) d` written by hand | ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it`` — **as landed**: the message is built from the type's name, its own reader column and its constructor, so it names a member the type really has (D54) |
-| a day that does not exist | `teko: that date does not exist`, exit 70 |
-| an hour, minute or second out of range | `teko: that time of day does not exist`, exit 70 |
+| a day that does not exist | `teko: a date does not exist`, exit 70 — **as landed** (N4a drifted from this page's own wording; fixed here, D58) |
+| an hour, minute, second or millisecond out of range | `teko: an hour is out of range` and its three siblings, exit 70 — **as landed** (N4b): `DateTime`'s own four wordings, because `new TimeOnly(h, mi, s[, ms])` panics on the very function `new DateTime(y, m, d, h, mi, s)` does |
+| a raw tick count outside `0 .. 863999999999` (`new TimeOnly(ticks)`, `TimeOnly.FromTimeSpan(ts)`) | `teko: a time of day is out of range`, exit 70 — **as landed** (N4b): the one wording this crumb adds, since none of `lib/time.tk`'s existing panics reads honestly for an interval that starts at zero |
 | an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
 | `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `datetime.md` § 8 is blocked on |
 
@@ -167,7 +186,7 @@ keeps it rather than inventing an operator C# does not have.
 |---|---|
 | `DateOnly.MinValue`, `MaxValue` | `.Year` `.Month` `.Day` `.DayOfWeek` `.DayOfYear` `.DayNumber` — all `i64` |
 | `new DateOnly(y, m, d)` | `.AddDays(i64)` `.AddMonths(i64)` `.AddYears(i64)` |
-| `DateOnly.FromDayNumber(i64)` | `.ToDateTime(TimeOnly)` → `DateTime` — **N4b**, the argument's type is not registered yet |
+| `DateOnly.FromDayNumber(i64)` | `.ToDateTime(TimeOnly)` → `DateTime` — **landed with N4b**, once `TimeOnly` existed |
 | `DateOnly.FromDateTime(DateTime)` | `.CompareTo` `.Equals`; `.ToString()` is **not in N4a** |
 | `DateOnly.Parse(str)`, `TryParse(str, out DateOnly)` — **not in N4a**, no primitive here has a `str` member yet ([not-yet.md](../reference/not-yet.md)) | |
 
@@ -176,10 +195,10 @@ keeps it rather than inventing an operator C# does not have.
 | static | instance |
 |---|---|
 | `TimeOnly.MinValue`, `MaxValue` | `.Hour` `.Minute` `.Second` `.Millisecond` `.Ticks` |
-| `new TimeOnly(h, mi, s)`, `new TimeOnly(h, mi, s, ms)` | `.Add(TimeSpan)` `.AddHours(f64)` `.AddMinutes(f64)` — all **wrapping**, C#'s own |
+| `new TimeOnly(h, mi)`, `new TimeOnly(h, mi, s)`, `new TimeOnly(h, mi, s, ms)` | `.Add(TimeSpan)` `.AddHours(f64)` `.AddMinutes(f64)` — all **wrapping**, C#'s own |
 | `new TimeOnly(i64 ticks)` | `.ToTimeSpan()` → `TimeSpan` |
 | `TimeOnly.FromDateTime(DateTime)`, `FromTimeSpan(TimeSpan)` | `.IsBetween(TimeOnly, TimeOnly)` |
-| `TimeOnly.Parse(str)`, `TryParse(str, out TimeOnly)` | `.CompareTo` `.Equals` `.ToString()` |
+| `TimeOnly.Parse(str)`, `TryParse(str, out TimeOnly)` — **not in N4b**, no primitive here has a `str` member yet | `.CompareTo` `.Equals`; `.ToString()` is **not in N4b** either |
 
 **`DateTimeOffset`**
 
@@ -214,6 +233,15 @@ answers `0`/`1` and writes `MinValue` on failure — the same pair, the same rea
 
 ## 6. What it costs in `mc limits`
 
+**This is the PAGE's total, across all three crumbs, not one crumb's own share.** Each
+crumb registers exactly one `type_new` and one type word, so each owns `+1`/`+1` of the
+`+3`/`+3` below: N4a's is D54's own, N4b's is D58's, and N5 owes the third. The `hello.tk`
+floor does not show every `+1` of `syntax` moving — it never opens the new type's own
+expression, so that row can stay at its own peak even while `types` (an unconditional
+registration, unlike `syntax`'s table) climbs by one on every leg regardless — but a leg
+that opens one shows all three: `alias` climbs with `types` (each `type_new` takes an alias
+row too), and `syntax` climbs on the leg that actually uses the word.
+
 | row | before | after | why |
 |---|---|---|---|
 | `types` | — | **+3** | three `type_new` calls in the compiler itself |
@@ -225,11 +253,12 @@ answers `0`/`1` and writes `MinValue` on failure — the same pair, the same rea
 | fixture | asserts | `expect-exit` |
 |---|---|---|
 | `tests/surface_dateonly.tk` (**landed**; the page said `primitives_dateonly.tk`) | `2024-02-29` built three ways and read back component by component; `DayOfWeek` and `DayOfYear`; `AddDays` over a month and a year boundary; `AddMonths` clamping `2024-01-31` to `2024-02-29`; `AddYears` `2000-02-29` to `2001-02-28`; `MinValue`/`MaxValue`; the six comparisons; `DayNumber` round-trip; `FromDateTime`; and the value through a local, a parameter, a return, a field, a global, both shapes of array element, a `ref`/`out` pointee and a closure capture — the set that proves the four-byte width. No `ToString`/`Parse` | `42` |
-| `tests/primitives_timeonly.tk` | components; `Ticks`; `AddHours` wrapping past midnight in both directions; `t - t` as a `TimeSpan`; `IsBetween` across midnight; `ToTimeSpan`; the six comparisons; `ToString`/`Parse` in both formats | `42` |
+| `tests/surface_timeonly.tk` (**landed**; the page said `primitives_timeonly.tk`) | all four constructors; `MinValue`/`MaxValue`; `FromDateTime`/`FromTimeSpan` agreeing; `.Add` wrapping past midnight both ways; `.AddHours`/`.AddMinutes` wrapping; `.ToTimeSpan()`; `.IsBetween`, ordinary and wrapping, both ends' inclusive/exclusive edges; the six comparisons, `.CompareTo`, `.Equals`; `t - t` both ordinary and forward-wrapping; `DateOnly.ToDateTime(TimeOnly)` round-tripped through `DateOnly.FromDateTime`/`TimeOnly.FromDateTime`/`.TimeOfDay`; the spec's own § 2 sample; and the value through a local, a field, a global, both shapes of array element and a closure capture, short — eight bytes needs no width proof. No `ToString`/`Parse` | `42` |
 | `tests/primitives_dto.tk` | a value through a local, a parameter, a return, a field, a global and an array element, and a recursive function proving the sixteen-byte return buffer; two values with different offsets naming one instant compare **equal**; `ToOffset` preserves the instant; the Unix conversions round-trip; `ToString`/`Parse` | `42` |
 | `tests/surface_dateonly_panic.tk` (**landed**) | `new DateOnly(2024, 2, 30)`, after a page of checks that must not fire | `70` |
 | `tests/refuse/dateonly_{from_int,to_i64,to_datetime,cast,plus_datetime}.tk` (**landed**) | the five compile-time refusals of § 2, each by its exact message and line | *refused* |
-| `tests/primitives_timeonly_bad.tk` | `new TimeOnly(24, 0, 0)` | `70` |
+| `tests/surface_timeonly_panic.tk` (**landed**; the page said `primitives_timeonly_bad.tk`) | `new TimeOnly(864000000000)`, one tick past the range, after a page of checks — the calendar-free constructors at both ends of a day, the raw-ticks constructor and `FromTimeSpan` at the top of the range, wrapping arithmetic that goes nowhere near it — that must not fire | `70` |
+| `tests/refuse/timeonly_{from_int,to_i64,to_datetime,cast,plus_timeonly}.tk` (**landed**) | the five compile-time refusals of § 2's `TimeOnly` half, each by its exact message and line | *refused* |
 | `tests/primitives_dto_bad_offset.tk` | `new DateTimeOffset(dt, TimeSpan.FromHours(15))` | `70` |
 
 ## 8. The crumbs
@@ -244,12 +273,20 @@ the compiler's own casts became instructions (a sign extension and a narrowing s
 the record that tells such a cast from a hand-written one had to be handed over at five
 more in-place-replacement doors ([the internals note](../internals/primitives.md)).
 
-### N4b — `TimeOnly` (M)
+### N4b — `TimeOnly` (M) — **landed**, D58
 
-The second `type_new` of this crumb as it was first written: eight bytes of ticks since
-midnight, the wrapping `Add*` family, `t - t` as a `TimeSpan`, `IsBetween`, and
-`DateOnly.ToDateTime(TimeOnly)` — the one member N4a left out because the argument's type
-did not exist yet. **Depends on `docs/specs/datetime.md`'s C2** and on nothing else.
+The second `type_new` of this crumb, eight bytes of ticks since midnight: the wrapping
+`Add*` family, `t - t` as a `TimeSpan`, `IsBetween`, and `DateOnly.ToDateTime(TimeOnly)` —
+the one member N4a left out because the argument's type did not exist yet. Registered
+BETWEEN `DateTime` and `DateOnly` in `tk_time_init` so that member's own column reads a
+live id and neither table needs `tk_prim_late`. Cost the mechanism nothing new: half its
+rows call no new function at all, reusing `DateTime`'s own component functions (masking a
+`Kind` that was never packed is a no-op) and `TimeSpan`'s own comparisons (a tick count of
+a time of day is an ordinary non-negative `i64`, the case `DateOnly` already made), and
+`.Ticks`/`.ToTimeSpan()` are symbol-less identity rows — the first time that trick was used
+on a METHOD rather than a property, which needed no change to the mechanism because nothing
+in it special-cased the difference. **Depends on `docs/specs/datetime.md`'s C2** and on
+nothing else.
 
 **Gate (both):** the surface fixture at `42` and the panic one at `70`; every other
 fixture unchanged with `--dump-ast` byte-identical; `FIXPOINT OK`; `mc limits` verdict `ok`
@@ -258,7 +295,7 @@ with `passes` and `intrin` **not moved**; `sh scripts/check-docs.sh` green.
 [datetime.md](../reference/datetime.md), the refusals in
 [diagnostics.md](../reference/diagnostics.md), the functions in
 [runtime.md](../reference/runtime.md), and the removal of the "left out" row in
-`not-yet.md`.
+`not-yet.md`. All landed with D58.
 
 ### N5 — `DateTimeOffset` (M)
 

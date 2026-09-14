@@ -245,15 +245,43 @@ non-negative `i64` and those functions already answer exactly this (D54; the spe
 named a `tk_do_eq` … `tk_do_ge` family, and six wrappers that forward and nothing else are
 what this does not write).
 
+...and the `TimeOnly` half (N4b), whose value is the TICKS SINCE MIDNIGHT and not a day
+number: an ordinary, non-negative `i64` in `0 .. TICKS_PER_DAY - 1`. `DateTime`'s own
+component functions are read directly for `.Hour`, `.Minute`, `.Second` and
+`.Millisecond` — masking `DATETIME_TICK_MASK` off a value already well under it is a
+no-op, so four more functions that would repeat the same division and modulo are not
+written:
+
+| signature | is |
+|---|---|
+| `i64 tk_to_min()` `tk_to_max()` | `TimeOnly.MinValue`, `MaxValue`: ticks `0` and `863999999999` |
+| `i64 tk_to_from_ticks(i64)` | `new TimeOnly(ticks)` AND `TimeOnly.FromTimeSpan(ts)`: the one range check both share |
+| `i64 tk_to_hm(i64, i64)` `tk_to_hms(i64, i64, i64)` `tk_to_hmsms(i64, i64, i64, i64)` | the three calendar-free constructors, through `tk_dt_time_ticks` |
+| `i64 tk_to_add(i64 t, i64 ts)` | `.Add(TimeSpan)`, wrapping at both ends of the day; never panics |
+| `i64 tk_to_add_hours(i64, f64)` `tk_to_add_minutes(i64, f64)` | C#'s own form, `.Add(TimeSpan.FromHours(v))` and its sibling |
+| `i64 tk_to_is_between(i64 t, i64 s, i64 e)` | `.IsBetween`: `s` inclusive, `e` exclusive, wraps when `s` is after `e` |
+| `i64 tk_to_sub(i64 a, i64 b)` | `a - b`: the elapsed `TimeSpan`, wrapping FORWARD across midnight, never negative |
+| `i64 tk_do_to_datetime(i64 n, i64 t)` | `DateOnly.ToDateTime(TimeOnly)`: the day number back into ticks, plus the time of day, `Kind` Unspecified |
+
+`.Ticks` and `.ToTimeSpan()` are in no row: the former is the eight bytes themselves,
+`TimeSpan.Ticks`'s own identity, and the latter is the SAME eight bytes read back under
+`TimeSpan`, the identity the other way — neither calls a function of this file.
+`TimeOnly.FromDateTime(d)` is `tk_dt_tod` above, named directly and not copied: it already
+answers ticks since midnight, masked and modulo `TICKS_PER_DAY`, which is exactly a
+`TimeOnly`'s own range. Nor are `.CompareTo`, `.Equals` or the six comparisons: like
+`DateOnly`'s, they lower to `tk_ts_cmp` and `tk_ts_eq` … `tk_ts_ge`, because a tick count of
+a time of day is an ordinary non-negative `i64` too.
+
 Five constants come with the file, and a program may read them: `TICKS_PER_MILLISECOND`,
 `TICKS_PER_SECOND`, `TICKS_PER_MINUTE`, `TICKS_PER_HOUR`, `TICKS_PER_DAY`, plus
-`TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS` — and the date half adds
+`TIMESPAN_MAX_TICKS` and `TIMESPAN_MIN_TICKS` — the date half adds
 `DATETIME_MAX_TICKS`, `UNIX_EPOCH_TICKS`, `DATETIME_TICK_MASK`, `DAYS_PER_YEAR`,
 `DAYS_PER_4_YEARS`, `DAYS_PER_100_YEARS`, `DAYS_PER_400_YEARS`, the four `DT_*`
-selectors and `DATEONLY_MAX_DAYNUM`. They are ordinary top-level `const i64`, so
-a program that declares one of those names itself collides with it.
+selectors and `DATEONLY_MAX_DAYNUM` — and the time-of-day half adds `TIMEONLY_MAX_TICKS`.
+They are ordinary top-level `const i64`, so a program that declares one of those names
+itself collides with it.
 
-Fourteen panics live here, all exit **70**:
+Fifteen panics live here, all exit **70**:
 
 | panic | when |
 |---|---|
@@ -271,6 +299,7 @@ Fourteen panics live here, all exit **70**:
 | `teko: a date kind is out of range` | a `Kind` outside `0..2` at `new DateTime(ticks, kind)` |
 | `teko: a month count is out of range` | `AddMonths` outside ±120000, C#'s own bound |
 | `teko: a year count is out of range` | `AddYears` outside ±10000 |
+| `teko: a time of day is out of range` | a tick count outside `0 .. 863999999999`: `new TimeOnly(ticks)` or `TimeOnly.FromTimeSpan(ts)` |
 
 ---
 
