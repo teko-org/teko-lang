@@ -5497,7 +5497,13 @@ exactly the pipeline mc has today.
 **Proof.** `actionlint` clean beyond the `SC2016` information `ngen.yml`'s own summary step
 already reports (a `printf` format in single quotes, which is what a format string is);
 `sh scripts/check-docs.sh` → `docs ok: 599 links, 42 fragments, 389 diagnostics, 50 refusals,
-141 samples`; and the workflow dispatched against mc 0.16.0 — a real release, so an `ok` there
-is a true statement about it — landing its verdict at the contract URL. No `.tk`, `.mc` or
-`teko.toml` byte moves in this crumb, so `--dump-ast` is unchanged by inspection: nothing the
-parser reads was touched.
+141 samples`. No `.tk`, `.mc` or `teko.toml` byte moves in this crumb, so `--dump-ast` is
+unchanged by inspection: nothing the parser reads was touched. **What is NOT yet proved, and
+why:** the round trip. `workflow_dispatch` refuses a workflow that is not on the default branch
+(`HTTP 404: workflow mc-canary.yml not found on the default branch`), so the proof dispatch —
+`gh workflow run mc-canary.yml -f version=0.16.0`, a real release whose `ok` is a true statement
+— is the first step after this lands; and `refs/heads/canary` is not yet on the `All Green`
+ruleset's exclude list (the ruleset PUT is an owner action the session could not take), so
+until it is, `verdict`'s push is refused and every candidate falls through to mc's advisory
+timeout. Both are recorded here so the entry does not claim a run that has not happened; the
+verifier of this crumb caught the first draft of this paragraph claiming exactly that.
