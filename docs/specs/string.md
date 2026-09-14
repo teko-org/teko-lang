@@ -270,7 +270,7 @@ temporary. There is no new operator machinery on this page at all.
 needs a root type, which needs `object`, which needs boxing — § 11. `"n=" +
 tk_num(n)` is the road today and `$"n={n}"` is the road when § 9 unblocks.
 
-## 9. `$"..."` needs `mc` 0.15.25, where a module claims `$`
+## 9. `$"..."` needs `mc` 0.15.25, where a module claims `$` — and the pin is past it
 
 C#'s interpolation is `$"a{x}b"`. In `mc` up to 0.15.24 the lexer could not hand it over:
 `$` opens a **hole** token — `$1`, `$name`, `$$name`, the machinery `#rule` substitution
@@ -282,10 +282,11 @@ tree at the 0.15.23 pin: `puts($"hi")` is `invalid hole` at the `$`.
 digit or `$`), the lexer falls through to the punctuation matcher, so a module that
 registered `syntax_expr("$", …)` owns the token and reads the string literal after it with
 `p_cp()`/`p_take_lit`; the three `#rule` forms are untouched, nothing in `mc`'s core changed.
-N10 therefore waits for one thing only: teko's pin reaching 0.15.25 (a `MC_VERSION` crumb
-proved by the whole recipe, D29/D35/D37). Until then `$"…"` is what the pinned lexer says it
-is, and this page's own refusal (`teko: string interpolation is not taught yet`) only
-becomes reachable afterwards.
+N10 waited for one thing only: teko's pin reaching 0.15.25 (a `MC_VERSION` crumb proved by
+the whole recipe, D29/D35/D37). **D64 raised the pin to 0.16.1, so that wait is over** —
+N10 is now blocked by nothing but its own crumb, and this page's refusal (`teko: string
+interpolation is not taught yet`) is reachable the day the module claims `$`. The
+measurement above is kept as the record of what the 0.15.23 lexer did.
 
 **What it lowers to, so the crumb is ready the day it lands.** `$"a{x}b{y}"` becomes a
 chain of `string.Concat` over the literal pieces and one formatter per hole, chosen **by

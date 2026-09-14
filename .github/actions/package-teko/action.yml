@@ -25,6 +25,13 @@ inputs:
     description: 'suffix an executable carries on this operating system (`.exe` on Windows)'
     required: false
     default: ''
+  mc-version:
+    description: >
+      the mc release the binary was built by, without its leading `v` -- the
+      key of the library root that travels with it (`lib/mc/v<mc-version>/`).
+      Empty reads `MC_VERSION`.
+    required: false
+    default: ''
   outdir:
     description: 'where the tarball and its checksum are written'
     required: false
@@ -50,6 +57,7 @@ runs:
         BINARY: ${{ inputs.binary }}
         EXE: ${{ inputs.exe }}
         OUTDIR: ${{ inputs.outdir }}
+        MC_VERSION_INPUT: ${{ inputs.mc-version }}
       run: |
         set -eu
         version="${VERSION#v}"
@@ -79,6 +87,30 @@ runs:
         # every fixture under `tests/` does), so the archive that carries the
         # compiler carries the runtime that compiler expects to find.
         cp lib/rt.tk "$stage/lib/rt.tk"
+
+        # Since mc 0.16.0 the standard library is OUT of the binary: `mc build`
+        # stages `lib/mc/v<mc-version>/` beside the `[compiler]` product, and the
+        # taught compiler resolves `<sys>`, `<prelude>`, `<io>` and `<float>` from
+        # there -- next to itself, or one directory up. `lib/rt.tk` includes
+        # `<sys>`, so a teko binary shipped without that tree cannot compile a
+        # single program. It travels in the archive, under the same `lib/`.
+        # The root is keyed by mc's version, not by teko's: only the tree of
+        # the mc that built this binary is accepted and copied, and it has to
+        # be the ONLY versioned root there -- a stale sibling from an earlier
+        # toolchain would otherwise ride into the release unnoticed.
+        mcver="${MC_VERSION_INPUT:-$(tr -d '[:space:]' <MC_VERSION)}"
+        mclib="$(dirname "$binary")/lib/mc"
+        if [ ! -d "$mclib/v$mcver" ]; then
+          echo "::error::$mclib/v$mcver is missing -- mc $mcver's standard library was not staged beside $binary" >&2
+          exit 1
+        fi
+        roots=$(ls -d "$mclib"/v*/ 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$roots" != 1 ]; then
+          echo "::error::$mclib holds $roots versioned roots; exactly one (v$mcver) belongs beside $binary" >&2
+          exit 1
+        fi
+        mkdir -p "$stage/lib/mc"
+        cp -R "$mclib/v$mcver" "$stage/lib/mc/v$mcver"
         if [ -f README.md ]; then cp README.md "$stage/README.md"; fi
         if [ -f LICENSE ]; then cp LICENSE "$stage/LICENSE"; fi
 
@@ -129,6 +161,18 @@ runs:
           echo "lib/rt.tk is the runtime a teko program includes:"
           echo
           printf '%s\n' '  #include "lib/rt.tk"'
+          echo
+          echo "The library beside it"
+          echo "---------------------"
+          echo "lib/mc/ in this archive is the mc standard library this compiler was"
+          echo "taught on; teko looks for it next to its own binary, and one directory"
+          echo "up. Installing the binary alone loses <sys>, <prelude>, <io> and"
+          echo "<float>, and lib/rt.tk stops compiling. So:"
+          echo
+          case "$TARGET" in
+            windows-*) printf '%s\n' '  xcopy /E /I lib C:\tools\lib' ;;
+            *)         echo "  cp -R lib /usr/local/" ;;
+          esac
           echo
           echo "Documentation: README.md and docs/README.md in the"
           echo "repository this was built from."

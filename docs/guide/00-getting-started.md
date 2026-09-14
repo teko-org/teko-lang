@@ -14,7 +14,7 @@ The version is [`MC_VERSION`](../../MC_VERSION), one line, and it is the only on
 to build this tree.
 
 ```sh
-version=$(cat MC_VERSION)                          # 0.15.23
+version=$(cat MC_VERSION)                          # 0.17.0
 name="mc-$version-macos-arm64"                     # or linux-x86_64, linux-arm64, windows-x86_64, windows-arm64
 base="https://github.com/minicompiler/mc/releases/download/v$version"
 curl -fsSLO "$base/$name.tar.gz"
@@ -22,12 +22,20 @@ curl -fsSLO "$base/$name.tar.gz.sha256"
 sha256sum -c "$name.tar.gz.sha256" 2>/dev/null || shasum -a 256 -c "$name.tar.gz.sha256"   # Linux, then macOS
 tar xzf "$name.tar.gz"
 mkdir -p ~/.local/bin && install -m 755 "$name/mc" ~/.local/bin/mc   # no root needed; put ~/.local/bin on PATH
+cp -R "$name/lib" ~/.local/                        # the standard library, one directory up from the binary
 
 mc --version                                       # must print the pinned version
 mc --host                                          # the (os, arch) pair this binary is
 ```
 
-On Windows the asset is a `.tar.gz` too; extract it and put `mc.exe` on `PATH`.
+Since **0.16.0 the standard library lives beside the binary**, not inside it: the archive
+carries `lib/mc/v<version>/`, and `mc` looks for it next to its own binary and one
+directory up. `~/.local/bin/mc` therefore reads `~/.local/lib/mc/v$version/`, which is what
+the `cp -R` above puts there; a binary copied out of the archive alone loses `<sys>`,
+`<prelude>`, `<io>` and `<float>`, and says so.
+
+On Windows the asset is a `.tar.gz` too; extract it, put `mc.exe` on `PATH` and keep its
+`lib\` directory beside it or one level up.
 
 The release names the machine `x86_64` or `arm64`; `mc --host` calls the same machine
 `x86_64` or `aarch64`. On macOS the binary is ad-hoc signed, so a download through a

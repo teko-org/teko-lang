@@ -6157,6 +6157,112 @@ compiler leg; `./build/teko limits tests/hello.tk` byte-identical to the base co
 pkg hash .` `c9f8692f8bfdba896b329d634fa10357cff0f936e1195111549082d66799501b` (`teko_rc.tk`
 is a listed file, so the hash moves by design).
 
+### D64 · The pin rises to 0.16.1 (2026-09-14)
+`MC_VERSION` moves from `0.15.23` to `0.16.1` — twenty-five `minicompiler/mc` commits, of
+which one changes the SHAPE of what a build produces here and two more close a blocker this
+same entry once recorded open. **M52: the standard library left the binary.** Up to 0.15.23
+`<sys>`, `<prelude>`, `<io>`, `<float>` and the two float machines were a blob inside `mc`;
+since 0.16.0 they are 44 files (41 at 0.16.0) on disk under `lib/mc/v<version>/`, which `mc` resolves next to
+its own binary (by realpath, so a symlinked `mc` still finds it) and one directory up. `mc
+build` **stages that tree beside a `[compiler]` product**, so `build/lib/mc/v0.16.1/` now
+travels with `build/teko`, and the child resolves its own roots — teko passes **no
+`--libs-dir` anywhere**, and none was added. The rest of the range is invisible from here:
+the x86-64/Win64 register allocator and peephole (M49 D2), the arm64 peephole,
+loop-invariant hoisting, the reproducible bench cell (M50), `mc --exe` for Windows PE,
+version constraints for `[deps]`/`[tools]`, `[package].mc`, the registry index snapshot,
+`$` as a claimable surface token, `i128`/`u128` on x86-64 (SysV and Win64), and M53's own
+release canary machinery, which is the mechanism that unblocked this entry below.
+
+**`mc.toml` gains `[package].mc = "0.16.1"`, a bare MINIMUM (not a cap).** R2, the
+registry's own validator, moved off its 0.15.20 pin once 0.16.0 shipped and now reads
+version constraints, so the manifest can finally say which mc a build of this package
+needs — mc `docs/reference/packages.md § The minimum mc version` is mc's own prescription: a
+bare/`>=` value is the normal form, a `^`/`~`/`=` CAPS the compiler and is written only
+against a future break already known, which this package has none of. `teko.toml` stays
+bare — it is a build config, not a manifest, and carries no `[package]` table to begin
+with. There is still no `[deps] stdlib` to declare — `docs/specs/packages.md` predicted the
+library would become a *package* reached through the lock; what shipped moved it to a
+*directory*, leaving the include names, the closure rule and `[deps]` untouched.
+
+**One change beyond the version string, and it is not cosmetic.**
+`.github/actions/package-teko` used to stage `teko` and `lib/rt.tk` into the release
+archive and nothing else. `lib/rt.tk` includes `<sys>`; under 0.16.x a `teko` binary with no
+`lib/mc/` beside it answers `lib/rt.tk:40: unknown bundled include: sys` and cannot compile
+a single program — measured, by copying `build/teko` out of `build/` and running it, and
+measured again on a full staged archive, which compiles `#include "lib/rt.tk"` to
+`exit 42` with the tree and refuses with that line the moment `lib/mc/` is removed. (`mc`
+itself, whose driver resolves the same names, says `not in this compiler and mc 0.16.1's
+library tree was not found`; the taught compiler is built on `<mc/core_min>` and keeps the
+core's shorter wording.) The action now copies the tree `mc build` staged beside the
+binary into the archive's own `lib/mc/`, and fails loudly if it is not there; the archive's
+`INSTALL.txt` and the release notes gained the `cp -R lib /usr/local/` (and the Windows
+`xcopy`) that the install needs. `docs/guide/00-getting-started.md` gained the same line for
+`mc` itself, `docs/reference/build.md` states where the tree lives, and both were verified
+by installing `mc` into a `bin/` + `lib/` pair and into a bare directory: the first
+compiles `#include <sys>`, the second refuses with that exact message.
+`.github/actions/setup-mc` needed nothing — it already untars the WHOLE asset into
+`.mc-toolchain/mc-<version>-<os>-<asset>/` and addresses the binary inside it, so
+`lib/mc/v0.16.1/` lands beside it by construction.
+`.github/actions/windows-sysroot`'s `kernel32.def` needed nothing either: mc's own
+`scripts/sysroot-windows.sh` at `v0.16.1` still lists the same nineteen names, compared
+verbatim.
+
+**The windows/x86_64 blocker this entry recorded open is CLOSED, by `mc` 0.16.1, not by
+anything here.** mc 0.16.0 added a direct PE executable backend for windows/x86_64 (M42
+step 2), and `drv_teach` took that host's exe slot unconditionally, ignoring a declared
+`[linker]` and writing `build/teko.exe` with mc's own PE writer — an image that the loader
+refused the moment the program imported anything from `kernel32`, so `build/teko.exe`
+exited 127 on every invocation and `mc build` reported it as a silent `return 1`, with no
+diagnostic. That was reported to `minicompiler/mc` with the two-line pure-`mc` reproducer
+this entry's earlier draft carried, and never worked around here (D2). `minicompiler/mc`
+PR #84 (commit `718bd82`) makes a declared `[linker]` win over the host's direct exe
+backend for the taught compiler too — the same precedence `drv_entry` already gave the
+entry — so `mc build` on windows/x86_64 links `teko.exe` with the leg's own `lld-link`
+exactly as it did at 0.15.23, and the direct PE writer never enters the road at all; a
+companion finding, PR #83 (commit `166c9f1`), separately showed the loader's refusal on the
+DIRECT road was never a layout defect but an unresolvable `kernel32` import (`write`, which
+`kernel32.dll` does not export), orthogonal to teko once fix 1 takes the linked road.
+Teko's own release canary (`.github/workflows/mc-canary.yml`, M53's mechanism) judged
+0.16.1 `ok` on every leg — `https://raw.githubusercontent.com/teko-org/teko-lang/canary/0.16.1.json`,
+run `https://github.com/teko-org/teko-lang/actions/runs/34877983682` — windows/x86_64 and
+`teko_std` included, which is the measurement this entry stands on rather than a second
+reproducer written here: the fix is on mc's side and mc's own release process is what
+proves it, per D2.
+
+Proof, macos/aarch64, with the pinned `~/.local/mc/mc-0.16.1-macos-arm64/mc`: `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**75 passed, 83 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK` (`teko2.o == teko3.o`, fixed point on the FIRST turn —
+`teko1.o == teko2.o` — and the `--dump-asm` diff empty over 230438 lines);
+`sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments, 390 diagnostics, 83
+refusals, 144 samples` (re-measured on `abf3137b`, after `origin/main` `afdfae88` — D65 to
+D70 — was merged in). `mc pkg hash .` is
+`373c8f04a413bae0f5c86fab5a19f2dedfffc76c5fc0028691f162a2660bcdc2` (base, `origin/main`
+`afdfae88` under 0.15.23,
+`a8122b64a3235e39820a1cc1aa3fc1446e3b890fc684791fdbc12868b7343e50`: the tree hash now moves
+with this pin, because `[package].mc` is new bytes in `mc.toml`, which the previous 0.16.0
+draft of this entry did not carry).
+
+`mc limits . --config mc.macos.toml` keeps verdict `ok` on every row of both tables, and no
+table appeared, disappeared or changed its ceiling. The rows that MOVED, `build/teko.mc`
+first (estimate / used, 0.15.23 → 0.16.1): `includes` 78/78 → 79/79, `nodes`
+181369/157320 → 188941/164854, `defines` 1249/1201 → 1334/1284, `funcs` 3833/3193 →
+3980/3277, `lowered` 3833/3175 → 3980/3258, `globals` 1277/945 → 1326/946, `strings`
+2667/2138 → 2727/2174, `ins` 217118 → 226179, `symbols` 7777/6276 → 8033/6397, `undef`
+18 → 0, `backends` 8 → 9. On `tests/hello.tk` exactly one row moves: `backends` 8 → 9
+(the `heap` column is not a proof figure — it reflects the state of `build/` at the time
+of the run, D55's lesson). Every row's motion is the same handful of causes read twice —
+D69's own capacity raise (already on `main`, unrelated to this pin), the library now
+SOURCE the build reads (one more include) instead of a blob, and 0.16.x registers one more
+backend (`mc --exe` for Windows PE) — and none of them is near its reserve.
+
+`--dump-ast` of all **158** fixtures (75 under `tests/`, 83 under `tests/refuse/`, the
+refusals compared on their stderr since they produce no tree), taken with the compiler
+built by 0.15.23 (`origin/main` `afdfae88`) and with the compiler built by 0.16.1 over the
+same unmodified tree, is **byte-identical on every one**. The taught compiler's own output
+does not depend on the host `mc`; what moved underneath it is codegen, one more capacity
+ceiling (D69) and library location, not grammar.
+
 ### D65 · A delegate FIELD is callable on every road it can be read (2026-09-14)
 D59 closed the argument gap on the four `callp` roads that HAD a call. This entry is about
 the roads that had none. `class H { public Op cb; }` with `delegate i64 Op(i64 a, i64 b)`
@@ -7206,3 +7312,41 @@ ruleset's exclude list (the ruleset PUT is an owner action the session could not
 until it is, `verdict`'s push is refused and every candidate falls through to mc's advisory
 timeout. Both are recorded here so the entry does not claim a run that has not happened; the
 verifier of this crumb caught the first draft of this paragraph claiming exactly that.
+
+**Amendment (2026-09-15).** Both open items above closed the same day: the mc session, an
+admin of this repository, added `refs/heads/canary` to the `All Green` exclude list, and the
+dispatch for 0.16.0 (run 34863283302) wrote `0.16.0.json` = `fail` (windows/x86_64, the direct
+PE backend, the truthful verdict). The 0.16.1 and 0.17.0 candidates were judged `ok` in full
+(runs 34877983682 and 34889251142). What did NOT work is the `schedule` trigger: zero cron runs
+in the six hours after the workflow landed on `main`, so every candidate so far was judged by a
+manual `workflow_dispatch`; mc's `promote` reads the file the same way either road writes it.
+
+### D72 · The pin rises to mc 0.17.0, the release candidate that freezes mc's surface (2026-09-15)
+mc 0.17.0 is the RC whose publication starts the surface freeze (mc `hooks.md` § 8: from here to
+1.0.0 a rename or a removal of the hook surface ships only with an alias or a major). It was
+judged by this repository's own canary before it was promoted (D71; run 34889251142, all fifteen
+jobs green, `teko_std` included), and the whole local recipe is green on it, on `main`
+`6bffa633` before a single file moved: `mc build . --config mc.macos.toml` clean;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **75 passed, 83 refused as expected,
+0 failed**; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (`--dump-asm`
+diff empty over 230438 lines); `sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments,
+390 diagnostics, 83 refusals, 144 samples`; `mc limits` verdict `ok`, no ceiling moved.
+
+The move is the one D64 prescribed for a pin: `MC_VERSION` → `0.17.0`; `mc.toml`'s
+`[package].mc` follows the pin (the registry's own validator runs 0.17.0 since mc-registry #33,
+so the minimum this manifest states is the compiler that validates it); the four places that
+quote the pinned number as the CURRENT one (`CONTRIBUTING.md`, `docs/guide/00-getting-started.md`,
+`docs/reference/build.md`'s staged path and message text, `.github/workflows/site.yml`'s comment)
+follow; every mention of 0.16.0/0.16.1 that narrates a past measurement stays. Nothing in the
+hook modules moves: `--dump-ast` of all **158** fixtures (75 under `tests/`, 83 under
+`tests/refuse/`) is byte-identical between the compiler built by 0.16.1 over `main` and the
+compiler built by 0.17.0 over this tree. `mc pkg hash .` on this tree is
+`ef8f2df1e26e615cb0452ce7a436ffafbcf42710c4f3002e690919aca71dd287` (the manifest moved; the
+modules did not).
+
+Two facts recorded for the next raise. The registry refused teko 0.12.4 while its sandbox ran
+0.16.0 (`teko 0.12.4 needs mc >= 0.16.1 (this is mc 0.16.0): upgrade the compiler`, job 64):
+`[package].mc` doing its job, and the reason the minimum and the validator's compiler have to
+move together. And `mc tool install` exists since mc 0.15.21 (M48 C3): `tekoc` as an
+installable tool (`[project] kind = "exe"`, `[package].bin`, `[[permission]]`) is a crumb of its
+own, the last row of `docs/specs/roadmap-1.0.md` § What teko owes.
