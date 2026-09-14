@@ -53,6 +53,13 @@ i64 main() {
 `f(3, 4)` is an indirect call through the value's own code pointer. A **null** delegate
 called is a panic with exit 70, never a segfault ([memory.md](memory.md)).
 
+Its arguments are judged and converted exactly as a direct call's are — the count, the
+`ref`/`out` kind, the pointee of a `ref`/`out` one, the type of one passed by value, and
+C# §10.2.3's widening of an integer onto a float parameter — on all three roads a delegate
+is called through: a LOCAL, PARAMETER or GLOBAL slot named directly, a class FIELD —
+`h.cb(x)` — and an `Op[]` ELEMENT called at its index. See
+[diagnostics.md](diagnostics.md#parameters-overloads-ref-out-and-params).
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"

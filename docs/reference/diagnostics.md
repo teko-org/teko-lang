@@ -1165,13 +1165,13 @@ the scope open at the site nor the table of globals holds a row for.
 A call through a DELEGATE is judged by the same rule, from the delegate's own signature.
 That call is a `callp`, built after the `ref` pass and naming no callee, so nothing
 downstream ever reads its arguments: the delegate's own argument check
-(`tk_deleg_check_arg_kinds`, [teko_deleg.tk](../../teko_deleg.tk)) is the only door, and it
-compared the `ref`/`out` TAG alone — an `i64`'s address reached a callee that writes a
-double through it, and the integer came back holding that double's bits (D51, twelfth
-pass). A delegate LOCAL, PARAMETER or GLOBAL called by name is judged whole; the two roads
-whose `callp` is built while the file is still being parsed, a delegate FIELD and an `Op[]`
-ELEMENT, stand where neither the scope nor the table of globals is filled, so the pointee
-there is a name no oracle holds a row for and the check stays silent on it:
+(`tk_deleg_check_arg_kinds`, [teko_deleg.tk](../../teko_deleg.tk)) is the only door — and
+it is the door for all three roads alike, a delegate LOCAL, PARAMETER or GLOBAL called by
+name, a delegate FIELD, and an `Op[]` ELEMENT. An argument whose type that door cannot read
+where it stands is deferred to the same point a virtual call's is, so the pointee is judged
+on every road (D59; before it, the two roads whose `callp` is built while the file is still
+being parsed read no pointee at all and an `i64`'s address reached a callee that writes a
+double through it):
 
 ```teko
 // no-run
@@ -1184,6 +1184,13 @@ i64 main() {
     return 0;
 }
 ```
+
+The argument passed BY VALUE takes the same judgement at that same door, and the same
+conversion: `delegate i64 Op(i64); Op f = twice; f64 lf = 8.5; f(lf);` is refused
+`teko: a value of type f64 does not convert to i64`, exactly as `twice(lf)` is, and
+`delegate f64 F(f64); F f = half; f(5);` widens the 5 the way `half(5)` does (D59 — before
+it the door read the `ref`/`out` kind and nothing else, so the value crossed as its own raw
+bits on all three roads).
 
 A VIRTUAL call, an INTERFACE call and the UNQUALIFIED form of either inside a method are
 `callp`s too, and their arguments take the judgement a direct call's take — by type
