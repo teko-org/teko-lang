@@ -82,15 +82,43 @@ i64 dg_pslot_at(i64 si, i64 j) {
 uptr dgi_row[TK_MAXDGI];              // the delegate row a wrap targets
 uptr dgi_fn[TK_MAXDGI];               // the function it wraps
 uptr dgi_alloc[TK_MAXDGI];            // the allocator symbol already built for it
+uptr dgi_thunk[TK_MAXDGI];            // the forwarder's own N_FUNC node (D63)
 i64  tk_ndgi = 0;
 
 i64  dgi_row_at(i64 i)   { return ld64(dgi_row + i * 8); }
 uptr dgi_fn_at(i64 i)    { return ld64(dgi_fn + i * 8); }
 uptr dgi_alloc_at(i64 i) { return ld64(dgi_alloc + i * 8); }
+i64  dgi_thunk_at(i64 i) { return ld64(dgi_thunk + i * 8); }
 
 void set_dgi_row_at(i64 i, i64 v)   { st64(dgi_row + i * 8, v); }
 void set_dgi_fn_at(i64 i, uptr v)   { st64(dgi_fn + i * 8, v); }
 void set_dgi_alloc_at(i64 i, uptr v) { st64(dgi_alloc + i * 8, v); }
+void set_dgi_thunk_at(i64 i, i64 v) { st64(dgi_thunk + i * 8, v); }
+
+// 1 when `f` is one of the forwarders `tk_deleg_thunk` below generates. This
+// table IS the registry: one row per (delegate row, function) pair, and the
+// forwarder's node is the row's fourth column -- so telling a thunk apart
+// costs no state of its own and no name pattern. `Op__thunk_add` is a
+// SPELLING, which teko_over.tk already reserves against a collision; the node
+// is an identity, which is what a pass has to ask about.
+//
+// `tk_ref_pass` (teko_ref.tk) is what asks. A thunk is the one function in
+// the tree whose body the COMPILER wrote argument by argument, out of
+// `dg_pk_at`/`dg_pty_at`, over a target `tk_deleg_check_sig` has already
+// proved identical to the delegate parameter by parameter: the forwarding is
+// correct BY CONSTRUCTION and that pass has nothing there either to judge or
+// to rewrite (D63, second pass). A LAMBDA's body is generated too and is NOT
+// a thunk -- it holds the code the program wrote, and keeps every check the
+// same code written inline would get.
+i64 tk_deleg_is_thunk(i64 f) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ndgi) break;
+        if (dgi_thunk_at(i) == f) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
 
 // `Op(i64, i64)`, for a mismatch message
 uptr tk_deleg_sig_str(i64 si) {
@@ -169,40 +197,17 @@ void tk_deleg_check_sig(i64 si, uptr fn, i64 d) {
                    tk_deleg_sig_str(si)));
 }
 
-// ONE forwarded parameter of the thunk below, as the ARGUMENT the callee
-// wants (D63). A by-value one is the bare name; a `ref`/`out` one is an
-// ADDRESS the thunk already holds in a `uptr` slot (`dg_pslot_at`), so the
-// forward carries the address itself -- never `&a0`, which would be the
-// THUNK's own slot -- and has to SAY so, or every reader of a call argument
-// judges it as a value: `tk_ref_check_kind` (teko_ref.tk) refused the bare
-// name ``argument 1 needs `ref` at the call site``, the overload matcher
-// (`tk_ov_match`, teko_over.tk) compares the same tag, and `tk_rc_call_args`
-// (teko_rc.tk) types the argument by the parameter's POINTEE.
-//
-// The tag is the one the DELEGATE declares (`dg_pk_at`/`dg_pty_at`), which is
-// the callee's own by then: `tk_deleg_check_sig` has already proved kind and
-// type identical, parameter by parameter, before this function is reached.
-//
-// The `(uptr)` around the name is what makes the tag readable. The pointee
-// oracle (`tk_ref_arg_pointee`, teko_ref.tk) PREFERS the lexical scope for an
-// N_IDENT -- the right rule for a `ref x` the source wrote, where the tag is
-// the parser's guess and the scope is the truth -- and the scope holds `a0`
-// under the `uptr` it is declared at, there being no pointee row for it. One
-// node that is not an N_IDENT sends that oracle to the tag instead. The cast
-// is inert everywhere else: `uptr` is no primitive-with-members, so
-// `tk_cast` does not register it (teko_array.tk) and `tk_prim_cast_check`
-// (teko_prim.tk) returns before reading it, and eight bytes to eight bytes is
-// no instruction.
-i64 tk_deleg_thunk_arg(i64 si, i64 i, uptr pn) {
-    i64 pk = dg_pk_at(si, i);
-    if (pk == TK_RP_NONE) return tk_id(pn);
-    i64 a = tk_cast(TY_UPTR, tk_id(pn));
-    tk_rfarg_tag(a, pk, dg_pty_at(si, i));
-    return a;
-}
-
 // `i64 Op__thunk_add(uptr env, i64 a, i64 b) { return add(a, b); }` -- the
-// ABI every delegate value shares, so a plain function needs a forwarder
+// ABI every delegate value shares, so a plain function needs a forwarder.
+//
+// A `ref`/`out` parameter is forwarded as the bare name too: the slot holds
+// an ADDRESS already (`dg_pslot_at` declares it `uptr`, K2w), so the name IS
+// what the callee wants -- never `&a0`, which would be the THUNK's own slot.
+// Nothing says `ref` at this call site and nothing has to: the body is the
+// COMPILER's, written out of `dg_pk_at`/`dg_pty_at` over a target
+// `tk_deleg_check_sig` has already proved identical parameter by parameter,
+// and `tk_ref_pass` (teko_ref.tk) does not judge it (D63, `tk_deleg_is_thunk`
+// above).
 i64 tk_deleg_thunk_fn(i64 si, uptr thunkname, uptr fn) {
     i64 prs = param_new(TY_UPTR, "env");
     i64 args = 0;
@@ -212,7 +217,7 @@ i64 tk_deleg_thunk_fn(i64 si, uptr thunkname, uptr fn) {
         if (i >= np) break;
         uptr pn = tk_join("a", tk_num(i));
         prs = list_append(prs, param_new(dg_pslot_at(si, i), pn));
-        args = list_append(args, tk_deleg_thunk_arg(si, i, pn));
+        args = list_append(args, tk_id(pn));
         i = i + 1;
     }
     i64 ret = dg_ret_at(si);
@@ -271,7 +276,8 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
     uptr thunkname = tk_join(tk_join(base, "__thunk_"), fn);
     uptr vtname = tk_join(tk_join(base, "__vt_"), fn);
     uptr relname = tk_join(tk_join(base, "__release_"), fn);
-    tk_top_emit(tk_deleg_thunk_fn(si, thunkname, fn));
+    i64 thunk = tk_deleg_thunk_fn(si, thunkname, fn);
+    tk_top_emit(thunk);
     tk_top_emit(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
     tk_top_emit(tk_deleg_release_fn(relname));
     tk_top_emit(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
@@ -279,6 +285,7 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
     set_dgi_row_at(tk_ndgi, si);
     set_dgi_fn_at(tk_ndgi, fn);
     set_dgi_alloc_at(tk_ndgi, allocname);
+    set_dgi_thunk_at(tk_ndgi, thunk);       // the node `tk_ref_pass` asks about (D63)
     tk_ndgi = tk_ndgi + 1;
     return allocname;
 }
