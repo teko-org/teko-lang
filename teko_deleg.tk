@@ -318,45 +318,66 @@ i64 tk_new_deleg(i64 si, i64 line, uptr fl) {
     return r;
 }
 
-// a delegate call's own arguments against the KIND its signature declares:
-// a `ref`/`out` slot is an ADDRESS (K2w), so an argument that carries a value
-// would be written through as if it were one -- the same two diagnostics
-// `tk_ref_check_call` (teko_ref.tk) gives a direct call.
+// a delegate call's own arguments, against the signature the delegate row
+// carries -- the KIND of each parameter, and the TYPE behind it. The `callp`
+// this function guards is built AFTER `tk_ref_pass` and names no callee, so
+// neither that pass's own call check nor `tk_rc_call_args` (teko_rc.tk) ever
+// sees it: this is the ONE door every argument of every delegate call passes,
+// on all three roads (the bare name rewritten in `tk_deleg_pass`, a delegate
+// FIELD through `tk_field_use`/teko_expr.tk, an `Op[]` ELEMENT through
+// `tk_ha_deleg_call`/teko_heaparr.tk -- `tk_deleg_build` below is their only
+// builder).
 //
-// ...and against the POINTEE it declares, which is the third diagnostic that
-// call gets and the one this check had none of: the TAG matched and the TYPE
-// behind it was never read, so `delegate void Mut(ref f64 x); Mut m = bumpf;
-// i64 g; m(ref g);` handed an `i64`'s address to a callee that writes a
-// double through it -- the integer came back holding 8.0's bit pattern, on a
-// LOCAL slot and on a GLOBAL one alike, where `bumpf(ref g)` written DIRECTLY
-// is refused `teko: a value of type i64 does not convert to f64` (D51,
-// twelfth pass). The `callp` this function guards is built AFTER
-// `tk_ref_pass` and names no callee, so neither that pass's own call check
-// nor `tk_rc_call_args` (teko_rc.tk) ever sees it: this is the only door the
-// argument passes. It reads the one oracle every pointee is read by
-// (`tk_ref_arg_pointee`, inside `tk_ref_check_pointee_ty`: the lexical scope
-// live at the site, then the globals), so a call rewritten in
-// `tk_deleg_pass` -- a delegate LOCAL, PARAMETER or GLOBAL called by name --
-// is judged whole. The two roads that build their `callp` at PARSE time, a
-// delegate FIELD (`tk_field_use`, teko_expr.tk) and an `Op[]` ELEMENT
-// (`tk_ha_deleg_call`, teko_heaparr.tk), stand where neither table is filled
-// yet, so the pointee answers -1 there and is skipped in silence -- the same
-// answer `tk_ref_check_pointee` gives any pointee no oracle names.
+//   - the KIND: a `ref`/`out` slot is an ADDRESS (K2w), so an argument that
+//     carries a value would be written through as if it were one. One rule,
+//     one wording, the direct call's own (`tk_ref_check_kind`, teko_ref.tk).
+//   - the POINTEE of a `ref`/`out` slot: `delegate void Mut(ref f64 x);
+//     Mut m = bumpf; i64 g; m(ref g);` handed an `i64`'s address to a callee
+//     that writes a double through it, where `bumpf(ref g)` written DIRECTLY
+//     is refused `teko: a value of type i64 does not convert to f64` (D51,
+//     twelfth pass).
+//   - and, D59, the argument passed BY VALUE, which this door judged not at
+//     all: `delegate i64 Op(i64); Op f = twice; f64 lf = 8.5; f(lf);` compiled
+//     and handed the double's bit pattern to an integer parameter, on every
+//     one of the three roads, where `twice(lf)` is refused. The CONVERSION
+//     went missing with the check, and that half is silently wrong in a
+//     program with nothing exotic in it: `delegate f64 F(f64); F f = half;
+//     f(5);` passed the raw integer 5 where `half(5)` widens it (measured on
+//     `f660795d`, exits 64 and 1 against the direct call's refusal and 25).
+//
+// Both judgements go through D57's own park (`tk_vca_park`, teko_typeof.tk):
+// the parse-time oracle (`tk_pty_of`, teko_struct.tk) answers for a literal, a
+// cast and an xt-tagged node on every road, and for a bare NAME only while the
+// parser's own stack is live -- which the pass-8 road is not, so there every
+// identifier parks. A `ref`/`out` argument parks always: its pointee is read
+// by the lexical scope and the globals (`tk_ref_arg_pointee`), tables the two
+// parse-time roads stand before. What is parked is judged at the end of
+// `tk_over_pass` (pass 14, `tk_vcall_arg_judge`), where the scope is live and
+// every overload pick is committed; -1 back is "not known here" and the two
+// readers below already understand it.
+//
+// The conversion is written IN PLACE (`tk_fs_convert`, teko_typeof.tk): this
+// walk is over `nd_next` and holds no handle to relink with, so the node keeps
+// its identity and BECOMES the cast -- the same shape the park's own judge
+// writes, not `tk_vcall_args_check`'s splice.
 void tk_deleg_check_arg_kinds(i64 si, i64 args, i64 line, uptr fl) {
     i64 a = args;
     i64 i = 0;
     loop {
         if (a == 0) break;
         i64 pk = dg_pk_at(si, i);
-        i64 ak = tk_rfarg_kind(a);
-        if (pk != ak) {
-            if (pk == TK_RP_NONE)
-                err_at(fl, line, tk_join3("teko: argument ", tk_num(i + 1), " is not passed by reference"));
-            err_at(fl, line,
-                   tk_join(tk_join3("teko: argument ", tk_num(i + 1), " needs `"),
-                           tk_join(tk_ref_kindname(pk), "` at the call site")));
+        i64 pt = dg_pty_at(si, i);
+        tk_ref_check_kind(pk, a, i, line, fl);
+        // a `ref`/`out` argument is an address, and no oracle at this door
+        // types what it points at: it is parked unconditionally, and the park
+        // judges it by the POINTEE rule rather than the by-value one.
+        i64 at = 0 - 1;
+        if (pk == TK_RP_NONE) at = tk_pty_of(a);
+        at = tk_vca_park(pt, a, at, line, fl);
+        if (at >= 0) {
+            tk_check_compat(pt, at, a, line, fl);
+            tk_fs_convert(pt, at, a);
         }
-        if (pk != TK_RP_NONE) tk_ref_check_pointee_ty(dg_pty_at(si, i), a, line, fl);
         i = i + 1;
         a = nd_next(a);
     }
