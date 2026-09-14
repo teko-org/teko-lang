@@ -1280,19 +1280,153 @@ void tk_lg_add(i64 n) {
     tk_nlg = tk_nlg + 1;
 }
 
+// D70: the wording a name that is a param, a local, a capture, a function,
+// a type NOR a global already answers with -- factored out so a class
+// MEMBER below reads exactly the same sentence, by construction, rather
+// than by a second copy of the string.
+void tk_lam_not_captured(i64 n) {
+    err_at(nd_file(n), nd_line(n), tk_join3("teko: ", nd_name(n), " is not captured; add it to use (...)"));
+}
+
+// D70: a name the ENCLOSING CLASS declares -- a field, a member const, a
+// property, a method -- judged before `decl_find`/`tk_struct_find` below
+// ever get a look, and never deferred to `tk_lam_resolve_globals`: a global
+// of the very same name used to win there, silently, because a class
+// member was never checked at all. Measured on the base tree: `h.direct()`
+// (the method itself, `tk_this_ident`) read the FIELD; `h.cb(0)` (the SAME
+// name, inside a lambda `arm()` builds) read a same-named GLOBAL instead --
+// two different answers for one name, neither refused.
+//
+// A STATIC member takes no receiver, exactly as it takes none for the
+// method itself (`tk_this_field_addr`, `tk_mconst_use`, `tk_prop_static_use`),
+// so it resolves here the same way. An INSTANCE one needs `this`, which a
+// lambda never captures implicitly (D11 stands; giving it one opens a
+// reference cycle the reclaim does not break, an open fork of its own,
+// `docs/reference/not-yet.md`) -- so it reads the one wording a plain field
+// with no colliding global already gets, above, rather than a global that
+// only happens to share its name. 1 when `n` is a member at all: the
+// caller's cue to stop, resolved or refused, never falling through to a
+// name of some OTHER thing entirely.
+i64 tk_lam_member(i64 n, uptr name) {
+    if (tk_body_class < 0) return 0;
+    i64 fi = tk_field_find(tk_body_class, name);
+    if (fi >= 0) {
+        if (fd_sym_at(fi)) {
+            tk_node_replace(n, tk_ld(fd_ty_at(fi), tk_id(fd_sym_at(fi))));
+            return 1;
+        }
+        tk_lam_not_captured(n);
+        return 1;
+    }
+    i64 mci = tk_mconst_find(tk_body_class, name);
+    if (mci >= 0) {
+        tk_node_replace(n, tk_mconst_use(mci, nd_line(n), nd_file(n)));
+        return 1;
+    }
+    i64 pi = tk_prop_find(tk_body_class, name);
+    if (pi >= 0) {
+        i64 mi = tk_prop_accessor_of(tk_body_class, name, 0, nd_line(n), nd_file(n));
+        if (!mt_static_at(mi)) {
+            tk_lam_not_captured(n);
+            return 1;
+        }
+        tk_check_member(mt_cls_at(mi), mt_vis_at(mi), name, nd_line(n), nd_file(n));
+        tk_node_replace(n, tk_call(mt_fn_at(mi), 0));
+        return 1;
+    }
+    if (tk_method_named_find(tk_body_class, name) >= 0) {
+        tk_lam_not_captured(n);
+        return 1;
+    }
+    return 0;
+}
+
 // a name that is neither a param, a local the body itself declares, a
-// capture, a function nor a type -- C#'s own rule keeps every one of the
-// program's STATICS (a top-level global, a `const`, a free function) visible
-// with no `use (...)` at all; only a name none of those turns out to be is
-// truly `D221`'s own wording for it, and that answer waits on `tk_deleg_pass`
-// below (`tk_lg_add`), the one point a global's own row is knowable.
+// capture, a MEMBER of the enclosing class, a function nor a type -- C#'s
+// own rule keeps every one of the program's STATICS (a top-level global, a
+// `const`, a free function) visible with no `use (...)` at all; only a name
+// none of those turns out to be is truly `D221`'s own wording for it, and
+// that answer waits on `tk_deleg_pass` below (`tk_lg_add`), the one point a
+// global's own row is knowable.
 void tk_lam_check_name(i64 n) {
     uptr name = nd_name(n);
     if (tk_ty_scope_find(name) >= 0) return;
     if (tk_lc_find(name) >= 0) return;
+    if (tk_lam_member(n, name)) return;
     if (decl_find(name) >= 0) return;
     if (tk_struct_find(name) >= 0) return;
     tk_lg_add(n);
+}
+
+// D70: the CALL twin of `tk_lam_member` above -- a name that is a METHOD of
+// the enclosing class, called bare inside a lambda. `tk_lam_walk` below
+// never looked past `N_IDENT` before this, so `go(x)` fell straight to the
+// core's own resolver (`gen_resolve.mc`), which knows no function literally
+// named `go` (a method's real symbol is always mangled, `tk_this_call`'s own
+// `Owner_method`) and refused `call to unknown function`, the core's own
+// wording, never teko's -- and a FREE function of the same name would have
+// silently answered instead, the identical door the field fix above closes
+// for a plain name. A STATIC method needs no receiver and resolves the same
+// way `tk_this_emit`'s own static branch does; an INSTANCE one needs `this`,
+// not implicitly captured (D11) -- refused by name, its own wording: `use
+// (...)` captures a VALUE, never a method, so the field's own sentence would
+// read false here.
+//
+// A name that is no method may still be a delegate FIELD, called bare
+// (`cb(0)` where `cb` is `public Op cb;`) -- D65's own `tk_this_deleg_call`
+// opens exactly this road for a method's OWN body, over `tk_field_deleg_call`
+// (teko_expr.tk), which is PARSE-time and reads its arguments off the token
+// stream (`tk_args`); a lambda's `N_CALL` already carries its own parsed
+// `nd_a(n)`, so the road here is `tk_deleg_build` directly, the same builder
+// every delegate-call door eventually funnels through (D59's argument judge
+// rides along unasked, exactly as it does for every other one). Measured on
+// the base tree: a free function and a delegate field sharing one name, the
+// field's own target answered through `direct()` (`this.cb(x)`, D65) and the
+// FREE function answered through a lambda's bare `cb(x)` instead -- two
+// answers for one name, the identical silent-shadow D65 closed for every
+// OTHER road but this one. A STATIC field needs no receiver, exactly as
+// `tk_static_deleg_call` (teko_access.tk) resolves it for the type's own
+// name; an INSTANCE one needs `this`, not implicitly captured (D11) -- the
+// one wording a plain field with no colliding global already answers with.
+i64 tk_lam_deleg_call(i64 n, uptr name) {
+    i64 fi = tk_field_find(tk_body_class, name);
+    if (fi < 0) return 0;
+    if (fd_nel_at(fi) > 0) return 0;               // an array field: the loop below is not this road
+    i64 fty = fd_ty_at(fi);
+    i64 di = tk_deleg_row(fty);
+    if (di < 0) return 0;                          // not a delegate field: leave it to whatever else resolves it
+    if (!fd_sym_at(fi)) {
+        tk_lam_not_captured(n);
+        return 1;
+    }
+    tk_check_member(tk_field_owner(fi), fd_vis_at(fi), name, nd_line(n), nd_file(n));
+    i64 obj = tk_ld(fty, tk_id(fd_sym_at(fi)));
+    i64 args = nd_a(n);
+    i64 r = tk_deleg_build(di, obj, args, tk_arg_count(args), nd_line(n), nd_file(n));
+    tk_node_replace(n, r);
+    i64 ret = dg_ret_at(di);
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
+    return 1;
+}
+
+void tk_lam_check_call(i64 n) {
+    if (tk_body_class < 0) return;
+    uptr name = nd_name(n);
+    if (tk_ty_scope_find(name) >= 0) return;        // a local or a parameter answers first (C#'s rule)
+    if (tk_lc_find(name) >= 0) return;               // ...and so does a capture, by-value or by-reference
+    i64 mi = tk_method_named_find(tk_body_class, name);
+    if (mi < 0) {
+        tk_lam_deleg_call(n, name);
+        return;
+    }
+    i64 na = tk_arg_count(nd_a(n));
+    i64 pick = tk_method_pick(tk_body_class, name, na);
+    if (pick < 0) tk_pick_refuse(pick, name, nd_line(n), nd_file(n));
+    if (!mt_static_at(pick))
+        err_at2(nd_file(n), nd_line(n), "teko: a method is not reachable from a lambda", name);
+    tk_check_member(mt_cls_at(pick), mt_vis_at(pick), name, nd_line(n), nd_file(n));
+    set_nd_a(n, tk_fill_defaults(nd_a(n), na, mt_np_at(pick), mt_nreq_at(pick), mt_d0_at(pick)));
+    set_nd_name(n, mt_fn_at(pick));
 }
 
 // the freshly built body of ONE lambda: a by-reference capture's every read
@@ -1325,6 +1459,8 @@ void tk_lam_walk(i64 n) {
                 n = nd_next(n);
                 continue;
             }
+        } else if (k == N_CALL) {
+            tk_lam_check_call(n);
         }
         if (k == N_BLOCK) {
             i64 mark = tk_nscope;

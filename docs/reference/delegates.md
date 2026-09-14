@@ -295,7 +295,15 @@ value and the closure holds a reference of its own — the object outlives the d
 local and is released when the closure is. A capture **by reference** cannot leave the
 scope that declared it: returning such a lambda, or storing it into a field, is refused.
 
-A global, a `const` and a free function are read **live** and need no `use` at all.
+A global, a `const` and a free function are read **live** and need no `use` at all — and so
+is a **member** of the enclosing class, judged BEFORE any global of the same name ever gets
+a look: a STATIC field, a member `const` and a STATIC property resolve with no `use` and no
+receiver, exactly as they do for the method itself. An INSTANCE one — a field, a delegate
+field called bare, a property, or a method (called or named bare) — needs `this`, which is
+not implicitly captured (D11), so it is refused by the same sentence a plain global-shadowed
+name already gets, `X is not captured; add it to use (...)`, except a bare method CALL,
+which has a sentence of its own, `a method is not reachable from a lambda` — `use (...)`
+captures a value, never a method (D70).
 
 ```teko
 // expect-exit: 42

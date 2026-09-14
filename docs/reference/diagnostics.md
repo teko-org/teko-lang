@@ -763,7 +763,20 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
   POINTEE is part of the type, so `void fillc(ref Cell c)` on a `Fill(ref Box)` is refused
   here and nowhere later),
   *`Op` takes a function, another `Op`, or null*, *`X` is not
-  captured; add it to use (...)*, and *`X` is used but never declared*.
+  captured; add it to use (...)*, and *`X` is used but never declared*. A MEMBER of the
+  enclosing class (a field, a delegate field, a member const, a property, or a bare method
+  NAME with no call around it) reads the same *X is not captured; add it to use (...)*
+  when it is an INSTANCE one, judged before any global of the same name ever gets a look —
+  a lambda captures nothing implicitly (D11), `this` included, so a global that only
+  happens to share the name is never silently read or called in its place (D70,
+  `tests/refuse/lambda_field_name.tk`, `tests/refuse/lambda_deleg_field_call.tk`,
+  `tests/refuse/lambda_prop_name.tk`, `tests/refuse/lambda_method_name.tk`). A static
+  member needs no receiver and still resolves.
+- `"teko: a method is not reachable from a lambda"` — completed by the method's name: a
+  METHOD of the enclosing class, called bare inside a lambda (D70,
+  `tests/refuse/lambda_method_call.tk`). `use (...)` captures a VALUE, never a method, so
+  the wording above would read false here — this is its own sentence. A static method
+  takes no receiver and still resolves.
 
 An ELEMENT of a `T[]` whose element type is a delegate is judged exactly as any other slot
 of that type, and a GLOBAL array's element is judged exactly as a local array's. The store

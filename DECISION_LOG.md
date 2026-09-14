@@ -6822,6 +6822,77 @@ DECLARATION count, only the reserved bytes behind each one, confirmed directly a
 `teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
 design).
 
+### D70 · A lambda inside a method reads the CLASS's own member, never a same-named global, silently (2026-09-14)
+`i64 n = 100; class Holder { public i64 n; public i64 direct() { return n; } public void
+arm() { this.cb = new Op((i64 x) => x + n); } }` -- `direct()` read the field (1,
+`tk_this_ident`); `arm()`'s own lambda read the GLOBAL instead (100), for the identical bare
+name, neither refused. `tk_lam_check_name` (teko_deleg.tk) asked scope, capture,
+`decl_find` (functions only) and `tk_struct_find` (types only) -- never the enclosing
+class's own members -- so a global that only happened to share a field's name silently won
+the door `tk_this_field` already guards for the method itself.
+
+D11 stands: a lambda captures nothing implicitly, `this` included, and giving it one is a
+design of its own -- a closure holding a counted `this` opens a reference cycle the reclaim
+does not break on its own, an open fork rather than a patch here (recorded in
+`docs/reference/not-yet.md`). So the fix is the refusal a field with no colliding global
+already gave: `tk_lam_member` (new, teko_deleg.tk), asked right before `decl_find` for
+every bare `N_IDENT`, checks `tk_field_find`/`tk_mconst_find`/`tk_prop_find`/
+`tk_method_named_find` against `tk_body_class` -- the PARSE-time class the lambda's own
+`tk_lambda_finish` still runs inside (the generated function is only promoted to a
+top-level `N_FUNC` afterwards, past every later pass's own reach). An INSTANCE member reads
+`teko: X is not captured; add it to use (...)`, the same sentence a plain field already
+answered with; a STATIC one takes no receiver and resolves right there, the same road
+`tk_this_field_addr`/`tk_mconst_use`/`tk_prop_static_use` already open for the method
+itself -- measured: it did not resolve before this fix either (a static field/method named
+bare inside a lambda answered the SAME "not captured", or a raw core error for a call --
+never a working read), so nothing regresses by making it work now.
+
+The CALL twin of the same door: `go(x)` inside a lambda, `go` a method of the class.
+`tk_lam_walk` only ever looked at `N_IDENT`; a call's own name was never checked, so it fell
+straight to the core's own resolver (`gen_resolve.mc`), which knows no function literally
+named `go` (a method's real symbol is always mangled) and refused `call to unknown
+function` -- the core's wording, never teko's -- and a FREE function of the identical name
+would have silently answered in `go`'s place, the same silent-shadow bug for a call instead
+of a read (measured). `tk_lam_check_call` (new) asks `tk_method_named_find` the same way,
+before `tk_lam_walk` even reaches the call's arguments; a STATIC method resolves (the
+mangled symbol takes the call node's own name, `tk_fill_defaults` filling what the site
+left out); an INSTANCE one is refused by a literal of its own, `teko: a method is not
+reachable from a lambda`, completed by the name -- `use (...)` captures a VALUE, never a
+method, so the field's own sentence would read false here.
+
+**Out of scope, measured and recorded as an adjacent finding, not fixed here**: the WRITE
+twin of the read bug -- `(i64 x) => { n = x; }` inside `arm()`, `n` a field shadowed by a
+same-named global -- silently writes the global too (`tk_lam_walk`'s `N_ASSIGN` branch
+checks a by-reference capture and nothing else; a plain field/global write target is never
+asked `tk_lam_check_name` at all). A field with no colliding global already dies `unknown
+name` from the core today, so nothing currently PASSES on the strength of the bug; closing
+it needs `tk_field_store_val`'s own coercion gate (D33/D43/Q1b) threaded through a SECOND
+site, which is a write-side crumb of its own, not this read-and-call door.
+
+**Fixtures.** `tests/refuse/lambda_field_name.tk`: the exact repro above, refused at
+`arm()`'s own line. `tests/refuse/lambda_method_call.tk`: the call twin, `go(x)` inside a
+lambda, `go` an instance method. `tests/surface_lambda.tk`'s new `member_check`: a lambda
+naming only a global with no colliding member (`armGlobal`, unchanged) and one naming a
+STATIC field and a STATIC method of its own class (`armStatic`, now resolves).
+
+**Proof** (mc 0.15.23, macos/aarch64 + linux/x86_64, base `59652293`): `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 64
+refused as expected, 0 failed** (62 refused before this crumb, two refusals added; 73
+passed unmoved, `surface_lambda.tk` grown in place); `--dump-ast` byte-identical against the
+base compiler for every one of the 73 pre-existing `tests/*.tk`, `surface_lambda.tk`'s OWN
+base source compiled by both binaries since the tracked copy grew; `sh scripts/bootstrap.sh
+--os macos --arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs ok: 611
+links, 41 fragments, 390 diagnostics, 64 refusals, 143 samples`; `mc limits` (the compiler's
+own build) verdict `ok` with `grow` 0 on every row of both legs, `passes` 15, `types` 13,
+`intrin` 8, `alias` 20, `syntax` 15, `rules` 6, `on_stmt` 4 all exactly where the base left
+them -- only the size-of-surface-code rows moved (`nodes` 156704 -> 156995, `funcs` 3185 ->
+3188, `lowered` 3167 -> 3170, `strings` 2138 -> 2139, `symbols` 6267 -> 6271, `ins` 216176 ->
+216748, identical on both legs); `mc pkg hash .`
+`c0f40c8b25d32be9bb452ce9c2ab4f7beee9df01559909f5687af7c69f83a58c` (base
+`5c0738020efa4533cdf6442d5fa6e7cc593c6c8776d9974e30450f0e9c299cce`: `teko_deleg.tk` is a
+listed file (`mc.toml`), so the hash moves by design; `docs/` and `tests/` are not listed
+and do not affect it).
+
 ### D71 · The mc canary: a pre-release is promoted by a file this repository writes (2026-09-15)
 mc's M53 (`docs/specs/M53.md` § 6, its D14-D17) freezes the surface for 1.0.0 and asks one
 thing of the language it compiles: **that a release be proved by teko before it is a release
