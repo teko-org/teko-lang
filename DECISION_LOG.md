@@ -5768,3 +5768,103 @@ base left it -- `passes` 15, `types` 13, `intrin` 8, `alias` 20, `syntax` 15, `r
 `fda769ca698d63e4ccddfbc3a5d2820edfb5b8c3bac24be8b20adc9e55a006dc` (base
 `571bf6db10a035eded3f0b36a36abda17fe2d6d82adedb6db6f4041c5523ab75`: `teko_deleg.tk` and
 `teko_typeof.tk` are listed files, so the hash moves by design).
+
+### D69 · Two capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096 (2026-09-14)
+
+(D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry
+takes the next free number, D69.)
+
+Two verifiers hit two separate ceilings this week, both sized in the crumb's early days and
+never re-measured against a program with more than a handful of types or stores.
+
+**`TK_MAXFWD` (teko_fwd.tk), the lexical pre-scan's own table** (`fw_name`/`fw_ty`/
+`fw_kind`/`fw_vis`/`fw_proj`/`fw_span`/`fw_spanlen`/`fw_multi`/`fw_mat`, plus `fl_name` --
+ten `uptr`/`i64` arrays, 8 B a column): a `class`/`struct`/`interface`/`delegate` keyword the
+byte-level pre-scan finds ANYWHERE in the reachable source (the whole file, not just a
+forward reference) takes one row, for the whole build, never released. The 32nd was fine;
+the 33rd refused `teko: too many forward-declared types` at `?:0:` (no file/line: the scan
+runs before any real parsing). Raised to 256.
+
+**`TK_MAXOS` (teko_struct.tk), one array, `os_node[TK_MAXOS]`** (one `i64` column): a store
+this module emits into a slot of counted type (a field, an inline array element, an
+auto-property's backing) takes one row, keyed to the STORE SITE in the source (a store
+inside a loop body is one row no matter how many times the loop runs). D51's eleventh pass
+already fixed the double-counting that had silently halved this ceiling for a global array
+(128 declared, 64 delivered); this entry raises the declared number itself, matching
+`TK_MAXXT`/`TK_MAXFS`, both already 4096 for the same reason -- one row per site, a unit-wide
+table that never shrinks. Raised to 4096.
+
+**Cost, measured, not assumed.** `mc limits . --config mc.macos.toml`, both legs, mc
+**0.15.23**, macos/aarch64, base `59652293`:
+
+| leg | `globals` before | `globals` after | `heap` used before | `heap` used after | verdict |
+|---|---|---|---|---|---|
+| compiler (`build/teko`) | 944 / 2546 reserved | 944 / 2546 reserved (unmoved) | 95084208 | 95115648 | `ok`, `grow` 0 |
+| `tests/hello.tk` (compiled BY `build/teko`) | 0 / 32 reserved | 0 / 32 reserved (unmoved) | 468016 | 492592 | `ok`, `grow` 0 |
+
+`globals` counts DECLARATIONS (one per `i64 x[N];`, whatever `N` is), so raising a
+`#define`'s numeric literal moves it not at all -- the ten arrays above and `os_node` are
+still ten and one top-level globals, respectively, before and after. The real cost is the
+STATIC storage the two ceilings' arrays reserve in `build/teko`'s own BSS, which is what
+`heap`'s `used` column picks up: +30720 B on the compiler's own leg (10 x 8 B x 224 for
+`TK_MAXFWD`'s growth, 1 x 8 B x 3968 for `TK_MAXOS`'s, plus a few bytes of comment text the
+pre-scan counts), +24576 B on the `hello.tk` leg (the SAME arrays, now compiled into the
+teko compiler that leg measures, `os_node`'s own share of it). Both legs stay `ok` with
+`grow` 0 by a wide margin (`heap` reserved is 223739904 / 33554432), so 256 and 4096 are the
+numbers taken, not a smaller compromise.
+
+**Proof, throwaway probes in scratch (not fixtures -- a refuse fixture pinning a ceiling
+breaks the day it grows, D63's lesson), each run on the base build (`59652293`, ceilings 32
+and 128) and on this crumb's build (256 and 4096), mc 0.15.23, macos/aarch64:**
+
+| probe | shape | base (`59652293`) | this crumb |
+|---|---|---|---|
+| 33 distinct classes (`class C0 { public i64 v; }` x33, `#include "lib/rt.tk"`) | one keyword occurrence per class, scanned once each | refused `teko: too many forward-declared types` at `?:0:` (scan time, no line) | refused `teko: too many type declarations` at line 34 (a SEPARATE ceiling, `TK_MAXSTRUCT`, see below) -- proves `TK_MAXFWD`'s OWN ceiling cleared: the SAME 33 classes no longer trip the scan |
+| 257 distinct classes | same shape, 257 of them | refused `teko: too many forward-declared types` at `?:0:` | refused `teko: too many forward-declared types` at `?:0:`, unchanged wording -- the new ceiling (256) is honored and reported the same way |
+| 129 stores into elements of a LOCAL `Probe[]` (one class, one instance stored 129 times by literal index -- `TK_MAXOS` counts SITES, not runtime iterations, so a loop proves nothing here) | 129 store statements | refused `teko: too many stores into a slot of class type` at the 129th | compiles, runs 42 |
+| 4096 of the same | 4096 store statements | (not run; already known refused past 128) | compiles, runs 42 |
+| 4097 of the same | 4097 store statements | (not run) | refused `teko: too many stores into a slot of class type` at the 4097th |
+| 512 / 513 deferred delegate-element stores (`ops[i] = pick();`, `pick()` a CALL, so `tk_deleg_store_late` defers every one to `TK_MAXDGLATE`, teko_deleg.tk, a SEPARATE 512-row table -- each also takes a row of `TK_MAXOS` first, since a delegate is a counted type) | 512 / 513 stores | (base already refuses at the 65th on a GLOBAL array, D51 -- this probe uses a LOCAL one, unaffected) | 512 compiles, runs 42; 513 refuses `teko: too many element stores of unknown type` (`TK_MAXDGLATE`'s own wording, not `TK_MAXOS`'s -- `TK_MAXOS` no longer fills first now that it is 4096) |
+
+The last row is why `docs/reference/diagnostics.md`'s note under `"teko: too many element
+stores of unknown type"` needed a wording change, not just a number: it used to say a
+program with 513 such stores never reaches this table's own ceiling because `TK_MAXOS`
+(128) fills first, at the 129th; with `TK_MAXOS` at 4096 that is no longer true, and the
+513th now answers with THIS table's own message.
+
+**Adjacent finding, not fixed here: `TK_MAXSTRUCT` (teko_struct.tk, still 32, "structs,
+classes and interfaces declared in one source") is coupled to `TK_MAXFWD` in lockstep for
+any plain, non-generic program, and raising `TK_MAXFWD` alone does not let one declare more
+than 32 distinct types.** `tk_type_row_new`, the ONE function that appends a row to the
+shared type table `TK_MAXSTRUCT` bounds, is called both by a real declaration
+(`tk_type_add`, every `class`/`struct`/`interface`/`delegate` alike -- `teko_deleg.tk:285`
+calls it too, so the comment naming only three of the four kinds is stale) and by
+`tk_fwd_row`/`tk_fwd_row_by_ty` materializing a forward-scanned placeholder. A `partial`
+class's SECOND and later parts do NOT take a second row of EITHER table (`tk_fwd_try_decl`:
+`if (seen >= 0) { set_fw_multi_at(fi, 1); return p; }`, no second `tk_fwd_add`; the real
+parser adopts the existing row too), so there is no way, in the language as taught today,
+for `tk_nfwd` to exceed `tk_nstruct` for a program with no generics: every scanned keyword
+becomes exactly one real declaration, and the pre-scan (a single pass over the WHOLE
+reachable source, run before any parsing) always finishes counting all of them before the
+parser reaches declaration 1. Measured: the 33-classes probe above, run on THIS crumb's
+build, no longer trips `TK_MAXFWD` (which now allows up to 256) but trips `TK_MAXSTRUCT`
+(still 32) one parse-time step later, at the exact same count -- the wording changes, the
+practical ceiling does not. `docs/specs/nullable.md` already names this ceiling and its
+cost ("a raise costs BSS in `globals`... measure before raising it"), so this is a known,
+tracked tension, not a new one; whether it needs raising too is a separate crumb's call
+(possibly D67 or D68, reserved and not yet in this log at write time) -- out of scope here,
+since the task named these two ceilings only.
+
+**Gate**, mc **0.15.23** (`MC_VERSION`), macos/aarch64, base `59652293`: `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **73 passed, 62
+refused as expected, 0 failed**, identical count to the base; `--dump-ast` byte-identical
+against the base build for all 73 `tests/*.tk` and all 62 `tests/refuse/*.tk` -- neither
+ceiling changes any accepted or refused program already in the tree; `sh scripts/
+bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (73/73, 196.7s); `sh scripts/
+check-docs.sh` -> `docs ok: 611 links, 41 fragments, 389 diagnostics, 62 refusals, 143
+samples`; `mc limits` verdict `ok` with `grow` 0 on both legs, `globals` unmoved on both (see
+table above); `mc pkg hash .`
+`f7ef6013d75a654878e132765963b6bd288ca718575a5b10481d623a36298f30` (base
+`5c0738020efa4533cdf6442d5fa6e7cc593c6c8776d9974e30450f0e9c299cce`: `teko_fwd.tk`,
+`teko_struct.tk` and `docs/reference/diagnostics.md` are listed files, so the hash moves by
+design).
