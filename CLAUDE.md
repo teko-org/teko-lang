@@ -49,7 +49,9 @@ Before halting on a design question, be sure it is not already decided:
   with a minimal, pure-mc reproducer; it is never worked around here.
 - **Zero new intrinsics.** Every function has surface code; `mc limits` is the budget a
   construct has to fit in. A construct that "wants" backend magic is a fork.
-- **Every fixture carries `// expect-exit: N`.** No oracle, no fixture.
+- **Every fixture carries `// expect-exit: N`, or — under `tests/refuse/` — the two-line
+  `// expect-refuse: teko: <message>` / `// expect-refuse-line: N`.** No oracle, no fixture
+  (D52).
 - **Refusals say `teko: <short cause>`** — compiler style, no prose, no references.
 - **`--dump-ast` is identical when a change does not change accepted code.** That is the
   proof a refactor is a no-op.
@@ -61,13 +63,7 @@ Before halting on a design question, be sure it is not already decided:
 sed -e 's/^os   = .*/os   = "macos"/' -e 's/^arch = .*/arch = "aarch64"/' \
     teko.toml >mc.macos.toml
 mc build . --config mc.macos.toml
-for src in tests/*.tk; do
-  n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
-  sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
-      mc.macos.toml >"mc.$n.toml"
-  ./build/teko build . --config "mc.$n.toml" --entry-only && "./build/$n"
-  echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
-done
+sh scripts/fixtures.sh ./build/teko mc.macos.toml
 sh scripts/bootstrap.sh --os macos --arch aarch64   # prints FIXPOINT OK
 sh scripts/check-docs.sh
 ```
