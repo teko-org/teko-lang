@@ -5169,3 +5169,88 @@ on this head exactly as on the base, local and global alike, where the direct `t
 refused. It is its own crumb -- the door is a different one, in a different module, and the
 rule it needs is the one this entry just wrote down. Recorded as a row of
 `docs/reference/not-yet.md` § "Numeric conversions".
+
+**Copilot findings, second pass -- the door judged a tag it never read, and trusted an
+oracle that answers about the WRONG declaration.** Three findings on the compiler and one
+on the prose, each measured first on `d0fbe9a4` (the base) and on this crumb's head
+(`14502bef`), where every one of them reads the SAME: none is a regression of this branch,
+each is a gap the judge it added does not close. mc 0.15.23, macos/aarch64; `Box` a class
+with `virtual i64 takei(i64)`, `virtual i64 takef(f64)` and `virtual i64 bump(ref f64)`,
+`Sink` the interface declaring the same three, and `pick` an overloaded name:
+
+| probe | `d0fbe9a4` = `14502bef` | now |
+|---|---|---|
+| `b.takef(pick(2))`, `f64 pick(f64)` declared ahead of `i64 pick(i64)` | compiles, **exit 40** (the raw integer 3 read as a double) | runs, **30** -- the direct twin's own answer |
+| `s.takef(pick(2))`, the itab road | compiles, **exit 40** | runs, **30** |
+| `b.takei(pick(2))`, the same pair | **refuses** a legal program, `teko: a value of type f64 does not convert to i64` | runs, 13 |
+| `b.takef(pick(2.5))`, `i64 pick(i64)` declared first | runs, 30 -- the cast the door wrote was `f64` over an `f64` and mc lowered it to nothing | runs, 30, with no cast written at all |
+| `b.takei(ref x)` on a by-value `i64` | compiles, **exit 209** (the low byte of a stack address) | refuses, `teko: argument 2 is not passed by reference` |
+| `s.takei(ref x)`, the itab road | compiles, **exit 209** | the same refusal |
+| `takei(ref x)` unqualified, inside a method | compiles, **exit 177** | the same refusal |
+| `b.bump(x)` on a `ref f64`, no tag at the site | compiles, **SIGSEGV** (the callee's `d = 2.0` written through a value) | refuses, ``teko: argument 2 needs `ref` at the call site`` |
+| `s.bump(x)` / unqualified `bump(x)` | compiles, **SIGSEGV** | the same refusal |
+| the direct twins, `takef(pick(2))`, `takei(ref x)`, `bump(x)` | 30, and the two refusals in exactly those words | unmoved |
+
+1. **An OVERLOADED call's return type is not the first declaration's.** `tk_pty_of`
+   (teko_struct.tk) types an `N_CALL` as `decl_ret(decl_find(name))`, and `decl_find`
+   (mc/src/parse.mc) walks `unit_head` in declaration order and answers with the FIRST --
+   while which overload a site reaches is settled by `tk_ov_pick` at pass 14. Both doors
+   read that answer as final, and it is wrong in both directions at once: against a matching
+   parameter it writes no conversion where the picked overload needs one (the raw integer
+   into an `f64` parameter, exit 40), and against a mismatched one it REFUSES a program
+   whose picked overload fits. It is D49's own finding, one door over: `tk_prim_defers`
+   (teko_prim.tk) defers a call on a float column for exactly this reason. So the park test
+   grows one shape -- `tk_vca_ov_call` (teko_typeof.tk) -- and the whole decision moves into
+   `tk_vca_park`, the one helper both loops now call: it hands back the parse-time answer
+   when that answer is trustworthy and -1, the "check nothing, convert nothing" both readers
+   already understand, when the argument was parked instead. The count is taken from
+   `decl_find`'s own node forward along `nd_next`, because teko_over.tk's `tk_ov_find` is a
+   table built at pass 6 and this door runs while the parser is still inside the body. Only
+   a call to an overloaded name is added: a call to a name declared once is answered
+   correctly today, and a call to a name declared BELOW is left exactly as it was.
+2. **and 3. The `ref`/`out` TAG was never compared with the parameter's kind.** Both loops
+   compared TYPES only, and the tag is not a type: `tk_ref_check_call` (teko_ref.tk) is
+   keyed on a call's SYMBOL and a `callp` has none, so nothing on the three indirect roads
+   ever asked the question. An address crossed into a by-value slot and a value crossed into
+   a `ref` one, the second being the one that writes through what it was handed -- SIGSEGV
+   on every road, where the direct call refuses at the same line. The rule is factored out
+   of `tk_ref_check_call` as `tk_ref_check_kind` and asked FIRST at all three doors, before
+   the compat and the park: nothing that follows means anything when the tag is wrong. The
+   words are the direct call's, and so is the numbering -- the receiver counts as argument
+   1, exactly as it does in the mangled `Owner_method` a non-virtual method call lowers to,
+   so `b.m(ref x)` says "argument 2" whichever road carries it. `tk_ref_check_call` keeps
+   its own behaviour to the letter: the 98 base dumps and its own fixtures prove the
+   factoring is a no-op.
+4. **The diagnostics page's own sentence.** "a `ref`/`out` pointee no scope and no table of
+   globals holds a row for stays silently skipped" is unreadable, and it was also the page's
+   only statement of what this door lets through in silence. Rewritten as two named cases --
+   a `ref`/`out` pointee no scope and no table of globals NAMES (the address was built by
+   the source and its target has no declared type to compare), and a by-value argument that
+   is neither a bare name nor a call to an overloaded one (no later pass knows more about it
+   than the site did) -- with the tag rule and the overload rule stated beside them, and
+   the two `"teko: argument "` completions amended to say that all three indirect roads give
+   them too.
+
+**FIXTURES** (7, for 39 refusals and 71 runs in the tree): `tests/vcall_overloaded_arg.tk`
+(39) drives both directions of finding 1 on the vtable road, the itab road and the
+unqualified one -- refused on the base at its fourth check -- and six refusals name one
+direction on one road each: `tests/refuse/vcall_ref_extra.tk`, `vcall_ref_missing.tk`,
+`ifcall_ref_extra.tk`, `ifcall_ref_missing.tk`, `thiscall_ref_extra.tk` and
+`thiscall_ref_missing.tk`. The unqualified road gets its own pair because its DOOR is
+another one (`tk_this_emit`, teko_this.tk, which runs from a pass where the parser's stack
+of locals is closed), even though the loop it reaches is shared.
+
+**Proof of the second pass** (mc 0.15.23, macos/aarch64): `sh scripts/fixtures.sh
+./build/teko mc.macos.toml` -> **71 passed, 39 refused as expected, 0 failed**;
+`--dump-ast` against the BASE compiler (`d0fbe9a4`) over every fixture that tree holds,
+**98 of 98 byte-identical**, and against this crumb's own head (`14502bef`) over all of
+its, **106 of 106** -- the dump is taken after the passes, checked by the same comparison
+reading `CAST type=f64` where the fix now writes one; `sh scripts/bootstrap.sh --os macos
+--arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` green (`docs ok: 587 links, 32
+fragments, 389 diagnostics, 39 refusals, 138 samples`); `mc limits . --config
+mc.macos.toml` verdict `ok` on both legs, the `tests/hello.tk` leg's whole table
+byte-identical to the base's and to `14502bef`'s (`passes` 15/30, `types` 12, `intrin`
+8/16, `alias` 19, `syntax` 15) and the compiler leg moving by the added surface alone --
+`nodes` 155975 -> 156097, `ins` 215007 -> 215225, `funcs` 3173 -> 3176, `lowered` 3155 ->
+3158, `globals` **942 unmoved** (no table is added, the park test only widens);
+`mc pkg hash .` `ef81724394452c08172a4a47bfcf2cfd2c463bc6861bcf1c40496a4122831b51`.
