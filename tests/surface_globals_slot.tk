@@ -1,0 +1,175 @@
+// surface_globals_slot.tk -- a global SCALAR slot takes the same
+// assignment-compatibility corridor a local takes (D53). Every rule here is
+// one the language already had for a local and had for nothing at file scope:
+// `tk_rc_assign` (teko_rc.tk) returned before the three shared rules for a
+// name no pass-time scope held, and a global's INITIALIZER was visited by no
+// check at all.
+//
+// What each helper proves, in order:
+//
+//   1. the four widen globals (`gw`, `gw2`, `gw3`, `gs`) -- D33's implicit
+//      numeric conversion at a global INITIALIZER. An `f64` slot given `1`
+//      held the integer's own bit pattern; it holds one point zero now. `-1`
+//      and a `const` name are both folded into the same `N_INT` before the
+//      pass sees them, so the three `f64` cases are one rule, and `f32` is
+//      the same rule at 24/8 rather than 53/11.
+//   2. `widencheck`    -- the same conversion written as a STATEMENT, which
+//      takes `tk_num_widen`'s ordinary `N_CAST`: `gw = 5;` reads 5.0. (The
+//      initializer cannot use that cast: mc's core refuses one at file scope,
+//      `global initializer must be constant`.)
+//   3. `plaincheck`    -- the cases that must NOT move: an `i64` global
+//      assigned an integer, an `i8`/`i16` global holding a negative literal,
+//      and a `uptr` one.
+//   4. `refcheck`      -- a `T?` over a REFERENCE at file scope still takes
+//      `new Cell(n)` and `null` (D43/Q1a), and a plain class global still
+//      takes an object and a value of a derived class.
+//   5. `enumcheck`     -- an enum global, initialized and assigned from its
+//      own members (the only values that convert to it).
+//   6. `spancheck`     -- a `TimeSpan` global: a primitive with members
+//      converts to nothing but itself, and its own type still lands.
+//   7. `shadowcheck`   -- a FIELD of the same name as a global scalar, in
+//      both declaration orders (the class above the global and below it).
+//      An implicit `n = e;` inside a method is a field store, and the global
+//      of that name is not what types it.
+//   8. `paramcheck`    -- a PARAMETER of the same name as a global scalar
+//      shadows it, so `gw = 5;` on an `i64` parameter stays an integer 5
+//      where the `f64` global of that name would have converted it.
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+const i64 K = 3;
+
+// 1. the widen at an initializer (D33 at file scope)
+f64 gw  = 1;                                      // one point zero, not the bits of 1
+f64 gw2 = -1;                                     // the core folds the negation first
+f64 gw3 = K;                                      // teko_const.tk rebuilds the literal
+f32 gs  = 1;                                      // 24/8, not 53/11
+
+// 3. the slots that must not move
+i64  gn = 0;
+i8   g8 = -7;
+i16  g16 = -700;
+uptr gp = 0;
+
+enum Color { Red, Green, Blue }
+Color gk = Color.Green;
+
+class Cell { public i64 v; public Cell(i64 n) { this.v = n; } }
+class Deep : Cell { public Deep(i64 n) : base(n) { } }
+Cell  gc;
+Cell? gq;
+
+TimeSpan gt;
+
+// 7a. the class declared ABOVE the global of the same field name
+class Holder {
+    public i64 n;
+    public Holder(i64 k) { this.n = k; }
+    public i64 bump(i64 k) {
+        n = n + k;                                // an implicit field store
+        return n;
+    }
+}
+
+f64 n = 1;                                        // the global `Holder.n` must not see
+
+// 7b. ...and the class declared BELOW it
+class Later {
+    public i64 n;
+    public Later(i64 k) { this.n = k; }
+    public i64 bump(i64 k) {
+        n = n + k;
+        return n;
+    }
+}
+
+i64 near(f64 x, f64 want) {
+    f64 d = x - want;
+    if (d < 0.0) d = 0.0 - d;
+    return d < 0.0001;
+}
+
+i64 widencheck() {
+    if (!near(gw, 1.0)) return 1;
+    if (!near(gw2, -1.0)) return 2;
+    if (!near(gw3, 3.0)) return 3;
+    if (!(gs > 0.9f && gs < 1.1f)) return 4;
+    gw = 5;                                       // the statement, not the initializer
+    if (!near(gw, 5.0)) return 5;
+    gw = 1;
+    return 0;
+}
+
+i64 plaincheck() {
+    gn = 5;
+    if (gn != 5) return 1;
+    if (g8 != -7) return 2;
+    if (g16 != -700) return 3;
+    gp = 0;
+    if (gp != 0) return 4;
+    return 0;
+}
+
+i64 refcheck() {
+    gc = new Cell(7);
+    if (gc.v != 7) return 1;
+    gc = new Deep(8);                             // a derived class fits the base slot
+    if (gc.v != 8) return 2;
+    gq = new Cell(9);
+    if (gq.Value.v != 9) return 3;
+    gq = null;
+    if (gq.HasValue) return 4;
+    return 0;
+}
+
+i64 enumcheck() {
+    if (gk != Color.Green) return 1;
+    gk = Color.Blue;
+    if (gk != Color.Blue) return 2;
+    return 0;
+}
+
+i64 spancheck() {
+    gt = TimeSpan.FromTicks(50);
+    if (gt.Ticks != 50) return 1;
+    return 0;
+}
+
+i64 shadowcheck() {
+    Holder h = new Holder(10);
+    if (h.bump(5) != 15) return 1;
+    if (h.n != 15) return 2;
+    Later l = new Later(20);
+    if (l.bump(5) != 25) return 3;
+    if (l.n != 25) return 4;
+    if (!near(n, 1.0)) return 5;                  // the global of that name, untouched
+    return 0;
+}
+
+// the parameter shadows the `f64` global `gw`: `gw = 5;` here is an integer
+// store into an `i64` slot, and nothing converts
+i64 paramcheck(i64 gw) {
+    gw = 5;
+    if (gw != 5) return 1;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = widencheck();
+    if (bad != 0) return 10 + bad;
+    bad = plaincheck();
+    if (bad != 0) return 20 + bad;
+    bad = refcheck();
+    if (bad != 0) return 30 + bad;
+    bad = enumcheck();
+    if (bad != 0) return 40 + bad;
+    bad = spancheck();
+    if (bad != 0) return 50 + bad;
+    bad = shadowcheck();
+    if (bad != 0) return 60 + bad;
+    bad = paramcheck(0);
+    if (bad != 0) return 70 + bad;
+    return 42;
+}
