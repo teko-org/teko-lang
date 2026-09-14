@@ -51,8 +51,14 @@ i64 tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl);
 void tk_check_member(i64 owner, i64 vis, uptr m, i64 line, uptr fl);
 
 // teko_deleg.tk is included after this file: D221/§41 K4b's own escape
-// check, read here where an implicit `this.field = e;` writes a field
+// check, read here where an implicit `this.field = e;` writes a field --
+// and, D65, the three a delegate FIELD called by its bare name needs: the
+// row its type names, the one builder of a delegate `callp`, and that row's
+// declared return
 i64 tk_lam_escapes(i64 e);
+i64 tk_deleg_row(i64 ty);
+i64 tk_deleg_build(i64 si, i64 obj, i64 args, i64 na, i64 line, uptr fl);
+i64 dg_ret_at(i64 i);
 
 i64 tk_body_class = 0 - 1;            // the type whose body is being PARSED, or -1
 i64 tk_body_static = 0;               // ...and 1 when that member takes no receiver
@@ -373,9 +379,42 @@ void tk_reject_prop_call(i64 n, uptr m) {
 // `area(2)`  ->  `this.area(2)`. A name the type declares as a method wins over
 // a function of the same name at top level, as it does in C#; a name it does not
 // declare is a call to that function and is not touched.
+// `cb(2)` where `cb` is a FIELD of delegate type: the bare spelling of
+// `this.cb(2)`, which teko_expr.tk's own `tk_field_deleg_call` already
+// builds. D65: a delegate field is callable on every road it can be read,
+// and this road had none at all -- the name reached no rewrite and left the
+// core to refuse it, `call to unknown function`, with no `teko:` prefix.
+//
+// The method table still answers FIRST (the caller's own guard): a method
+// named `cb` is what `cb(2)` means then, as it is in C#. A local or a
+// parameter of that name answers before either, which is `tk_this_field`'s
+// own rule; a delegate LOCAL is rewritten by teko_deleg.tk's pass-8 road.
+// Answers 0 when the name is no delegate field, and the caller falls
+// through to exactly what it did before.
+i64 tk_this_deleg_call(i64 n, uptr m) {
+    i64 fi = tk_this_field(m);
+    if (fi < 0) return 0;
+    i64 fty = fd_ty_at(fi);
+    i64 di = tk_deleg_row(fty);
+    if (di < 0) return 0;
+    tk_this_at(n);
+    tk_this_check(fi);
+    i64 args = nd_a(n);
+    i64 obj = tk_ld(fty, tk_this_field_addr(fi));
+    i64 r = tk_deleg_build(di, obj, args, tk_arg_count(args), tk_line, tk_file);
+    tk_node_replace(n, r);
+    // the node that ends up in the TREE is `n`, not `r` -- the same split
+    // `tk_deleg_call` (teko_deleg.tk) keeps, and for the same reason: the
+    // reclaim pass reads the count by node POSITION
+    i64 ret = dg_ret_at(di);
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
+    return 1;
+}
+
 void tk_this_call(i64 n) {
     uptr m = nd_name(n);
     if (tk_method_named_find(tk_pass_class, m) < 0) {
+        if (tk_this_deleg_call(n, m)) return;
         tk_reject_prop_call(n, m);
         return;
     }

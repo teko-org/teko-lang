@@ -226,10 +226,16 @@ i64 tk_static_field_of(i64 si, uptr m, i64 line, uptr fl) {
 }
 
 // teko_deleg.tk is included after this file: D221 decision 21's second
-// escape, checked where a static field of delegate type is written, and
-// K4b's own declaration reader for `Op f = <init>;`, read by `tk_type_stmt`
+// escape, checked where a static field of delegate type is written, K4b's
+// own declaration reader for `Op f = <init>;`, read by `tk_type_stmt`, and
+// the row a type word names when that word is a delegate (D65)
 i64 tk_lam_escapes(i64 e);
 i64 tk_deleg_var_stmt(i64 si, i64 line, uptr fl);
+i64 tk_deleg_row(i64 ty);
+
+// teko_expr.tk is included after this file too: the one shape a delegate
+// FIELD's call takes, `tk_deleg_build` over the field's own load (D65)
+i64 tk_field_deleg_call(i64 addr, i64 fty, i64 di, i64 line, uptr fl);
 
 // teko_enum.tk is included after this file too: N2b's own statics
 // (`Parse`/`TryParse`/`IsDefined`, docs/specs/enum.md § 6, D47), read by
@@ -285,6 +291,39 @@ i64 tk_static_call(i64 si, uptr m, i64 line, uptr fl) {
     return r;
 }
 
+// D65: `H.cb(21)` on a STATIC field of DELEGATE type. This door decides on
+// `(` before it ever looks at the field table, so the static road was the one
+// road where a field callable everywhere else had no call at all --
+// `tk_method_pick` answered -1 and the site came out `teko: unknown member:
+// cb`. The method table still answers first (the caller asks this only when
+// no method of that name exists), so a static `cb(i64)` declared beside the
+// field keeps the call it always had.
+//
+// The lookup is deliberately NOT `tk_static_field_of`: that one refuses an
+// INSTANCE member with a wording of its own, and an instance field spelled
+// `H.n(1)` is a mistake whose report belongs where it already was. -1 here
+// means "not this road" and nothing else.
+i64 tk_static_deleg_field(i64 si, uptr m) {
+    if (tk_method_named_find(si, m) >= 0) return 0 - 1;
+    i64 fi = tk_field_find(si, m);
+    if (fi < 0) return 0 - 1;
+    if (fd_sym_at(fi) == 0) return 0 - 1;
+    if (fd_nel_at(fi) > 0) return 0 - 1;
+    if (tk_deleg_row(fd_ty_at(fi)) < 0) return 0 - 1;
+    return fi;
+}
+
+// ...and the call itself, the very node `h.cb(21)` builds for an instance
+// field, over the global a static field lives in (`tk_static_use`'s own
+// address)
+i64 tk_static_deleg_call(i64 fi, uptr m, i64 line, uptr fl) {
+    i64 fty = fd_ty_at(fi);
+    tk_check_member(tk_field_owner(fi), fd_vis_at(fi), m, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    return tk_field_deleg_call(tk_id(fd_sym_at(fi)), fty, tk_deleg_row(fty), line, fl);
+}
+
 // the member half of `Name.member`, with the type word already read --
 // `Name.MAX` (D218, delivery 5's own `const` crumb, teko_const.tk) is checked
 // first: a const takes no slot at all, so neither the field table nor the
@@ -312,7 +351,11 @@ i64 tk_static_member(i64 si, i64 line, uptr fl) {
         if (r != 0) return r;
         err_at(fl, line, tk_join3("teko: ", sr_name_at(si), tk_join(" has no member ", m)));
     }
-    if (p_id() == K_LPAR) return tk_static_call(si, m, line, fl);
+    if (p_id() == K_LPAR) {
+        i64 dfi = tk_static_deleg_field(si, m);
+        if (dfi >= 0) return tk_static_deleg_call(dfi, m, line, fl);
+        return tk_static_call(si, m, line, fl);
+    }
     if (tk_prop_find(si, m) >= 0) return tk_prop_static_use(si, m, line, fl);
     i64 fi = tk_static_field_of(si, m, line, fl);
     if (fi < 0) err_at2(fl, line, tk_join("teko: unknown static member of ", sr_name_at(si)), m);
