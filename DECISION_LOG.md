@@ -5033,3 +5033,72 @@ unmoved; `mc limits . --config mc.macos.toml` verdict `ok`, `passes` 15/30, `typ
 `intrin` 8/16, `alias` 18, `syntax` 15 -- every table exactly where D53 left them; `mc pkg
 hash .` `b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`, UNMOVED against
 the base (no listed file changed -- `tests/` and `docs/` are not in `mc.toml`'s own list).
+
+### D60 · A type word already taught refuses a second `class`/`struct`/`interface`/`delegate` under the same name (2026-09-14)
+`class TimeSpan { public i64 v; }` (a teko primitive, `teko_time.tk`), `class f64 { ... }`
+(mc's own core word, its bundled `<float>` module) and `class usize { ... }` (one of the
+seven `type_alias` words `teko_type.tk` declares) all compiled SILENTLY, with the last
+registration winning program-wide: `class f64 { public i64 v; } f64 x = 1.5;` refused with
+`teko: a value of type f64 does not convert to f64` (both sides of `=` now the class's own
+row), and `class TimeSpan {} ... t.v` refused with `teko: unknown member of TimeSpan: v`
+(the primitive's own row, not the class's). `tk_newname` (`teko_struct.tk`) is the one door
+every one of those four constructs takes for its name, and its duplicate guard
+(`alias_find(p_id()) >= 0`, `teko_struct.tk:1463-1464`, the existing `teko: the name is
+already a type` wording D20 already names) is short-circuited by the `tk_fwd_pending`
+branch just above it: the byte-level forward scan (`tk_fwd_reg_type`, `teko_fwd.tk:353`,
+D50's own pre-pass so a use above its declaration still resolves) calls `type_new(qname, 8,
+8, TK_INT)` BLIND, guarded only by its own table (`tk_fwd_find`, its only guard), so a
+`class TimeSpan` lands a SECOND row under the same word in mc's type table before the real
+declaration is ever read -- `type_new` appending unconditionally is mc's own documented
+contract (`src/hooks.mc:637-639`, read-only, D2), not a defect to report. `enum` has no such
+pre-scan (D216: no `type_new` at all) and was the one construct already refused correctly.
+
+**The fix**, entirely inside `tk_newname`'s own `tk_fwd_pending` branch, on the
+declaration's own line (the pre-scan carries no line number to refuse from,
+`tk_fwd_try_decl`): `tk_type_word_shadowed(qname)` answers 1 when `qname` is a type word
+registered MORE THAN ONCE in mc's type table -- `type_count()`/`type_name(t)` counted, since
+the pre-scan's own blind `type_new` is what put the second row there -- which catches every
+`type_new`-based collision (`TimeSpan`, `DateTime`, `DateOnly`, `ref`, `out`, `params`, `i8`,
+`i16`, and mc's own `f64`/`f32`/`f64raw`/`i32`) with zero new state. The seven
+`type_alias`-based words (`bool`, `char`, `byte`, `isize`, `usize`, `ptr`, `str`,
+`teko_type.tk:74-80`) leave no row in mc's type table for that count to see -- `type_alias`
+appends to the alias table alone -- and mc gives no by-name alias lookup that survives the
+scan (`alias_find` takes a token id and answers only the LAST registration, which after the
+scan's own blind `type_new` is always the scan's own row: measured empirically, not a
+documented gap to report). Teko owns those seven words, so `tk_type_word_shadowed` checks a
+short table beside their declaration instead -- the same corridor, one more list. A
+namespaced type is unaffected either way: `namespace geo { class TimeSpan {} }` qualifies to
+`geo__TimeSpan` (`tk_ns_qualified_name`), a name neither list nor count ever matches, so the
+word stays free per namespace exactly as D-unnumbered (§31 N1, `teko_struct.tk`'s own
+comment) already promised. A genuine duplicate (`class Cell {}` twice, no namespace) never
+reaches this branch at all -- its second occurrence's token is already a reserved word by
+the time it is read, so it falls straight to the pre-existing `alias_find` guard, unchanged.
+
+**Fixtures.** Six refusals, `tests/refuse/type_word_{class,struct,iface,deleg,core,alias}.tk`
+-- one per construct (`class`/`struct`/`interface`/`delegate`) plus the mc-core and the
+`type_alias` collision, each `// expect-refuse: teko: the name is already a type: <name>` at
+the declaration's own line. One positive: `tests/surface_namespace.tk` grows a `geo.TimeSpan`
+class (measured first: the un-fixed compiler already accepted it, silently, the same gap) and
+a `main()` read of its own field, proving the namespaced word still resolves to the class, not
+the primitive, `expect-exit: 42` unmoved (an early `return 9` guards the new check without
+touching the existing sum).
+
+**Docs.** `docs/reference/diagnostics.md`'s `"teko: the name is already a type"` entry widened
+to name the three sources (a teko primitive, mc's own core word, a `type_alias` word) and the
+namespace exception; no `docs/reference/not-yet.md` row named this gap, so none is removed.
+
+**Proof** (mc 0.15.23, macos/aarch64, base `d0fbe9a4`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **69 passed, 32 refused as
+expected, 0 failed** (was 69/26: six fixtures added, one grown); `--dump-ast` byte-identical
+against the base compiler for every one of the 68 other pre-existing `tests/*.tk` fixtures (no
+hook module change alters an ACCEPTING parse -- the new code path is reached only when the
+refusal fires); `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh
+scripts/check-docs.sh` → `docs ok: 585 links, 30 fragments, 388 diagnostics, 32 refusals, 137
+samples`; `mc limits . --config mc.macos.toml` verdict `ok` on both legs, `passes` 15/30,
+`types` 12, `intrin` 8/16, `alias` 19, `syntax` 15 -- every table exactly where the base left
+them, only the size-of-surface-code rows moved (`nodes` 176853 → 177006, `ins` 214500 →
+214683, `heap` used 94225952 → 94934768 on the compiler leg); `./build/teko limits
+tests/hello.tk` byte-identical to the base compiler's own output; `mc pkg hash .`
+`aec7809911795c16d3438606780ab75064b06a4d9b085b27148b66851b4f7dab` (base
+`0d0b6fa61e30ea12c7cb8ae1bd60b4db9827f53a4a5c5d67d8a74c038ae62795`: `teko_struct.tk` is a
+listed file, so the hash moves by design).
