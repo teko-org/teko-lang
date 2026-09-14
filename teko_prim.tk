@@ -50,17 +50,17 @@
 //     wordings teko_expr.tk and teko_access.tk already emit for a declared type.
 
 // teko_ops.tk is included AFTER this file (it is the pass that reads the
-// operator rows below), so the three helpers this file borrows from it -- the
-// spelling of an operator token, the "side is not known" wording and the
-// in-place replacement hooks.md § pass() demands -- are forward-declared here,
-// the same way teko_typeof.tk forward-declares `tk_args`.
+// operator rows below), so the two helpers this file borrows from it -- the
+// spelling of an operator token and the "side is not known" wording -- are
+// forward-declared here, the same way teko_typeof.tk forward-declares
+// `tk_args`. The in-place replacement hooks.md § pass() demands is
+// `tk_node_replace` (teko_struct.tk), which every module already sees.
 uptr tk_op_spell(i64 tok);
 uptr tk_op_side_msg(uptr side, uptr sp);
-void tk_ops_replace(i64 n, i64 with);
 
 #define TK_MAXPRIMT 8                 // primitive types carrying a member table
-#define TK_MAXPRIMM 96                // member rows, over every primitive
-#define TK_MAXPRIMO 32                // operator rows, over every primitive
+#define TK_MAXPRIMM 160               // member rows, over every primitive
+#define TK_MAXPRIMO 48                // operator rows, over every primitive
 #define TK_MAXPRIMC 4096              // casts over a primitive the COMPILER wrote
 
 // what a row is reached as, and therefore what the site may write after it
@@ -79,11 +79,13 @@ void tk_ops_replace(i64 n, i64 with);
 i64  pt_ty[TK_MAXPRIMT];
 uptr pt_name[TK_MAXPRIMT];
 uptr pt_inc[TK_MAXPRIMT];             // the include its lowering symbols live in
+uptr pt_read[TK_MAXPRIMT];            // the member that reads it, named in the cast refusal
 i64  tk_nprimt = 0;
 
 i64  pt_ty_at(i64 i)   { return ld64(pt_ty + i * 8); }
 uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
 uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
+uptr pt_read_at(i64 i) { return ld64(pt_read + i * 8); }
 
 // ---- a column that names a type the row cannot see yet ----
 // Every column below carries a type ID, written at `teko_init()` time -- and
@@ -195,11 +197,16 @@ i64  po_swap_at(i64 i) { return ld64(po_swap + i * 8); }
 // `inc` is the include the lowering symbols are written in, named in the
 // refusal a program that forgot it gets (§ 9: the include is part of the
 // surface).
-void tk_prim_type(i64 ty, uptr name, uptr inc) {
+// `read` is the member that reads the value out, spelled as the refusal shows
+// it (`` `.Ticks` ``): it is a COLUMN and not one word for every primitive
+// because a message naming a member the type does not have would be wrong --
+// a `DateOnly` is read by `.DayNumber` and has no `.Ticks` at all (N4a).
+void tk_prim_type(i64 ty, uptr name, uptr inc, uptr read) {
     if (tk_nprimt == TK_MAXPRIMT) err_at(tk_file, tk_line, "teko: too many primitive types");
     st64(pt_ty + tk_nprimt * 8, ty);
     st64(pt_name + tk_nprimt * 8, name);
     st64(pt_inc + tk_nprimt * 8, inc);
+    st64(pt_read + tk_nprimt * 8, read);
     tk_nprimt = tk_nprimt + 1;
 }
 
@@ -403,9 +410,18 @@ void tk_prim_own_cast_moved(i64 from, i64 to) {
     if (tk_prim_own_cast_is(from)) tk_prim_own_cast(to);
 }
 
-// the raw eight bytes, for a call into `lib/`: `(i64) t`. Not an instruction --
-// both slots are eight bytes -- and not a licence the SURFACE has: it is the
-// compiler's own cast, the same way `tk_num_widen` is.
+// the raw bytes, for a call into `lib/`: `(i64) t`. Not a licence the SURFACE
+// has: it is the compiler's own cast, the same way `tk_num_widen` is.
+//
+// It is not an INSTRUCTION where the primitive is eight bytes wide --
+// `walk_narrow` (mc/src/gen_walk.mc) answers 0 for a width-8 `TK_SINT`, which
+// the P0 probe measured -- and IS one where it is narrower: a `DateOnly` is
+// FOUR bytes (N4a), so this cast is the sign extension of them and
+// `tk_prim_ret` below the narrowing store back. Both are what the core already
+// writes for an `enum : i32` (`DateTimeKind`), through every slot a value
+// travels -- a local, a parameter, a return, a field, a global, an array
+// element and a closure capture (D38 sign-extends every narrow indirect load;
+// `tests/surface_dateonly.tk` walks that whole set).
 i64 tk_prim_raw(i64 e) {
     i64 n = tk_cast(TY_I64, e);
     tk_prim_own_cast(n);
@@ -958,8 +974,9 @@ void tk_prim_cast_check(i64 n) {
     i64 pty = tty;
     if (!tk_prim_is(pty)) pty = ety;
     uptr nm = tk_prim_name(pty);
+    uptr rd = pt_read_at(tk_prim_slot(pty));
     err_at(nd_file(n), nd_line(n),
-           tk_join3(tk_join3("teko: a ", nm, " does not cast; `.Ticks` reads it and `new "),
+           tk_join3(tk_join3(tk_join3("teko: a ", nm, " does not cast; "), rd, " reads it and `new "),
                     nm, "(...)` builds it"));
 }
 
@@ -1013,9 +1030,9 @@ void tk_prim_op_refuse(i64 tok, i64 line, uptr fl) {
     err_at(fl, line, tk_join3("teko: no operator `", sp, "` takes these operands"));
 }
 
-// `n` is the N_BINARY itself: the call replaces it in place (teko_ops.tk's own
-// `tk_ops_replace`), and the result type is registered so an enclosing operator
-// and the reclaim both read it.
+// `n` is the N_BINARY itself: the call replaces it in place (teko_struct.tk's
+// own `tk_node_replace`), and the result type is registered so an enclosing
+// operator and the reclaim both read it.
 void tk_prim_binary(i64 n, i64 ta, i64 tb) {
     i64 tok = nd_op(n);
     i64 line = nd_line(n);
@@ -1051,7 +1068,7 @@ void tk_prim_binary(i64 n, i64 ta, i64 tb) {
     i64 call = 0;
     if (po_swap_at(ri)) call = tk_call2(sym, b, a);
     else                call = tk_call2(sym, a, b);
-    tk_ops_replace(n, tk_prim_ret(ret, call));
+    tk_node_replace(n, tk_prim_ret(ret, call));
     tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
 }
 
@@ -1066,6 +1083,6 @@ void tk_prim_unary(i64 n, i64 ta) {
     tk_line = line;
     tk_file = fl;
     i64 ret = po_ret_at(ri);
-    tk_ops_replace(n, tk_prim_ret(ret, tk_call(sym, tk_prim_raw(nd_a(n)))));
+    tk_node_replace(n, tk_prim_ret(ret, tk_call(sym, tk_prim_raw(nd_a(n)))));
     tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
 }

@@ -14,7 +14,9 @@ design it comes from is
 the `enum` statics are meant to land on the same table without a line of their own here.
 `DateTime` was the second primitive and cost the mechanism three additions, each listed
 below: rows of more than one argument, a row that is refused BY NAME, and the list that
-tells a compiler-written cast from a hand-written one.
+tells a compiler-written cast from a hand-written one. `DateOnly` was the third and cost it
+a WIDTH — four bytes, where the other two are eight — which is the section at the end of
+this page.
 
 ---
 
@@ -80,9 +82,12 @@ t.Ticks                ->  (i64) t                    a row with no symbol: the 
 new TimeSpan(n)        ->  (TimeSpan) n               the same, the other way
 ```
 
-Neither cast is an instruction: both slots are eight bytes, and `walk_narrow`
-(`mc`'s own `mc/src/gen_walk.mc`) answers 0 for a width-8 `TK_SINT`. Three things follow, and all
-three are why the design is this and not a compiler intrinsic:
+Neither cast is an instruction where the primitive is eight bytes wide: both slots are the
+machine word, and `walk_narrow` (`mc`'s own `mc/src/gen_walk.mc`) answers 0 for a width-8
+`TK_SINT`. Over a NARROWER one — `DateOnly`, four bytes (N4a) — they are a sign extension
+in and a narrowing store out, the same pair an `enum : i32` already takes, and nothing else
+about them changes. Three things follow, and all three are why the design is this and not a
+compiler intrinsic:
 
 - **`lib/time.tk` never names the type.** It is ordinary teko over `i64`, so nothing in it
   can recurse into the very operator it implements.
@@ -107,11 +112,29 @@ was not an option — `--dump-ast` prints every field a node has, so a mark woul
 dump of code that did not change.
 
 Two details of that list are the whole of its subtlety. A node replaced **in place**
-(`node_assign`, mc's own) keeps the placeholder's index and not the built node's, so the
-two passes that replace a lowering's own result — the deferred `.` and the operator
-rewrite — hand the record over with `tk_prim_own_cast_moved`. And the check runs over the
-operator pass's walk, which covers function bodies only, so a second tiny walk
-(`tk_prim_cast_globals`) covers what is written outside them: a global's own initializer.
+(`node_assign`, mc's own) keeps the placeholder's index and not the built node's, so every
+site that replaces a value node hands the record over with `tk_prim_own_cast_moved`. And
+the check runs over the operator pass's walk, which covers function bodies only, so a
+second tiny walk (`tk_prim_cast_globals`) covers what is written outside them: a global's
+own initializer.
+
+**That hand-over is a rule for every in-place replacement, not for two of them** (D54).
+While every primitive was eight bytes wide the only cast a replaced node could carry was a
+lowering's own result, so the deferred `.` (`tk_pend_do`) and the operator rewrite
+(`tk_ops_replace`) were the whole list. A primitive **narrower** than the machine word
+makes every indirect load a cast as well — `tk_ld` (teko_struct.tk), `tk_arr_load` and
+`tk_callp_ret` (teko_array.tk) all write one — and six more doors turned out to copy such
+a value into a placeholder and drop the record, each of them refusing a `DateOnly` the
+compiler had just built itself: the implicit-`this` rewrite (teko_this.tk), a `ref`/`out`
+pointee read (teko_ref.tk), the two global-array element reads (teko_array.tk), the
+delegate call (teko_deleg.tk) and the forward-resolved static field read (teko_access.tk).
+A **seventh** — the read of a by-reference lambda capture (`tk_lam_walk`, teko_deleg.tk) —
+was found by the verifier after those six had been patched one by one, which is the lesson
+of the entry: the record is handed over inside the single `tk_node_replace`
+([teko_struct.tk](../../teko_struct.tk), [nodes-and-xt.md](nodes-and-xt.md)), which now
+holds the compiler's only `node_assign`, so a door cannot forget what it never writes.
+An `enum : i32` is four bytes too and needs none of this: nothing in the language casts an
+enum, so an enum load never reaches `tk_prim_cast_check` at all.
 
 ## The four sites that read the table
 
@@ -197,17 +220,21 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 | table | cap | counts |
 |---|---|---|
 | `TK_MAXPRIMT` | 8 | primitive types with a member table |
-| `TK_MAXPRIMM` | 96 | member rows, over every primitive |
-| `TK_MAXPRIMO` | 32 | operator rows, over every primitive |
+| `TK_MAXPRIMM` | 160 | member rows, over every primitive |
+| `TK_MAXPRIMO` | 48 | operator rows, over every primitive |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 | `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
 | `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
 | `TK_MAXPARG` | 128 | arguments of a primitive or `enum` position, in one unit, whose type only the pass can tell (D48) |
 
 `TimeSpan` uses 1, 30 and 12 of the first three; `DateTime` brings the totals to 2, 66 and
-22, with 41 parameter positions and one late type (`DateTimeKind`). The fourth is per compilation unit and not per registration: it grows with how much
-date arithmetic one program writes, roughly two entries per member access, and a unit past
-it is `teko: too many casts over a primitive in one unit`.
+22, with 41 parameter positions and one late type (`DateTimeKind`); `DateOnly` (N4a) brings
+them to **3, 82 and 28**, with **51** parameter positions and no late type of its own. The
+second and third caps were 96 and 32 until that crumb and are 160 and 48 now — `TimeOnly`
+(N4b) would have overflowed both, and raising a `#define` costs nothing but the array it
+sizes. The `TK_MAXPRIMC` row is per compilation unit and not per registration: it grows
+with how much date arithmetic one program writes, roughly two entries per member access,
+and a unit past it is `teko: too many casts over a primitive in one unit`.
 
 ## What the second primitive actually cost
 
@@ -218,6 +245,28 @@ deleted both and wrote an ordinary `enum` in `lib/time.tk` instead, which is why
 compiler's own `alias` row is 18 today and not 19.
 
 In `teko_prim.tk` it cost the three additions this page names (multi-argument rows,
-`TK_PMSOON`, the own-cast list) and no pass. The next primitive —
-[`decimal`](../specs/decimal.md), sixteen bytes and a derived machine — is the one that
-will ask the mechanism a question it has not answered yet.
+`TK_PMSOON`, the own-cast list) and no pass.
+
+## What the third primitive cost: a width
+
+`DateOnly` (N4a) is **four bytes**, `type_new("DateOnly", 4, 4, TK_SINT)`, and it is the
+first primitive narrower than the machine word. It added sixteen rows, six operator rows
+and the `tk_do_*` half of `lib/time.tk` — and in the mechanism itself, exactly two things:
+
+- **The two casts became instructions.** `tk_prim_raw`'s `(i64) d` is a sign extension of
+  the four bytes and `tk_prim_ret`'s `(DateOnly) r` a narrowing store, where over an
+  eight-byte primitive both were nothing at all (`walk_narrow`, mc's own, answers 0 for a
+  width-8 `TK_SINT`). Nothing in any machine changed: an `enum : i32` already travelled
+  every slot a value has, and `tests/surface_dateonly.tk` walks the same set — a local, a
+  parameter, a return, a field, a global, an element of a fixed array and of a `T[]`, a
+  `ref`/`out` pointee and a closure's captured copy — with the largest day number there is.
+- **The own-cast record had to travel further**, which is the five doors named above: with
+  every load of a narrow primitive being a cast, every in-place replacement that copies one
+  into a placeholder had to hand the record over.
+
+The refusal a hand-written cast earns also gained a column: the member it names is the
+primitive's own reader (`` `.Ticks` ``, `` `.DayNumber` ``), because a message naming a
+member the type does not have would be wrong (D54).
+
+The next primitive — [`decimal`](../specs/decimal.md), sixteen bytes and a derived
+machine — is the one that will ask the mechanism a question it has not answered yet.
