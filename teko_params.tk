@@ -182,6 +182,32 @@ i64 tk_bracket(i64 left) {
             tk_this_reject_array(bfi);
             err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
         }
+        // a field is not the only member a bare name stands for: `tk_this_ident`
+        // answers a member CONST and then a PROPERTY with the very same rule, so
+        // the global road may not claim those two names either. With a global
+        // `i64[] src` beside a `const i64 src` the method's `src[0]` read the
+        // constant's value as the array's handle (exit 139, pass 11's shape
+        // again); beside a scalar PROPERTY `src` it read the getter's result the
+        // same way (exit 70, the null-array trap catching by luck what nothing
+        // refused) -- Copilot on #698, pass 13. The order is `tk_this_ident`'s
+        // own, const before property, so the name resolves here to exactly what
+        // it resolves to there. A const is always a scalar value
+        // (`tk_mconst_use`, teko_const.tk), so it only ever indexes nothing; a
+        // property CAN be declared `T[]`, and that one is read by calling its
+        // getter and indexing the result -- `h.xs[0]` already compiles that way,
+        // and the bare `xs[0]` is the same access with the receiver implicit, so
+        // the base the pass turns into the getter call takes `tk_ha_index`
+        // exactly as a `T[]` field does above. A property of any other type takes
+        // the refusal. An INLINE array is no property's type at all (only a field
+        // is laid out that way), so `tk_this_reject_array` has no second site.
+        if (tk_mconst_find(tk_body_class, nd_name(left)) >= 0)
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        i64 bpi = tk_prop_find(tk_body_class, nd_name(left));
+        if (bpi >= 0) {
+            i64 psi = tk_struct_by_ty(pr_ty_at(bpi));
+            if (tk_is_ha(psi)) return tk_ha_index(left, psi);
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        }
     }
     i64 line = p_line();
     uptr fl = p_file();

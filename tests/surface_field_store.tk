@@ -108,13 +108,22 @@
 //                       declares is that field at PARSE time, which is what
 //                       keeps the global rewrite -- keyed by name alone --
 //                       off it;
+//  26. the same check -- the implicit index on a `T[]` PROPERTY (`gl[0]`,
+//                       `gl[0] += 3`, `return gl[0]`), whose name is a
+//                       GLOBAL array of this file too. A bare name resolves
+//                       to a field, then to a member const, then to a
+//                       property (`tk_this_ident`, teko_this.tk), so the
+//                       parse-time guard answers all three; the property is
+//                       read by calling its getter, the implicit form of
+//                       `x.gl[0]`, and the global keeps its own value;
 //  20. `rccheck`      -- `rt_live()` back to its floor once every object
 //                       this file allocated is released, the global arrays
 //                       above excepted: those are roots.
 //
 // A refusal has no exit code to assert (D33's own harness note): the
 // narrowing refusal, the reference/number mismatch (D34), `null` in a
-// non-`T?` field and the local that SHADOWS a global array
+// non-`T?` field and the local, the FIELD, the member CONST and the scalar
+// PROPERTY that SHADOW a global array
 // (``teko: `[` needs an array: src``, the one thing the rewrite of a global's
 // reads may not do by name alone) are probed outside `tests/` and documented
 // as `// no-run` in [types.md](../docs/reference/types.md) and
@@ -347,18 +356,31 @@ class X {
     public i64[] xs;
     public f64 rate;
 
+    // (26) the OTHER member a bare name stands for, with the same global `gl`
+    // of this file beside it: a `T[]` PROPERTY. `tk_this_ident` resolves a
+    // bare name to a field, then to a member const, then to a property, so
+    // the parse-time guard has to answer all three or the global rewrite --
+    // keyed by name alone -- claims the last two. Indexed here through the
+    // GETTER, the implicit form of `x.gl[0]`.
+    private i64[] gback;
+    public i64[] gl { get { return gback; } set { gback = value; } }
+
     public X() {
         xs = new i64[2];
         rate = 0.0;
+        gl = new i64[2];              // the setter, through the implicit form
     }
 
     public void fill() {
         xs[0] = 8;                    // the implicit store...
         xs[0] += 1;                   // ...the implicit compound...
         this.rate = xs[0];            // ...and the implicit load, widened by the gate
+        gl[0] = 4;                    // the property's own element store...
+        gl[0] += 3;                   // ...and its compound, over the getter
     }
 
     public i64 at0() { return xs[0]; }
+    public i64 gl0() { return gl[0]; }
 }
 
 // a FREE function's own parameter: no member body is being parsed, so nothing
@@ -750,9 +772,12 @@ i64 mbindexcheck() {
         x.fill();
         if (x.at0() != 9) return 1;
         if (x.rate != 9.0) return 2;
+        if (x.gl0() != 7) return 5;   // 26: the `T[]` PROPERTY, read by its getter
+        if (x.gl[0] != 7) return 6;   // ...the same element, written out
+        if (gl[0] != 5) return 7;     // ...and the GLOBAL of that name, untouched
         seen = rt_live();
     }
-    if (seen != floor + 2) return 3;  // the object and the array it holds
+    if (seen != floor + 3) return 3;  // the object and the two arrays it holds
     if (rt_live() != floor) return 4;
     return 0;
 }
@@ -847,7 +872,7 @@ i64 main() {
     if (bad != 0) return 245 + bad;
 
     bad = rccheck();
-    if (bad != 0) return 250 + bad;
+    if (bad != 0) return 253 + bad;
 
     return 42;
 }
