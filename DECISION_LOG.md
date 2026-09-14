@@ -5699,3 +5699,14 @@ the deleted helper); `mc pkg hash .`
 `c71e2f944b688166f76bad309b374fa2ab32add347cec1d0c92666258451c8af` (base
 `15c2fdc3d62c5110cd8b5589f28beb3a3c837cc49ecc7a8c0c0b46f8688d1e6e`: three hook modules and
 two fixtures are listed files, so the hash moves by design).
+
+**Verifier finding, first pass (the ceiling the broad form reaches).** Every untagged call
+receiver now waits in the `pd_*` table, which the deferred `.` road shared at `TK_MAXPEND`
+128 — a function holding 129 reads such as `s = s + mkday().Day;`, a single non-overloaded
+callee, compiled on the base at any count tried (1000) and refused on this branch's first
+head with `teko: too many member accesses on a value of unknown type`. The table is now
+4096 (nine arrays of that many words), the same size `TK_MAXXT`, `TK_MAXFS` and the argument
+park use; measured: 600 such reads in one function compile and run (exit 248 = 600·29 mod
+256), `mc limits` verdict `ok` with `globals` 943/2544 unmoved and `grow` 0 on every row.
+The ceiling is a fact of the shared table, not a fixture: a refuse fixture that pins it
+would break the day it grows.
