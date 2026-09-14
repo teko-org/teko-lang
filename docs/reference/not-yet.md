@@ -58,6 +58,7 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | a capture **by reference** of a counted type | `teko: a capture by reference of a counted type is not taught yet` |
 | capturing a **parameter** of the declaring function | ``teko: `use` captures a local; this name is not one`` |
 | a by-reference capture returned or stored in a field | `teko: a lambda that captures by reference cannot leave its scope` |
+| a by-reference capture handed to a PARAMETER that the callee stores in a slot outliving the caller — `void sink(Op p) { g_op = p; }`, called `sink(held)` | not caught: the taint does not cross a call. The escape is an intra-function rule (D42), and the call itself is the ordinary way to use a delegate — `forEach(xs, new Op((i64 x) use (&sum) => ...))` is the same shape, and a rule that refused the argument would refuse it too. Carrying the verdict into the callee needs a qualifier on the parameter's own type, which is a design, not a patch (D51, sixth pass) |
 | a lambda written against a `delegate` declared **below** it | ``teko: a delegate declared below `new` is not taught yet`` |
 
 ## Arrays

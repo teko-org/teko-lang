@@ -624,8 +624,10 @@ are listed in [runtime.md](runtime.md#the-time-library).
   **by value**; the closure then holds a reference of its own.
 - `"teko: a lambda that captures by reference cannot leave its scope"` — such a closure
   cannot be returned, nor stored in a field, a static field, a GLOBAL of delegate type or
-  an ELEMENT of a `T[]`, whether the array is a local or a global. Handing it to another
-  LOCAL is allowed: the scope that owns the capture is still the one holding it.
+  an ELEMENT of a `T[]`, whether the array is a local or a global. A ternary is read BRANCH
+  BY BRANCH at every one of those slots: `c ? held : other` is refused when either branch
+  carries the capture, since either branch is what the slot ends up holding. Handing it to
+  another LOCAL is allowed: the scope that owns the capture is still the one holding it.
 - ``"teko: a delegate declared below `new` is not taught yet"`` — move the `delegate`
   declaration above the `new` that names it.
 - `"teko: an array of this type is not taught yet"` — a fixed array whose element is a type
@@ -690,6 +692,28 @@ i64 f() {
 And a value the store is written at cannot TYPE waits for the same walk whether the array
 is global or local: `ops[0] = chooser(1)`, with `chooser` a local delegate that answers
 `Op`, is judged where `chooser` has a type, never refused at the store (D51, fifth pass).
+A bare NAME is one of those values at every store, because a PARAMETER shadows a function
+of the same name and nothing the parser keeps records a parameter; a ternary is late
+exactly when one of its branches is (D51, sixth pass).
+
+The escape reads a ternary branch by branch, at every slot that outlives the capture
+(D51, sixth pass):
+
+```teko
+// no-run
+delegate i64 Op(i64 a);
+i64 addOne(i64 a) { return a + 1; }
+Op g_op;
+i64 f(i64 c) {
+    i64 acc = 0;
+    Op held = new Op((i64 x) use (&acc) => acc + x);
+    Op other = addOne;
+    Op picked = c == 1 ? held : other;   // fine: a LOCAL holds it
+    g_op = c == 1 ? held : other;
+                  // teko: a lambda that captures by reference cannot leave its scope
+    return picked(1);
+}
+```
 
 ## Arrays
 

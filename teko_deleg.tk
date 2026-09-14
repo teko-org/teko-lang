@@ -528,20 +528,19 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // store built in a pass takes for every value it holds. `null` means the same
 // thing at every site, so it never takes a row of the table.
 //
-// For a bare name that reads:
-//
-//   - the pass-time scope or a global row already names it (both are empty at
-//     parse time and both are live once `tk_array_pass` has run), so the
-//     validator reads the same type the pass would read;
-//   - nothing names it as a SLOT and a declaration seen so far gives it a
-//     body, which is the one table a wrap has -- `ops[0] = add;` with `add`
-//     written above, the shape every fixture holds today.
-//
-// A name the parser's own scoped table of locals holds (`tk_pty_of`,
-// teko_struct.tk) is a SLOT, even when a function of that name exists, and a
-// slot is judged by the type the validator reads from the scope, not by the
-// wrap -- so it waits. So does a name no table here knows at all: it may still
-// be a global, a parameter, or a function declared further down the file.
+// A bare NAME is settled here only when the site's own two slot oracles name
+// it -- the pass-time scope or a global row, both empty at parse time and both
+// live once `tk_array_pass` has run -- and waits otherwise. There is no third
+// table to ask: `decl_find` answers "a function of that name has been read so
+// far", which is not the question, because a PARAMETER of the enclosing
+// function shadows that function and nothing the parser keeps records one.
+// `storeParam(Op p) { ops[0] = p; }` written under a free `i64 p(i64)` stored
+// a wrap of the FUNCTION and called it -- a silent wrong answer, on the base
+// exactly as here (D51, sixth pass). `tk_pty_of` (teko_struct.tk) is the same
+// dead end: it records a declaration and never a parameter, so it cannot tell
+// the two apart either. The WALK can, and that is where the name goes: a
+// parameter stands in `tk_ty_scope_var` exactly as a local does, and a name
+// nothing there names is the function to wrap.
 //
 // Every OTHER shape asks `tk_deleg_expr_ty`, which is the oracle the
 // validator itself would ask one line later: a `new Op(...)`, a lambda, an
@@ -552,19 +551,25 @@ void tk_deleg_defer_all_set(i64 on) { tk_deleg_defer_all = on; }
 // refused on the spot (D51, fifth pass). Deferring only what the site types
 // WRONG is also what keeps every accepted program's tree where it was: a wrap
 // that already worked emits four declarations through `tk_top_emit`, and
-// moving the wrap would move them (the 62 dumps of `da33ebd4`). A ternary is
-// the one value this validator takes APART, one branch at a time, so it stays
-// here whenever the site is judging at all.
+// moving the wrap would move them (the 62 dumps of `da33ebd4`).
+//
+// A ternary is the one value the validator takes APART, one branch at a time,
+// so it is late exactly when a BRANCH is. Settling the whole of it here handed
+// each branch to a site that cannot type it: `ops[0] = c ? chooser(1) :
+// chooser(0)` through a local delegate was refused `teko: Op takes a function,
+// another Op, or null`, and a branch naming a function declared BELOW the
+// store died `teko: unknown function: ...` -- two legal programs (D51, sixth
+// pass).
 i64 tk_deleg_store_late(i64 si, i64 v) {
     if (si < 0 || v == 0) return 0;
     if (nd_kind(v) == N_INT && nd_val(v) == 0) return 0;    // `null`, the same answer anywhere
     if (tk_deleg_defer_all) return 1;             // built in a pass: judge nothing here
-    if (nd_kind(v) == N_IDENT) {
-        if (tk_ty_scope_or_global(nd_name(v)) >= 0) return 0;
-        if (tk_pty_of(v) >= 0) return 1;
-        return decl_find(nd_name(v)) < 0;
+    if (nd_kind(v) == N_IDENT) return tk_ty_scope_or_global(nd_name(v)) < 0;
+    if (nd_kind(v) == N_CALL && str_eq(nd_name(v), "tk_ternary")) {
+        i64 c = nd_a(v);                          // `c ? a : b`, still the raw placeholder
+        i64 a = nd_next(c);                       // (teko_ternary.tk lowers it later)
+        return tk_deleg_store_late(si, a) || tk_deleg_store_late(si, nd_next(a));
     }
-    if (nd_kind(v) == N_CALL && str_eq(nd_name(v), "tk_ternary")) return 0;
     return tk_deleg_expr_ty(v) != sr_ty_at(si);
 }
 
@@ -839,9 +844,23 @@ uptr tk_taint_owner() {
 // `teko_access.tk`'s `tk_static_use`, `teko_heaparr.tk`'s `tk_ha_index`) --
 // everywhere BUT an argument of `new Op(...)`, which a callee only ever
 // reads, C-like, never stores.
+//
+// A ternary is read BRANCH BY BRANCH, because that is how the validator reads
+// it (`tk_deleg_coerce` above, one coercion per branch) and how the code
+// generator writes it: `g_op = flag ? held : other` stores whichever branch
+// runs, so `held` carrying a by-reference capture is the same dangling slot
+// `g_op = held` is. Reading the top of the node alone answered `tk_lamref_has`
+// over the placeholder's own name, `tk_ternary`, which no allocator has: every
+// escaping site of the language -- the global slot, the field, the static
+// field, the element of a `T[]` and the `return` -- accepted that shape (D51,
+// sixth pass). Every other value the validator accepts is a leaf here.
 i64 tk_lam_escapes(i64 e) {
     if (e == 0) return 0;
     i64 k = nd_kind(e);
+    if (k == N_CALL && str_eq(nd_name(e), "tk_ternary")) {
+        i64 a = nd_next(nd_a(e));                 // `c ? a : b`, the raw placeholder
+        return tk_lam_escapes(a) || tk_lam_escapes(nd_next(a));
+    }
     if (k == N_CALL) return tk_lamref_has(nd_name(e));
     if (k == N_IDENT) return tk_taint_find(tk_taint_owner(), nd_name(e));
     return 0;

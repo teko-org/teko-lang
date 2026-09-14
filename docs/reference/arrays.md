@@ -194,7 +194,9 @@ or write an argument list straight after the index — the element `ops[i]` foll
 What may be written into such an element is what the delegate slot takes anywhere else: a
 function's name, whether it is declared above the store or further down the file; a lambda
 under `new Op(...)`; a call that answers the delegate type; and a name of that delegate
-type — a local, a parameter or a global alike, in a local array and in a global one.
+type — a local, a parameter or a global alike, in a local array and in a global one; and a
+ternary whose branches are any of those. A name a PARAMETER of the enclosing function
+shadows is that parameter, never the free function of the same name (D51, sixth pass).
 A value of any other type is refused in the delegate's own words, *`Op` takes a function,
 another `Op`, or null*.
 

@@ -49,6 +49,19 @@
 //      store already had. The by-reference capture handed to another LOCAL is
 //      the other half: it is accepted, where the global slot of section 3 is
 //      refused (D51, fifth pass).
+//   3e. `delegternarycheck` -- a TERNARY at the element store, local and
+//      global: the validator coerces it one branch at a time, so it is late
+//      exactly when a BRANCH is. Settled whole at the store's own site, a
+//      branch calling a local delegate was refused and a branch naming a
+//      function declared below the store died `teko: unknown function: ...`.
+//      The last store is the escape's own half: the rule read the top of the
+//      node alone, so a by-reference capture inside a ternary reached a
+//      global, a field, a static field, an element and a `return` unrefused.
+//      It reads both branches now, and handing one to another LOCAL is still
+//      accepted. `storeParam` gains the shadow that makes the same point
+//      about a bare NAME: a parameter written under a free function of that
+//      name was stored as a wrap of the FUNCTION and called (D51, sixth
+//      pass).
 //   4. `paramscheck`   -- a `params i64[]` call with a global SCALAR element
 //      among its tail (`teko_params.tk`'s own `tk_pm_arg_ty`, which read only
 //      `tk_ty_global_ha` -- a global `T[]` of heap -- before this crumb; a
@@ -157,8 +170,14 @@ Op[] g_ops;                                       // a GLOBAL array of them
 
 i64 addTwo(i64 a) { return a + 2; }
 
+i64 p(i64 a) { return a + 100; }                  // a free function named `p`
+
 // the store is written here, and the name is a PARAMETER: neither the
-// pass-time scope nor the parser's own table of locals holds one
+// pass-time scope nor the parser's own table of locals holds one -- and the
+// one table that DID answer, "a function of that name has been read so far"
+// (`decl_find`), answered about the function right above, whose wrap the
+// store then held and called (D51, sixth pass). A parameter shadows a
+// function for the whole body; the walk is where that is knowable.
 i64 storeParam(Op p) {
     Op[] ops = new Op[1];
     ops[0] = p;
@@ -180,7 +199,7 @@ i64 delegarrcheck() {
     Op[] ops = new Op[4];
     ops[0] = g_op;                                // a global
     ops[1] = lo;                                  // a local
-    ops[2] = addOne;                              // a plain function: wrapped as it always was
+    ops[2] = addOne;                              // a plain function, wrapped at the walk
     ops[3] = addLater;                            // ...declared BELOW this body
     if (ops[0](10) != 11) return 1;
     if (ops[1](10) != 12) return 2;
@@ -283,6 +302,46 @@ i64 delegarrlocalcheck() {
     if (held3(2) != 42) return 4;
     return 0;
 }
+
+// ---- 3e. the ternary at an element store, judged branch by branch, and the
+// escape that reads both branches (D51, sixth pass) ----
+
+i64 delegternarycheck() {
+    Chooser chooser = pickOp;
+    i64 c = 1;
+
+    // a LOCAL `Op[]`: the validator takes a ternary APART, one coercion per
+    // branch, so the value is late exactly when a BRANCH is. Settling the
+    // whole of it at the store's own site refused both of these legal stores
+    // -- `teko: Op takes a function, another Op, or null` for the call
+    // through a local delegate, `teko: unknown function: addAfter` for the
+    // arm that names a function declared below the store.
+    Op[] ops = new Op[2];
+    ops[0] = c == 1 ? chooser(1) : chooser(0);
+    ops[1] = c == 1 ? addAfter : addOne;
+    if (ops[0](10) != 12) return 1;
+    if (ops[1](10) != 14) return 2;
+
+    // ...and the same ternary at a GLOBAL `Op[]`, whose store the pass builds
+    // and the walk judges whole
+    g_ops2[0] = c == 1 ? chooser(0) : chooser(1);
+    Op b0 = g_ops2[0];
+    if (b0(10) != 11) return 3;
+
+    // a by-reference capture inside a ternary, handed to another LOCAL: the
+    // escape rule reads both branches now, and a LOCAL target is still not a
+    // slot that outlives the capture -- the global, the field, the static
+    // field, the element and the `return` are, and every one of them refused
+    // this shape in silence before (docs/reference/diagnostics.md)
+    i64 acc = 40;
+    Op held = new Op((i64 x) use (&acc) => acc + x);
+    Op other = addOne;
+    Op picked = c == 1 ? held : other;
+    if (picked(2) != 42) return 4;
+    return 0;
+}
+
+i64 addAfter(i64 a) { return a + 4; }
 
 // ---- 4. `params` over a global scalar element ----
 
@@ -425,6 +484,9 @@ i64 main() {
 
     bad = delegarrlocalcheck();
     if (bad != 0) return 100 + bad;
+
+    bad = delegternarycheck();
+    if (bad != 0) return 110 + bad;
 
     bad = paramscheck();
     if (bad != 0) return 40 + bad;
