@@ -77,6 +77,15 @@
 //      parser, `expected ) in cast`, and each had to be written
 //      `new Op((i64 x) => ...)` instead; `method_check` above, which did
 //      exactly that, is written the direct way now.
+//  23. `arg_roads_check` (D66, Copilot on #719) -- the three METHOD-argument
+//      shapes the first reader missed, because it asked the callee's single
+//      declaration for the parameter's type: a parameter declared `Op?`, an
+//      OVERLOADED name (which signature applies is not known until the
+//      argument COUNT is, but every candidate spells the same delegate at
+//      that position), and a method INHERITED from a base, whose name the
+//      derived class itself declares zero times. A GROUP at a delegate
+//      argument and a CAST at the position beside it measure the other half:
+//      the lookahead claims neither.
 //
 // expect-exit: 42
 
@@ -437,6 +446,47 @@ i64 slot_roads_check() {
     return 0;
 }
 
+// D66 (Copilot on #719): the three shapes of METHOD ARGUMENT the reader used
+// to miss. `keep` STORES its `Op?` and never calls it -- calling through a
+// nullable delegate is not taught (docs/reference/not-yet.md), and this row
+// proves the PARSE of the argument, nothing more.
+class ArgBase {
+    public i64 inherited(Op f) {
+        return f(20);
+    }
+}
+
+class Args : ArgBase {
+    public i64 keep(Op? f, i64 k) {
+        Op? held = f;
+        if (held == null) return 0;
+        return k;
+    }
+
+    public i64 pick(Op f) {
+        return f(1);
+    }
+
+    public i64 pick(Op f, i64 k) {
+        return f(k);
+    }
+}
+
+i64 arg_roads_check() {
+    Args a = new Args;
+    if (a.keep((i64 x) => x, 42) != 42) return 1;              // an `Op?` PARAMETER
+    if (a.pick((i64 x) => x * 2, 21) != 42) return 2;          // an OVERLOADED name...
+    if (a.pick(x => x + 41) != 42) return 3;                   // ...at the other arity
+    if (a.inherited((i64 x) => x + 22) != 42) return 4;        // a method of the BASE
+
+    // ...and the same reader leaves a GROUP at a delegate argument and a CAST
+    // at the position beside it exactly where the core always read them.
+    Op t = (i64 x) => x * 2;
+    if (a.pick((t), 21) != 42) return 5;
+    if (a.pick(t, (i64) 21.5) != 42) return 6;
+    return 0;
+}
+
 i64 main() {
     i64 bad = nocap_check();
     if (bad != 0) return 10 + bad;
@@ -521,12 +571,16 @@ i64 main() {
     if (bad != 0) return 410 + bad;
     if (rt_live() != 0) return 420;
 
+    bad = arg_roads_check();
+    if (bad != 0) return 430 + bad;
+    if (rt_live() != 0) return 440;
+
     // LAST, and the one helper whose floor is not zero: `St.cb` is a STATIC,
     // so the closure it holds outlives every scope in the program and is
     // still counted here. Nothing runs after it.
     bad = slot_roads_check();
-    if (bad != 0) return 430 + bad;
-    if (rt_live() != 1) return 440;
+    if (bad != 0) return 450 + bad;
+    if (rt_live() != 1) return 460;
 
     return 42;
 }
