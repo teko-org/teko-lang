@@ -2840,7 +2840,9 @@ self-hosted `teko1`); `sh scripts/check-docs.sh` green (570 links, 387 diagnosti
 samples); `mc limits . --config mc.macos.toml` verdict `ok`, every table of elements unmoved
 — `passes` 15/30, `syntax` 15, `infix` 24, `alias` 18, `types` 11, `intrin` 8/16 — no new
 pass, no new intrinsic (D2, D21); the floor leg's `heap` is the one figure that moves,
-**467824 → 1114992** bytes used against a 33554432-byte reservation, which is the two tables
+**467824 → 1114992** bytes used against a 33554432-byte reservation (measured in a clean
+`build/`; the floor leg's heap figure follows the state of `build/` and is not a gate — an
+independent run over a used `build/` reads 721776 on both sides), which is the two tables
 raised to 4096. `mc pkg hash .` over the source tree of this entry's code commits:
 `3b494b9d138ad4420f8492f43802cdf7ffaf0cde03b36b9a6df9c8b0a12ab015`.
 
