@@ -4609,3 +4609,102 @@ then pairs its closing quote with the next literal's opening one, and the compos
 `"teko: " + name + " is used before it is assigned"` was exactly the case that exposed it.
 Drill: replacing one fixture's message tail with an undocumented word fails the check;
 restored, `docs ok: 569 links, 387 diagnostics, 15 refusals, 122 samples`.
+
+---
+
+### D53 · A global SCALAR slot takes the same assignment corridor as a local (G-b, 2026-09-14)
+D48 gave a global a TYPE (`tk_ty_global`, teko_array.tk, over the slot table `tk_hg_collect`
+records) and D51 gave every by-name oracle a fallback into it. What neither gave it is the
+CHECK: the corridor a value crosses on its way into a slot -- `tk_check_compat` /
+`tk_num_widen` / `tk_nl_wrap` (teko_typeof.tk, teko_null.tk) -- ran on a local, a field, an
+argument, an array element and a `return`, and on a global it ran nowhere. Eight shapes
+measured on the base (`84c63025`), every one of them compiling, every one of them refused
+or converted on the identical local:
+
+- `f64 gw = 1;` -- `gw` held the raw integer bits (`GLOBAL type=f64 name=gw` /
+  `INT val=1 type=i64`), so the guard `gw > 0.9 && gw < 1.1` failed. A local `f64 x = 1;`
+  is one point zero (D33).
+- `f64 gw; ... gw = 5;` from inside a body -- the same raw store.
+- `i64 gn = 1.5;` and `gn = 1.5;` -- accepted; the local refuses,
+  `teko: a value of type f64 does not convert to i64`.
+- `Cell gc; ... gc = null;` -- accepted; the local refuses,
+  `teko: null needs a slot declared Cell?` (D43).
+- `i64 gn; ... gn = someCell;` -- accepted; the local refuses (D34).
+- `Color gk = 1;` and `gk = 1;` -- an enum out of a bare integer, accepted.
+- `Cell gc; Box b; gc = b;` -- two unrelated rows, accepted.
+- `i8 g8 = 1.5;` -- accepted.
+
+**ROOT: two doors, one of them shut and the other never cut.** `tk_rc_assign` (teko_rc.tk)
+opened with `i64 li = tk_rc_index(nd_name(n)); if (li < 0) return;` -- a global is in no
+pass-time scope, so it answered -1 and the function returned ABOVE the three shared rules
+rather than below them. The early return becomes a fallback: the slot's type is
+`sc_ty_at(li)` when the name is a local or a parameter and `tk_ty_global(nd_name(n))`
+otherwise, and the `li < 0` return moves down to just above the rc lowering, which is
+untouched and still needs a scope slot of its own (the address it stores through, the
+borrowed-parameter rule). The ORDER is lexical, and it is the order D51 already settled:
+`tk_rc_index` walks the scope stack and holds the parameters below its floor, so the global
+is reached only when no local and no parameter of that name is in scope --
+`i64 paramcheck(i64 gw)` beside an `f64 gw` at file scope stores an integer 5, and a field
+`n` written implicitly inside a method is a field store that never reaches this function at
+all (proved in both declaration orders, the class above the global and below it -- D50's
+pass 3 found real shadow hazards on the field-store gate, so it is a fixture, not an
+argument). `tk_nl_wrap` is a no-op here by construction: a global declared `T?` over a
+VALUE is already refused at pass 5 by `tk_gs_check` (teko_array.tk, D44).
+
+A global's own INITIALIZER had no door at all. The two sweeps that walk an `N_GLOBAL`
+(`tk_garr_collect`, `tk_hg_collect`) only record rows, and nothing else in fifteen passes
+looked at one. `tk_rc_global` is **one clause in `tk_rc_pass`'s own top-level loop**, beside
+the `N_FUNC` one -- no new pass, `tk_compat_needed()` already answers 1 for every unit, and
+`passes` stays 15/30. It skips the two shapes that are not a slot with a value: `nd_val != 0`
+is an array (and the shape every GENERATED global takes -- an enum's element table writes
+`nd_val = cnt`, teko_enum.tk, and `tk_glb`'s vtable globals carry no `nd_a`), `nd_a == 0` is
+a declaration with nothing to judge. The value needs no deferral machinery: a global
+initializer is constant by mc's own rule, so `tk_pty_of` (teko_struct.tk) reads its type off
+the folded node.
+
+**The widen at an initializer is a LITERAL REWRITE, not a cast.** `tk_num_widen` writes an
+`N_CAST`, and mc's core refuses one at file scope -- `f64 g = (f64) 1;` dies with `global
+initializer must be constant`, measured on mc 0.15.23, which is also why no `N_CALL`, no
+`N_IDENT` and no `N_CAST` can ever be a global initializer in the first place. So
+`tk_rc_glb_widen` converts the literal where the literal reader itself does:
+`fl_dec2bits(neg, m, 0, mant, ebits, 0)` (`lib/float.mc`, in scope through teko_float.tk's
+`#include <float>`), 53/11 for `f64` and 24/8 for `f32`, the same widths `fl_lit` passes for
+`1.0` and `1.0f`. `-1` is folded by the core and a `const` name is rebuilt into an `N_INT` by
+teko_const.tk before this pass runs, so `f64 a = 1;`, `f64 b = -1;` and `f64 c = K;` are ONE
+case and not three -- all three read their float value in the fixture, as does `f32 d = 1;`
+at its own width. Inside a body the same conversion is an ordinary statement and takes
+`tk_num_widen`'s `N_CAST`: `gw = 5;` on an `f64` global reads 5.0.
+
+**Nothing else moved, and the measurement says why.** Across all 64 pre-existing fixtures
+there are 285 global initializers, every one an `N_INT` or an `N_STR`; of the ones in a
+scalar slot, the pairs are `i64 <- i64`, `f64 <- f64`, `Color <- Color`,
+`DateTimeKind <- DateTimeKind` and `i8`/`i16` from a negative integer -- not one float slot
+takes a non-float literal, and an `N_STR` is typed -1 by every oracle, so `tk_num_widens`
+never answers 1 for it. The `--dump-ast` of all 64 is byte-identical to the base's.
+
+**OPEN, on the same early return, and NOT this crumb's:** a counted global is not stored
+through `rt_store`. `Cell gc; void fill(){ Cell c = new Cell(42); gc = c; }
+void churn(){ Cell a = new Cell(7); Cell b = new Cell(9); } i64 main(){ fill(); churn();
+churn(); return gc.v; }` exits **7** and wants 42 -- the global takes the pointer with no
+count of its own and is left pointing at reclaimed memory. Fixing it means letting the rc
+lowering itself run for a global, which moves the dumps of `surface_globals.tk:643/647` and
+`surface_nullable_ref.tk:331/342` and needs a ruling on whether that lands before the
+release; it is its own crumb. Recorded for the user in
+`docs/reference/not-yet.md` § "Types and declarations".
+
+**Proof** (mc 0.15.23, macos/aarch64, base `84c63025`): `mc build . --config mc.macos.toml`
+clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **65 passed, 21 refused as
+expected, 0 failed** (was 64/15: `tests/surface_globals_slot.tk` and six under
+`tests/refuse/`, each one measured compiling on the base before it was written down, and the
+surface fixture exiting **11** there -- the first `f64` global read -- against 42 here);
+`./build/teko --dump-ast` byte-identical against the base build for every one of the 64
+pre-existing `tests/*.tk`; `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK`, the judge running over the compiler's own global slots with the new check in
+force; `sh scripts/check-docs.sh` green (`docs ok: 575 links, 388 diagnostics, 21 refusals,
+133 samples`); `mc limits . --config mc.macos.toml` verdict `ok` with `passes` 15/30,
+`types` 11, `intrin` 8/16, `alias` 18, `syntax` 15 -- every table unmoved -- and
+`./build/teko limits tests/hello.tk` byte-identical to the base compiler's own output on the
+same file; `mc pkg hash .`
+`b119323edb59839324ee65fbbb29f0da741a099ee2e3f3c76942282aa414e0db`
+(base `93fab590c5fd29dc2ceaabab56ba296e39d41044b3b6e38bd6ee36861d45ed6e`: `teko_rc.tk` is a
+listed file, so the hash moves by design).

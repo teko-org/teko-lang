@@ -46,11 +46,22 @@ with that line in its stderr (D52).
   written where an `i64`/`f64` is declared (D34). All three hold in every slot: an
   argument (of a free function, a method, a virtual call, an interface call), an
   overload's parameter, an element of a `params` list, an assignment, an initializer, a
-  field store and a `return`
+  field store, a GLOBAL slot's own initializer and assignment, and a `return`
   ([parameters.md](parameters.md#what-a-literal-converts-to)). `i64 n = 2.5;`,
   `solo(null)` against a single `i64 solo(i64)` and `i64 n = f;` with `f` a class value
   are the three shortest forms of it, all written out in
   [types.md](types.md#f32-and-f64).
+- **The same six, at file scope** (D53): a global slot is judged exactly as a local is, so
+  each one has a fixture of its own under `tests/refuse/`.
+
+  | written at file scope, or into a global from a body | message |
+  |---|---|
+  | `i64 gn = 1.5;` | `teko: a value of type f64 does not convert to i64` (`global_narrow_init.tk`) |
+  | `i64 gn; ... gn = 1.5;` | `teko: a value of type f64 does not convert to i64` (`global_narrow_assign.tk`) |
+  | `Cell gc; ... gc = null;` | `teko: null needs a slot declared Cell?` (`global_null_nonnullable.tk`) |
+  | `i64 gn; ... gn = c;` on a `Cell c` | `teko: a value of type Cell does not convert to i64` (`global_ref_into_numeric.tk`) |
+  | `Color gk = 1;` | `teko: a value of type i64 does not convert to Color` (`global_enum_from_int.tk`) |
+  | `Cell gc; ... gc = b;` on a `Box b` | `teko: a value of type Box does not convert to Cell` (`global_row_mismatch.tk`) |
 - `"teko: field of type void"` — a field has a type; `void` is a return type only.
 - `"teko: duplicate field"` — two fields of one type share a name.
 - `"teko: an array field size is an integer literal"` — `T items[N]` takes a literal or a

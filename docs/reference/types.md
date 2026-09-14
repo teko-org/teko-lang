@@ -173,7 +173,7 @@ i64 main() {
 direction, and it holds in every slot: a variable initializer, an assignment, a `return`,
 an argument (of a free function, a method, a virtual call, an interface call), an element
 of a `params f64[]`, a field store, an array ELEMENT store (a `T[]` of heap and a fixed
-array alike), and a binary mixing the two — where the integer
+array alike), a GLOBAL slot's own initializer and assignment, and a binary mixing the two — where the integer
 operand is converted whichever side it stands on, so `1 + 2.5` and `2.5 + 1` are both
 three point five. The conversion is a cast the compiler writes for you, and it rounds the
 way C#'s `long` to `double` does: an `f64` carries 53 bits of precision, so every integer up
@@ -199,6 +199,27 @@ i64 main() {
 }
 ```
 
+**A global slot converts exactly as a local does.** The slot at the top of a file is judged
+by the same rules and refused with the same words as the one inside a body — the widening
+above, the narrowing below, `null` outside a `T?`, a reference in a numeric slot, an `enum`
+from a bare integer and a class that fits no row. So `f64 g = 1;` at file scope holds one
+point zero, and `g = 5;` written from inside any body holds five point zero.
+
+```teko
+// expect-exit: 42
+const i64 K = 2;
+f64 g  = 1;                                      // an initializer, at file scope
+f64 g2 = K;                                      // a `const` name folds to the same literal
+f32 g3 = 1;                                      // and `f32` rounds to its own width
+
+i64 main() {
+    g = 5;                                       // an assignment to a global
+    if (g2 != 2.0) return 1;
+    if (g3 != 1.0f) return 2;
+    return (i64) (g + 37);
+}
+```
+
 The other direction is refused where it is written, because C# narrows nothing without a
 cast spelled out. It reads `teko: a value of type f64 does not convert to i64`
 ([diagnostics.md](diagnostics.md)) — and `(i64) x` is the cast that says you meant it.
@@ -216,7 +237,7 @@ i64 main() {
 spelling. A comparison against `null` stays legal on any reference-shaped slot. It is not a
 number either, so it does not land in a numeric slot at all —
 `teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
-carries. A **raw `uptr`/`ptr`** slot is the one exception, local or field: `0` is an ordinary
+carries. A **raw `uptr`/`ptr`** slot is the one exception, local, field or global: `0` is an ordinary
 value of a raw pointer, the type `null` already carries, so `uptr p = null;` is accepted and
 no `?` is written on it.
 
