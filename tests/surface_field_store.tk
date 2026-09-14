@@ -65,8 +65,15 @@
 //                       over a load nobody typed, the widening an `f64[]`
 //                       writes and the box an `i64?[]` wraps -- one door, the
 //                       same verdicts a field gets;
-//  14. `rccheck`      -- `rt_live()` back to its floor once every object
-//                       this file allocated is released.
+//  14. `gloadcheck`  -- an element of a GLOBAL array in a field store, both
+//                       kinds: the `T[]` of heap and the fixed one. The load
+//                       is rewritten by a pass and copied into the tree
+//                       (`node_assign`), which left the element's type on the
+//                       node the load was BUILT as -- the store was refused
+//                       for a value the compiler itself had just typed;
+//  15. `rccheck`      -- `rt_live()` back to its floor once every object
+//                       this file allocated is released, the global arrays
+//                       above excepted: those are roots.
 //
 // A refusal has no exit code to assert (D33's own harness note): the
 // narrowing refusal, the reference/number mismatch (D34) and `null` in a
@@ -93,6 +100,17 @@
 // it is the parameter's own slot or the field's own load.
 f64 k = 1.5;
 f64 step = 2.5;
+
+// the two loads a PASS rewrites into the tree (18): a global `T[]` of heap and
+// a FIXED global array are both plain `N_INDEX` nodes while a body is parsed --
+// neither table is filled yet -- and `tk_array_walk_reads` (teko_array.tk)
+// replaces the node in place afterwards. The load is built as one node and
+// COPIED into another (`node_assign`), so the element type its builder tagged
+// stayed on a node nobody reads and the store was refused for a value the
+// compiler itself had just typed.
+i64[] gl;
+Cell[] gc;
+i64 gx[2];
 
 enum Color { Red, Green, Blue }
 
@@ -172,6 +190,18 @@ class H {
 
     public void setrow() {
         this.rc = rick(1, 2);         // 17: the pick returns a ROW, not `i64`
+    }
+
+    public void fromglobal() {
+        this.rate = gl[0];            // 18a: an element of a global `T[]` of heap
+    }
+
+    public void fromfixed() {
+        this.rate = gx[0];            // 18b: an element of a FIXED global array
+    }
+
+    public void fromrowglobal() {
+        this.c = gc[0];               // 18c: the same load, with a ROW element
     }
 }
 
@@ -453,8 +483,33 @@ i64 rowpickcheck() {
     return 0;
 }
 
+// 18: the element of a global array, in a field store. The load is rewritten
+// by a PASS and lands in the tree through `node_assign`, which used to leave
+// its type behind -- the store was refused, `teko: the type of this value is
+// not known here`, for a value the compiler had just built and typed itself.
+i64 gloadcheck() {
+    gl = new i64[2];
+    gl[0] = 5;
+    gc = new Cell[2];
+    gc[0] = rick(1, 2);
+    gx[0] = 3;
+    H h = new H(0);
+    h.fromglobal();
+    if (h.rate != 5.0) return 1;      // the widening the store writes
+    h.fromfixed();
+    if (h.rate != 3.0) return 2;
+    h.fromrowglobal();
+    if (!h.c.HasValue) return 3;      // the row, through Q1b's own box
+    if (h.c.Value.v != 7) return 4;
+    return 0;
+}
+
+// the two global `T[]`s `gloadcheck` fills are ROOTS: a global array is never
+// released (surface_array_global.tk's own header), so the floor this counter
+// returns to is those three objects -- the two arrays and the one `Cell` that
+// `gc` holds. `gx` is a FIXED array, static storage the counter never sees.
 i64 rccheck() {
-    if (rt_live() != 0) return 1;
+    if (rt_live() != 3) return 1;
     return 0;
 }
 
@@ -513,8 +568,11 @@ i64 main() {
     bad = elemcheck();
     if (bad != 0) return 180 + bad;
 
-    bad = rccheck();
+    bad = gloadcheck();
     if (bad != 0) return 190 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 200 + bad;
 
     return 42;
 }

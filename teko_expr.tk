@@ -366,7 +366,7 @@ i64 tk_vcall_args_check(i64 mi, i64 args, i64 line, uptr fl) {
 //
 // The virtual call is shaped by `tk_callp_ret` (teko_array.tk) at the moment
 // it is built -- the cast that declares its return type has to be the `callp`'s
-// IMMEDIATE parent -- and the `tk_xt_add` below deliberately comes after, so
+// IMMEDIATE parent -- and the registration below deliberately comes after, so
 // the type lands on the node this returns and not on the call underneath.
 i64 tk_emit_call(i64 left, i64 mi, i64 args, i64 na, i64 line, uptr fl) {
     tk_line = line;
@@ -376,6 +376,17 @@ i64 tk_emit_call(i64 left, i64 mi, i64 args, i64 na, i64 line, uptr fl) {
     i64 r = 0;
     if (slot < 0) {
         r = tk_call(mt_fn_at(mi), list_append(left, args));
+        // a DIRECT call names its callee: `tk_ty_of` reads the declared return
+        // off that symbol (teko_typeof.tk, the `N_CALL` arm), so a scalar
+        // registration here answers nothing new and spends a row of
+        // `TK_MAXXT` (256) on every call in the unit -- a body with enough of
+        // them started refusing `teko: too many expressions whose type is
+        // known` where it used to compile (Copilot on #698, pass 5; measured
+        // at 253 calls). The ROW is still registered, because `.` and the
+        // ownership walk ask this table and not the oracle.
+        i64 rs = tk_struct_by_ty(mt_ret_at(mi));
+        if (rs >= 0) tk_xt_add(r, rs, 0, TK_OWNED);
+        return r;
     } else {
         if (!tk_pure(left))
             err_at2(fl, line, "teko: a virtual call needs a name or a field on the left", mt_name_at(mi));
@@ -387,16 +398,16 @@ i64 tk_emit_call(i64 left, i64 mi, i64 args, i64 na, i64 line, uptr fl) {
         r = tk_callp_ret(mt_ret_at(mi),
                          tk_call("callp", list_append(list_append(fnp, left), args)));
     }
-    // the DECLARED return type, whatever it is -- the row when the type has
-    // one and the type id in every case, exactly what the pass-time road
-    // registers for the very same call (`tk_pend_do`, teko_typeof.tk). A
-    // VIRTUAL return is `callp`'s, and `callp` names no callee: a wide scalar
-    // (`i64`, `uptr`) carries no cast either (`tk_callp_ret`, teko_array.tk,
-    // since the core already types the node `TY_I64`), so a row was the only
-    // thing anyone could ask this node about and `tk_ty_of` answered -1 for
-    // `f64 rate; this.rate = a.M();` on an `i64 M()` -- the store had nothing
-    // to judge and wrote the integer's raw bits into the float field (Copilot
-    // on #698, pass 4).
+    // an INDIRECT return is the compiler's own to record: `callp` names no
+    // callee, so the DECLARED return type -- the row when the type has one and
+    // the type id in every case -- is registered here, exactly what the
+    // pass-time road registers for the very same call (`tk_pend_do`,
+    // teko_typeof.tk). A wide scalar (`i64`, `uptr`) carries no cast either
+    // (`tk_callp_ret`, teko_array.tk, since the core already types the node
+    // `TY_I64`), so a row was the only thing anyone could ask this node about
+    // and `tk_ty_of` answered -1 for `f64 rate; this.rate = a.M();` on a
+    // VIRTUAL `i64 M()` -- the store had nothing to judge and wrote the
+    // integer's raw bits into the float field (Copilot on #698, pass 4).
     i64 ret = mt_ret_at(mi);
     if (ret != TY_VOID) tk_xt_put(r, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
     return r;

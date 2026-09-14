@@ -570,6 +570,12 @@ void tk_array_maybe_rewrite_index(i64 n) {
     i64 keep = nd_next(n);
     node_assign(n, tk_arr_load(ety, tk_arr_addr(base, ety, idx)));
     set_nd_next(n, keep);
+    // the same tag the heap load below carries, for the same reason: this node
+    // is what a field store, an argument or an operator is handed, and a load
+    // nobody can type is refused by the judge (D50). `tk_arr_load` tags
+    // nothing of its own -- a `ref` parameter's read and a lambda capture's go
+    // through it too, and they are not elements of anything.
+    tk_xt_put(n, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
 }
 
 // `g[i]` on a global `T[]` (G1): unlike a FIXED array's own rewrite above,
@@ -587,10 +593,18 @@ void tk_hg_rewrite_index(i64 n) {
     tk_line = nd_line(n);
     tk_file = nd_file(n);
     i64 keep = nd_next(n);
-    node_assign(n, tk_ha_load(base, ety, nd_b(n)));
+    i64 r = tk_ha_load(base, ety, nd_b(n));
+    node_assign(n, r);
     set_nd_next(n, keep);
-    i64 es = tk_struct_by_ty(ety);                // the same re-mark tk_ha_load
-    if (es >= 0) tk_xt_add(n, es, 1, TK_BORROWED);  // gives its OWN return node
+    // the registration follows the VALUE into the node the tree holds:
+    // `tk_ha_load` tags the node IT built (the element's row and its type id,
+    // teko_heaparr.tk), and `node_assign` copies that value into `n`, leaving
+    // the tag on a node nobody reads -- so `this.rate = g[0];` on a global
+    // `i64[] g` reached the field-store judge with no type at all and was
+    // refused, `teko: the type of this value is not known here` (Copilot on
+    // #698, pass 5). Moving the row, rather than adding one, is also what
+    // keeps the element's type id -- a scalar has no row to re-add.
+    tk_xt_move(r, n);
 }
 
 // a deferred write whose base never turns out to be a global array is not a
