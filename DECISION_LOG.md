@@ -6826,6 +6826,82 @@ locally cannot LINK on this host, so that leg is CI's to confirm); `mc pkg hash 
 `a8122b64a3235e39820a1cc1aa3fc1446e3b890fc684791fdbc12868b7343e50`: `teko_deleg.tk` is a listed
 file, so the hash moves by design).
 
+### D68 · A member name after `.` -- or in its own declaration -- may be a word teko has TAUGHT (2026-09-14)
+
+C# lets a member share its name with a contextual keyword (`value`, `where`...); teko's own
+words are reserved harder than that -- `word_is_taught` (mc core, `src/hooks.mc`) marks every
+`syntax`/`syntax_stmt`/`syntax_expr`/`type_alias`/`type_new` word PROGRAM-WIDE, including one a
+`class`/`struct`/`enum`/`interface`/`trait`/`delegate` declaration teaches on the spot -- and
+every seat that read a member name called `p_ident()`, which refuses anything that is not a
+plain `T_IDENT`. `public i64 ref;`, `i64 params() {}`, `Type.out`, `a.isize`, `E.ptr`, all
+refused with mc core's own bare `name expected`, no `teko:` prefix, on a program with nothing
+wrong beyond spelling a field the way C#'s `ref`/`params` would.
+
+**Measured** (base `0ae03bcb`, `class H { public i64 value; }` / `i64 now() {}` first): `value`,
+`now`, `count`, `get` are NOT taught words in this tree (no `type_alias`/`type_new`/`syntax*`
+registers them) -- they compiled before this crumb and compile after it, unchanged. The real
+refusal needs a word teko DID register: `ref`/`out`/`params` (`type_new`), `isize`/`usize`/
+`byte`/`str` (`type_alias`). `public i64 ref;` (a field), `i64 params() {}` (a method), `Late.str`
+(a static on a type declared BELOW the read, `tk_fwd_defer_static`) -- all `name expected` on
+`0ae03bcb`, all compile and run after this crumb.
+
+**The fix: one helper, twelve seats.** `tk_member_name()` (`teko_struct.tk`, beside `tk_newname`,
+the type-name reader D60 already guards) reads `p_name()` -- the token's own lexeme, whichever id
+it carries -- when `word_is_taught(p_id())` answers 1, `p_ident()` otherwise; every other seat
+(`tk_newname` itself for a TYPE, a LOCAL, a PARAMETER, a FUNCTION) is untouched and keeps its
+D60 refusal -- there is no shadow risk after a `.` or inside a member's own declaration, so the
+widening stops exactly at the member seat.
+
+| seat | file:line (before) | what it reads |
+|---|---|---|
+| `p.m` | `teko_expr.tk:604` (`tk_dot`) | an instance member on a typed receiver |
+| `Type.m` | `teko_access.tk:344` (`tk_static_member`) | a static member, mconst, enum member |
+| `Type.m` (declared below) | `teko_access.tk:427` (`tk_fwd_defer_static`) | a static on a `TK_PFWD` row |
+| `PrimType.m` | `teko_prim.tk:834` (`tk_prim_static`) | a primitive's own static table |
+| `base.m` | `teko_this.tk:148` (`tk_base_call`) | the base class's own method, direct |
+| `p?.m` | `teko_null.tk:624` (`tk_qd_infix`) | Q2's `?.` placeholder |
+| `ref p.m` | `teko_ref.tk:312` (`tk_ref_addr`) | a field address argument |
+| `foreach (... in x.m)` | `teko_loop.tk:443` (`tk_fe_source`) | the loop source's own field (guard line 442 widened too: `p_id() != T_IDENT && !word_is_taught(p_id())`) |
+| field / method / property | `teko_ops.tk:213` (`tk_op_name`) | every non-`operator` member name `tk_member` (teko_class.tk) reads |
+| enum member | `teko_enum.tk:319` | the member's own declared name |
+| interface member | `teko_iface.tk:607` (`tk_iface_member`) | a method or property signature |
+| const member | `teko_const.tk:173` (`tk_member_const`) | `public const T m = e;` |
+
+That is the "8 seats" the scout counted after `.` (`tk_dot` through `tk_fe_source`) plus the four
+DECLARATION seats the task also named (`tk_op_name` covers field, method AND property in one
+line, since `tk_member` reads all three through it).
+
+**What stays refused, unwidened (D60).** A TYPE name (`class ref {}`): `teko: the name is
+already a type: ref`, mc core's own `err_name`, unchanged -- `tk_newname` was not touched. A
+LOCAL (`i64 ref = 5;`): `name reserved by a syntax/type_alias registration: ref`, mc core's own
+message, no `teko:` prefix -- also unchanged, and per the crumb's own instructions this is not a
+`teko:`-authored refusal, so no `tests/refuse/*.tk` fixture is added for it (there was nothing to
+add: it already compiled to that same core wording before this crumb, and still does). Bare
+(implicit `this.`) access is a THIRD, unrelated case this crumb does not touch: `return ref;`
+inside a method still reads `ref`/`out` as the argument-position prefix `type_new("ref")`/
+`type_new("out")` registers at EXPRESSION position -- the ambiguity is inherent to those two
+specific words wearing a prefix meaning teko itself gave them, not a member-name gap, and it
+predates this crumb (`this.ref` reads the field exactly as it always did).
+
+**Fixture.** `tests/surface_member_word.tk` -- one class (`Box`), one enum (`Kind`), one type
+declared below the code that reaches its static (`Late`), eight checks (field, method, static,
+property, `this.`, `?.`, enum member, forward static), each keyed to a genuinely taught word
+(`ref`, `params`, `out`, `isize`, `byte`, `usize`, `ptr`, `str`) -- `// expect-exit: 42`.
+`docs/reference/types.md`'s own "reserved program-wide" sample grows a `class Box` proving the
+same `ref`/`params` pair, run by `scripts/check-docs.sh`. No `docs/reference/not-yet.md` row
+named this gap (searched: no row mentions a member sharing a taught word), so none is removed.
+
+**Proof** (mc 0.17.0, macos/aarch64, base `0ae03bcb`): `mc build . --config mc.macos.toml` clean;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` -> **76 passed, 84 refused as expected, 0
+failed** (75/84 on the base: one fixture added, none removed, none reworded); `--dump-ast` of
+every pre-existing `tests/*.tk` and `tests/refuse/*.tk` (159, the new fixture excluded since the
+base refuses it), each run against ITS OWN source by both binaries -- **159/159 byte-identical**
+(stdout+stderr, so a refusal's own wording is part of the comparison, not just an accepted
+program's tree); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (46.5s);
+`sh scripts/check-docs.sh` -> `docs ok: 614 links, 45 fragments, 392 diagnostics, 84 refusals, 146
+samples`; `mc limits . --config mc.macos.toml` verdict **ok** on every row but `heap` (never
+cited, per this crumb's own gate).
+
 ### D69 · Five capacity ceilings measured too low for a real program: `TK_MAXFWD` 32 -> 256, `TK_MAXOS` 128 -> 4096, `TK_MAXSTRUCT` 32 -> 256, `TK_MAXEMIT` 512 -> 4096, `TK_MAXMETHOD` 128 -> 1024 (2026-09-14)
 
 (D67/D68 are reserved by in-flight scouts, not yet in this log at write time; this entry

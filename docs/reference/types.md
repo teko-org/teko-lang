@@ -48,10 +48,23 @@ core words nor an alias of one: they are two primitives of teko's own, C#'s `sby
 A type word is **reserved program-wide**: `i64 str = 1;` is refused, exactly as C#
 refuses a variable named `int`.
 
+A **member** name is the one seat that reservation does not reach: `p.str`, `Box.ref`, a
+field `public i64 ref;`, a method `i64 params() { ... }`, a property, an enum member, all
+read the word after a `.` (or declare it) rather than as a bare name — exactly as C# lets a
+member share a name with a contextual keyword (`value`, `where`...). A type name, a local
+and a parameter stay refused: only the member seat has no shadow to guard against.
+
 ```teko
 // expect-exit: 42
+#include "rt.tk"
+
 isize sum_isize(isize a, i64 b) {
     return a + b;
+}
+
+class Box {
+    public i64 ref;
+    public i64 params() { return this.ref; }
 }
 
 i64 main() {
@@ -59,7 +72,9 @@ i64 main() {
     char  c = 12;
     usize u = (usize) b + (usize) c;
     isize n = sum_isize(10, 0);
-    return (i64) u + (i64) n;
+    Box box = new Box();
+    box.ref = 10;
+    return (i64) u + (i64) n + box.params() - 10;
 }
 ```
 
