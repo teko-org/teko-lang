@@ -7161,3 +7161,41 @@ ruleset's exclude list (the ruleset PUT is an owner action the session could not
 until it is, `verdict`'s push is refused and every candidate falls through to mc's advisory
 timeout. Both are recorded here so the entry does not claim a run that has not happened; the
 verifier of this crumb caught the first draft of this paragraph claiming exactly that.
+
+**Amendment (2026-09-15).** Both open items above closed the same day: the mc session, an
+admin of this repository, added `refs/heads/canary` to the `All Green` exclude list, and the
+dispatch for 0.16.0 (run 34863283302) wrote `0.16.0.json` = `fail` (windows/x86_64, the direct
+PE backend, the truthful verdict). The 0.16.1 and 0.17.0 candidates were judged `ok` in full
+(runs 34877983682 and 34889251142). What did NOT work is the `schedule` trigger: zero cron runs
+in the six hours after the workflow landed on `main`, so every candidate so far was judged by a
+manual `workflow_dispatch`; mc's `promote` reads the file the same way either road writes it.
+
+### D72 · The pin rises to mc 0.17.0, the release candidate that freezes mc's surface (2026-09-15)
+mc 0.17.0 is the RC whose publication starts the surface freeze (mc `hooks.md` § 8: from here to
+1.0.0 a rename or a removal of the hook surface ships only with an alias or a major). It was
+judged by this repository's own canary before it was promoted (D71; run 34889251142, all fifteen
+jobs green, `teko_std` included), and the whole local recipe is green on it, on `main`
+`6bffa633` before a single file moved: `mc build . --config mc.macos.toml` clean;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **75 passed, 83 refused as expected,
+0 failed**; `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK` (`--dump-asm`
+diff empty over 230438 lines); `sh scripts/check-docs.sh` → `docs ok: 615 links, 45 fragments,
+390 diagnostics, 83 refusals, 144 samples`; `mc limits` verdict `ok`, no ceiling moved.
+
+The move is the one D64 prescribed for a pin: `MC_VERSION` → `0.17.0`; `mc.toml`'s
+`[package].mc` follows the pin (the registry's own validator runs 0.17.0 since mc-registry #33,
+so the minimum this manifest states is the compiler that validates it); the four places that
+quote the pinned number as the CURRENT one (`CONTRIBUTING.md`, `docs/guide/00-getting-started.md`,
+`docs/reference/build.md`'s staged path and message text, `.github/workflows/site.yml`'s comment)
+follow; every mention of 0.16.0/0.16.1 that narrates a past measurement stays. Nothing in the
+hook modules moves: `--dump-ast` of all **158** fixtures (75 under `tests/`, 83 under
+`tests/refuse/`) is byte-identical between the compiler built by 0.16.1 over `main` and the
+compiler built by 0.17.0 over this tree. `mc pkg hash .` on this tree is
+`ef8f2df1e26e615cb0452ce7a436ffafbcf42710c4f3002e690919aca71dd287` (the manifest moved; the
+modules did not).
+
+Two facts recorded for the next raise. The registry refused teko 0.12.4 while its sandbox ran
+0.16.0 (`teko 0.12.4 needs mc >= 0.16.1 (this is mc 0.16.0): upgrade the compiler`, job 64):
+`[package].mc` doing its job, and the reason the minimum and the validator's compiler have to
+move together. And `mc tool install` exists since mc 0.15.21 (M48 C3): `tekoc` as an
+installable tool (`[project] kind = "exe"`, `[package].bin`, `[[permission]]`) is a crumb of its
+own, the last row of `docs/specs/roadmap-1.0.md` § What teko owes.
