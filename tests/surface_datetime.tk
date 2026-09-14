@@ -13,6 +13,8 @@
 //   DateTime.IsLeapYear DaysInMonth    the two statics that need no value
 //   b - a  d + t  t + d  d - t         the operators mixing the two types
 //   a < b  a == b  ...                 the six comparisons, Kind masked off
+//   ds[i] + t  ds[i] - ds[j]  ks[i]    an ELEMENT as an operand and as a
+//                                      `DateTimeKind` argument (D50)
 //   () use (d) => ...                  a lambda's by-value capture of an
 //                                      8-byte primitive (teko_deleg.tk's
 //                                      `tk_cap_val`, the same fix `TimeSpan`
@@ -199,6 +201,37 @@ i64 main() {
     table[2] = leap + day;
     DateTime e2 = table[2];
     if (e2.Month != 3 || e2.Day != 1) return 100;
+
+    // ...and the element AS AN OPERAND, which needed the local above until
+    // D50 gave every element load the element's own type
+    // (docs/reference/datetime.md): with a typed operand beside it the site
+    // was refused, and with an element on both sides the core's RAW
+    // arithmetic ran over the eight bytes, `Kind` bits and all. The fixed
+    // array and the `T[]` of heap both answer, with an index that is a
+    // variable, and the Kind rides through the add exactly as it does from a
+    // local (`utc + day`, above).
+    i64 ei = 0;
+    if ((table[ei] + day).Month != 3) return 110;
+    if ((table[ei] + day).Day != 1) return 111;
+    if ((table[ei + 1] - table[ei]).Days != 15) return 112;
+    if (!(table[ei + 1] > table[ei])) return 113;
+    DateTime[] heap = new DateTime[2];
+    heap[0] = utc;
+    heap[1] = utc.AddDays(1);
+    if ((heap[ei] + day).Kind != DateTimeKind.Utc) return 114;
+    if ((heap[ei] + day).Day != 1) return 115;
+    if ((heap[ei + 1] - heap[ei]).Ticks != day.Ticks) return 116;
+    if (heap[ei].Kind != DateTimeKind.Utc) return 117;
+
+    // an element of a `DateTimeKind` array as an ARGUMENT: the second
+    // parameter of the raw constructor is that enum (N2c, D48), and the
+    // element's own load is what the overload pick reads to land on it
+    DateTimeKind ks[2];
+    ks[0] = DateTimeKind.Utc;
+    ks[1] = DateTimeKind.Local;
+    if (new DateTime(1, ks[ei]).Kind != DateTimeKind.Utc) return 118;
+    if (new DateTime(1, ks[ei + 1]).Kind != DateTimeKind.Local) return 119;
+    if (new DateTime(1, ks[ei]).Ticks != 1) return 120;
 
     g_moment = precise;
     DateTime fromglobal = g_moment;

@@ -134,14 +134,17 @@ slot the check never sees.
 | a constructor argument, `new N(null)` | **yes** |
 | a delegate initializer, `Op f = null;` | **yes** |
 | a parameter default, `i64 use(Cell c = null)` | **yes** |
-| an element of a `Cell[]`, `cs[0] = null;` | **no** — see below |
+| an element of a `Cell[]`, `cs[0] = null;` | **yes** since D50 — see below |
 | a comparison, `c == null` | **no**, and that is required (§ 3) |
 | a global left with no initializer | **no**, and that is required (§ 9) |
 
-The array element is the one store the scalar check does not own: `tk_ha_store`
-(teko_heaparr.tk) checks its value through `tk_check_field_store` (teko_struct.tk), which
-returned at once for a `null`. Rule 1 is applied there instead, in that function's own
-`null` arm — which is why `cs[0] = null` on a `Cell[]` is refused and on a `Cell?[]` is not.
+When this probe was written the array element was the one store the scalar check did not
+own: `tk_ha_store` (teko_heaparr.tk) checked its value through `tk_check_field_store`
+(teko_struct.tk), which returned at once for a `null`, and rule 1 lived in that function's
+own `null` arm. Since D50 every element store — heap `T[]` and fixed array alike — goes
+through `tk_field_store_val`, the same door as a field, so the scalar check owns it too;
+`cs[0] = null` on a `Cell[]` is still refused, and on a `Cell?[]` still accepted, now by the
+one rule every slot answers.
 
 ---
 

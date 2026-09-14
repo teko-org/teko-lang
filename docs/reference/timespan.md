@@ -185,12 +185,16 @@ argument. It is never reference counted, because there is no object to count
 ([memory.md](memory.md)).
 
 A **global** is a receiver like any other — `g.Days`, `g.Negate()`, `g.CompareTo(t)` —
-since the oracle answers a global by its declaration (D48); the fixture reads one. The one
-place the type is still not known is an **array element** as an operand, which
-[not-yet.md](not-yet.md) carries: beside a typed operand (`xs[i] + t`) it is refused,
-``teko: the type of the left side of `+` is not known here``; with array elements on both
-sides (`xs[i] + xs[j]`) the core's own `+` runs on the raw ticks, right in value and
-without the overflow check. Bind those to locals first.
+since the oracle answers a global by its declaration (D48); the fixture reads one. An
+**array element** is a typed operand too since D50: every load of an element — a fixed
+array's, a `T[]`'s, a global's, an inline array field's — carries the element's own type,
+so `xs[i] + t` and `xs[i] + xs[j]` are claimed by the operator table and checked like any
+other pair, overflow check included — `tests/surface_timespan.tk` reads both shapes with a
+variable index, and the last line of `tests/surface_timespan_overflow.tk` is an element
+operand, which is where the check itself is proven. Both were the one gap this page
+carried: the first was
+refused, ``teko: the type of the left side of `+` is not known here``, and the second ran
+on the core's raw arithmetic.
 
 ## Under the hood
 

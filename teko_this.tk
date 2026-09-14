@@ -311,6 +311,14 @@ void tk_this_ident(i64 n) {
 // `side = e;`  ->  stW(this + OFF, e). The core parses an assignment to a name
 // as N_ASSIGN, so this is the statement form of the load above. D221/§41
 // K4b: the implicit form of `x.cb = e;`, the same escape refused there.
+//
+// G-e: the value goes through `tk_field_store_val` (teko_typeof.tk) first,
+// the same gate `p.f = e` and `this.f = e` already pass through
+// (teko_expr.tk's `tk_field_use`) -- D33's widening, its narrowing refusal,
+// D43's `null`-only-in-`T?`, D34's reference/number mismatch and Q1b's box
+// wrap. Before this, the implicit form built the raw store directly and
+// skipped every one of them: `rate = k;` inside a constructor wrote the
+// PARAMETER's bit pattern into an `f64` field, silently.
 void tk_this_assign(i64 n) {
     i64 fi = tk_this_field(nd_name(n));
     if (fi < 0) {
@@ -322,7 +330,12 @@ void tk_this_assign(i64 n) {
     if (tk_lam_escapes(nd_a(n)))
         err_at(tk_file, tk_line, "teko: a lambda that captures by reference cannot leave its scope");
     i64 fty = fd_ty_at(fi);
-    i64 st = tk_os_mark(tk_call2(tk_stn(fty), tk_this_field_addr(fi), nd_a(n)), fty);
+    i64 line = tk_line;
+    uptr fl = tk_file;
+    i64 v = tk_field_store_val(fty, nd_a(n), line, fl);
+    tk_line = line;                          // the gate builds nodes of its own
+    tk_file = fl;                            // (`tk_field_use`'s own restore)
+    i64 st = tk_os_mark(tk_call2(tk_stn(fty), tk_this_field_addr(fi), v), fty);
     tk_node_replace(n, tk_stmt(st));
 }
 

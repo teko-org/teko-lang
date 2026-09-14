@@ -274,8 +274,12 @@ argument. It is never reference counted, because there is no object to count
 ([memory.md](memory.md)).
 
 A **global** is a receiver like any other since the oracle answers one by its
-declaration (D48). The place the type is still not known is an **array element** as an
-operand, which [not-yet.md](not-yet.md) carries: bind it to a local first.
+declaration (D48), and so is an **array element** since D50: an element's load carries the
+element's own type, so `ds[i] + t` is claimed and checked like any other operand pair, and
+an element of a `DateTimeKind` array is an argument like any other — `tests/surface_datetime.tk`
+reads `ds[i] + t`, `ds[i] - ds[j]` and `new DateTime(1, ks[i])` on both shapes of array. It
+was the one gap left here — with a typed operand beside it the site was refused, and with
+an element on both sides the core's own arithmetic ran on the raw bits, `Kind` included.
 
 ## Under the hood
 

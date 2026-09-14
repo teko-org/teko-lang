@@ -172,7 +172,8 @@ i64 main() {
 **An integer converts to a float; a float does not convert back.** That is C#'s own
 direction, and it holds in every slot: a variable initializer, an assignment, a `return`,
 an argument (of a free function, a method, a virtual call, an interface call), an element
-of a `params f64[]`, a field store, and a binary mixing the two — where the integer
+of a `params f64[]`, a field store, an array ELEMENT store (a `T[]` of heap and a fixed
+array alike), and a binary mixing the two — where the integer
 operand is converted whichever side it stands on, so `1 + 2.5` and `2.5 + 1` are both
 three point five. The conversion is a cast the compiler writes for you, and it rounds the
 way C#'s `long` to `double` does: an `f64` carries 53 bits of precision, so every integer up
@@ -188,9 +189,12 @@ f64 twice(f64 x) { return x + x; }
 i64 main() {
     f64 y = 1;                                   // an initializer
     y = 5;                                       // an assignment
+    f64 fa[2];
+    fa[0] = 1;                                   // an array element
     if (twice(3) != 6.0) return 1;               // an argument
     if (1 + 2.5 != 3.5) return 2;                // the integer on the left
     if (2.5 + 1 != 3.5) return 3;                // ...and on the right
+    if (fa[0] != 1.0) return 4;                  // ...and it landed as a float
     return (i64) (y + 37);
 }
 ```
@@ -212,7 +216,9 @@ i64 main() {
 spelling. A comparison against `null` stays legal on any reference-shaped slot. It is not a
 number either, so it does not land in a numeric slot at all —
 `teko: a value of type uptr does not convert to i64`, `uptr` being the type `null`
-carries.
+carries. A **raw `uptr`/`ptr`** slot is the one exception, local or field: `0` is an ordinary
+value of a raw pointer, the type `null` already carries, so `uptr p = null;` is accepted and
+no `?` is written on it.
 
 **Every type on this page has a `T?`**, the scalars included: `i64?`, `f64?`, `bool?`,
 `char?`, `i8?`, an `enum?`, `TimeSpan?` and `DateTime?` are the same one mechanism, over a
@@ -259,6 +265,46 @@ i64 main() {
 A raw `uptr`/`ptr` value is left alone in a numeric slot — the core converts it to an
 integer of its own accord, and only a value the type table has a row for (or the `null`
 literal above) is judged here.
+
+**A field store is one rule, at every site that writes one.** `p.f = e`, `this.f = e`, the
+implicit `f = e` inside a method or a constructor, a `static` field `T.f = e` (through its
+type, whether or not the type is already known where the store is written) and an ELEMENT
+of a `T[]`, `xs[i] = e`, all pass through the same check: the widening above, the narrowing
+refusal, `null` only in a `T?` field ([nullable.md](nullable.md)) with the raw `uptr`/`ptr`
+slot above excepted, an `enum` field converting from nothing but itself, and the
+reference/number mismatch (D34), in both directions.
+
+```teko
+// no-run
+class Foo { public i64 v; }
+enum Color { Red, Green, Blue }
+
+class H {
+    public i64 n;
+    public Color c;
+    public static Foo f;
+
+    public H(f64 x) {
+        this.n = x;                              // teko: a value of type f64 does not convert to i64
+    }
+
+    public void set(i64 k) {
+        c = k;                                    // teko: a value of type i64 does not convert to Color
+    }
+}
+
+i64 main() {
+    H.f = 5;                                      // teko: a value of type i64 does not convert to Foo
+    return 0;
+}
+```
+
+The rule does not weaken where the site cannot type the value — a parameter, an implicit
+`f = e` the pass rewrites, a `static` field on a type declared below, a call to an
+overloaded name, a user operator. That store waits for the pass and is judged there, under
+the same rule and at its own line; a value that has no type even then is refused rather
+than written raw
+([diagnostics.md](diagnostics.md#a-field-store-whose-value-only-the-pass-can-type)).
 
 Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
 slot is neither converted nor refused ([not-yet.md](not-yet.md)).

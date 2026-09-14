@@ -416,17 +416,59 @@ i64 tk_arr_store(i64 ety, i64 at, i64 v) {
     return tk_call2(tk_stn(ety), at, v);
 }
 
+// D50: the ELEMENT of a fixed array is a slot like any other, so the value
+// goes through the ONE door every field store is built by
+// (`tk_field_store_val`, teko_typeof.tk, forward-declared in teko_struct.tk):
+// the deferral first, then the two scalar verdicts, the row one and Q1b's
+// box. `tk_arr_store` above may NOT do it for them -- a `ref` parameter's
+// write (teko_ref.tk) and a lambda capture's (teko_deleg.tk) go through it
+// too, and they are elements of nothing -- so the door is here, where the
+// three sites that store an element meet: the local write the parser lowers
+// on the spot, the compound below and the global write a pass resolves.
+// Before this, all three built the raw `stW(addr, v)`: `f64 gf[2];
+// gf[0] = 1;` wrote the integer's own eight bytes and read back 5e-324,
+// `i64 gi[2]; gi[0] = 1.5;` wrote the double's and was not refused, local
+// and global alike (Copilot on #698, pass 8) -- the very defect the HEAP
+// element had one slot over until the fourth pass (`tk_ha_store`,
+// teko_heaparr.tk), whose shape this mirrors exactly.
+// ...and the door REPORTS the store it built, exactly as the other five do
+// (`tk_os_mark`, teko_struct.tk): a store into a slot of counted type is what
+// the reclaim pass turns into `rt_store_own` (teko_rc.tk), and a store it
+// never heard of keeps the raw `stW` -- one retain and one release lost. No
+// fixed element is counted TODAY, and the refusal that makes it so is three
+// files away: an element of class, of `struct` or of `T?` type is refused at
+// the DECLARATION (`tk_arr_on_stmt` and `tk_garr_collect` above,
+// ``teko: an array of objects is not taught yet``, measured on all three), and
+// an `enum` element is the exempt one `tk_is_counted` answers "no" for. The
+// mark is what makes "every element store is reported" a property of this
+// door rather than a coincidence of that refusal.
+i64 tk_arr_elem_store(i64 ety, i64 at, i64 v, i64 line, uptr fl) {
+    v = tk_field_store_val(ety, v, line, fl);
+    tk_line = line;                    // the gate builds nodes of its own
+    tk_file = fl;
+    return tk_os_mark(tk_arr_store(ety, at, v), ety);
+}
+
 // `a[i] OP= e` / `a[i]++` / `a[i]--`: the address is built TWICE (`tk_clone`
 // on both `base` and `idx`), once for the read and once for the write, since
 // a node lives in only one sibling list. Re-evaluating a pure `idx` twice is
 // the same trade the struct-field precedent leaves open (`teko_struct.tk`'s
 // own header never claims otherwise); no crumb fixture indexes with a call.
 i64 tk_arr_compound(i64 base, i64 ety, i64 idx, i64 op, i64 e) {
+    i64 line = tk_line;
+    uptr fl = tk_file;
     i64 idx2 = tk_clone(idx);
     i64 base2 = tk_clone(base);
     i64 cur = tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+    // the element's own type, the same tag the heap load carries
+    // (`tk_ha_load`, teko_heaparr.tk): this load is the LEFT operand of the
+    // sum the store below is judged on, and a value no oracle can type is
+    // deferred to a judge that refuses it (D50). `f64 gf[2]; gf[0] += 1;`
+    // summed a float nobody had typed (Copilot on #698, pass 8).
+    tk_xt_put(cur, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
     i64 val = tk_bin(op, cur, e);
-    return tk_arr_store(ety, tk_arr_addr(base2, ety, idx2), val);
+    i64 at = tk_arr_addr(base2, ety, idx2);
+    return tk_arr_elem_store(ety, at, val, line, fl);
 }
 
 // whether the token(s) right after an already-parsed index spell a write:
@@ -454,7 +496,8 @@ i64 tk_arr_index_of(i64 base, i64 ety, i64 nel, uptr name) {
         i64 v = parse_expr(0);
         tk_line = line;
         tk_file = fl;
-        return tk_arr_store(ety, tk_arr_addr(base, ety, idx), v);
+        i64 at = tk_arr_addr(base, ety, idx);
+        return tk_arr_elem_store(ety, at, v, line, fl);
     }
     if (p_id() == tk_pluseq_tok || p_id() == tk_minuseq_tok) {
         i64 op = K_ADD;
@@ -473,7 +516,13 @@ i64 tk_arr_index_of(i64 base, i64 ety, i64 nel, uptr name) {
         tk_file = fl;
         return tk_arr_compound(base, ety, idx, op, tk_int(1));
     }
-    return tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+    // the element's own type, the same tag every other load carries
+    // (`tk_ha_load`, `tk_field_use`, the global rewrite below): `tk_arr_load`
+    // tags nothing of its own -- a `ref` parameter's read and a lambda
+    // capture's go through it too, and they are elements of nothing.
+    i64 r = tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+    tk_xt_put(r, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
+    return r;
 }
 
 // `a.Length` -- the one member a local array answers, decided here because
@@ -575,6 +624,12 @@ void tk_array_maybe_rewrite_index(i64 n) {
     i64 keep = nd_next(n);
     node_assign(n, tk_arr_load(ety, tk_arr_addr(base, ety, idx)));
     set_nd_next(n, keep);
+    // the same tag the heap load below carries, for the same reason: this node
+    // is what a field store, an argument or an operator is handed, and a load
+    // nobody can type is refused by the judge (D50). `tk_arr_load` tags
+    // nothing of its own -- a `ref` parameter's read and a lambda capture's go
+    // through it too, and they are not elements of anything.
+    tk_xt_put(n, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
 }
 
 // `g[i]` on a global `T[]` (G1): unlike a FIXED array's own rewrite above,
@@ -592,10 +647,18 @@ void tk_hg_rewrite_index(i64 n) {
     tk_line = nd_line(n);
     tk_file = nd_file(n);
     i64 keep = nd_next(n);
-    node_assign(n, tk_ha_load(base, ety, nd_b(n)));
+    i64 r = tk_ha_load(base, ety, nd_b(n));
+    node_assign(n, r);
     set_nd_next(n, keep);
-    i64 es = tk_struct_by_ty(ety);                // the same re-mark tk_ha_load
-    if (es >= 0) tk_xt_add(n, es, 1, TK_BORROWED);  // gives its OWN return node
+    // the registration follows the VALUE into the node the tree holds:
+    // `tk_ha_load` tags the node IT built (the element's row and its type id,
+    // teko_heaparr.tk), and `node_assign` copies that value into `n`, leaving
+    // the tag on a node nobody reads -- so `this.rate = g[0];` on a global
+    // `i64[] g` reached the field-store judge with no type at all and was
+    // refused, `teko: the type of this value is not known here` (Copilot on
+    // #698, pass 5). Moving the row, rather than adding one, is also what
+    // keeps the element's type id -- a scalar has no row to re-add.
+    tk_xt_move(r, n);
 }
 
 // a deferred write whose base never turns out to be a global array is not a
@@ -615,12 +678,22 @@ void tk_array_resolve_write(i64 i) {
     tk_file = fl;
     i64 idx = tk_arr_bounds(gd_idx_at(i), nel, nm, line, fl);
     i64 r = 0;
-    if (gd_form_at(i) == TK_ASTORE) r = tk_arr_store(ety, tk_arr_addr(base, ety, idx), gd_val_at(i));
-    else                            r = tk_arr_compound(base, ety, idx, gd_op_at(i), gd_val_at(i));
+    if (gd_form_at(i) == TK_ASTORE) {
+        i64 at = tk_arr_addr(base, ety, idx);
+        r = tk_arr_elem_store(ety, at, gd_val_at(i), line, fl);
+    } else {
+        r = tk_arr_compound(base, ety, idx, gd_op_at(i), gd_val_at(i));
+    }
     i64 n = gd_node_at(i);
     i64 keep = nd_next(n);
     node_assign(n, r);
     set_nd_next(n, keep);
+    // what the TREE holds is the placeholder, not the node the door built, so
+    // a store the door reported is re-marked under the identity the reclaim
+    // pass walks -- the same re-mark `tk_hg_resolve_write` below makes for a
+    // `T[]` of heap, asked the other way round (was the store marked?) so the
+    // two halves cannot drift apart.
+    if (tk_os_has(r)) tk_os_add(n);
 }
 
 // the write half of a global `T[]` (G1): the address is the SAME
@@ -654,6 +727,26 @@ void tk_hg_resolve_write(i64 i) {
     tk_deleg_late_move(r, n);         // MOVED onto the node the tree keeps
 }
 
+// the subtrees a deferred write PARKED are not in the tree the walk above
+// reads: `gd_val`/`gd_idx` hold expressions the parser handed to `tk_gd_add`,
+// and only `tk_array_resolve_write` splices them back -- after every rewrite
+// this pass makes. An `N_INDEX` inside one of them therefore survived
+// untouched: `dst[0] = src[0];` between two globals, and `dst[src[0]] = 9;`,
+// were REFUSED, ``teko: `[` needs an array: src`` (teko_params.tk's own
+// check over an index nothing lowered), for a read this module knows how to
+// build (Copilot on #698, pass 8). They are walked HERE, before the writes
+// resolve, so the load is rewritten and TYPED by the time the field-store
+// door judges the value.
+void tk_gd_walk_reads() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ngd) break;
+        tk_array_walk_reads(gd_val_at(i));
+        tk_array_walk_reads(gd_idx_at(i));
+        i = i + 1;
+    }
+}
+
 void tk_array_resolve_writes() {
     i64 i = 0;
     loop {
@@ -669,7 +762,7 @@ void tk_array_resolve_writes() {
 i64 tk_array_pass(i64 root) {
     tk_garr_collect();
     tk_hg_collect();
-    if (tk_ngv > 0 || tk_nhg > 0) tk_array_walk_reads(root);
+    if (tk_ngv > 0 || tk_nhg > 0) { tk_array_walk_reads(root); tk_gd_walk_reads(); }
     tk_array_resolve_writes();
     return root;
 }

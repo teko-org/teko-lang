@@ -123,6 +123,81 @@ i64 tk_bracket(i64 left) {
     }
     i64 hi = tk_struct_of_expr(left);             // a `T[]` of heap (K3): a local, a field, a call
     if (tk_is_ha(hi)) return tk_ha_index(left, hi);
+    // ...and a name the parser has ALREADY SEEN DECLARED as a local of this
+    // scope indexes nothing: every array shape a local can have was answered
+    // above (a fixed one by `tk_arr_find`, a `T[]` by `tk_struct_of_expr`),
+    // so what is left is a scalar, an object or a delegate with a `[` after
+    // it. Everything below this line is written for a name the parser cannot
+    // resolve YET -- a GLOBAL array, whose two tables are filled in a pass --
+    // and that pass matches by NAME ALONE: a global `i64[] src` beside a
+    // local `i64 src` had `dst[0] = src[0];` rewritten into a load of the
+    // GLOBAL, while the base identifier under it still resolved lexically to
+    // the local, so an invalid program compiled and ran off the local's own
+    // value (measured on `a9e0b0d7`: exit 139, and the same through a parked
+    // subtree). The lexical binding is known HERE and nowhere later, so the
+    // refusal is written here -- the same one `tk_pm_check_index` below gives
+    // an index no road lowered, at the same line and with the same wording.
+    if (nd_kind(left) == N_IDENT && tk_slv_find(nd_name(left)) >= 0)
+        err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+    // ...and the very same binding one scope out: inside a member body, a bare
+    // name the class DECLARES is that field (C#'s rule, `tk_this_field`'s own),
+    // and the global road may not claim it either. With a global `i64[] src`
+    // beside an `i64 src` FIELD, `src[0]` in a method was rewritten into a load
+    // of the global while the base identifier under it was rewritten by
+    // `tk_this_ident` (teko_this.tk) into the FIELD's own load -- the array
+    // pass runs first (teko.tk's own order) -- so the field's eight bytes were
+    // read as the array's handle: exit 139, an invalid program neither compiled
+    // correctly nor refused (Copilot on #698, pass 11). The field that IS an
+    // array answers here instead of by accident: a `T[]` of heap takes
+    // `tk_ha_index`, exactly as a `T[]` PARAMETER does four lines above, over a
+    // base the pass turns into the field load -- which also gives the implicit
+    // `src[0]` a road when no global of that name exists at all, where it used
+    // to be refused. Everything else -- a scalar, an object, a delegate -- takes
+    // the refusal above, and an INLINE array field keeps the one WRITTEN FOR IT:
+    // it is reached through `this.` and nowhere else, which is what
+    // `tk_this_reject_array` (teko_this.tk) says and what the pass used to say
+    // here, since the bare name reached `tk_this_ident` before anything refused
+    // it. Refusing it as "not an array" instead would be a worse sentence for
+    // the same program -- the field IS an array (docs/reference/diagnostics.md,
+    // and Copilot on #698, pass 12) -- so the specific road is taken first and
+    // the generic one is left for what really indexes nothing.
+    if (nd_kind(left) == N_IDENT && tk_body_class >= 0) {
+        i64 bfi = tk_field_find(tk_body_class, nd_name(left));
+        if (bfi >= 0) {
+            i64 bsi = tk_struct_by_ty(fd_ty_at(bfi));
+            if (fd_nel_at(bfi) == 0 && tk_is_ha(bsi)) return tk_ha_index(left, bsi);
+            tk_line = p_line();
+            tk_file = p_file();
+            tk_this_reject_array(bfi);
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        }
+        // a field is not the only member a bare name stands for: `tk_this_ident`
+        // answers a member CONST and then a PROPERTY with the very same rule, so
+        // the global road may not claim those two names either. With a global
+        // `i64[] src` beside a `const i64 src` the method's `src[0]` read the
+        // constant's value as the array's handle (exit 139, pass 11's shape
+        // again); beside a scalar PROPERTY `src` it read the getter's result the
+        // same way (exit 70, the null-array trap catching by luck what nothing
+        // refused) -- Copilot on #698, pass 13. The order is `tk_this_ident`'s
+        // own, const before property, so the name resolves here to exactly what
+        // it resolves to there. A const is always a scalar value
+        // (`tk_mconst_use`, teko_const.tk), so it only ever indexes nothing; a
+        // property CAN be declared `T[]`, and that one is read by calling its
+        // getter and indexing the result -- `h.xs[0]` already compiles that way,
+        // and the bare `xs[0]` is the same access with the receiver implicit, so
+        // the base the pass turns into the getter call takes `tk_ha_index`
+        // exactly as a `T[]` field does above. A property of any other type takes
+        // the refusal. An INLINE array is no property's type at all (only a field
+        // is laid out that way), so `tk_this_reject_array` has no second site.
+        if (tk_mconst_find(tk_body_class, nd_name(left)) >= 0)
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        i64 bpi = tk_prop_find(tk_body_class, nd_name(left));
+        if (bpi >= 0) {
+            i64 psi = tk_struct_by_ty(pr_ty_at(bpi));
+            if (tk_is_ha(psi)) return tk_ha_index(left, psi);
+            err_at2(p_file(), p_line(), "teko: `[` needs an array", nd_name(left));
+        }
+    }
     i64 line = p_line();
     uptr fl = p_file();
     i64 idx = parse_expr(0);

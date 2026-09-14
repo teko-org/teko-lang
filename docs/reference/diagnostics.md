@@ -346,15 +346,19 @@ messages reuse the wordings a declared type already gets; only a handful are its
   claims every binary and unary with a primitive operand and refuses the ones with no row
   (`t % t`, `t & t`, `t * t`, `t / t`, `t + 1`, `~t`, `!t`, `+t`).
 - ``"teko: the type of the left side of `+` is not known here"`` (also *right*) — the other
-  operand of an operator over a primitive is an expression the oracle cannot type, such as
-  an array element. Bind it to a local first; a primitive operand is exactly where leaving
-  the node to the core's raw arithmetic would answer a wrong number.
+  operand of an operator over a primitive is an expression the oracle cannot type. A
+  primitive operand is exactly where leaving the node to the core's raw arithmetic would
+  answer a wrong number, so the site is refused rather than guessed at; bind the value to a
+  local first. An **array element** was this message's one shape until D50 and is one no
+  longer: every element load carries the element's own type now, so `xs[i] + t` and
+  `xs[i] + xs[j]` are ordinary operand pairs.
 - `"teko: the type of this argument is not known here"` — the same rule one position over:
   an argument landing on a parameter of primitive or `enum` type, in a row of the member
-  table, whose type nothing can tell even after the oracle has run — a local array's
-  element (`new DateTime(t, a[0])`, `d.CompareTo(a[0])`) is today's one shape. That
-  position converts with a cast, so an unread value would cross under the column's name
-  instead of being refused. Bind it to a local first.
+  table, whose type nothing can tell even after the oracle has run. That position converts
+  with a cast, so an unread value would cross under the column's name instead of being
+  refused. Bind it to a local first. An array element reaches this one no longer either
+  (D50): `new DateTime(1, a[0])` on an `i64 a[2]` is judged by the type the element has,
+  `teko: a value of type i64 does not convert to DateTimeKind`.
 - `"teko: this primitive has no constructor"` — `new` on a primitive whose table declares
   no constructor row. `TimeSpan` declares one, so nothing in v0.4.0 reaches this; it is the
   mechanism's own guard for the primitives the specs still have coming.
@@ -414,7 +418,7 @@ i64 main() {
     DateTime b = new DateTime(1, seven());  // teko: a value of type i64 does not convert to DateTimeKind
     i64 arr[2];
     arr[0] = 7;
-    DateTime c = new DateTime(1, arr[0]);   // teko: the type of this argument is not known here
+    DateTime c = new DateTime(1, arr[0]);   // teko: a value of type i64 does not convert to DateTimeKind
     return 0;
 }
 ```
@@ -801,7 +805,65 @@ ternary and not the cause.
 - `"teko: the left side of = is not a place"` — the target of the assignment is not a
   variable, a field or an element.
 - ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
-  know to be one. Bind it to a local of the right type first.
+  know to be one. Bind it to a local of the right type first. The name the base spells is
+  appended when it has one, and a name that SHADOWS a global array is the shape that
+  reads oddest: the global's own index is rewritten by a pass that matches by name alone,
+  so the refusal is raised where the parser still knows what the binding really is. A
+  LOCAL and a FIELD of the class being parsed both shadow that way, and so do the other two
+  members a bare name stands for — a member `const` and a PROPERTY. A field or a property
+  that IS an array is read as the member instead, index and all: the field through its own
+  load, the property through its getter.
+
+```teko
+// no-run
+i64[] src;                    // a GLOBAL array...
+i64[] dst;
+
+i64 f() {
+    i64 src = 3;              // ...shadowed by a local of another type
+    dst[0] = src[0];          // teko: `[` needs an array: src
+    return dst[0];
+}
+
+class H {
+    public i64 src;           // ...and shadowed by a FIELD, one scope out
+    public i64[] xs;
+
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+
+    public i64 h() {
+        xs[0] = 8;            // ...while a field that IS an array reads the field
+        return xs[0];
+    }
+}
+
+class K {
+    public const i64 src = 5; // ...and shadowed by a member CONST
+
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+}
+
+class L {
+    private i64  n;
+    private i64[] back;
+    public i64 src { get { return n; } set { n = value; } }
+    public i64[] ys { get { return back; } set { back = value; } }
+
+    // ...and by a scalar PROPERTY, the third member a bare name resolves to
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src
+    }
+
+    public i64 h() {
+        ys[0] = 8;            // ...while a `T[]` PROPERTY is read by its getter
+        return ys[0];
+    }
+}
+```
 
 ## The nullable `T?`
 
@@ -1092,6 +1154,98 @@ the scope open at the site nor the table of globals holds a row for.
 - `"teko: a "` — completed by *`<what>` needs a class*: a construct that only a class
   carries (a constructor, a destructor, a vtable slot) was written on another kind of type.
 
+### A field store whose value only the pass can type
+
+A store is built where it is written, and the value's type is the one thing the site may
+not know then. A parameter is in no parse-time scope; an implicit `f = e` is rewritten from
+a pass with its right-hand side still a bare name; a `static` field on a type declared below
+is resolved one pass ahead of the scope that would answer; a **call to an overloaded name**
+is typed by the signature its arguments pick, which is written at the overload pass and is
+not always the first declaration of the name; and a **user operator** is not the call it
+stands for until the operator pass has lowered it. None of that is a licence to write the
+raw bits — the check and the conversion are deferred to one point, the end of the overload
+pass, where every one of those is already settled, and the value is then judged by the very
+rule every other slot is judged by (D50, the review findings on
+[#698](https://github.com/teko-org/teko-lang/pull/698)). What the deferral buys is a
+compile-time refusal where the eight bytes used to cross unread:
+
+```teko
+// no-run
+enum Color { Red, Green, Blue }
+class Cell { public i64 v; }
+class Box { public Cell c; }
+class H { public static Cell c; }
+
+i64 pick(i64 a)         { return 5; }
+f64 pick(i64 a, i64 b)  { return 2.5; }
+
+class N {
+    public i64 n;
+    // the PICK is the two-argument one, whatever the first declaration returns
+    public N() { this.n = pick(1, 2); }   // teko: a value of type f64 does not convert to i64
+}
+
+void put(Box b, Color k, uptr raw, i64 n) {
+    b.c = k;                     // teko: a value of type Color does not convert to Cell
+    b.c = raw;                   // teko: a value of type uptr does not convert to Cell
+    H.c = n;                     // teko: a value of type i64 does not convert to Cell
+}
+
+i64 main() { return 0; }
+```
+
+The receiver above is a **parameter**, which the parser cannot type either: that store is
+rebuilt by the pass and goes through the same gate, so a `T?` field written through it boxes
+its value like every other site rather than taking the raw bits for a box handle.
+
+An **element of a `T[]`** is that same slot: `xs[i] = e` is judged by the very gate, after
+the pick, so a narrowing into an `i64[]` is refused, an integer into an `f64[]` is widened
+and an `i64?[]` boxes what it is given.
+
+```teko
+// no-run
+class Cell { public i64 v; }
+
+i64 rick(i64 a)         { return 5; }
+Cell rick(i64 a, i64 b) { Cell c = new Cell(); c.v = 7; return c; }
+
+i64 main() {
+    i64[] ns = new i64[2];
+    ns[0] = 1.5;                 // teko: a value of type f64 does not convert to i64
+    Cell[] cs = new Cell[2];
+    cs[0] = null;                // teko: null needs a slot declared Cell?
+    cs[1] = rick(1, 2);          // ...and this one compiles: the PICK returns a Cell
+    return 0;
+}
+```
+
+- `"teko: the type of this value is not known here"` — the deferred store reached its one
+  point of judgement and **no** oracle could type the value even there. A store is judged or
+  it is refused; it is never written raw, because what crosses unread is the value's own
+  eight bytes in a slot of another type. Bind the value to a local of the right type first,
+  the same answer *the type of this argument is not known here* gives one position over.
+
+A **`void` call** reaches the same judgement with a type, and it is no value: the store is
+refused in the wording every mismatched value gets. mc's core already refuses a `void` where
+it can see one (`value of type void`, its own message, the one a local initializer gets),
+but a VIRTUAL or an INTERFACE call is indirect and the core types every indirect call `i64`
+by itself — so the declared return, `void` included, is what the compiler records and what
+the store is judged against. The verdict does not depend on WHEN the store learns it: on a
+receiver the parser already types (`B b = d; h.n = b.M();`) the answer is there at the store
+site itself, on a receiver only the pass types it arrives at the judgement, and one function
+answers for both.
+
+```teko
+// no-run
+class B { public virtual void M() { } }
+class H {
+    public i64 n;
+    public void go(B b) {
+        this.n = b.M();      // teko: a value of type void does not convert to i64
+    }
+}
+```
+
 ## Capacity
 
 Every table the compiler keeps has a ceiling. Hitting one is a diagnostic, not a silent
@@ -1134,9 +1288,10 @@ truncation; the fix is to split the unit.
 | `"teko: too many locals in one unit"` | 8192 |
 | `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |
 | `"teko: too many locals of struct type"` | 256 |
-| `"teko: too many expressions whose type is known"` | 256 |
+| `"teko: too many expressions whose type is known"` | 4096 expressions the parser typed in one unit — every load of a field, of an array element and of a `T[]`, every box and every indirect return spends one; 239 in `tests/surface_nullable_ops.tk`, the busiest fixture |
 | `"teko: too many member accesses on a value of unknown type"` | 128 waiting for the pass |
 | `"teko: too many stores into a slot of class type"` | 128 |
+| `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 512 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals; 134 in `tests/surface_lambda.tk`, the busiest fixture |
 | `"teko: too many overloaded names in one unit"` | 64 |

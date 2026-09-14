@@ -211,14 +211,26 @@ i64 tk_ha_addr(i64 base, i64 idx, i64 ety) {
 // slot is free) exactly as the struct-field precedent tags its own.
 i64 tk_ha_load(i64 base, i64 ety, i64 idx) {
     i64 r = tk_arr_load(ety, tk_ha_addr(base, idx, ety));
-    i64 es = tk_struct_by_ty(ety);
-    if (es >= 0) tk_xt_add(r, es, 1, TK_BORROWED);
+    // the ELEMENT type, whatever it is -- the row when it has one and the type
+    // id in every case, the same registration a field load carries
+    // (`tk_field_use`, teko_expr.tk). A scalar element answered -1 to every
+    // oracle, and the load is what `xs[0] += 100;` stores back through the
+    // gate: no one could type the sum (Copilot on #698, pass 4).
+    tk_xt_put(r, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
     return r;
 }
 
 // the store: the SAME `stW(addr, v)` call teko_struct.tk's own array-field
 // store builds, marked for teko_rc.tk's own pass to pick between `rt_store`/
 // `rt_store_own` when the element is counted -- zero new machinery there.
+// An element is a slot like any other (D50): the value goes through the ONE
+// door every field store is built by -- the deferral first, then the two
+// scalar verdicts, the row one and Q1b's box, all of them `tk_field_store_val`
+// (teko_typeof.tk). It used to call the row check ALONE, which judged before
+// the overload pick and skipped the scalar half entirely: `Cell[] xs; xs[0] =
+// rick(1, 2);` was refused by the FIRST declaration of an overloaded name,
+// `i64[] a; a[0] = 1.5;` compiled and wrote the double's raw bits, and
+// `f64[] f; f[0] = 1;` wrote the integer's (Copilot on #698, pass 4).
 i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v) {
     // `ops[i] = e` on an `Op[]`: the one validator every slot of delegate type
     // shares (`tk_deleg_coerce`, teko_deleg.tk), asked HERE rather than in
@@ -231,34 +243,27 @@ i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v) {
     // one is assembled inside a pass where no scope answers for any name at
     // all, not even to be asked (D51, fourth pass).
     // ...and a store that waits is judged by that validator ALONE (D51,
-    // seventh pass). `tk_check_field_store` (teko_struct.tk) ran over the
-    // waiting value all the same, and it types a name and a call from the
-    // same parse-time tables the guard above just refused to trust: `Op[]`
-    // taking a `new Other()` or an `Other` local died
-    // `teko: a value of type Other does not convert to Op` -- the generic
-    // conversion words, ahead of the delegate's own
+    // seventh pass). The door below (`tk_field_store_val`, teko_typeof.tk)
+    // would judge the waiting value all the same, and its row check types a
+    // name and a call from the same parse-time tables the guard above just
+    // refused to trust: `Op[]` taking a `new Other()` or an `Other` local
+    // died `teko: a value of type Other does not convert to Op` -- the
+    // generic conversion words, ahead of the delegate's own
     // `teko: Op takes a function, another Op, or null` -- and a call through
     // a LOCAL delegate shadowing a function was refused over the FUNCTION's
     // return type, a legal program. One judgement per store: `null` and the
-    // shapes this site types keep the check (the null rule for an element is
+    // shapes the door types keep the door (the null rule for an element is
     // its road to Q1a), and what waits is `tk_deleg_late_do`'s, whole.
     i64 dsi = tk_deleg_row(ety);
     i64 late = tk_deleg_store_late(dsi, v);
     if (dsi >= 0 && !late) v = tk_deleg_coerce(dsi, v, tk_line, tk_file);
-    if (!late) tk_check_field_store(ety, v, tk_line, tk_file);
-    // Q1b: `ns[0] = 5;` on an `i64?[]` writes the box, the same wrap every
-    // other store slot of the language takes. The scalar verdict is asked
-    // HERE, and only for this element type, because it is the one this crumb
-    // adds -- the check every other element type gets is exactly the one it
-    // got before, so no fixture's tree moves.
-    i64 ei = tk_struct_by_ty(ety);
-    if (tk_is_nl(ei) && tk_nl_boxes(nl_of_at(ei))) {
-        i64 vty = tk_pty_of(v);
-        tk_check_scalar_compat(ety, vty, v, tk_line, tk_file);
-        v = tk_nl_wrap(ety, vty, tk_num_widen(ety, vty, v));
-    }
+    i64 line = tk_line;
+    uptr fl = tk_file;
+    if (!late) v = tk_field_store_val(ety, v, line, fl);
+    tk_line = line;                               // the gate builds nodes of its own
+    tk_file = fl;
     i64 st = tk_os_mark(tk_call2(tk_stn(ety), tk_ha_addr(base, idx, ety), v), ety);
-    if (late) tk_deleg_store_defer(st, dsi, tk_line, tk_file);
+    if (late) tk_deleg_store_defer(st, dsi, line, fl);
     return st;
 }
 

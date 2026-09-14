@@ -42,7 +42,6 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
 | an integer argument at a **virtual** or an **interface** call, written as a bare **parameter** name (`a.by(n)` inside `g(i64 n)`) | not converted: those two are shaped at parse time and a parameter carries no type the parser can read, so the argument passes its own bits |
 | `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |
-| `h.f = 5;` on a field of class/struct/interface/delegate type, the value written by a PARSE-TIME field store (`p.f = e`) | neither converted nor refused: `tk_check_field_store` (teko_struct.tk) reads the value through `tk_struct_of_expr`, which answers about an OBJECT expression only, so a scalar value silently answers "not known" and the store proceeds, writing the integer's bit pattern where a pointer is expected. D34 fixed the opposite direction (a reference reaching a NUMERIC field); this is the same defect class, the other way round, at this one site — every other numeric-into-reference slot (an initializer, an assignment, an argument, a `return`) already refuses through `tk_check_compat`'s row check |
 
 ## Generics and delegates
 
@@ -69,7 +68,9 @@ An integer converts to a float in every slot that has one, and nothing narrows b
 | a **fixed** array of a class or struct type (an `enum` element is taught, N2a: it owns no object slot for `teko_rc.tk` to walk) | `teko: an array of objects is not taught yet; use a field array or wait for T[]` |
 | reading a `ref T[]` / `out T[]` inside the callee | `expression with no codegen`, from the core — the parameter carries the caller's slot, and the array is not reachable through it |
 | `.Length` on a **global fixed** array | `teko: unknown member: Length` — a local fixed array and any `T[]` answer |
-| an index whose base is not an array the parse can name | ``teko: `[` needs an array`` |
+| an index whose base is not an array the parse can name, a **local**, a **field**, a member **const** and a **property** of the class being parsed shadowing a global array included | ``teko: `[` needs an array`` (the base's own name follows it) |
+| a **member declared BELOW the method that reads it** shadowing a global array (`src[0]` above `public i64 src;`, and the same over a member `const` or a property) | not refused: the parser has not read the member yet, so the index takes the global road and the name under it is the member's — the program compiles and runs wrong (measured: exit 139 when the member's own bytes are read as the array's handle, exit 70 — `teko: index into a null array` — when the member is still zero and the trap catches it). Declare the member above its readers, which is what every other implicit use of it already asks for, or rename one of the two |
+| a **parameter** that shadows a **global array** (`f(i64 src)` beside a global `i64[] src`) | not refused: the index is rewritten into a read of the GLOBAL, while the name under it is still the parameter's — the program compiles and runs wrong (measured, exit 139). A parameter is in no parse-time scope, which is where the binding is known; shadow it with a LOCAL and the site is refused instead. Rename one of the two |
 | an inline array field by its bare name | ``teko: an array field is reached through `this.``` |
 | an inline array field of a type declared **below** | `teko: an array field on a type declared below is not taught yet` |
 | a heap array as the element of another heap array | not taught |
@@ -209,7 +210,6 @@ not:
 | `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
 | `+t` (C#'s unary plus) | ``teko: no operator `+` takes these operands`` — the unary minus is taught, its C# twin is not |
 | `new TimeSpan(h, m, s)` and the two longer constructors | `teko: wrong number of arguments for new` — one row, one argument: the tick constructor. Build it from `FromHours(h) + FromMinutes(m) + FromSeconds(s)` |
-| an **array element** as an operand | the oracle answers "not known" for an array element ([types.md](types.md)). With a typed operand on the other side (`xs[i] + t`) the operator table claims the node and refuses it, ``teko: the type of the left side of `+` is not known here`` (or `right`); with an array element on BOTH sides (`xs[i] + xs[j]`) nothing claims it and the core's own `+` runs on the two raw values — for a `TimeSpan` the value is right and only the OVERFLOW CHECK is skipped, and for a `DateTime` it is wrong outright, `Kind` bits included. Bind the elements to locals first |
 | `switch` on a `TimeSpan` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a `TimeSpan` takes no integer operand |
 
 ## Dependency injection

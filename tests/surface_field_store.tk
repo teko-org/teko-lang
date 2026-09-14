@@ -1,0 +1,878 @@
+// surface_field_store.tk -- one gate, every site (G-e, D50; D33/D34/D43/D44):
+// every field store -- `p.f = e`, `this.f = e` (explicit), the implicit
+// `f = e` inside a method or a constructor, and `T.f = e` (a static field,
+// both the direct site and its forward-referenced twin) -- passes through the
+// SAME `tk_field_store_val` (teko_typeof.tk). Before this crumb only `p.f = e`
+// on a receiver the parser could type did: the others built the store CALL
+// directly over the source's own value node, with no widening, no narrowing
+// refusal and no row check at all -- an integer landing in an `f64` field kept
+// its raw bits, silently, through every one of them.
+//
+// The wrinkle the first pass of this crumb only half closed: the value's own
+// TYPE is the one thing a store site may not know. A PARAMETER is in no
+// parse-time scope (`tk_slv`'s own rule, D33's "not known here"), an implicit
+// `f = e` is rewritten from a pass with its right-hand side still a bare name,
+// and a `T.f = e` on a type declared below is resolved one pass ahead of the
+// scope that would answer. `-1` is not a licence to write the raw bits: the
+// store is DEFERRED and judged once, in `tk_field_store_judge`, with the scope
+// alive and the tree resolved -- the discipline D48 wrote for a primitive
+// row's argument. Every helper below is a shape that answered -1 at its own
+// site.
+//
+// What each helper proves, in order:
+//
+//   1. `ctorcheck`   -- `this.rate = k;` in a constructor, `k` an `i64`
+//                       PARAMETER: the field reads back 5.0, not the
+//                       parameter's raw bits;
+//   2. `implcheck`   -- the same store, spelled without `this.` (implicit,
+//                       rewritten by the pass rather than by the parser);
+//   3. `methodcheck` -- `this.rate = this.rate + 1;` in an ordinary method:
+//                       the binary widens its own integer operand (D33,
+//                       unchanged by this crumb) and the store keeps the
+//                       result;
+//   4. `staticcheck` -- `H.total = 3;` then `H.total = H.total + 2;`, a
+//                       `static f64` field written and read back through
+//                       the same type;
+//   5. `nlfieldcheck` -- a `Cell?` instance field written through `this.`
+//                       with `null` and then with a live reference, boxing
+//                       and unboxing through `.HasValue`/`.Value` (D44);
+//   6. `enumcheck`    -- an `enum` instance field written through `this.`
+//                       with one of its own members;
+//   7. `binarycheck`  -- `this.rate = k + 1;`, an N_BINARY value: no
+//                       parse-time oracle types a binary at all;
+//   8. `fieldtofieldcheck` -- `rate = step;`, implicit on BOTH sides: the
+//                       right-hand side is a bare name until `tk_this_ident`
+//                       has rewritten it into the typed load;
+//   9. `fwdstaticcheck` -- `H2.total = k;` written where `H2` is declared
+//                       BELOW, from a member whose own parameter is the
+//                       value: the store is resolved in `tk_fwd_pass`, one
+//                       pass before the scope that types `k`;
+//  10. `freefncheck`  -- a FREE function's own parameter into a static field
+//                       and into an instance one through a local receiver:
+//                       no member body is being parsed, so no parse-time
+//                       scope ever held that name;
+//  11. `boxcheck`     -- an `i64?` field written from a parameter: the Q1b
+//                       box is built in the judge, and the raw eight bytes
+//                       used to be stored as a handle (a segfault, measured);
+//  12. `vcallcheck`   -- a VIRTUAL `i64 M()` and an INTERFACE `i64 M()` into
+//                       an `f64` field, on both roads: a receiver the parser
+//                       types and a receiver only the pass does. The call is
+//                       a `callp`, which names no callee and carries no cast
+//                       when it returns a wide integer, so nothing could type
+//                       it and the store wrote the integer's raw bits;
+//  13. `elemcheck`    -- an ELEMENT of a `T[]` of heap, the sixth store site:
+//                       the overloaded pick that returns a ROW, the compound
+//                       over a load nobody typed, the widening an `f64[]`
+//                       writes and the box an `i64?[]` wraps -- one door, the
+//                       same verdicts a field gets;
+//  14. `gloadcheck`  -- an element of a GLOBAL array in a field store, both
+//                       kinds: the `T[]` of heap and the fixed one. The load
+//                       is rewritten by a pass and copied into the tree
+//                       (`node_assign`), which left the element's type on the
+//                       node the load was BUILT as -- the store was refused
+//                       for a value the compiler itself had just typed;
+//  15. `localcheck`   -- an element of a LOCAL fixed array and an element of
+//                       an INLINE array field, both in a field store: the
+//                       parser lowers each to an address and a load on the
+//                       spot and no pass revisits them, so a SCALAR element
+//                       was tagged with nothing and the store was refused
+//                       for a value the parser had known all along;
+//  17. `fixedstorecheck` -- an element of a FIXED array as the store TARGET,
+//                       global and local: the one road that never entered the
+//                       door at all, so `gf[0] = 1;` wrote the integer's raw
+//                       bits and `gf[0] += 1;` summed a load nobody typed;
+//  18. `copycheck`    -- a global element as the VALUE and as the INDEX of
+//                       another global's write: both are subtrees PARKED in
+//                       the deferred-write table, which the pass that
+//                       rewrites an index does not walk;
+//  19. `pendglobalcheck` -- the same parked subtree on the deferred
+//                       RECEIVER's road (`pd_arg`);
+//  23. `parkedcheck`  -- the three OTHER subtrees that same table parks and
+//                       no walk reached: the receiver's own INDEX
+//                       (`h.items[gl[1]] = 7;`, `pd_na`), the argument of a
+//                       NESTED member call inside the value
+//                       (`h.rate = 1 + h.mul(gl[1]);`, the inner row's own
+//                       `pd_arg`) and an index NESTED inside the receiver
+//                       (`gc[gl[1] - 1].v`, where only the outer one was
+//                       rewritten). Each was refused, ``teko: `[` needs an
+//                       array: gl``;
+//  24. `fwdloadcheck` -- the forward-referenced static as the VALUE of a
+//                       store (`this.rate = W3.tally;` on a class declared
+//                       ABOVE it): the load is built by the same pass that
+//                       resolves the write and copied into the tree, which
+//                       left its type on a node nobody reads -- the store
+//                       was REFUSED for a value the compiler had just typed;
+//  25. `mbindexcheck` -- the implicit index on a `T[]` FIELD (`xs[0]`,
+//                       `xs[0] += 1`, `this.rate = xs[0]`) with a global
+//                       array of this file beside it: a bare name the class
+//                       declares is that field at PARSE time, which is what
+//                       keeps the global rewrite -- keyed by name alone --
+//                       off it;
+//  26. the same check -- the implicit index on a `T[]` PROPERTY (`gl[0]`,
+//                       `gl[0] += 3`, `return gl[0]`), whose name is a
+//                       GLOBAL array of this file too. A bare name resolves
+//                       to a field, then to a member const, then to a
+//                       property (`tk_this_ident`, teko_this.tk), so the
+//                       parse-time guard answers all three; the property is
+//                       read by calling its getter, the implicit form of
+//                       `x.gl[0]`, and the global keeps its own value;
+//  20. `rccheck`      -- `rt_live()` back to its floor once every object
+//                       this file allocated is released, the global arrays
+//                       above excepted: those are roots.
+//
+// A refusal has no exit code to assert (D33's own harness note): the
+// narrowing refusal, the reference/number mismatch (D34), `null` in a
+// non-`T?` field and the local, the FIELD, the member CONST and the scalar
+// PROPERTY that SHADOW a global array
+// (``teko: `[` needs an array: src``, the one thing the rewrite of a global's
+// reads may not do by name alone) are probed outside `tests/` and documented
+// as `// no-run` in [types.md](../docs/reference/types.md) and
+// [diagnostics.md](../docs/reference/diagnostics.md).
+//
+// A COUNTED element of a fixed array has no shape to be written here: an
+// element of class, `struct` or `T?` type is refused at the DECLARATION
+// (``teko: an array of objects is not taught yet``), so the door's own
+// `tk_os_mark` (teko_array.tk) reports a store no program can write today --
+// what it buys is that the reclaim pass hears about every element store
+// whatever a later crumb teaches, instead of depending on that refusal.
+//
+// Compound assignment on a field (`this.rate += 2;`, `H.total *= 2;`) is
+// not taught: the `+=`/`*=` sugar (`<teko-loop-prelude>`) takes a bare NAME
+// on its left and refuses anything else, `the rule expected a name on the
+// left`, which is unrelated to field-store widening and out of this
+// crumb's scope -- helper 3 above writes the same shape out by hand
+// instead (`this.rate = this.rate + 1;`).
+//
+// expect-exit: 42
+#include "../lib/rt.tk"
+
+// the two GLOBALS whose names the code below SHADOWS: `k` is every `i64`
+// parameter of this file and `step` is class I's own `i64` field. A global is
+// in scope in every body, so the pass-time oracle answers `f64` for both
+// names -- and that answer is not about the name the store actually writes
+// (15, 16). The door asks the PARSE-TIME oracle alone for exactly this
+// reason: what it cannot type is deferred, and the judge reads the name once
+// it is the parameter's own slot or the field's own load.
+f64 k = 1.5;
+f64 step = 2.5;
+
+// the two loads a PASS rewrites into the tree (18): a global `T[]` of heap and
+// a FIXED global array are both plain `N_INDEX` nodes while a body is parsed --
+// neither table is filled yet -- and `tk_array_walk_reads` (teko_array.tk)
+// replaces the node in place afterwards. The load is built as one node and
+// COPIED into another (`node_assign`), so the element type its builder tagged
+// stayed on a node nobody reads and the store was refused for a value the
+// compiler itself had just typed.
+i64[] gl;
+Cell[] gc;
+i64 gx[2];
+
+// the FIXED array's own element STORE (20): `gf[0] = 1;` and `gf[0] += 1;`
+// were built as the raw `stW(addr, v)` -- the door every other store site
+// enters was not on this road at all, so the integer's eight bytes landed in
+// a float element and the compound summed a load nobody had typed. `gdst` is
+// the second global of (21): a global element read as the VALUE of another
+// global's write, a subtree parked in the deferred-write table that no walk
+// reached.
+f64 gf[2];
+i64[] gdst;
+
+enum Color { Red, Green, Blue }
+
+class Cell {
+    public i64 v;
+}
+
+// the operator is a `public static` member that names both operands (D8), and
+// a store whose value is written with it is an N_BINARY until pass 11 (14).
+class GrandBase {
+    public i64 v;
+
+    public static i64 operator+(GrandBase g, i64 k) {
+        return g.v + k;
+    }
+}
+
+// two overloaded names, the PICKED signature declared SECOND in each and the
+// two orders mirrored, so a store converted by the first declaration is wrong
+// in one direction (a float field taking the picked integer raw) and in the
+// other (a cast written over a value that is already a float) -- 13.
+f64 pick(i64 a) { return 2.5; }
+i64 pick(i64 a, i64 b) { return 5; }
+
+i64 qick(i64 a) { return 5; }
+f64 qick(i64 a, i64 b) { return 2.5; }
+
+// ...and a third pair whose picked signature returns a ROW: the first
+// declaration answers `i64`, which is what the row check read for a value
+// `tk_struct_of_expr` cannot see, so `Cell rc; this.rc = rick(1, 2);` was
+// refused for a store that is a `Cell` (17).
+i64 rick(i64 a) { return 5; }
+Cell rick(i64 a, i64 b) {
+    Cell c = new Cell();
+    c.v = 7;
+    return c;
+}
+
+class H {
+    public f64 rate;
+    public static f64 total;
+    public Cell? c;
+    public Color kind;
+    public i64? count;
+    public i64 sum;
+    public Cell? rc;
+    public i64 items[2];              // 19b: an INLINE array field, read below
+                                      // ...and written through a DEFERRED receiver (23)
+
+    public H(i64 k) {
+        this.rate = k;                // 1: explicit `this.f = e`, `e` a parameter
+        this.c = null;                // 5a: `null` written through `this.`
+        this.count = k;               // 11: the Q1b BOX, built from a parameter
+        this.items[0] = 4;
+        this.items[1] = 9;
+    }
+
+    public void bump() {
+        this.rate = this.rate + 1;    // 3: the field read back into its own store
+    }
+
+    public void take(Cell cc) {
+        this.c = cc;                  // 5b: a live reference boxed into `Cell?`
+    }
+
+    public void bumpby(i64 k) {
+        this.rate = k + 1;            // 7: an N_BINARY value, typed by no parser
+    }
+
+    public void setpick() {
+        this.rate = pick(1, 2);       // 13a: the pick returns i64, the field is f64
+    }
+
+    public void setqick() {
+        this.rate = qick(1, 2);       // 13b: the pick returns f64, no conversion
+    }
+
+    public void addop(GrandBase g) {
+        this.sum = g + 1;             // 14: `operator+(GrandBase, i64) -> i64`
+    }
+
+    public void setrow() {
+        this.rc = rick(1, 2);         // 17: the pick returns a ROW, not `i64`
+    }
+
+    public void fromglobal() {
+        this.rate = gl[0];            // 18a: an element of a global `T[]` of heap
+    }
+
+    public void fromfixed() {
+        this.rate = gx[0];            // 18b: an element of a FIXED global array
+    }
+
+    public void fromrowglobal() {
+        this.c = gc[0];               // 18c: the same load, with a ROW element
+    }
+
+    public void fromlocal() {
+        i64 a[2];
+        a[0] = 6;
+        a[1] = 8;
+        this.rate = a[0];             // 19a: an element of a LOCAL fixed array
+    }
+
+    public void frominline() {
+        this.rate = this.items[0];    // 19b: an element of an INLINE array field
+    }
+
+    // 23: the two readers the parked-subtree helpers below are proved by --
+    // an inline element written through a deferred receiver's own INDEX, and
+    // the method a nested member call reaches
+    public i64 item1() { return this.items[1]; }
+
+    public i64 mul(i64 x) { return x * 2; }
+}
+
+class I {
+    public f64 rate;
+    public i64 step;
+    public i64 cnt;
+
+    public I(i64 k) {
+        rate = k;                     // 2 and 15: `k` is also a global `f64`
+    }
+
+    public void copy() {
+        rate = step;                  // 8 and 16: `step` is also a global `f64`
+    }
+
+    // the MIRROR of the two above: an `i64` field written from the same two
+    // shadowed names, where reading the global's `f64` refuses a store that
+    // is an integer instead of writing raw bits.
+    public void setcnt() {
+        cnt = step;                   // 16b: field to field, `i64` to `i64`
+    }
+
+    public void setfrom(i64 k) {
+        cnt = k;                      // 15b: parameter to field, `i64` to `i64`
+    }
+}
+
+// the FORWARD-referenced static twin, for real: `H2` is declared BELOW this
+// class, so `H2.total = k` is resolved by `tk_fwd_resolve_static_one`
+// (teko_access.tk) in `tk_fwd_pass` -- one pass ahead of the scope that types
+// `k`, a member's own parameter (9).
+class W {
+    public void put(i64 k) { H2.total = k; }
+}
+
+class H2 {
+    public static f64 total;
+}
+
+// the forward-referenced static as the VALUE of a store, the other half of
+// the road helper 9 writes (24): `W3` is declared BELOW this class, so
+// `W3.tally` is a LOAD built by `tk_fwd_resolve_static_one` and copied into
+// the tree with `node_assign` -- which used to leave the element's own type
+// on the node the load was BUILT as, so the store was refused for a value the
+// compiler itself had just typed.
+class FS {
+    public f64 rate;
+    public FS() { rate = 0.0; }
+    public void take() { this.rate = W3.tally; }
+}
+
+class W3 {
+    public static i64 tally;
+}
+
+// a `T[]` of heap as a FIELD, indexed by the IMPLICIT name (25): a bare name
+// the class declares is that field, at parse time, which is what keeps the
+// global-array rewrite -- keyed by name alone -- off it. `gl` is a global
+// `i64[]` of this very file and `xs` is not, so the two names below are the
+// pair the defect needs: a field that IS an array reads the field, and a
+// field that is NOT one refuses the `[` instead of reading the global's
+// storage through the field's own bytes.
+class X {
+    public i64[] xs;
+    public f64 rate;
+
+    // (26) the OTHER member a bare name stands for, with the same global `gl`
+    // of this file beside it: a `T[]` PROPERTY. `tk_this_ident` resolves a
+    // bare name to a field, then to a member const, then to a property, so
+    // the parse-time guard has to answer all three or the global rewrite --
+    // keyed by name alone -- claims the last two. Indexed here through the
+    // GETTER, the implicit form of `x.gl[0]`.
+    private i64[] gback;
+    public i64[] gl { get { return gback; } set { gback = value; } }
+
+    public X() {
+        xs = new i64[2];
+        rate = 0.0;
+        gl = new i64[2];              // the setter, through the implicit form
+    }
+
+    public void fill() {
+        xs[0] = 8;                    // the implicit store...
+        xs[0] += 1;                   // ...the implicit compound...
+        this.rate = xs[0];            // ...and the implicit load, widened by the gate
+        gl[0] = 4;                    // the property's own element store...
+        gl[0] += 3;                   // ...and its compound, over the getter
+    }
+
+    public i64 at0() { return xs[0]; }
+    public i64 gl0() { return gl[0]; }
+}
+
+// a FREE function's own parameter: no member body is being parsed, so nothing
+// ever pushed `k` onto a parse-time scope -- into a static field and into an
+// instance one through a receiver the parser types (10).
+void setstatic(i64 k) { H2.total = k; }
+
+void setinstance(H h, i64 k) {
+    H hh = h;                         // a LOCAL: the receiver the PARSER types
+    hh.rate = k;                      // 10: `k` is a free function's parameter
+}
+
+// the receiver is a PARAMETER, so the parser cannot type it at all and the
+// whole access waits for the pass (`tk_pend_field`, teko_typeof.tk) -- the
+// sixth site that builds a field store, box included (12).
+void setthrough(H h, i64 k) {
+    h.rate = k;
+    h.count = k;
+}
+
+// (22) the same deferred receiver, with a global ELEMENT for a value: the
+// value of a deferred store is parked in the table's own row (`pd_arg`) and
+// is not in the tree `tk_array_walk_reads` reads, so the index stood raw
+// inside it and the store was refused, ``teko: `[` needs an array: gl``.
+// Nested, to prove the whole subtree is rewritten and not just its root.
+void setfromglobal(H h) {
+    h.rate = gl[0] + gx[0];
+}
+
+// (23) the other two subtrees the SAME table parks, on the same deferred
+// receiver: the INDEX of `h.items[i]` (`pd_na`, which is a call's argument
+// COUNT in every other form and a node only in these two) and the arguments
+// of a NESTED member call inside the value (`pd_arg` of the inner row, which
+// this very road resolves). Each was refused, ``teko: `[` needs an array:
+// gl``, for a read the compiler knows how to build (Copilot on #698, pass 9).
+void setitem(H h) {
+    h.items[gl[1]] = 7;
+}
+
+void setcall(H h) {
+    h.rate = 1 + h.mul(gl[1]);
+}
+
+// the two INDIRECT calls, the shapes `tk_callp_ret` (teko_array.tk) leaves
+// with no cast at all: a VIRTUAL method reached through the vtable and an
+// INTERFACE method reached through the itab. `callp` names no callee, so the
+// core types the node `TY_I64` by itself and teko registered nothing for a
+// scalar return -- `f64 rate; this.rate = b.M();` reached the judge with no
+// type and the raw eight bytes of an integer landed in a float field. A float
+// RETURN never had the bug: its own declaring cast is what every oracle reads
+// it by, which is why `fromfloat` is here beside the other two.
+class Base {
+    public virtual i64 M() { return 3; }
+    public virtual f64 F() { return 2.5; }
+}
+
+class Derived : Base {
+    public override i64 M() { return 5; }
+    public override f64 F() { return 2.5; }
+}
+
+interface IM {
+    i64 M();
+}
+
+class Impl : IM {
+    public i64 M() { return 5; }
+}
+
+class V {
+    public f64 rate;
+
+    // the receiver is a PARAMETER, so the whole access waits for the pass
+    public void fromvirt(Base b) { this.rate = b.M(); }
+    public void fromiface(IM m) { this.rate = m.M(); }
+    public void fromfloat(Base b) { this.rate = b.F(); }
+}
+
+i64 vcallcheck() {
+    Derived d = new Derived();
+    Impl im = new Impl();
+    V v = new V();
+    v.fromvirt(d);
+    if (v.rate != 5.0) return 1;
+    v.fromiface(im);
+    if (v.rate != 5.0) return 2;
+    v.fromfloat(d);
+    if (v.rate != 2.5) return 3;
+    Base b = d;                       // a LOCAL: the receiver the PARSER types
+    IM mi = im;
+    v.rate = b.M();
+    if (v.rate != 5.0) return 4;
+    v.rate = mi.M();
+    if (v.rate != 5.0) return 5;
+    return 0;
+}
+
+// the sixth site: an ELEMENT of a `T[]` of heap (teko_heaparr.tk's
+// `tk_ha_store`), which called the row check ALONE -- before the pick, with
+// no scalar verdict of its own and no deferral of its own.
+i64 elemcheck() {
+    f64[] fs = new f64[2];
+    fs[0] = 1;                        // the widening a field gets
+    if (fs[0] != 1.0) return 1;
+    i64[] ns = new i64[2];
+    ns[0] = 2;
+    ns[0] += 100;                     // the compound, over a load nobody typed
+    if (ns[0] != 102) return 2;
+    i64?[] bs = new i64?[2];
+    bs[0] = 5;                        // Q1b's box, the element's own
+    if (!bs[0].HasValue) return 3;
+    if (bs[0].Value != 5) return 4;
+    i64 floor = rt_live();            // the three arrays above are live objects
+    {
+        Cell[] cs = new Cell[2];
+        cs[0] = rick(1, 2);           // the pick returns a ROW, not `i64`
+        if (cs[0].v != 7) return 5;
+    }
+    if (rt_live() != floor) return 6;
+    return 0;
+}
+
+i64 ctorcheck() {
+    H h = new H(5);
+    if (h.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 implcheck() {
+    I i = new I(5);
+    if (i.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 methodcheck() {
+    H h = new H(5);
+    h.bump();
+    if (h.rate != 6.0) return 1;
+    return 0;
+}
+
+i64 staticcheck() {
+    H.total = 3;
+    if (H.total != 3.0) return 1;
+    H.total = H.total + 2;
+    if (H.total != 5.0) return 2;
+    return 0;
+}
+
+i64 nlfieldcheck() {
+    H h = new H(0);
+    if (h.c.HasValue) return 1;       // the constructor's own `this.c = null;`
+    Cell cc = new Cell();
+    cc.v = 9;
+    h.take(cc);
+    if (!h.c.HasValue) return 2;
+    if (h.c.Value.v != 9) return 3;
+    return 0;
+}
+
+i64 enumcheck() {
+    H h = new H(0);
+    h.kind = Color.Green;
+    if (h.kind != Color.Green) return 1;
+    return 0;
+}
+
+i64 boxcheck() {
+    H h = new H(5);
+    if (!h.count.HasValue) return 1;
+    if (h.count.Value != 5) return 2;
+    return 0;
+}
+
+i64 binarycheck() {
+    H h = new H(0);
+    h.bumpby(4);
+    if (h.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 fieldtofieldcheck() {
+    I i = new I(0);
+    i.step = 5;
+    i.copy();
+    if (i.rate != 5.0) return 1;
+    return 0;
+}
+
+i64 fwdstaticcheck() {
+    W w = new W();
+    w.put(5);
+    if (H2.total != 5.0) return 1;
+    return 0;
+}
+
+i64 freefncheck() {
+    setstatic(7);
+    if (H2.total != 7.0) return 1;
+    H h = new H(0);
+    setinstance(h, 5);
+    if (h.rate != 5.0) return 2;
+    return 0;
+}
+
+i64 pendcheck() {
+    H h = new H(0);
+    setthrough(h, 5);
+    if (h.rate != 5.0) return 1;
+    if (!h.count.HasValue) return 2;
+    if (h.count.Value != 5) return 3;
+    return 0;
+}
+
+i64 pickcheck() {
+    H h = new H(0);
+    h.setpick();
+    if (h.rate != 5.0) return 1;
+    h.setqick();
+    if (h.rate != 2.5) return 2;
+    return 0;
+}
+
+i64 opcheck() {
+    GrandBase g = new GrandBase();
+    g.v = 4;
+    H h = new H(0);
+    h.addop(g);
+    if (h.sum != 5) return 1;
+    return 0;
+}
+
+// 15/15b and 16/16b: the two SHADOWED roads, in both directions. The store
+// the pass rewrites (`tk_this_assign`) reached the door with its value still
+// a bare NAME, and the door's pass-time fallback answered about the GLOBAL of
+// that name: `rate = step;` was typed `f64` by the global rather than `i64`
+// by the field, converted nothing, was not deferred -- measured, the store
+// did not land at all and the field kept what the constructor had left in it
+// -- and the mirror stores into `cnt` were REFUSED for a narrowing nobody
+// wrote. `k` is the same shadow one step over, on a PARAMETER: the pass scope
+// answers that one, so it is the guard that the global must never win there.
+i64 shadowcheck() {
+    I i = new I(5);
+    if (i.rate != 5.0) return 1;      // 15: parameter, shadowed by `f64 k`
+    i.step = 7;
+    i.copy();
+    if (i.rate != 7.0) return 2;      // 16: field, shadowed by `f64 step`
+    i.setcnt();
+    if (i.cnt != 7) return 3;         // 16b: the same name into an `i64` field
+    i.setfrom(9);
+    if (i.cnt != 9) return 4;         // 15b: the parameter into an `i64` field
+    if (k != 1.5) return 5;           // ...and the globals themselves untouched
+    if (step != 2.5) return 6;
+    return 0;
+}
+
+// 17: the picked signature returns a ROW. The row check read the FIRST
+// declaration's `i64` for it and refused the store; the judge reads the pick.
+i64 rowpickcheck() {
+    H h = new H(0);
+    h.setrow();
+    if (!h.rc.HasValue) return 1;
+    if (h.rc.Value.v != 7) return 2;
+    return 0;
+}
+
+// 18: the element of a global array, in a field store. The load is rewritten
+// by a PASS and lands in the tree through `node_assign`, which used to leave
+// its type behind -- the store was refused, `teko: the type of this value is
+// not known here`, for a value the compiler had just built and typed itself.
+i64 gloadcheck() {
+    gl = new i64[2];
+    gl[0] = 5;
+    gc = new Cell[2];
+    gc[0] = rick(1, 2);
+    gx[0] = 3;
+    H h = new H(0);
+    h.fromglobal();
+    if (h.rate != 5.0) return 1;      // the widening the store writes
+    h.fromfixed();
+    if (h.rate != 3.0) return 2;
+    h.fromrowglobal();
+    if (!h.c.HasValue) return 3;      // the row, through Q1b's own box
+    if (h.c.Value.v != 7) return 4;
+    return 0;
+}
+
+// 19: the two loads the PARSER itself resolves and used to tag nothing -- an
+// element of a LOCAL fixed array (`tk_arr_index_of`, teko_array.tk) and an
+// element of an INLINE array field (`tk_array_index`, teko_struct.tk). Both
+// are lowered to an address and a load right where they are read, so no pass
+// ever revisits them: the store was refused, `teko: the type of this value is
+// not known here`, for a value the parser had known all along. The scalar
+// element was the whole of it -- a ROW element was tagged and a row is what
+// the global fixed array above already reads.
+i64 localcheck() {
+    H h = new H(0);
+    h.fromlocal();
+    if (h.rate != 6.0) return 1;      // the widening the store writes
+    h.frominline();
+    if (h.rate != 4.0) return 2;
+    return 0;
+}
+
+// 20: the element of a FIXED array as a store TARGET, the road that never
+// entered the door: `gf[0] = 1;` wrote the integer's own eight bytes into a
+// float element (read back as 5e-324) and `gf[0] += 1;` summed a load nobody
+// had typed, global and local alike. A `T[]` of heap already passed through
+// it (helper 13), which is what makes the two roads read the same now.
+i64 fixedstorecheck() {
+    gf[0] = 1;                        // the widening the door writes
+    if (gf[0] != 1.0) return 1;
+    gf[0] += 1;                       // the compound, over its own typed load
+    if (gf[0] != 2.0) return 2;
+    f64 a[2];
+    a[0] = 1;                         // the same two, on a LOCAL fixed array
+    if (a[0] != 1.0) return 3;
+    a[0] += 1;
+    if (a[0] != 2.0) return 4;
+    i64 b[2];
+    b[0] = 7;                         // an element whose type ALREADY matched:
+    if (b[0] != 7) return 5;          // the door emits exactly what it emitted
+    return 0;
+}
+
+// 21: a global array element as the VALUE (and as the INDEX) of another
+// global's write. Both are subtrees the parser PARKED in the deferred-write
+// table, and the pass that rewrites an index walks the tree, which they are
+// not in -- so the index survived raw and the write was refused,
+// ``teko: `[` needs an array: gl``, on both kinds of global array.
+i64 copycheck() {
+    gdst = new i64[4];
+    gdst[0] = gl[0];                  // heap element into a heap element
+    if (gdst[0] != 5) return 1;
+    gx[1] = gx[0];                    // fixed element into a fixed element
+    if (gx[1] != 3) return 2;
+    gdst[gx[0]] = 9;                  // ...and the same read in the INDEX
+    if (gdst[3] != 9) return 3;
+    return 0;
+}
+
+// 22: the deferred receiver with a global element for a value (`setfromglobal`
+// above), the third subtree no walk reached.
+i64 pendglobalcheck() {
+    H h = new H(0);
+    setfromglobal(h);
+    if (h.rate != 8.0) return 1;
+    return 0;
+}
+
+// 23: the three OTHER subtrees a deferred access parks, each walked by the
+// one walk that rewrites a global array's reads -- the receiver's own index,
+// a nested member call's argument, and an index NESTED inside the receiver
+// itself (`gc[gl[1] - 1].v`, where the outer index was rewritten one node at
+// a time and the inner one under it was not). Nothing here allocates: the
+// `Cell` read back is the one `gloadcheck` above already put in `gc`.
+i64 parkedcheck() {
+    gl[1] = 1;
+    H h = new H(0);
+    setitem(h);                       // `h.items[gl[1]] = 7;`  -- pd_na
+    if (h.item1() != 7) return 1;
+    setcall(h);                       // `h.rate = 1 + h.mul(gl[1]);` -- pd_arg
+    if (h.rate != 3.0) return 2;      // of the INNER access, one row over
+    if (gc[gl[1] - 1].v != 7) return 3;   // a nested index in the RECEIVER
+    return 0;
+}
+
+// the forward static as a VALUE (24): `W3.tally` is an `i64` read into an
+// `f64` field, so the gate has to WIDEN it -- which it can only do over a
+// load that carries its type. Nothing here allocates beyond the one `FS`.
+i64 fwdloadcheck() {
+    W3.tally = 5;
+    FS v = new FS();
+    v.take();
+    if (v.rate != 5.0) return 1;
+    return 0;
+}
+
+// the implicit index on a `T[]` FIELD (25), with the file's own global `gl`
+// standing beside it under a different name: the store, the compound and the
+// load all reach the field, and the `X` this helper allocates -- the object
+// and its array -- is released before it returns, so the floor `rccheck`
+// reads below is unmoved.
+i64 mbindexcheck() {
+    i64 floor = rt_live();
+    i64 seen = 0;
+    {
+        X x = new X();
+        x.fill();
+        if (x.at0() != 9) return 1;
+        if (x.rate != 9.0) return 2;
+        if (x.gl0() != 7) return 5;   // 26: the `T[]` PROPERTY, read by its getter
+        if (x.gl[0] != 7) return 6;   // ...the same element, written out
+        if (gl[0] != 5) return 7;     // ...and the GLOBAL of that name, untouched
+        seen = rt_live();
+    }
+    if (seen != floor + 3) return 3;  // the object and the two arrays it holds
+    if (rt_live() != floor) return 4;
+    return 0;
+}
+
+// the global `T[]`s the helpers above fill are ROOTS: a global array is never
+// released (surface_array_global.tk's own header), so the floor this counter
+// returns to is those four objects -- the three arrays (`gl`, `gc`, `gdst`)
+// and the one `Cell` that `gc` holds. `gx` and `gf` are FIXED arrays, static
+// storage the counter never sees.
+i64 rccheck() {
+    if (rt_live() != 4) return 1;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = ctorcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = implcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = methodcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = staticcheck();
+    if (bad != 0) return 40 + bad;
+
+    bad = nlfieldcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = enumcheck();
+    if (bad != 0) return 60 + bad;
+
+    bad = binarycheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = fieldtofieldcheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = fwdstaticcheck();
+    if (bad != 0) return 90 + bad;
+
+    bad = freefncheck();
+    if (bad != 0) return 100 + bad;
+
+    bad = boxcheck();
+    if (bad != 0) return 110 + bad;
+
+    bad = pendcheck();
+    if (bad != 0) return 120 + bad;
+
+    bad = pickcheck();
+    if (bad != 0) return 130 + bad;
+
+    bad = opcheck();
+    if (bad != 0) return 140 + bad;
+
+    bad = shadowcheck();
+    if (bad != 0) return 150 + bad;
+
+    bad = rowpickcheck();
+    if (bad != 0) return 160 + bad;
+
+    bad = vcallcheck();
+    if (bad != 0) return 170 + bad;
+
+    bad = elemcheck();
+    if (bad != 0) return 180 + bad;
+
+    bad = gloadcheck();
+    if (bad != 0) return 190 + bad;
+
+    bad = localcheck();
+    if (bad != 0) return 200 + bad;
+
+    bad = fixedstorecheck();
+    if (bad != 0) return 210 + bad;
+
+    bad = copycheck();
+    if (bad != 0) return 220 + bad;
+
+    bad = pendglobalcheck();
+    if (bad != 0) return 230 + bad;
+
+    bad = parkedcheck();
+    if (bad != 0) return 240 + bad;
+
+    bad = fwdloadcheck();
+    if (bad != 0) return 243 + bad;
+
+    bad = mbindexcheck();
+    if (bad != 0) return 245 + bad;
+
+    bad = rccheck();
+    if (bad != 0) return 253 + bad;
+
+    return 42;
+}
