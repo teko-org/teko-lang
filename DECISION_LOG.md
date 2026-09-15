@@ -5229,7 +5229,12 @@ closed list of the runtime's own, positive) — because a `panic(s)` that printe
 header would be a silently wrong answer (D3); every other runtime function (`rt_own`,
 `rc_inc`, `tk_cap_own`, the plumbing that takes any counted reference) receives the
 object. `puts(s)` is unaffected (the core declares it, not `lib/rt.tk`).
-`docs/reference/not-yet.md` § string carries the row. Fixture: `tests/surface_string_capture.tk` (`42`) — a
+`docs/reference/not-yet.md` § string carries the row. The operand slot got the other
+half of its pair on the review's seventh thread: a `string` VALUE against an operator row
+declared `str`/`ptr`/`uptr` matches from round 1 (`tk_str_borrows` in `tk_op_slot_fits`,
+distance 1 in `tk_op_slot_dist`, so an exact `(Tag, string)` row still wins) and borrows
+its text in `tk_ops_binary` beside the literal's interning — `t + s` with `s: string` and
+only `operator+(Tag, str)` declared answers 42 (`tests/surface_string_op_str.tk`). Fixture: `tests/surface_string_capture.tk` (`42`) — a
 `string` captured by value, an interned literal captured, two captures in one closure, a
 closure returned from a block and called after it closed, `rt_live()` back to its baseline
 once the work returns. By REFERENCE is not a road at all: `use (&s)` on a counted type is

@@ -425,6 +425,11 @@ i64 tk_op_slot_fits(i64 pt, i64 t, i64 x, i64 round) {
         return tk_str_lit_fits(pt, x);
     }
     if (pt == t) return 1;
+    // N7b, the other direction of the pair (review thread 7): a `string`
+    // VALUE against a row declared `str`/`ptr`/`uptr` borrows its text --
+    // the operand slot is one the program declares, D88 -- a conversion, so
+    // never in round 0, where an exact `(Tag, string)` row still wins.
+    if (round >= 1 && tk_str_borrows(pt, t)) return 1;
     if (round < 2) return 0;
     return tk_op_in_chain(tk_op_row(pt), tk_op_row(t));
 }
@@ -493,6 +498,7 @@ i64 tk_op_slot_dist(i64 pt, i64 t, i64 x) {
     // conversion, to `string` -- but it is one hop from its own exact `str`,
     // so a row taking `str` beats a row taking `string` here too.
     if (nd_kind(x) == N_STR) return 1;
+    if (tk_str_borrows(pt, t)) return 1;     // a `string` value one hop from `str`
     return tk_op_chain_dist(tk_op_row(pt), tk_op_row(t));
 }
 
@@ -863,6 +869,10 @@ void tk_ops_binary(i64 n) {
     // declares a `string`.
     a = tk_str_intern(op_t0_at(r), ta, a);
     b = tk_str_intern(op_t1_at(r), tb, b);
+    // ...and a `string` VALUE that matched a `str` row by `tk_str_borrows`
+    // borrows its text here, the same `ld64` of `data` every other slot gets.
+    a = tk_str_borrow(op_t0_at(r), ta, a);
+    b = tk_str_borrow(op_t1_at(r), tb, b);
     tk_ops_emit(n, r, list_append(a, b), line, fl);
 }
 
