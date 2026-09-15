@@ -452,7 +452,7 @@ runtime.md, and the conversion table in types.md.
   answering (C# declares that operator too, and declares none on `DateTime`/`Guid`);
 - the four casts are a **table** (`tk_prim_cast_op`, `teko_prim.tk`) and not a branch on
   `decimal`, so a target the table does not name keeps C3's own
-  `teko: a decimal does not cast yet` — which is what `(str) d` still earns;
+  `teko: a decimal does not cast yet` — the wording `(str) d` earned until C5 filled the read and build clauses; since D79 it reads `` teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it ``;
 - a `decimal` **global takes no initializer** (§ 9's row, one line lower than the design
   put it): `decimal g = 3.25m;` dies in mc's own `parse_global`, which demands an `N_INT`,
   and `decimal g = 5;` — the one spelling that gets past it — is refused by name. A global
