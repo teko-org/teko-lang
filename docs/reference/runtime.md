@@ -1,12 +1,13 @@
 # The runtime
 
-Seven library files, all of them **program** code compiled under the same taught vocabulary
+Eight library files, all of them **program** code compiled under the same taught vocabulary
 as the program that includes them: `lib/rt.tk`, the runtime every program links against,
 [`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` and `DateTime` member
 and operator lowers to, the three files of the sixteen-byte types —
 [`lib/decimal.tk`, `lib/guid.tk` and `lib/wide.tk`](#the-wide-libraries) — the limb vector
-they compute over ([`lib/limbs.tk`](#the-limb-library)), and `lib/math.tk`, C#'s `Math`
-over a `decimal`, which is an ordinary class and no mechanism at all.
+they compute over ([`lib/limbs.tk`](#the-limb-library)), `lib/math.tk`, C#'s `Math`
+over a `decimal`, which is an ordinary class and no mechanism at all, and
+[`lib/string.tk`](#the-string-library), `string`'s own class and no mechanism either.
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
 the compiler injects, the guards behind an index and an interface call, and a handful of
@@ -490,6 +491,25 @@ to one of them.
 | `str tk_guid_tostring(Guid g)`, `str tk_guid_tostring_fmt(Guid g, str f)` | 36 characters of the `"D"` form, or `"N"`'s 32; the buffer is `rt_alloc`'d and the caller keeps it, exactly as `tk_enum_digits` hands one back |
 | `i64 tk_guid_fmt(ptr buf, Guid g, i64 dash)` | the allocation-free half, returning the length. `buf` needs 37 bytes with `dash`, 33 without |
 | `i64 tk_guid_cmp(Guid a, Guid b)` and `tk_guid_eq`…`tk_guid_ge` | the sixteen bytes, UNSIGNED, left to right, stopping at the first difference |
+
+---
+
+## The string library
+
+`lib/string.tk` carries [`string`](types.md#string)'s own class: the constructor, the
+destructor, every member and every operator N7a lands, plus two byte-level helpers kept
+here rather than in `lib/rt.tk` — a line added there would move the `--dump-ast` include
+chain of every fixture in the tree, and this file's own gate is that chain staying
+byte-identical. Needs `rt.tk` for `rt_alloc`, `rt_free` and `tk_str_eq`.
+
+| | |
+|---|---|
+| `void tk_string_copy(uptr dst, uptr src, i64 n)` | `n` bytes, no overlap assumed |
+| `i64 tk_string_utf8count(uptr buf, i64 nbytes)` | the number of UTF-8 LEAD bytes in `nbytes` bytes — a one-pass substitute for a full decode, which is what `.Length` needs at construction |
+
+Every member and every operator of `string` is an ordinary method or a `public static`
+member of the class itself, `new string(raw)` included — there is no lowering table here
+the way `TimeSpan`/`DateTime`/`decimal`/`Guid` each own one: a class needs none.
 
 ---
 

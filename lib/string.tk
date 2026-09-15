@@ -1,0 +1,227 @@
+// string.tk -- `string`, N7a of docs/specs/string.md (§ 1-3, § 7-8): an
+// ORDINARY counted teko class, not a `type_new` primitive (§ 1's own
+// argument: a primitive has no row in `teko_struct.tk`'s type table, so
+// `tk_is_counted` answers 0 for it and the reclaim never fires). Program
+// code, not compiler code: `#include "string.tk"` from the `.tk` source
+// itself, exactly as `rt.tk`, `time.tk`, `decimal.tk` and `guid.tk` are
+// included (docs/reference/runtime.md). Needs `rt.tk` for `rt_alloc`,
+// `rt_free` and `tk_str_eq`; `#include "rt.tk"` ahead of this file.
+//
+// N7a's own half of N7 (the dispatcher's split on the D81->D83/D84/D85
+// precedent): the class, its constructor and destructor, its members and its
+// operators, constructed ONLY through `new string(raw)` from a `str` (rule
+// 4). N7b owes the rest of § 2-4: literal interning, the two implicit
+// conversions in the nine slots D33 enumerates, and the
+// `#include "string.tk"` named refusal -- none of those three is here, and a
+// program that writes `string s = "hi";` (a literal, with no explicit `new`)
+// is refused the ordinary way a `str` fails to fit a class slot, until N7b
+// lands the conversion.
+//
+//     +0   vtable pointer       (word 0, every class)
+//     +8   reference count      (word 1, every class)
+//     +16  nbytes  (i64)        the UTF-8 length, no NUL
+//     +24  nchars  (i64)        the code-point count
+//     +32  data    (uptr)       nbytes bytes, then a NUL
+//     +40  owned   (i64)        1 when the destructor frees `data`
+//                                                             STRING_SIZE = 48
+//
+// The bytes live in a SECOND allocation rather than a tail of the object (a
+// teko class has a fixed size; a variable tail needs an allocator `new` does
+// not have), `nchars` is stored rather than walked (`.Length` in a loop
+// condition must not be quadratic), and `data` stays NUL-terminated so a
+// `string` reaches `puts`/`write`/every `extern` with a field load, not a
+// copy (§ 1).
+//
+// The methods are NOT virtual (C#'s own sealed `string`, and § 4's own
+// reason: an interned literal's word 0 is never read) -- this file writes
+// none of them `virtual`, which is teko's default.
+//
+// `==`/`!=` are BY VALUE (a byte compare of the two `data` fields), never by
+// identity: two independently built strings holding the same bytes compare
+// equal. `a == null` and `null == a` do not reach either operator at all --
+// `tk_nl_binary_check`/the plain non-nullable path (teko_ops.tk) leave a
+// comparison against the `null` literal to the CORE's own raw-pointer
+// compare against zero, on any reference-shaped operand, nullable slot or
+// not (D43 rule 2's comparison exemption). That supersedes this page's own
+// § 8 sentence ("the same operator; null lands on a row parameter, D32"),
+// written before D43 landed on 2026-09-08: D43 is newer and this entry says
+// so rather than silently disagreeing with the page it implements.
+//
+// NONE OF THIS FILE NAMES A PARAMETER `p`. `teko_class.tk`'s own `tk_new_fn`
+// -- the allocator every `new ClassName(...)` lowers through -- declares a
+// LOCAL literally named `p` (the fresh block `rt_alloc` just answered) in
+// the very scope that clones the constructor's own parameter list to build
+// the call; a constructor parameter also spelled `p` is silently shadowed by
+// that local, so the argument the caller wrote is lost and the constructor
+// reads the allocation's own address instead. Measured (`Cell(i64 p){v=p;}`
+// against `Cell(i64 x){v=x;}`, the second the only one landing `7`), general
+// to every class and not to this one, and not this crumb's compiler code to
+// fix -- reported as an adjacent finding and routed around here by naming.
+
+// ---- two byte-level helpers, kept here rather than in `lib/rt.tk` (the
+// scout's own finding: a line added to `rt.tk` moves the `--dump-ast`
+// include chain of every fixture in the tree, and this crumb's gate is that
+// chain staying byte-identical) ----
+
+// `n` bytes copied from `src` to `dst`, no overlap assumed -- the two ever
+// built here are freshly allocated, so this is never asked to shift a
+// buffer over itself
+void tk_string_copy(uptr dst, uptr src, i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        st8(dst + i, ld8(src + i));
+        i = i + 1;
+    }
+}
+
+// the number of UTF-8 lead bytes in `nbytes` bytes at `buf` -- a byte whose
+// top two bits are not `10` starts a code point, so counting them is a
+// one-pass substitute for a full decode (§ 6's own O(1)-at-construction
+// argument)
+i64 tk_string_utf8count(uptr buf, i64 nbytes) {
+    i64 n = 0;
+    i64 i = 0;
+    loop {
+        if (i >= nbytes) break;
+        if ((ld8(buf + i) & 192) != 128) n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+public class string {
+    private i64  nbytes;
+    private i64  nchars;
+    private uptr data;
+    private i64  owned;
+
+    // rule 4: the one constructor N7a teaches, `new string(raw)` -- measures
+    // `raw` with `tk_str_len` and COPIES it, so the source `str` may be
+    // mutated or released afterwards with no effect on this object
+    // the no-argument form: `new string()` is the EMPTY string, never a
+    // zeroed object. teko's allocator hands out a zeroed object for any
+    // class that declares no parameterless constructor (`tk_allocators`,
+    // teko_class.tk), and every member here dereferences `data` -- so the
+    // class declares one and makes it `Empty`. C# has no `new string()`
+    // at all; teko cannot refuse the form per class today (D86), so the
+    // safe value is the answer, not a null pointer.
+    public string() {
+        nbytes = 0;
+        data = rt_alloc(1);
+        st8(data, 0);
+        nchars = 0;
+        owned = 1;
+    }
+
+    public string(str raw) {
+        nbytes = tk_str_len(raw);
+        data = rt_alloc(nbytes + 1);
+        tk_string_copy(data, raw, nbytes);
+        st8(data + nbytes, 0);
+        nchars = tk_string_utf8count(data, nbytes);
+        owned = 1;
+    }
+
+    ~string() {
+        if (owned) rt_free(data, nbytes + 1);
+    }
+
+    // § 6: the number of CODE POINTS, O(1), stored -- teko's `char` is a
+    // scalar code point and not a UTF-16 unit, so this is C#'s `Length`
+    // MEANING kept and its UNITS stated (both numbers exposed, both O(1))
+    public i64 Length { get => nchars; }
+
+    // not a C# member: the byte count every `extern` wants, which would
+    // otherwise be a walk (§ 6)
+    public i64 Utf8Length { get => nbytes; }
+
+    // § 7: identity in C#'s sense -- the same bytes, no work done to answer
+    // it. `return this;` is not written here: a bare `this` used as a VALUE
+    // (as opposed to the receiver of `this.field`) types as `uptr`, not as
+    // the enclosing class (`teko_class.tk`'s `this` parameter is declared
+    // `param_new(TY_UPTR, ...)`, and no bare-`this` expression node is ever
+    // re-typed against it -- measured, not this crumb's to fix, and reported
+    // as an adjacent finding). A fresh copy of the same bytes answers the
+    // same observable contract with no compiler change.
+    public string ToString() { return new string(data); }
+
+    // by value: the same bytes, NUL for NUL, `tk_str_eq` (`lib/rt.tk`)
+    // unchanged and reused
+    public i64 Equals(string other) {
+        return tk_str_eq(data, other.data);
+    }
+
+    // ordinal over UTF-8 BYTES (unsigned): the first byte that differs
+    // decides, and a common prefix loses to the shorter string. That is
+    // code-point order, which is C#'s `String.CompareOrdinal` order except
+    // where a non-BMP code point meets one in U+E000..U+FFFF (UTF-16 sorts
+    // the surrogate first) -- docs/specs/string.md § 6, D86.
+    public i64 CompareTo(string other) {
+        i64 n = nbytes;
+        if (other.nbytes < n) n = other.nbytes;
+        i64 i = 0;
+        loop {
+            if (i >= n) break;
+            i64 ca = ld8(data + i);
+            i64 cb = ld8(other.data + i);
+            if (ca != cb) return ca - cb;
+            i = i + 1;
+        }
+        return nbytes - other.nbytes;
+    }
+
+    // djb2 over the bytes -- no C# guarantee to match, only the one this
+    // class itself promises: equal values hash equal
+    public i64 GetHashCode() {
+        i64 h = 5381;
+        i64 i = 0;
+        loop {
+            if (i >= nbytes) break;
+            h = h * 33 + ld8(data + i);
+            i = i + 1;
+        }
+        return h;
+    }
+
+    // concatenation, § 8: a scratch buffer built and freed around the one
+    // constructor this class has, so the result is an ordinary owned
+    // `string` and no second construction road is opened
+    public static string operator+(string a, string b) {
+        i64 total = a.nbytes + b.nbytes;
+        uptr buf = rt_alloc(total + 1);
+        tk_string_copy(buf, a.data, a.nbytes);
+        tk_string_copy(buf + a.nbytes, b.data, b.nbytes);
+        st8(buf + total, 0);
+        string r = new string(buf);
+        rt_free(buf, total + 1);
+        return r;
+    }
+
+    // by value, § 8; `a == null` and `null == a` never reach this row (see
+    // the header note on D43)
+    public static i64 operator==(string a, string b) {
+        return tk_str_eq(a.data, b.data);
+    }
+
+    public static i64 operator!=(string a, string b) {
+        return !(a == b);
+    }
+
+    // C#'s three statics this crumb owes (§ 7); `Join` and the method half
+    // of the surface are N8's
+    public static string Empty { get { return new string(""); } }
+
+    public static string Concat(string a, string b) {
+        return a + b;
+    }
+
+    // D43 widens the parameter to `string?`: C#'s own `IsNullOrEmpty` takes
+    // a possibly-null string, and a non-nullable `string` parameter here
+    // would refuse the call `null` itself needs to reach
+    public static i64 IsNullOrEmpty(string? s) {
+        if (s == null) return 1;
+        if (s.Value.Utf8Length == 0) return 1;
+        return 0;
+    }
+}

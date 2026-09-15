@@ -88,7 +88,7 @@ overloads grow beside them. Nothing is renamed and nothing is removed.
 | `string` | `str`, `ptr`, `uptr` | **implicit**, one `ld64` of the `data` field | rule 3 |
 | `str`, `ptr`, `uptr` (not a literal) | `string` | **explicit**: `new string(p)`, which copies | rule 4 |
 | `string` | `string` | identity | |
-| `null` | `string` | **implicit** — a `string` is a reference and C# strings are nullable | D32 |
+| `null` | `string?` | **implicit** into the nullable slot only — `string s = null;` is refused, D43 supersedes D32's "C# strings are nullable" reading | D43 |
 | `string` | any number | refused: `teko: a value of type string does not convert to i64` | D34, already |
 | any number | `string` | refused: `teko: a value of type i64 does not convert to string` | D34, already |
 | `char` | `string` | `new string(c)` and `new string(c, i64 count)` | C#'s two constructors |
@@ -172,7 +172,7 @@ i64 main() {
     string d = new string("raw");                // an explicit copy of a `str`
     if (d != "raw") return 9;
 
-    string e = null;                             // a string is a reference
+    string? e = null;                            // D43: null lands only in a T? slot
     if (e != null) return 10;
 
     if (greet("world").Length != 12) return 11;
@@ -207,7 +207,7 @@ i64 main() {
 | `string + i64` and every other mixed `+` | ``teko: no operator `+` takes these operands`` (§ 8) |
 | `s[i] = c` | `teko: a string is immutable` |
 | `$"…"` | `teko: string interpolation is not taught yet` — **and the lexer gets there first today**, § 9 |
-| `s.Lenght` | `teko: string has no member Lenght` — the wording a class member already gets |
+| `s.Lenght` | `teko: unknown member of string: Lenght` — the wording a class member already gets (measured) |
 | `string` used without the include | ``teko: `string` needs #include "string.tk"`` |
 
 ## 6. `Length`, and what an index means
@@ -228,10 +228,20 @@ and it would otherwise be a walk. `s[i]` on an index outside `0 .. Length - 1` p
 carries ([arrays.md](../reference/arrays.md)).
 
 `s[i]` is the one construct on this page that needs a lowering **outside** the class
-mechanism: `[` is `teko_array.tk`'s `tk_bracket`, and it refuses a receiver that is not an
-array today (``teko: `[` needs an array``). It gains one row: a receiver typed `string`
+mechanism: `[` is `teko_params.tk`'s `tk_bracket` (registered `teko.tk:441`; not
+`teko_array.tk` — corrected here, measured on the tree by N7a's own scout), and it refuses
+a receiver that is not an array today (``teko: `[` needs an array``). It gains one row: a
+receiver typed `string`
 lowers to `tk_string_at(s, i)`. That is a targeted addition and **not** a general indexer —
 `this[i]` on a user class stays untaught, and stays a `not-yet.md` row.
+
+**Ordering (D86, the review's question).** `.CompareTo` is ordinal over the UTF-8 BYTES,
+unsigned: the first byte that differs decides, a common prefix loses to the shorter string.
+That is code-point order. C#'s `String.CompareOrdinal` orders UTF-16 code units, which agrees
+everywhere except where a code point above U+FFFF meets one in U+E000..U+FFFF: UTF-16 puts the
+surrogate pair (`D800`..`DBFF`) first, UTF-8 puts the four-byte sequence (`F0`..) last.
+teko keeps code-point order — the same reason § 6 keeps code points for `.Length` — and
+states the divergence rather than emulating a surrogate sort.
 
 ## 7. The API
 
@@ -239,9 +249,9 @@ Split across two crumbs; § 12 says which is which.
 
 | static | instance — N7 | instance — N8 |
 |---|---|---|
-| `string.Empty` | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
+| `string.Empty`, `new string()` (the same value) | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
 | `string.Concat(string, string)` | `.ToString()` — identity | `.IndexOf(string)`, `.IndexOf(char)`, `.LastIndexOf(string)` |
-| `string.IsNullOrEmpty(string)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
+| `string.IsNullOrEmpty(string?)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
 | `string.Join(string, string[])` | `.GetHashCode()` | `.Trim()`, `.TrimStart()`, `.TrimEnd()` |
 | | | `.ToUpper()`, `.ToLower()` — **ASCII only**, § 10 |
 | | | `.Replace(string, string)`, `.Split(char)` → `string[]` |
@@ -257,7 +267,7 @@ describes and the reclaim already releases.
 |---|---|---|
 | `a + b`, both `string` | `public static string operator+(string a, string b)` on the class | a new `string`, owned |
 | `a == b`, `a != b` | `public static i64 operator==(string a, string b)` and its mandatory pair (D8) | `i64` 0/1, **by value** |
-| `a == null`, `null == a` | the same operator; `null` lands on a row parameter (D32) and the body answers on the pointer | `i64` 0/1 |
+| `a == null`, `null == a` | **not** the operator above (D43, which post-dates this row's own D32): a comparison against the `null` literal is the CORE's own raw-pointer check against zero, on any reference-shaped operand — `operator==` is never even a candidate, so `string` needs no clause for it | `i64` 0/1 |
 | `a < b` and the other three | not declared, so not taught: `.CompareTo` is the form | — |
 | `string + i64`, `string + f64`, `string + Foo` | refused | — |
 
@@ -356,7 +366,7 @@ spelling from this page's first day.
 | `teko_typeof.tk` | `tk_str_intern` and `tk_str_borrow` beside `tk_num_widen`, and the two calls in the slots it owns |
 | `teko_rc.tk` | the same two helpers called at the six slots it owns (initializer, assignment, `return`, and the three call-argument kinds) |
 | `teko_iface.tk`, `teko_expr.tk`, `teko_params.tk` | one call each, at the slot each already owns for `tk_num_widen` |
-| `teko_array.tk` | one row in `tk_bracket`: a `string` receiver lowers to `tk_string_at` (§ 6) |
+| `teko_params.tk` | one row in `tk_bracket`: a `string` receiver lowers to `tk_string_at` (§ 6; not `teko_array.tk` — corrected here) |
 | `teko_ops.tk` | **nothing**: `operator+` and `operator==` on a class are D8's road |
 | `teko_class.tk`, `teko_prop.tk` | **nothing**: `string` is an ordinary class with ordinary methods and properties |
 | `lib/string.tk` (new) | the class, its methods, `tk_string_at`, `tk_str_from_i64`: about 600 lines of ordinary teko, `#include "rt.tk"` |
@@ -384,50 +394,110 @@ That is the strongest argument for the class over the primitive, after the recla
 
 ## 14. Fixtures
 
-| fixture | asserts | `expect-exit` |
-|---|---|---|
-| `tests/surface_string_value.tk` | a literal in every one of the nine slots; `==` and `!=` by value against a second literal with the same bytes and a different one; `.Length` and `.Utf8Length` on ASCII and on a multi-byte string; `string.Empty`; `null` in and out | `42` |
-| `tests/surface_string_intern.tk` | `rt_live()` and `rt_used()` do **not** move across a hundred uses of the same literal; two occurrences of `"hi"` are the same address; a literal survives being assigned and released in a loop | `42` |
-| `tests/surface_string_interop.tk` | a `string` passed to `puts`, to `panic`-shaped `str` parameters, to `tk_str_len` and to an `extern`; `new string(p)` from a raw `str`, proving it copies by mutating the source afterwards | `42` |
-| `tests/surface_string_concat.tk` | `+` on two literals, on two heap strings and on a mix; the result's `Length`; `rt_live()` returning to its starting value once the temporaries sweep | `42` |
-| `tests/surface_string_index.tk` | `s[i]` on ASCII and on a multi-byte string; `s[Length - 1]` | `42` |
-| `tests/surface_string_index_oob.tk` | `s[Length]` | `70` |
-| `tests/surface_string_methods.tk` | `Substring`, `IndexOf`, `LastIndexOf`, `Contains`, `StartsWith`, `EndsWith`, `Trim`, `Replace`, `PadLeft`, `ToUpper`, `Split(…).Length` and the elements it produced | `42` |
-| `tests/surface_string_rc.tk` | a `string` field of a class released with the object; a `string[]` released element by element; `rt_live()` back to zero at the end | `42` |
+| fixture | asserts | `expect-exit` | crumb |
+|---|---|---|---|
+| `tests/surface_string_interop.tk` | `new string(raw)` from a `str`, proving it copies by mutating the source afterwards; `.ToString()`; `.Length`/`.Utf8Length` on ASCII and on a multi-byte string; `string.Empty`; `IsNullOrEmpty` over a `string` and a `string?` | `42` | N7a, landed |
+| `tests/surface_string_concat.tk` | `+` on heap strings, chained three deep, `string.Concat`; `Equals`/`CompareTo`/`==`/`!=`, the prefix case and the empty string | `42` | N7a, landed |
+| `tests/surface_string_rc.tk` | `rt_live()` back to its floor after a block's own strings drop, churned in a loop; a `string` held in a class FIELD surviving the block that built it; `GetHashCode` equal for equal values | `42` | N7a, landed |
+| `tests/surface_string_value.tk` | a literal in every one of the nine slots; `==` and `!=` by value against a second literal with the same bytes and a different one; `null` in and out of a `string?` slot | `42` | N7b |
+| `tests/surface_string_intern.tk` | `rt_live()` and `rt_used()` do **not** move across a hundred uses of the same literal; two occurrences of `"hi"` are the same address; a literal survives being assigned and released in a loop | `42` | N7b |
+| `tests/surface_string_index.tk` | `s[i]` on ASCII and on a multi-byte string; `s[Length - 1]` | `42` | N8 |
+| `tests/surface_string_index_oob.tk` | `s[Length]` | `70` | N8 |
+| `tests/surface_string_methods.tk` | `Substring`, `IndexOf`, `LastIndexOf`, `Contains`, `StartsWith`, `EndsWith`, `Trim`, `Replace`, `PadLeft`, `ToUpper`, `Split(…).Length` and the elements it produced | `42` | N8 |
+
+D52's own harness, the six refuse fixtures N7a's class already makes reachable — every one
+the GENERIC row a class already answers with, no new code:
+
+| fixture | `expect-refuse` |
+|---|---|
+| `tests/refuse/string_to_numeric.tk` | `teko: a value of type string does not convert to i64` (D34) |
+| `tests/refuse/numeric_to_string.tk` | `teko: a value of type i64 does not convert to string` (D34) |
+| `tests/refuse/string_str_implicit.tk` | `teko: a value of type uptr does not convert to string` — a `str`, literal or not, until N7b's conversion lands |
+| `tests/refuse/string_plus_mismatched.tk` | ``teko: no operator `+` takes these operands`` |
+| `tests/refuse/string_unknown_member.tk` | `teko: unknown member of string: Lenght` — the mechanism's own wording, not this page's `` string has no member Lenght `` prose |
+| `tests/refuse/string_null_nonnullable.tk` | `teko: null needs a slot declared string?` (D43, superseding this page's own `string e = null;` sample under D32) |
+
+The named `` `string` needs #include "string.tk" `` refusal (§ 5's own table) is **not**
+reachable yet: N7a teaches no such check, so `string` with no include is a plain parse
+error today — N7b's own fixture, once `teko_string.tk` exists to raise it.
 
 ## 15. The crumbs
 
-### N7 — the value (L)
+N7 splits into two, on the D81→D83/D84/D85 precedent (`i128`/`u128` landed the same way, one
+crumb for the type and one for the rest): N7a is the class and its members, self-contained
+and provable with no other half of this page built yet; N7b is everything that reaches INTO
+the class from outside it — a literal, an implicit conversion, the include check.
 
-`lib/string.tk`'s class with `nbytes`/`nchars`/`data`/`owned`, the constructor and
-destructor, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/`.CompareTo`, `operator+` and
-`operator==`/`!=`, `string.Empty`/`Concat`/`IsNullOrEmpty`; the literal interning; the two
-implicit conversions in all nine slots; the include check. **Depends on nothing** — not on
-`docs/specs/decimal.md`, not on `docs/specs/datetime.md`, not on `enum`. It is placed late
-because it is expensive, not because anything gates it, and it can be pulled forward at any
-time.
+### N7a — the class and its members (L) — **landed, D86**
 
-**Gate:** `surface_string_value.tk`, `_intern.tk`, `_interop.tk`, `_concat.tk` and `_rc.tk`
-at `42`; every existing fixture at its `expect-exit` with `--dump-ast` **byte-identical** —
-that is the proof rule 2 held and no existing literal moved; `FIXPOINT OK`; `mc limits`
-verdict `ok` with `passes`, `intrin` and `alias` **not moved**;
-`sh scripts/check-docs.sh` green. **Owes:** a `string` section in
-[types.md](../reference/types.md) stating the `str`/`string` pair, the borrowed-pointer
-lifetime rule in [memory.md](../reference/memory.md), the refusals in
-[diagnostics.md](../reference/diagnostics.md), `lib/string.tk` in
-[runtime.md](../reference/runtime.md), the new module in
-[modules.md](../internals/modules.md), the module count in
-[`CLAUDE.md`](../../CLAUDE.md) and [docs/README.md](../README.md), and a section in
-[guide/10-values-and-types.md](../guide/10-values-and-types.md).
+`lib/string.tk`'s class with `nbytes`/`nchars`/`data`/`owned`, the constructor (`new
+string(raw)` from a `str`, rule 4 — the road N7a builds an instance with — and `string()`,
+the no-argument form, which is the EMPTY string rather than the zeroed object teko's
+allocator would otherwise hand out, D86) and destructor, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/`.CompareTo`/`.GetHashCode()`,
+`operator+` and `operator==`/`!=`, `string.Empty`/`Concat`/`IsNullOrEmpty`. **Depends on
+nothing** — not on `docs/specs/decimal.md`, not on `docs/specs/datetime.md`, not on `enum`.
+
+**What N7a does NOT build**, left to N7b: the literal interning of § 4, the two implicit
+conversions of § 3 in D33's nine slots, and the `` `string` needs #include "string.tk" ``
+named refusal — until N7b lands, `string s = "hi";` (a literal, no explicit `new`) is
+refused the ordinary way any `str` fails to fit a class slot, and `string` used with no
+`#include "string.tk"` is a plain parse error rather than the named message this page
+designs (`docs/reference/not-yet.md` § `string` carries both, measured).
+
+**Gate, measured:** `surface_string_interop.tk`, `_concat.tk` and `_rc.tk` at `42`, plus six
+`tests/refuse/` fixtures for every refusal reachable through the class alone
+(`string_to_numeric.tk`, `numeric_to_string.tk`, `string_str_implicit.tk`,
+`string_plus_mismatched.tk`, `string_unknown_member.tk`, `string_null_nonnullable.tk`) —
+every one of them the GENERIC row a class already answers with, no new code; every base
+fixture at its `expect-exit` with `--dump-ast --include=lib --include=tests`
+**byte-identical**, since no base fixture includes `lib/string.tk`; `FIXPOINT OK`; `mc
+limits` verdict `ok` with `passes`, `syntax`, `alias`, `types`, `intrin` and `on_stmt` **not
+moved** — `lib/string.tk` is program code, outside `[compiler].modules`, so the compiler's
+own build never parses it; `sh scripts/check-docs.sh` green. **Owed and landed:** a
+`string` section in [types.md](../reference/types.md), a NEW `string` section in
+[not-yet.md](../reference/not-yet.md) naming N7b's and N8's own gaps, `lib/string.tk` in
+[runtime.md](../reference/runtime.md), the module count in [`CLAUDE.md`](../../CLAUDE.md),
+this page's own N7a/N7b split and its three `teko_array.tk` → `teko_params.tk`
+corrections, and `DECISION_LOG.md` D86. **Not landed, out of N7a's own scope:** the
+borrowed-pointer lifetime rule in [memory.md](../reference/memory.md) (N7b's, once the
+`string` → `str` conversion exists to make a borrowed pointer reachable at all) and
+[guide/10-values-and-types.md](../guide/10-values-and-types.md) (a guide page reads best
+once N7b's literal makes `string s = "hi";` legal, rather than teaching `new string(raw)`
+first and rewriting the page a crumb later).
+
+**Two adjacent findings, neither this crumb's compiler code to fix, both routed around in
+`lib/string.tk` by naming rather than worked around:** `teko_class.tk`'s `tk_new_fn` (the
+allocator wrapper every `new ClassName(...)` lowers through) declares a local literally
+named `p` in the same scope that clones the constructor's own parameter list to build the
+call, so a constructor parameter ALSO spelled `p` is silently shadowed and the caller's
+argument is lost — general to every class, not to `string`, measured with `Cell(i64 p){v=p;}`
+against `Cell(i64 x){v=x;}`. And a bare `this` used as a VALUE (not as `this.field`'s
+receiver) types as `uptr` rather than as the enclosing class — `teko_class.tk`'s own `this`
+parameter is declared `param_new(TY_UPTR, ...)` and no bare-`this` node is ever re-typed
+against it — so `.ToString()` returns a fresh copy of the same bytes rather than `this`.
+
+### N7b — the literal, the conversions, the `#include` check (L)
+
+`teko_string.tk` (new module): the literal interning of § 4 (an `N_STR` in a `string` slot
+becomes an `N_IDENT` naming a module-private, gensym'd global), the two implicit
+conversions of § 3 in the nine slots `tk_num_widen`'s own siblings reach, and the named
+`#include` refusal. Depends on N7a.
+
+**Gate:** `surface_string_value.tk` and `_intern.tk` at `42`; every N7a fixture unmoved;
+`--dump-ast` byte-identical on every fixture that names no `string`; `FIXPOINT OK`; `mc
+limits` verdict `ok` with `passes` **+1** (one module) and `intrin`/`alias` not moved (the
+conversions ride the nine slots that exist). **Owes:** the borrowed-pointer lifetime rule
+in [memory.md](../reference/memory.md), [guide/10-values-and-types.md](../guide/10-values-and-types.md),
+and `not-yet.md`'s N7b rows deleted once they are true.
 
 ### N8 — the methods, and the index (L)
 
-`s[i]` in `tk_bracket` with its guard; `Substring`, `IndexOf`, `LastIndexOf`, `Contains`,
-`StartsWith`, `EndsWith`, `Trim*`, `Replace`, `Pad*`, `ToUpper`/`ToLower`, `Split`, `Join`.
-Depends on N7 and on nothing else.
+`s[i]` in `tk_bracket` (`teko_params.tk`) with its guard; `Substring`, `IndexOf`,
+`LastIndexOf`, `Contains`, `StartsWith`, `EndsWith`, `Trim*`, `Replace`, `Pad*`,
+`ToUpper`/`ToLower`, `Split`, `Join`. Depends on N7a and N7b.
 
 **Gate:** `surface_string_index.tk` and `_methods.tk` at `42`, `_index_oob.tk` at `70`;
-everything N7 gated on. **Owes:** runtime.md, the index guard in
+everything N7a/N7b gated on. **Owes:** runtime.md, the index guard in
 [arrays.md](../reference/arrays.md), and the `this[i]` row in
 [not-yet.md](../reference/not-yet.md).
 
