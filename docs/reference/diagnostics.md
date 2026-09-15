@@ -2003,6 +2003,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many `scope` blocks"`` | 64, plus one per singleton |
 | `"teko: scopes nested too deep"` | 32 open at once |
 | `"teko: too many nested service dependencies"` | 32 under construction at once |
+| `"teko: too many distinct string literals"` | 512 distinct `"..."` literals reaching a `string` slot, in one compilation unit (N7b, D88 — each interns to its own `$tk_str_<n>` global, § 4) |
 
 ---
 

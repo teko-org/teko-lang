@@ -1356,12 +1356,62 @@ none. `null` itself still lands only in a slot declared `string?` (D43), so
 `string.IsNullOrEmpty` takes a `string?`, the one parameter this page's members declare
 that way.
 
-**What is not here yet**, and whose crumb owes it: literal interning (`string s = "hi";`
-with no explicit `new`), the two implicit conversions between `string` and `str` in every
-slot D33 enumerates, and the `` `string` needs #include "string.tk" `` named refusal are
-N7b's; `s[i]`, `Substring`, `IndexOf`, `Contains`, `Trim`, `Replace`, `Split` and the rest
-of the method surface are N8's — the full list, each with its own row, is
+**N7b's own share (D88).** A `"..."` LITERAL written where a `string` is expected is no
+longer refused: it interns, at compile time, to a module-private global built once per
+distinct literal and reused by every other occurrence of the same bytes in the unit —
+`string s = "hi";` reads like C# and allocates nothing (`teko_string.tk`, no `rt_alloc`, no
+new `syntax`/`type_new`/`pass()` of its own). The conversion table, over every one of
+D33's nine slots — an initializer, an assignment, a `return`, an argument of a
+free/method/virtual/interface call, an element of a `params T[]`, a field store, an array
+element, a `??` arm and a `+`/`==`/`!=` operand:
+
+| from | to | how |
+|---|---|---|
+| a `"..."` LITERAL | `string` | implicit, interned (§ 4 above) |
+| `string` | `str`, `ptr`, `uptr` | implicit, one `ld64` of the `data` field |
+| `str`, `ptr`, `uptr` (not a literal) | `string` | explicit only: `new string(p)`, which copies |
+| `null` | `string` | implicit, only into a slot declared `string?` (D43) |
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "string.tk"
+
+i64 main() {
+    string a = "hi";                              // interned, no allocation
+    string b = "hi";
+    if ((uptr) a != (uptr) b) return 1;            // the SAME object
+    if (a.Length != 2) return 2;
+
+    if (tk_str_len(a) != 2) return 3;              // `string` -> `str`, a field load
+    if ((a == "hi") != 1) return 4;                // a literal on either side of `==`
+    if ((a + " there").Length != 8) return 5;      // ...and of `+`
+
+    string? n = null;
+    string d = n ?? "fallback";                    // ...and of `??`
+    if (d.Length != 8) return 6;
+
+    return 42;
+}
+```
+
+A `str` VARIABLE — even one a literal initialized two lines earlier — is still refused the
+generic way (`teko: a value of type uptr does not convert to string`,
+`tests/refuse/string_str_implicit.tk`): interning reads the SOURCE NODE, not the value, so
+only a literal written directly in the slot converts, and `new string(p)` stays the road
+for everything else. `s[i]`, `Substring`, `IndexOf`, `Contains`, `Trim`, `Replace`, `Split`
+and the rest of the method surface are N8's — the full list, each with its own row, is
 [not-yet.md](not-yet.md) § `string`.
+
+**The include refusal § 5 names is not built, and not buildable the way the page asks.**
+D48 already measured the identical question for `DateTimeKind`, a type an `#include`d
+library file declares rather than a compiler-registered primitive: the only door to a
+program-wide hint is `syntax_expr`/`type_alias`/`type_new`, and all three claim the WORD,
+which would make `lib/string.tk`'s own `class string { ... }` refuse its own name the
+moment it is parsed (`teko: the name is already a type`, measured). `string` named with no
+`#include "string.tk"` therefore stays the core's own `expected ; after expression`, and
+`docs/specs/string.md` § 5/§ 9's own row is corrected to say so — a library type is told
+apart by the library, D48's own sentence (D88).
 
 ---
 

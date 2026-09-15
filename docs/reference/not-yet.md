@@ -289,22 +289,18 @@ conversion table carries one row per source signedness and no implicit/explicit 
 
 ## `string`, and the rest of `docs/specs/string.md`
 
-N7a (D86) landed the class alone ([the type reference](types.md#string)): the four fields,
+N7a (D86) landed the class ([the type reference](types.md#string)): the four fields,
 `new string(raw)` from a `str`, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/
 `.CompareTo`/`.GetHashCode`, `operator+`/`operator==`/`operator!=`, and the three statics
-`Empty`/`Concat`/`IsNullOrEmpty`. Two crumbs still owe the rest of the design.
-
-**N7b** owes § 2-4 of the specification: literal interning (a `"..."` written where a
-`string` is expected becomes an interned object at compile time, no allocation), the two
-implicit conversions — `string` → `str`/`ptr`/`uptr`, and a literal `str` → `string` — in
-every one of D33's nine slots, and the named refusal a program gets for using `string`
-without `#include "string.tk"`.
+`Empty`/`Concat`/`IsNullOrEmpty`. N7b (D88) landed § 2-4: literal interning, the two
+implicit conversions in every one of D33's nine slots, and the measurement of the include
+refusal § 5 names. One crumb still owes the rest of the design.
 
 | written | what happens today, and why |
 |---|---|
-| `string s = "hi";` | `teko: a value of type uptr does not convert to string` — the literal is a `str` until N7b's interning lands; `new string("hi")` is the road today |
-| `puts(s)`, `panic(s)`, `tk_str_len(s)`, `extern ... (str ...)` given a `string` | **accepted, and wrong** (measured): a class reference is a `uptr`, and `str`/`ptr`/`uptr` are one type to mc, so the callee reads the OBJECT HEADER as text — `puts(s)` prints garbage bytes, `tk_str_len(s)` answers the header's length. Pre-existing for every class passed where a `str` is expected; named here because `string` makes the slip likely. N7a offers no road back to a `str` (`.ToString()` answers a `string`); the implicit `string` → `str` conversion is N7b's, and until it lands keep text that a `str` slot needs as a `str` |
-| `string` named with no `#include "string.tk"` | a plain parse error today (`string` is an ordinary, undeclared identifier) rather than the friendly `` teko: `string` needs #include "string.tk" `` the design names — N7b's own mechanism, not reachable yet |
+| `string s = "hi";` | **accepted, interned** (N7b) — `string s = p;` on a `str` VARIABLE `p` (a literal or not) still refuses, `teko: a value of type uptr does not convert to string`: interning reads the source NODE, not the value, so only a literal written directly in the slot converts (`tests/refuse/string_str_implicit.tk`) |
+| `puts(s)`, `panic(s)`, `tk_str_len(s)`, `extern ... (str ...)` given a `string` | **accepted, and correct** since N7b: the implicit `string` → `str` conversion (`tk_str_borrow`) reads the `data` field, one `ld64`, wherever a `str`/`ptr`/`uptr` slot receives a `string` — the object-header bug this row used to name is gone |
+| `string` named with no `#include "string.tk"` | a plain parse error, `expected ; after expression` — and it stays that way: D48 already measured the identical question for `DateTimeKind`, a type an `#include`d library file declares, and ruled the friendly hint IMPOSSIBLE without making `class string { ... }` refuse its own name (`tk_newname`, `teko: the name is already a type`) the moment `lib/string.tk` is parsed. A library type is told apart by the library, D48's own sentence and D88's re-measurement of it for a class rather than an `enum` |
 
 **N8** owes § 6-7's index and method surface, all of it over the class N7a already
 declares:
@@ -315,6 +311,14 @@ declares:
 | `s[i] = c` | the same, ahead of N8's own `teko: a string is immutable` |
 | `.Substring`, `.IndexOf`, `.LastIndexOf`, `.Contains`, `.StartsWith`, `.EndsWith`, `.Trim`/`.TrimStart`/`.TrimEnd`, `.ToUpper`/`.ToLower`, `.Replace`, `.Split`, `.PadLeft`/`.PadRight` | `teko: unknown member of string: <name>` — N8's own method surface |
 | `string.Join(string, string[])` | `teko: unknown member: Join` (a static's wording carries no type) — a static N8 owes beside the instance methods |
+
+Two gaps N7b's own interning does not reach, both measured directly, neither one of D33's
+nine slots:
+
+| written | what happens today, and why |
+|---|---|
+| `pick("hi")` against an OVERLOADED `string pick(string)`/`pick(i64)` | `teko: no overload of pick matches these arguments` — overload SELECTION (`tk_ov_args_fit`, `teko_over.tk`) is a different question from the nine slots' own conversion, asked before any declaration is chosen; a name declared ONCE still interns (`greet("world")` in `docs/specs/string.md` § 5's own sample), and `string pick(string s) { return s; }` alone, called the same way, works |
+| `c ? "yes" : s` (a literal ternary arm beside a `string`) | `` teko: the two arms of ?: have different types `` — `tk_tern_lower` (`teko_ternary.tk`) requires its two arms' types to already be EQUAL and converts neither one, for any type, string included (`cond ? 1 : 2.5` refuses the identical way); `??` is `string`'s own gap this crumb closed (`teko_null.tk`), `?:` is a different mechanism with no conversion of its own to extend |
 
 `$"..."` (N10) and `"n=" + 5` (needing a universal `ToString`/`object`, § 11) are neither
 N7a's nor N7b's nor N8's; both stay exactly where
