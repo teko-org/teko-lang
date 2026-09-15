@@ -1287,6 +1287,84 @@ rule (D85).
 
 ---
 
+## `string`
+
+An ORDINARY counted class, declared in `lib/string.tk` behind `#include "string.tk"` — not
+a `type_new` primitive, because a primitive carries no row `tk_is_counted` answers for, and
+the reclaim would never fire over one ([the specification](../specs/string.md) § 1, N7a).
+`str` — a `uptr` with a NUL at the end, [above](#ptr-uptr-and-str) — stays exactly what it
+was: the C boundary every `extern` and every existing fixture already reaches. `string` is
+the language's own string, sitting beside it:
+
+```
+class string {
+    private i64  nbytes;      // the UTF-8 length, no NUL
+    private i64  nchars;      // the code-point count
+    private uptr data;        // nbytes bytes, then a NUL
+    private i64  owned;       // 1 when the destructor frees `data`
+}
+```
+
+**This page's own N7a share.** `new string(raw)` is the constructor that takes text (the other, `new string()`, is the empty string, D86): it measures `raw`
+(a `str`) with `tk_str_len` and COPIES it, so mutating or releasing the source afterwards
+has no effect on the object. `.Length` is the code-point COUNT and `.Utf8Length` is the
+byte count — teko's `char` is a scalar code point, not a UTF-16 unit, so `.Length` keeps
+C#'s MEANING and states its own units (both `O(1)`, both stored at construction). `==`/`!=`
+compare BY VALUE — a byte compare of the two `data` fields — never by identity, and
+`operator+`/`operator==` are ordinary `public static` members resolved the way
+[classes.md](classes.md) § Operators already resolves any (D8): no row of `teko_ops.tk`'s
+own, no new pass, no new intrinsic.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "string.tk"
+
+i64 main() {
+    string a = new string("hi");
+    string b = new string("hi");
+    if ((a == b) != 1) return 1;                  // by VALUE, not by reference
+    if (a.Length != 2) return 2;
+
+    string c = a + b;                              // operator+, a fresh string
+    if (c.Length != 4) return 3;
+    if (c.CompareTo(new string("hihi")) != 0) return 4;
+
+    string mb = new string("hπllo");                // one two-byte code point
+    if (mb.Utf8Length != 6) return 5;
+    if (mb.Length != 5) return 6;
+
+    if (string.IsNullOrEmpty(string.Empty) != 1) return 7;
+    return 42;
+}
+```
+
+| member | is |
+|---|---|
+| `new string(raw)` | copies a `str` |
+| `new string()` | the empty string — never a zeroed object (D86) |
+| `.Length`, `.Utf8Length` | code points, bytes — both `O(1)` |
+| `.ToString()`, `.Equals(string)`, `.CompareTo(string)` (ordinal), `.GetHashCode()` | |
+| `operator+` | concatenation, a fresh `string` |
+| `operator==`, `operator!=` | by value |
+| `string.Empty`, `string.Concat(a, b)`, `string.IsNullOrEmpty(s)` | statics |
+
+`a == null` and `null == a` never reach `operator==` at all: a comparison against the
+`null` literal is the CORE's own raw-pointer check against zero, on any reference-shaped
+operand, nullable slot or not (D43 rule 2) — `string` needs no row for it and declares
+none. `null` itself still lands only in a slot declared `string?` (D43), so
+`string.IsNullOrEmpty` takes a `string?`, the one parameter this page's members declare
+that way.
+
+**What is not here yet**, and whose crumb owes it: literal interning (`string s = "hi";`
+with no explicit `new`), the two implicit conversions between `string` and `str` in every
+slot D33 enumerates, and the `` `string` needs #include "string.tk" `` named refusal are
+N7b's; `s[i]`, `Substring`, `IndexOf`, `Contains`, `Trim`, `Replace`, `Split` and the rest
+of the method surface are N8's — the full list, each with its own row, is
+[not-yet.md](not-yet.md) § `string`.
+
+---
+
 ## Members
 
 The same member grammar serves a struct and a class.

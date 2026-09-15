@@ -9522,3 +9522,122 @@ that cache is populated -- reproduced on a clean `65d54f40` checkout with a pre-
 package cache, unrelated to this crumb, outside its boundary to fix. `docs/reference/
 diagnostics.md`'s own count (`411` diagnostics, unmoved) confirms this crumb's new refusal
 wordings are measured, not merely claimed.
+
+### D86 · `string`, the value: an ordinary counted class, and N7 splits in two (N7a, 2026-09-15)
+[`docs/specs/string.md`](docs/specs/string.md) §§ 1-3, 7-8, the dispatcher's own split of
+N7 on the D81→D83/D84/D85 precedent: N7a is the class and its members, self-contained and
+provable with no other half of the page built; N7b is everything that reaches INTO the
+class from outside it -- literal interning, the two implicit conversions of § 3 in D33's
+nine slots, and the `#include` named refusal. N7a lands here; N7b and N8 are untouched.
+
+**The class, not a primitive.** `lib/string.tk` declares `public class string`, the FIRST
+instance/counted class `lib/` carries (`lib/math.tk`'s `Math` is static-only). § 1's own
+argument is decisive and needed no re-proving: a `type_new` primitive has no row
+`tk_is_counted` answers for, so the reclaim never fires over one, where a class gets the
+reclaim, the vtable and the operator mechanism at no cost of its own. The four fields
+(`nbytes`, `nchars`, `data`, `owned`) land in declaration order at `+16`/`+24`/`+32`/`+40`,
+exactly the layout the page's own comment predicts, confirmed by construction rather than
+assumed.
+
+**What N7a builds.** The one constructor, `new string(raw)` from a `str` (rule 4): measures
+with `tk_str_len`, copies, and a mutation of the source afterwards is proved to have no
+effect on the object (`surface_string_interop.tk`). `.Length` (code points, § 6 -- teko's
+`char` is a scalar code point and not a UTF-16 unit, so the MEANING of C#'s `Length` is
+kept and its UNITS are stated) and `.Utf8Length` (bytes), both `O(1)` and stored at
+construction via a one-pass UTF-8 lead-byte count. `.ToString()`, `.Equals`, `.CompareTo`
+(ordinal), `.GetHashCode()` (djb2 -- no C# guarantee, only the one promise this class makes:
+equal values hash equal). `operator+` (concatenation, a fresh owned `string`) and
+`operator==`/`!=`, by VALUE (a byte compare of the two `data` fields, `tk_str_eq` reused
+unchanged from `lib/rt.tk`), never by identity. `string.Empty`, `string.Concat`,
+`string.IsNullOrEmpty` (over a `string?`, D43's own widening -- see below).
+And a second constructor the review forced, `string()` with no argument: teko's allocator
+hands out a ZEROED object for any class that declares no parameterless constructor
+(`tk_allocators`, teko_class.tk -- "which is what every class written before constructors
+existed keeps doing"), and every member here dereferences `data`, so `new string()` would
+have been a null pointer with a vtable. C# has no `new string()` at all, and teko cannot
+refuse the form per class today; the safe value is the answer -- `new string()` IS the empty
+string (allocated, NUL-terminated, owned), equal to `string.Empty`
+(`surface_string_interop.tk`'s last rows).
+
+**Zero compiler-module changes, by construction and not by restraint.** `lib/string.tk` is
+program code, resolved through `[include].paths` the way `lib/rt.tk`, `lib/time.tk`,
+`lib/decimal.tk` and `lib/guid.tk` already are (`docs/reference/runtime.md`) -- it is not a
+row of `[compiler].modules` in `teko.toml`, so the taught compiler's OWN build never parses
+it and `mc limits` cannot move for it. `operator+`/`operator==` on a class are D8's own
+mechanism (`tests/surface_operator.tk`'s `Vec` is the proof this crumb reused rather than
+re-derived): `teko_ops.tk` gains no row, and neither does any other `teko_*.tk` file. Two
+byte-level helpers (`tk_string_copy`, `tk_string_utf8count`) live IN `lib/string.tk` rather
+than in `lib/rt.tk`: a line added to `rt.tk` moves the `--dump-ast` include chain of every
+fixture in the tree (the scout's own finding, confirmed), and this crumb's gate is that
+chain staying byte-identical -- proved, not assumed: no base fixture includes
+`lib/string.tk`, so none of their dumps could move by construction, and `mc limits`
+verdict `ok` with `passes` (15), `syntax` (20), `alias` (25), `types` (18), `intrin` (8) and
+`on_stmt` (4) every one of them **exactly** where the tree left them before this crumb.
+
+**`null`, and the correction D43 forces on this page.** `docs/specs/string.md` § 8 was
+written under D32 ("a reference lands on any row") and reads `a == null` as reaching
+`operator==` itself, "`null` lands on a row parameter". D43 (2026-09-08) is NEWER and rules
+otherwise: a comparison against the `null` literal on any reference-shaped operand -- a
+nullable slot or not -- is the CORE's own raw-pointer check against zero, and `operator==`
+is never even a CANDIDATE (`teko_ops.tk`'s early exit on `tk_is_null_lit`). The newest
+ruling wins, and this entry says so rather than silently disagreeing with the page it
+implements: § 8's row and the illustrative `string e = null;` sample (now `string? e =
+null;`) are both corrected in the same pull request. `string.IsNullOrEmpty` takes a
+`string?` rather than the page's own `string` for the same reason: D43 rule 1 lands `null`
+only in a slot declared `T?`, so a non-nullable parameter would refuse the very call C#'s
+own signature exists to answer.
+
+**D52's harness, six fixtures, all pre-existing mechanism.** `string_to_numeric.tk`,
+`numeric_to_string.tk` (D34's pair), `string_str_implicit.tk` (a `str`, literal or not,
+still does not fit a `string` slot until N7b's conversion), `string_plus_mismatched.tk`
+(the generic operator-resolution refusal), `string_unknown_member.tk` (the generic
+"unknown member of X: Y" row -- and the page's own § 5 wording, `` string has no member
+Lenght ``, is corrected to the wording measured: `teko: unknown member of string: Lenght`)
+and `string_null_nonnullable.tk` (D43's own row). None of the six is new code; each is the
+proof that a pre-existing mechanism already answers for the class the moment it exists. The
+page's own `` `string` needs #include "string.tk" `` refusal is confirmed NOT reachable in
+N7a: measured directly, `string` named with no include is a plain parser `expected ; after
+expression`, since N7a teaches no reserved word and no include check at all -- that
+mechanism is `teko_string.tk`'s, N7b's own module, named so in `not-yet.md` rather than
+claimed here.
+
+**One adjacent finding that is a real, general, pre-existing defect, reported and routed
+around rather than fixed (out of this crumb's own boundary -- `teko_class.tk` is compiler
+code and N7a is library code by the dispatcher's own instruction).** `tk_new_fn`, the
+allocator wrapper every `new ClassName(...)` lowers through, declares a local literally
+named `p` (`uptr p = rt_alloc(size);`) in the SAME scope that clones the constructor's own
+parameter list to build the constructor call. A constructor parameter also spelled `p` is
+silently SHADOWED by that local: every reference to `p` inside the wrapper after the local
+declaration resolves to the freshly allocated block's own address rather than to the
+caller's argument, so the value passed in is lost without any diagnostic. Measured directly
+and isolated to the one variable: `class Cell { public i64 v; public Cell(i64 p){v=p;} }`
+against `Cell(i64 x){v=x;}` -- the first answers `c.v` as the allocation's own address
+truncated into an `i64` (non-deterministic across builds, since it is an uninitialized-read
+artifact of the shadow rather than a value anyone wrote), the second answers `7` exactly.
+General to every class in the tree, not particular to `string`, and not this crumb's
+compiler code to fix; `lib/string.tk` names no parameter `p` anywhere, and the header
+records the finding for whichever crumb owns `teko_class.tk` next. A second, smaller
+finding of the same shape: a bare `this` used as a VALUE (as opposed to the receiver of
+`this.field`) types as `uptr`, because `teko_class.tk`'s own `this` parameter is declared
+`param_new(TY_UPTR, tk_this_name())` and no bare-`this` expression node is ever re-typed
+against the enclosing class -- `return this;` fails `teko: a value of type uptr does not
+convert to <Class>` on every class in the tree, not only `string`. `.ToString()` returns
+`new string(data)`, a fresh copy of the same bytes, rather than `this`.
+
+**Proof** (mc 1.0.1, macos/aarch64, on PR #747's head after the review's fixes): `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` ->
+**124 passed, 141 refused as expected, 0 failed** (121/135 before this crumb, +3 run
+fixtures, +6 refuse fixtures); `--dump-ast --include=lib --include=tests` **byte-identical**
+on every one of the 118 pre-existing `tests/*.tk` fixtures -- no base fixture includes
+`lib/string.tk`, so the proof is by construction, confirmed rather than assumed;
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`; `sh
+scripts/check-docs.sh` green (one round-trip: a multi-byte fixture first spelled a Latin
+letter with an acute accent, which D18's own accent list catches even though the comment is
+English prose -- corrected to the Greek letter pi, the same two-byte code point with no such
+collision); `mc limits . --config
+mc.macos.toml` verdict `ok`, `passes`/`syntax`/`alias`/`types`/`intrin`/`on_stmt` every one
+unmoved, only the `heap` estimate moving with the tree's own growth. PR #743 (N6b-3, D85)
+squash-merged while this crumb was in flight, exactly as the dispatch predicted;
+`origin/main` merged into this branch with no conflict, and the fixture count after the
+merge is **124 passed, 141 refused as expected, 0 failed** (N6b-3's own three fixtures
+added on top).
