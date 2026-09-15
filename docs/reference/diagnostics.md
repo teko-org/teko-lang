@@ -771,7 +771,7 @@ sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
   is `tk_dec_neg` and `+d` is the operand itself, written by the unary lowering with no row
   at all (`tk_prim_unary_plus`, D77).
 - `"teko: a cast is not defined on a sixteen-byte value yet"` — `MTASK_CAST`; the four casts
-  § 6 opens are calls and the rest is `teko: a decimal does not cast yet`.
+  § 6 opens are calls and the rest is `` teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it `` (the shorter *does not cast yet* was C3/C4's, before the read and build clauses existed).
 - `"teko: a constant is not defined on a sixteen-byte value yet"` — `MTASK_CONST`. A
   `decimal` has no folded form at all, so the surface refusals are
   `teko: const requires a constant expression` and

@@ -970,7 +970,7 @@ block to reclaim. C# gives it value semantics and no heap.
 | `d << 1`, `d & d`, `~d` | ``teko: no operator `<<` takes these operands`` |
 | `i64 n = d;`, `f64 x = d;` | `teko: a value of type decimal does not convert to i64` — the cast is the written form |
 | `decimal d = 1.5;` | `teko: a value of type f64 does not convert to decimal` — `(decimal) 1.5` is the written form |
-| `(str) d` | `teko: a decimal does not cast yet` — text is `ToString`, C5 |
+| `(str) d` | `` teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it `` — text is `ToString`/`Parse` (C5, D79) |
 | `decimal g = 5;` at file scope | `teko: a global decimal takes no initializer` |
 | `d.Anything`, `decimal.Anything` | `teko: unknown member of decimal` and its static twin |
 | `const decimal R = 1m;` | `teko: const requires a constant expression` |

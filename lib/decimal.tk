@@ -1014,7 +1014,10 @@ i64 tk_dec_scan(ptr p, str s) {
         loop {
             c = ld8(s + i);
             if (!tk_dec_isdig(c)) break;
-            if (exp < 1000) exp = exp * 10 + (c - '0');   // a bound, not a value
+            // the exponent is read WHOLE, so `0.<10000 zeros>1e10001` lands at
+            // scale 0 as written; past a billion it saturates, which is only
+            // ever an overflow or a zero below (Copilot on #733)
+            if (exp < 1000000000) exp = exp * 10 + (c - '0');
             ne = ne + 1;
             i = i + 1;
         }
@@ -1023,13 +1026,19 @@ i64 tk_dec_scan(ptr p, str s) {
     }
     if (ld8(s + i) != 0) return 0;            // trailing text of any kind
     scale = scale - exp;
+    i64 zero = tk_dv_is_zero(v);
     // a NEGATIVE scale is no representation at all: the mantissa absorbs it,
-    // ten at a time, exactly as the literal does (teko_decimal.tk)
+    // ten at a time, exactly as the literal does (teko_decimal.tk) -- and a
+    // non-zero mantissa needing more than 29 tens is an overflow before the
+    // first multiply, while a zero is a zero at any scale
+    if (scale < 0 && zero) scale = 0;
+    if (scale < 0 - 29) return 0 - 1;
     loop {
         if (scale >= 0) break;
         if (tk_dv_muladds(v, 10, 0)) over = 1;
         scale = scale + 1;
     }
+    if (zero && scale > TK_DEC_MAXSCALE) scale = TK_DEC_MAXSCALE;
     if (over || tk_dv_over96(v)) return 0 - 1;
     // EXACT or refused (D79, ruling 5): a scale past 28 places is a value this
     // type cannot hold, and rounding it here would answer a number the writer
