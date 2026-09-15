@@ -7484,6 +7484,20 @@ compares `u64`/`uptr` unsigned from 0.17.3 on — the pages that recorded the si
 (`small-ints.md`, `lib/limbs.tk`) now say which side of the fix each pin is on, and the 32-bit
 limbs stay, because the minimum still admits 0.17.0.
 
+**Fourth amendment (2026-09-15) — the pin rises to 1.0.0.** mc 1.0.0 is the release that
+promises the frozen surface for good: the 423 entries of mc's `tests/golden/surface.txt`, any
+later removal or change of one being a MAJOR (mc's `docs/reference/hooks.md` § 8). Same
+tarballs, same layout, same canary contract. The canary judged it `ok` (run 34965435282,
+verdict written seven minutes after the publish, dispatched by this repository's poller). The
+whole local recipe is green on 1.0.0 over `12bc95f9` (112 passed, 133 refused, 0 failed;
+`FIXPOINT OK`; docs ok), and `--dump-ast` is byte-identical between the compiler built by
+0.17.5 and by 1.0.0 on all 245 fixtures. The move is D64's: `MC_VERSION` to 1.0.0 and the
+current-pin quotes with it (`site.yml`, `CONTRIBUTING.md`, `build.md`, `00-getting-started.md`);
+`[package].mc` stays 0.17.0 (the second amendment: the oldest mc of the frozen surface, which
+1.0.0 now guarantees); nothing in the modules moves. What 1.0.0 changes for this repository is
+the owner's: CLAUDE.md's "v1.0.0 ships only together with mc 1.0.0" is now satisfiable, and
+that tag is the owner's to cut, not this log's.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
