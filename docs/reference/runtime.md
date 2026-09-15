@@ -394,7 +394,7 @@ four intrinsics, and its machine handlers break 34 of this repository's fixtures
 
 | | |
 |---|---|
-| `tk_i128_add`, `_sub`, `_mul`, `_div`, `_neg` | `+ - * /` and unary `-`. `+ - * -` wrap modulo 2^128 — C#'s unchecked default. `/` truncates toward zero and takes the sign from the two operands; `/ 0i` panics `teko: division by zero`, exit 70, and (D82) `MinValue / -1i` panics `teko: an integer division overflowed`, exit 70 rather than wrapping — the one quotient `+ - * -` do not share |
+| `tk_i128_add`, `_sub`, `_mul`, `_div`, `_neg` | `+ - * /` and unary `-`. `+ - * -` wrap modulo 2^128 — C#'s unchecked default. `/` truncates toward zero and takes the sign from the two operands; `/ 0i` panics `teko: division by zero`, exit 70, and (D82) `MinValue / -1i` panics `teko: an integer division overflowed`, exit 70 rather than wrapping — the one quotient the other operations do not share |
 | `tk_i128_cmp`, `_eq`, `_ne`, `_lt`, `_le`, `_gt`, `_ge` | the six comparisons, SIGNED: the sign bits decide first and the limbs after them |
 | `tk_u128_*` | the same twelve, with `/` and the four orderings UNSIGNED. `+ - *` and unary `-` are the same bits either way and the wrappers differ only in the type they build |
 | `tk_i128_from_i64` / `_from_u64` / `tk_u128_from_i64` / `_from_u64` | an integer widened. The SIGNED source sign-extends and the UNSIGNED one does not, which is why there are four and not two: a `u64` at or above 2^63 through a signed door is a negative 128-bit value, in silence (D77's ruling 8, the shape every wide type takes for this question) |

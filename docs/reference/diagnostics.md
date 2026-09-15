@@ -977,19 +977,36 @@ answered `MinValue` back). C# throws `DivideByZeroException` and, on both its ow
 `OverflowException` for the second; this project has no exceptions, so it panics
 (`tk_div_guard`, [`teko_ternary.tk`](../../teko_ternary.tk)).
 
-The guard is built only around a divisor `tk_div_applies` cannot fold away — a **literal**
-nonzero divisor (`x / 2`) carries no guard at all, left exactly as the core wrote it, and a
-literal zero is mc's own compile-time refusal (`division by zero`, no `teko:` prefix,
-`fold_binary`/`const_bin`, `mc/src/parse.mc`) when the dividend is ALSO constant; a dividend
-the folder cannot see through still reaches the run-time guard below. The overflow check
-applies to signed integers only — `type_signed`, the core's own predicate — and is built
-against the WIDTH's own `MinValue` (`type_width`), so a narrow `i32`/`i16`/`i8` guards its
-own 32/16/8-bit minimum, not `i64`'s.
+A **literal** divisor is never guarded, zero or nonzero. `x / 2` is left exactly as the
+core wrote it; a literal ZERO is answered where it is written, the way C# answers it
+(CS0020, *Division by constant zero*, whatever the dividend is) — `12 / 0`, both sides
+constant, is mc's own compile-time refusal (`division by zero`, no `teko:` prefix,
+`fold_binary`/`const_bin`, `mc/src/parse.mc`), and `a / 0`, a dividend the folder cannot
+see through, is the `teko:` refusal below. Only a divisor that is no literal at all
+carries a run-time guard. The overflow check applies to signed integers only —
+`type_signed`, the core's own predicate — and is built against the WIDTH's own `MinValue`
+(`type_width`), so a narrow `i32`/`i16`/`i8` guards its own 32/16/8-bit minimum, not
+`i64`'s.
 
+A division in the RIGHT operand of `&&`/`||` is guarded **inside the branch that reaches
+it**: the operator is lowered into the same `if`/`else` form `?:` already takes
+(`tk_div_lazy_lower`, [`teko_ternary.tk`](../../teko_ternary.tk)) before the guard is
+built, so `if (n != 0 && a / n > 1)` with `n == 0` runs neither the division nor its
+guard, and a divisor with a side effect runs exactly once and only where it is reached.
+Only an `&&`/`||` that carries such a division takes that form; every other one is
+untouched.
+
+- `"teko: division by zero"` — the divisor is the literal `0` and the dividend is not a
+  literal (`a / 0`, `a % 0`). The same wording as the run-time panic below, and the same
+  cause, answered at compile time because the source already says it.
 - `"teko: an integer division needs #include rt.tk"` — a division the guard has to build
   reaches a unit where `panic` (`lib/rt.tk`) is not declared, directly or through
-  `decimal.tk`/`time.tk`/… A program with no division that needs a guard never sees this:
-  `tests/hello.tk`-style code with no `#include` at all keeps compiling.
+  `decimal.tk`/`time.tk`/… The declaration has to be the RUNTIME's own — the file it was
+  read from is checked, not only the name — so a program carrying its own `panic` and no
+  include is refused here too, rather than compiled into a guard that calls it. (A program
+  that declares its own `panic` AND includes the runtime is mc's own `function declared
+  twice`, ahead of this pass.) A program with no division that needs a guard never sees
+  any of this: `tests/hello.tk`-style code with no `#include` at all keeps compiling.
 
 Two are **run-time panics**, exit 70 and on stderr with no `file:line`
 ([runtime.md](runtime.md#failing)):
