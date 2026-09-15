@@ -368,6 +368,54 @@ void tk_rc_park(i64 n) {
     tk_nparked = tk_nparked + 1;
 }
 
+// ---- which parameter the `str`/`string` conversions are about (N7b) ----
+// This walk runs over EVERY `N_CALL` of every body it is given, and by then
+// most of them are the COMPILER's own: `tk_rc_store` above renames an
+// `st64`-shaped call into `rt_store`/`rt_store_own` in place, on the very
+// node the walk reads right after; `tk_cap_own`/`tk_cap_put` (lib/rt.tk) is
+// what a closure's captures are written with, one call per capture
+// (teko_deleg.tk); `rt_own`/`rc_inc`/`rc_dec`/`rt_park` are the reclaim's
+// own; and a GENERATED body such as `tkarr_put_string` (teko_heaparr.tk) is
+// walked exactly like a program's own. Every one of those takes its argument
+// as a `uptr` GENERICALLY -- the slot, the value, any counted reference at
+// all, never text -- so `tk_str_borrow` matching there read `.data` off a
+// `string` and stored the BYTES where the object belonged: a bus error on a
+// field store, a corrupt array of `string`, and a closure capturing a
+// `string` by value straight into SIGSEGV (`rc_inc` on `data`).
+//
+// So the question is asked POSITIVELY, about the slot rather than about a
+// list of names: the conversion is a genuinely USER-DECLARED parameter's
+// business, and nothing else is.
+//
+//   * the declaration was not read from `lib/rt.tk` -- the runtime is the
+//     compiler's own, never a user slot, and the file is the same fact
+//     `tk_div_rt_panic` (teko_ternary.tk) reads to tell the runtime's
+//     `panic` from a program's own. A `string` DOES still reach a
+//     `str` parameter of the runtime, one hop away and explicitly:
+//     `str p = s; tk_str_len(p);` converts at the local's own slot.
+//   * the parameter NODE exists -- an argument past the declared list
+//     (`decl_param_type`'s own answer, no node behind it) is nothing this
+//     conversion knows the shape of.
+//   * its name is not a compiler gensym -- `$` is the prefix the lexer
+//     never forms into an identifier (D87), so a `$` name is the
+//     compiler's by construction.
+//   * it is not the RECEIVER. A method's parameter 0 is `this`
+//     (`tk_this_name`, teko_this.tk), declared `uptr` -- the same `uptr`
+//     `str`/`ptr` alias -- and `a.Length` on a `string a` rewrote the
+//     receiver into `ld64(a + 32)`, calling `string_get_Length` on the
+//     `data` field's address instead of the object.
+i64 tk_rc_str_slot(i64 d, i64 i) {
+    if (d < 0) return 0;
+    if (tk_div_ends(nd_file(d), "lib/rt.tk")) return 0;
+    i64 pn = tk_decl_param_node(d, i);
+    if (pn < 0) return 0;
+    uptr nm = nd_name(pn);
+    if (nm == 0) return 0;
+    if (ld8(nm) == '$') return 0;
+    if (str_eq(nm, tk_this_name())) return 0;
+    return 1;
+}
+
 // D226 compat crumb: a CALL's own arguments against the callee's declared
 // parameter types, by INDEX -- `tk_decl_param_ty` (teko_ref.tk over the core's
 // own `decl_param_type`, K2w) answers for whatever `decl_find` resolves, and by the time this pass runs every
@@ -405,24 +453,6 @@ void tk_rc_call_args(i64 n) {
     if (tk_deleg_is_thunk(tk_rc_cur_fn)) return;
     i64 d = decl_find(nd_name(n));
     if (d < 0) return;
-    // N7b: this walk runs over EVERY `N_CALL`, the reclaim's own generated
-    // calls included (`rt_store`/`rt_own`/`rc_dec`... -- `tk_rc_store`
-    // above renames an `st64`-shaped call into `rt_store`/`rt_store_own` IN
-    // PLACE, on the very node this function reads right after, and a
-    // generated function such as `tkarr_put_string` -- an array-of-`string`
-    // put, teko_heaparr.tk -- is walked exactly like a program's own body).
-    // Every one of `lib/rt.tk`'s reference-management primitives takes its
-    // argument as a `uptr` GENERICALLY -- the slot, the value, any counted
-    // reference at all, never text -- so a `string` argument reaching one
-    // of them is never the `str`/`ptr`/`uptr` conversion's business:
-    // `rt_own(v)`/`rt_store(dst, v)` on a `string v` matched
-    // `tk_str_borrows` (`uptr` beside `string`) and read `.data` off the
-    // VALUE instead of keeping the object reference, corrupting a field
-    // store and every array of `string` alike (measured directly --
-    // `tests/surface_string_rc.tk` crashed on the field, and
-    // `tests/surface_string_value.tk`'s own `params string[]` row on the
-    // array -- neither without this guard).
-    i64 rt_plumbing = tk_str_is_rt_plumbing(nd_name(n));
     i64 prev = 0;
     i64 a = nd_a(n);
     i64 i = 0;
@@ -460,20 +490,8 @@ void tk_rc_call_args(i64 n) {
             continue;
         }
         tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
-        // N7b: this walk reads a METHOD call's own RECEIVER as parameter 0,
-        // by index, exactly like any other argument (this function's own
-        // header: "a CALL's own arguments against the callee's declared
-        // parameter types, by INDEX") -- and the receiver's declared type is
-        // `uptr` (`this`, teko_class.tk's `tk_this_name`), the same `uptr`
-        // `str`/`ptr` are. `a.Length` on a `string a` therefore matched
-        // `tk_str_borrows`, and reading `.data` off the receiver instead of
-        // the OBJECT itself corrupted every method call on a `string` --
-        // measured directly (`tests/surface_string_interop.tk` regressed to
-        // exit 1 without this guard). A parameter named `this` is never the
-        // `str`/`ptr`/`uptr` conversion's business.
-        i64 pn = tk_decl_param_node(d, i);
         i64 widened = tk_num_widen(pt, at, a);
-        if (!rt_plumbing && (pn == 0 || !str_eq(nd_name(pn), "this")))
+        if (tk_rc_str_slot(d, i))
             widened = tk_str_borrow(pt, at, tk_str_intern(pt, at, widened));
         i64 fixed = tk_nl_wrap(pt, at, widened);
         if (fixed != a) {

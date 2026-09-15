@@ -1380,7 +1380,7 @@ element, a `??` arm and a `+`/`==`/`!=` operand:
 | from | to | how |
 |---|---|---|
 | a `"..."` LITERAL | `string` | implicit, interned (§ 4 above) |
-| `string` | `str`, `ptr`, `uptr` | implicit, one `ld64` of the `data` field |
+| `string` | `str`, `ptr`, `uptr` | implicit at a slot the PROGRAM declares, one `ld64` of the `data` field — never at a parameter of `lib/rt.tk`'s own (which takes a `uptr` generically), never at a method's receiver |
 | `str`, `ptr`, `uptr` (not a literal) | `string` | explicit only: `new string(p)`, which copies |
 | `null` | `string` | implicit, only into a slot declared `string?` (D43) |
 
@@ -1395,7 +1395,8 @@ i64 main() {
     if ((uptr) a != (uptr) b) return 1;            // the SAME object
     if (a.Length != 2) return 2;
 
-    if (tk_str_len(a) != 2) return 3;              // `string` -> `str`, a field load
+    str p = a;                                    // `string` -> `str`, a field load
+    if (tk_str_len(p) != 2) return 3;
     if ((a == "hi") != 1) return 4;                // a literal on either side of `==`
     if ((a + " there").Length != 8) return 5;      // ...and of `+`
 

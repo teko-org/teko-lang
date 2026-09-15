@@ -1,0 +1,66 @@
+// surface_string_capture.tk -- verifier finding 1 of PR #749 (N7b, D88): a
+// `string` that a CLOSURE captures. Every capture is written with
+// `tk_cap_own`/`tk_cap_put` (lib/rt.tk, teko_deleg.tk's own writer), whose
+// parameter is a `uptr` GENERICALLY -- the object, any counted reference at
+// all, never text -- so the `string` -> `str` borrow matching there stored
+// the `data` pointer in the closure slot and handed THAT to `rc_inc`:
+// SIGSEGV on the first call. The conversion is a genuinely USER-declared
+// parameter's business alone (teko_rc.tk's `tk_rc_str_slot`), and this
+// fixture is the running proof of it.
+//
+// `rt_live()` back to its baseline once the work returns is the second half:
+// a captured `string` is owned by the closure, and released with it.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+delegate i64 Sum(i64 x);
+delegate i64 Take();
+
+// a closure built inside a block, returned, and called after that block
+// closed: the capture has to outlive the scope that declared it
+Take make_taker() {
+    string inner = new string("seven!!");
+    Take t = () use (inner) => inner.Length;
+    return t;
+}
+
+i64 work() {
+    // by value: the closure takes a reference of its own
+    string s = new string("captured");
+    Sum d = (i64 x) use (s) => x + s.Length;
+    if (d(34) != 42) return 1;
+    if (s.Length != 8) return 2;
+
+    // an interned LITERAL captured the same way
+    string lit = "hi";
+    Sum e = (i64 x) use (lit) => x + lit.Length;
+    if (e(40) != 42) return 3;
+
+    // two captures in one closure, one of them the `string`
+    i64 k = 5;
+    Sum f = (i64 x) use (s, k) => x + s.Length + k;
+    if (f(29) != 42) return 4;
+
+    // by REFERENCE is not one of the roads: `use (&s)` on a `string` is
+    // `teko: a capture by reference of a counted type is not taught yet: s`
+    // (a pre-existing refusal, measured on this pin, nothing this crumb
+    // moved), so by value is the whole of the question here.
+
+    // the closure that outlived its own block
+    Take t = make_taker();
+    if (t() != 7) return 5;
+    if (t() != 7) return 6;
+
+    return 0;
+}
+
+i64 main() {
+    i64 base0 = rt_live();
+    i64 bad = work();
+    if (bad != 0) return bad;
+    if (rt_live() != base0) return 7;            // every capture gave its reference back
+    return 42;
+}

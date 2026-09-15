@@ -47,7 +47,52 @@
 // (teko_prim.tk) reads a library-declared `enum`'s row through, minus the
 // column machinery that mechanism needs for a compiler-registered primitive
 // and this one does not.
-i64 tk_str_class_si() { return tk_struct_find_exact("string"); }
+// the suffix test `tk_div_rt_panic` (teko_ternary.tk) already asks of a
+// declaration's own file -- "was this name read from the library that
+// defines it?". That module is included after this one, so the name is
+// declared ahead the way `tk_this_name` is declared ahead in teko_class.tk.
+i64 tk_div_ends(uptr f, uptr suf);
+
+// the library class's own layout, and the ONE shape this module knows how to
+// build an interned literal out of: the vtable word, the pinned count, and
+// `lib/string.tk`'s four fields (`nbytes`/`nchars`/`data`/`owned`) -- six
+// words, measured through `sr_size_at` rather than assumed, and the bound of
+// `tk_str_intern_build`'s own buffer at the same time. A field added to
+// `lib/string.tk` raises this number; until it does, the gate below answers
+// "not the library's class" and every `string` fixture refuses out loud
+// rather than writing past the buffer in silence.
+#define TK_STR_WORDS 6
+
+i64 tk_str_lib_layout(i64 si) {
+    if (sr_size_at(si) != TK_STR_WORDS * 8) return 0;
+    if (tk_field_find(si, "nbytes") < 0) return 0;
+    if (tk_field_find(si, "nchars") < 0) return 0;
+    if (tk_field_find(si, "data")   < 0) return 0;
+    if (tk_field_find(si, "owned")  < 0) return 0;
+    return 1;
+}
+
+// `string` is the LIBRARY's class or it is not `string` at all. The lookup
+// reads a NAME, and a program is free to declare a class of that name of its
+// own -- `class string { public i64 a; }` with no `#include "string.tk"` in
+// sight -- on which neither conversion nor the interning may fire: it is an
+// ordinary user class, and `string s = "hi";` refuses on it with the same
+// `teko: a value of type uptr does not convert to string` any other class
+// gets. The test is PROVENANCE plus LAYOUT, the shape `tk_div_rt_panic`
+// asks of `panic`: the declaration was read from `lib/string.tk` (a suffix,
+// so an include from any root still names it -- `sr_hfile_at`, the file the
+// class's own header was read from, teko_struct.tk) AND the row measures the
+// six words above with all four fields present. Failing either half is not
+// this module's business at all, which is what keeps the interned global's
+// buffer in bounds BY CONSTRUCTION: a `class string` of sixteen `i64` fields
+// crashed the compiler outright before this gate existed.
+i64 tk_str_class_si() {
+    i64 si = tk_struct_find_exact("string");
+    if (si < 0) return 0 - 1;
+    if (!tk_div_ends(sr_hfile_at(si), "lib/string.tk")) return 0 - 1;
+    if (!tk_str_lib_layout(si)) return 0 - 1;
+    return si;
+}
 
 // a `string?` slot takes what a `string` slot takes (Q1a: `T -> T?` is
 // implicit, and a REFERENCE `T?` is `T`'s own pointer, no box -- so the
@@ -74,33 +119,6 @@ i64 tk_str_borrows(i64 tty, i64 ety) {
     i64 si = tk_str_class_si();
     if (si < 0) return 0;
     return ety == sr_ty_at(si);
-}
-
-// ---- the reclaim's OWN plumbing, never this conversion's business ----
-// `tk_rc_call_args` (teko_rc.tk) walks EVERY `N_CALL` of EVERY function body
-// it is given, generated bodies included (`tkarr_put_string`'s own -- an
-// array-of-`string` put built by teko_heaparr.tk, and read by the SAME pass
-// that reads the program's own code, since one pass owns the whole tree).
-// `lib/rt.tk`'s own reference-management primitives take a `uptr`
-// GENERICALLY -- "the slot", "the value", any counted reference at all --
-// never text, so a `string` argument reaching one of them is never the
-// `str`/`ptr`/`uptr` conversion's business either: `rt_own(v)` on a
-// `string v` matched `tk_str_borrows` (`uptr` beside `string`) and stored
-// `v`'s OWN BYTES pointer as if it were the object, corrupting every array
-// of `string` (measured directly: `tests/surface_string_value.tk`'s own
-// `params string[]` row crashed without this list). The set is closed and
-// named, not inferred: every function `lib/rt.tk` declares whose own
-// parameter is a bare, untyped reference.
-i64 tk_str_is_rt_plumbing(uptr name) {
-    if (str_eq(name, "rt_own"))       return 1;
-    if (str_eq(name, "rt_store"))     return 1;
-    if (str_eq(name, "rt_store_own")) return 1;
-    if (str_eq(name, "rt_drop"))      return 1;
-    if (str_eq(name, "rt_park"))      return 1;
-    if (str_eq(name, "rt_free"))      return 1;
-    if (str_eq(name, "rc_inc"))       return 1;
-    if (str_eq(name, "rc_dec"))       return 1;
-    return 0;
 }
 
 // ---- the literal, interned by VALUE, one global per distinct literal
@@ -190,8 +208,8 @@ uptr tk_str_gensym() {
 // left at zero (its own default), which is the whole of "an interned
 // literal frees nothing" (§ 4).
 uptr tk_str_intern_build(uptr bytes, i64 len, i64 e, i64 si, i64 sty) {
-    i64 nel = sr_size_at(si) / 8;
-    i64 words[8];                     // STRING_SIZE / 8 is 6 today; headroom for a wider class
+    i64 nel = sr_size_at(si) / 8;     // TK_STR_WORDS: `tk_str_class_si` measured it
+    i64 words[TK_STR_WORDS];
     i64 wi = 0;
     loop {
         if (wi >= nel) break;
