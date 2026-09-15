@@ -5056,7 +5056,7 @@ names. Depends on N7a and on nothing else.
 `type_alias`, no `type_new`, no `pass()` of its own — every helper is a plain function
 called from the module that already asks `tk_num_widen`, teko_typeof.tk, at that slot): a
 `"..."` node reaching a `string`-typed slot is looked up in a per-unit table by VALUE
-(byte-exact, never NUL-shortcut — a literal may carry an embedded NUL) and, on the first
+(by length and bytes; the core's `cstrlen` has already ended the literal at any embedded NUL, so none is carried) and, on the first
 occurrence, built into a module-private global with the shape § 4 shows —
 
 ```
@@ -5224,7 +5224,7 @@ teko_this.tk — a method's parameter 0, declared `uptr`, which is why `a.Length
 `string a` used to call `string_get_Length` on the `data` field's ADDRESS). The CEILING
 this draws is named rather than hidden, and then narrowed once more: a `string` handed
 to a `lib/rt.tk` function borrows its text ONLY for the runtime's own text readers —
-`panic`, `tk_str_len`, `tk_str_slice`, `tk_str_eq`, the enum readers (`tk_rc_rt_text`, a
+`panic`, `rt_panic`, `tk_str_len`, `tk_str_slice`, `tk_str_eq`, the enum readers (`tk_rc_rt_text`, a
 closed list of the runtime's own, positive) — because a `panic(s)` that printed the object
 header would be a silently wrong answer (D3); every other runtime function (`rt_own`,
 `rc_inc`, `tk_cap_own`, the plumbing that takes any counted reference) receives the
