@@ -255,8 +255,51 @@ i64 tk_dec_lit() {
 void tk_dec_init() {
     tk_ty_decimal = type_new("decimal", 16, 16, TK_WIDE);
     tk_wide_add(tk_ty_decimal, "tk_dec_ld", "tk_dec_st", "tk_dec_retbuf");
-    // an empty member table: every conversion, every operator and every member
-    // is refused by name, and none of them is spelled out here
+    // C4 fills the OPERATOR half of this table (`tk_dec_ops` below) and leaves
+    // the MEMBER half empty: `decimal.Round`, `.ToString` and `Parse` are C5,
+    // and an empty member table answers every one of them by name. The reader
+    // and the builder columns stay 0 for the same reason -- `(str) d` earns
+    // "a decimal does not cast yet" until the pair exists to be named.
     tk_prim_type(tk_ty_decimal, "decimal", "decimal.tk", 0, 0, "0m");
     syntax_lit(&tk_dec_lit);
+}
+
+// ---- the operators and the conversions (§ 5, § 6; D77) ----
+// Called from `teko_init()` AFTER `tk_float_init()`, because the two float
+// rows name `ty_f64` -- the id `<float>`'s own registration returns -- and
+// `tk_dec_init()` above has to run BEFORE it for the literal's sake. One
+// registration cannot be both, so it is two.
+//
+// TWELVE operator rows and no more. There is no `decimal`/`i64` row of any
+// kind: an integer operand is CONVERTED before the operator pass ever looks
+// for a row (`tk_ops_promote`, teko_ops.tk), which is C# §12.4.5's binary
+// numeric promotion and the same door the float side already goes through --
+// so `d + 1`, `1 + d`, `d += 1`, `d++` and every one of the eleven operators
+// are covered by the rows below without a mixed row anywhere.
+//
+// Unary `+` has no row either (D77, ruling 4): `tk_prim_unary_plus`
+// (teko_prim.tk) reads the `decimal + decimal` row to know this is a number
+// and hands the operand straight back.
+void tk_dec_ops() {
+    i64 d = tk_ty_decimal;
+    tk_prim_op(K_ADD, 2, d, d, "tk_dec_add", d, 0);
+    tk_prim_op(K_SUB, 2, d, d, "tk_dec_sub", d, 0);
+    tk_prim_op(K_MUL, 2, d, d, "tk_dec_mul", d, 0);
+    tk_prim_op(K_DIV, 2, d, d, "tk_dec_div", d, 0);
+    tk_prim_op(K_MOD, 2, d, d, "tk_dec_rem", d, 0);
+    tk_prim_op(K_SUB, 1, d, 0 - 1, "tk_dec_neg", d, 0);
+    tk_prim_op(K_EQ, 2, d, d, "tk_dec_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, d, d, "tk_dec_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, d, d, "tk_dec_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, d, d, "tk_dec_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, d, d, "tk_dec_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, d, d, "tk_dec_ge", TY_I64, 0);
+
+    // § 6's four explicit conversions. The INTEGER row of each direction comes
+    // first: a float slot takes an integer (`tk_prim_slot_fits`), so the row
+    // asked about first is the one that decides an `i64` source or target.
+    tk_prim_cast_op(d, TY_I64, "tk_dec_from_i64");
+    tk_prim_cast_op(d, ty_f64, "tk_dec_from_f64");
+    tk_prim_cast_op(TY_I64, d, "tk_dec_to_i64");
+    tk_prim_cast_op(ty_f64, d, "tk_dec_to_f64");
 }

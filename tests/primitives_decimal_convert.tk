@@ -1,0 +1,161 @@
+// primitives_decimal_convert.tk -- C4 of docs/specs/decimal.md (§ 6, § 11;
+// D77): the four conversions, and the nine slots the implicit one reaches.
+//
+//   any integer -> decimal      IMPLICIT, C# §10.2.3, in every one of D33's
+//                               nine slots: a call to `tk_dec_from_i64`
+//                               written by `tk_num_widen` (teko_typeof.tk)
+//   decimal -> any integer      EXPLICIT `(i64) d`, truncating TOWARD ZERO
+//   f32/f64 -> decimal          EXPLICIT `(decimal) x`, the double's own value
+//                               rounded to fifteen significant digits, which
+//                               is why `(decimal) 0.1` is `0.1m` and not the
+//                               0.1000000000000000055511151231 an `f64` holds
+//   decimal -> f64/f32          EXPLICIT `(f64) d`, may lose precision
+//
+// NONE of the four is an instruction: every one is a call into
+// `lib/decimal.tk`, because `MTASK_CAST` over sixteen bytes has no meaning at
+// all (`tw_cast`, teko_wide.tk). The two that keep a cast in the tree --
+// `(i32) d` and `(f32) d` -- keep it over the CALL's `i64`/`f64` result, where
+// it is an ordinary narrowing the core has always written.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "decimal.tk"
+
+i64 lo_of(decimal d) { ptr p = &d; return ld64(p); }
+i64 hi_of(decimal d) { ptr p = &d; return ld64(p + 8); }
+i64 scale_of(decimal d) { return (hi_of(d) >> 32) & 0xff; }
+i64 sign_of(decimal d) { return (hi_of(d) >> 63) & 1; }
+
+decimal gd;                                        // slot 2: an assignment
+
+class Box {
+    public decimal amount;                         // slot 8: a field store
+    public decimal keep(decimal d) { return d; }   // slot 4: a method argument
+}
+
+interface Sink {
+    decimal take(decimal d);
+}
+
+class Pipe : Sink {
+    public decimal take(decimal d) { return d; }   // slots 5 and 6
+}
+
+decimal echo(decimal d) { return d; }              // slot 4: a free call
+
+decimal seven() { return 7; }                      // slot 3: a `return`
+
+decimal total(params decimal[] xs) {               // slot 7: a `params` element
+    decimal s = 0m;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+i64 main() {
+    // ---- slot 1: a variable initializer, over every integer kind teko has
+    decimal a = 5;
+    if (a != 5m) return 1;
+    if (scale_of(a) != 0) return 2;
+    if (lo_of(a) != 5) return 3;
+
+    i64 n = 12;
+    decimal fromlocal = n;
+    if (fromlocal != 12m) return 4;
+
+    i32 small = 2147483647;
+    decimal fromi32 = small;
+    if (fromi32 != 2147483647m) return 5;
+
+    i32 neg = 0 - 2147483647;
+    decimal fromneg = neg;
+    if (fromneg != 0m - 2147483647m) return 6;
+    if (sign_of(fromneg) != 1) return 7;
+
+    u8 ub = 200;
+    decimal frombyte = ub;
+    if (frombyte != 200m) return 8;
+
+    decimal fromneglit = 0 - 3;
+    if (fromneglit != 0m - 3m) return 9;
+
+    // ---- slot 2: an assignment, to a local and to a global
+    decimal v = 0m;
+    v = 9;
+    if (v != 9m) return 10;
+    gd = 11;
+    if (gd != 11m) return 11;
+
+    // ---- slot 3: a `return`
+    if (seven() != 7m) return 12;
+
+    // ---- slot 4: an argument of a free call and of a method call
+    if (echo(3) != 3m) return 13;
+    Box box = new Box();
+    if (box.keep(4) != 4m) return 14;
+
+    // ---- slots 5 and 6: a virtual call and an interface call
+    Pipe pipe = new Pipe();
+    if (pipe.take(5) != 5m) return 15;
+    Sink sink = pipe;
+    if (sink.take(6) != 6m) return 16;
+
+    // ---- slot 7: an element of a `params decimal[]`
+    if (total(1m, 2m) != 3m) return 41;
+    if (total(1, 2) != 3m) return 47;
+    if (total(1, 2.5m) != 3.5m) return 43;
+
+    // ---- slot 8: a field store
+    box.amount = 8;
+    if (box.amount != 8m) return 17;
+
+    // ---- slot 9: a binary mixing the two (the promotion, § 5's last row)
+    if (a + 1 != 6m) return 18;
+    if (1 + a != 6m) return 19;
+
+    // ---- an array element takes the same conversion through the assignment
+    decimal cells[2];
+    cells[0] = 21;
+    if (cells[0] != 21m) return 20;
+
+    // ---- decimal -> integer, truncating TOWARD ZERO (C# §10.3)
+    if ((i64) 2.7m != 2) return 21;
+    if ((i64) 2.2m != 2) return 22;
+    if ((i64) (0m - 2.7m) != 0 - 2) return 23;
+    if ((i64) (0m - 0.9m) != 0) return 24;
+    if ((i64) 0m != 0) return 25;
+    if ((i64) 79228162514264337m != 79228162514264337) return 26;
+    i32 narrow = (i32) 7.9m;
+    if (narrow != 7) return 27;
+
+    // ---- f64 and f32 -> decimal, fifteen significant digits
+    if ((decimal) 0.1 != 0.1m) return 28;
+    if (scale_of((decimal) 0.1) != 1) return 29;
+    if ((decimal) 0.5 != 0.5m) return 30;
+    if ((decimal) 2.5 != 2.5m) return 31;
+    if ((decimal) 0.0 != 0m) return 32;
+    if ((decimal) (0.0 - 1.25) != 0m - 1.25m) return 33;
+    if (sign_of((decimal) (0.0 - 1.25)) != 1) return 34;
+    f64 x = 1234.5;
+    if ((decimal) x != 1234.5m) return 35;
+    f32 f = 0.5f;
+    if ((decimal) f != 0.5m) return 36;
+
+    // ---- decimal -> f64 and f32
+    if ((f64) 1.5m != 1.5) return 37;
+    if ((f64) 0.5m != 0.5) return 38;
+    if ((f64) 0m != 0.0) return 39;
+    if ((f64) (0m - 2.25m) != 0.0 - 2.25) return 40;
+    f32 back = (f32) 1.5m;
+    if (back != 1.5f) return 44;
+
+    // ---- and the round trip, both ways
+    if ((decimal) ((f64) 12.25m) != 12.25m) return 45;
+    if ((i64) ((decimal) 42.0) != 42) return 46;
+
+    return 42;
+}

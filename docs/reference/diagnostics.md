@@ -661,17 +661,27 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
 
 `decimal` is registered with `type_new("decimal", 16, 16, TK_WIDE)` and MOVES by address:
 three derived machines copy its sixteen bytes between frame slots, globals, arguments and
-the return buffer ([`teko_wide.tk`](../../teko_wide.tk), D74). C3 carries the movement and
-nothing else — no arithmetic, no comparison, no conversion, no member — so almost every
-refusal below is a wording this compiler already had, reached because `decimal` is
-registered as a primitive with an **empty** member table
+the return buffer ([`teko_wide.tk`](../../teko_wide.tk), D74). C4 adds the ARITHMETIC — the
+five operators, the two unary ones, the six comparisons and the four conversions, all of
+them a call into `lib/decimal.tk` (D77) — and leaves the MEMBER table empty, so `Round`,
+`ToString` and `Parse` are still answered by name
 ([the specification](../specs/decimal.md) § 4, [not-yet.md](not-yet.md)).
 
-- `"teko: a decimal does not cast yet"` — ``(i64) d``, ``(f64) d``, ``(decimal) x``. The
-  explicit conversions land in C4, where each becomes a call; `MTASK_CAST` on a sixteen-byte
-  value has no meaning. A primitive registered with **no** reader and **no** constructor
-  names neither in this refusal, which is why it is shorter than `DateTime`'s own
-  (`tk_prim_cast_check`, [`teko_prim.tk`](../../teko_prim.tk)).
+- `"teko: a decimal does not cast yet"` — a cast whose target the conversion table does not
+  name, `(str) d` being the one the surface reaches (text is `ToString`/`Parse`, C5). The
+  four casts § 6 opens — ``(i64) d``, ``(f64) d``, ``(decimal) n``, ``(decimal) x`` — are
+  each a CALL now and never reach this row; `MTASK_CAST` on a sixteen-byte value still has
+  no meaning. A primitive registered with **no** reader and **no** constructor names neither
+  in this refusal, which is why it is shorter than `DateTime`'s own (`tk_prim_cast_check`,
+  [`teko_prim.tk`](../../teko_prim.tk)).
+- `"teko: a global "` — completed by *decimal takes no initializer*. A `decimal` has no
+  folded form, so a global of that type is a slot and an assignment: `decimal g = 3.25m;`
+  dies one phase earlier with mc's own `global initializer must be constant` (the literal is
+  the `N_IDENT` of its own blob global), and `decimal g = 5;` is the one spelling that gets
+  past that rule — `5` IS the `N_INT` `parse_global` demands — only to need a call to
+  `tk_dec_from_i64`, which a global initializer may not be either. Refused by name
+  (`tk_rc_glb_widen`, [`teko_rc.tk`](../../teko_rc.tk), D77) rather than rewritten as the
+  `f64` bits the float slot beside it takes.
 - `"teko: new "` — completed by *`decimal() is not taught; write 0m`*, and the same
   template's own two other spellings, *`Guid() is not taught; write Guid.Empty`* (below) and
   *`DateTimeOffset() is not taught; write DateTimeOffset.MinValue`* ([below](#datetimeoffset),
@@ -707,18 +717,34 @@ registered as a primitive with an **empty** member table
   for the quoted form, and this message's own wording is unchanged because the quotes moved
   from the column to the one reader.
 
+Two are **run-time panics** of `lib/decimal.tk`, both exit 70 and both on stderr with no
+`file:line` ([runtime.md](runtime.md#the-decimal-library)):
+
+- `"teko: decimal overflow"` — a result that needs more than the 96 bits of a mantissa at a
+  scale that cannot be reduced any further: `79228162514264337593543950335m + 1m`, an
+  `(i64) d` outside `i64`'s own range, a `(decimal) x` on an `f64` above the type's ceiling,
+  and on NaN or an infinity, which are values base ten does not hold. C# raises
+  `OverflowException` at every one of them; teko has no exceptions, so it panics
+  (`tk_dec_pack`, `tk_dec_to_i64`, `tk_dec_from_f64`).
+- `"teko: decimal division by zero"` — `d / 0m` and `d % 0m`. `0m`, `0.00m` and `-0m` are
+  three bit patterns and one zero, and all three reach it (`tk_dec_is_zero`).
+
 Five more are **guards on the machine**, in the same file. Every one of them is unreachable
 from the surface — teko refuses each construct earlier, with a line and a name — and they
 are there so that a hole in that reasoning is a message rather than eight bytes moved where
 sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
 
-- `"teko: arithmetic is not defined on a sixteen-byte value yet"` — `MTASK_BIN`. The surface
-  refusal is ``teko: no operator `+` takes these operands``.
-- `"teko: a comparison is not defined on a sixteen-byte value yet"` — `MTASK_CMP`; the
-  surface refusal is the same one, naming the comparison.
-- `"teko: a unary operator is not defined on a sixteen-byte value yet"` — `MTASK_UN`.
-- `"teko: a cast is not defined on a sixteen-byte value yet"` — `MTASK_CAST`; the surface
-  refusal is `teko: a decimal does not cast yet`.
+- `"teko: arithmetic is not defined on a sixteen-byte value yet"` — `MTASK_BIN`. Since C4
+  every arithmetic operator a `decimal` takes is LOWERED to a call before codegen, and an
+  operator with no row is ``teko: no operator `&` takes these operands`` at the surface, so
+  the guard covers the hole between the two.
+- `"teko: a comparison is not defined on a sixteen-byte value yet"` — `MTASK_CMP`; the six
+  comparisons are calls too (`tk_dec_eq` … `tk_dec_ge`).
+- `"teko: a unary operator is not defined on a sixteen-byte value yet"` — `MTASK_UN`. `-d`
+  is `tk_dec_neg` and `+d` is the operand itself, written by the unary lowering with no row
+  at all (`tk_prim_unary_plus`, D77).
+- `"teko: a cast is not defined on a sixteen-byte value yet"` — `MTASK_CAST`; the four casts
+  § 6 opens are calls and the rest is `teko: a decimal does not cast yet`.
 - `"teko: a constant is not defined on a sixteen-byte value yet"` — `MTASK_CONST`. A
   `decimal` has no folded form at all, so the surface refusals are
   `teko: const requires a constant expression` and
@@ -1800,7 +1826,8 @@ truncation; the fix is to split the unit.
 | `"teko: loops nested too deep"` | 32 open at one point of one function |
 | `"teko: too many primitive types"` | 8 primitives with a member table (D74's own row was stale at 8; still 8 with `DateTimeOffset`, seven of the eight now spent) |
 | `"teko: too many primitive members"` | 160 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74) |
-| `"teko: too many primitive operators"` | 64 rows, over every primitive (D76: raised from 48, itself a stale `32` this table carried since before D74 — `DateTimeOffset`'s nine rows took the true count past 48) |
+| `"teko: too many primitive operators"` | 80 rows, over every primitive (D76: raised from 48, itself a stale `32` this table carried since before D74 — `DateTimeOffset`'s nine rows took the true count past 48; D77: raised to 80, `decimal`'s twelve rows took 50 to 62) |
+| `"teko: too many primitive conversions"` | 8 rows of the cast-to-call table, over every primitive — the four `decimal` registers today (D77). A cast whose target the table does not name is refused, never lowered, so the ceiling is a COMPILER one and no source can reach it |
 | `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row |
 | `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
 | `"teko: too many primitive arguments of unknown type"` | 128 arguments of primitive or `enum` position, in one unit, whose type only the pass can tell |

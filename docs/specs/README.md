@@ -49,7 +49,7 @@ fixes the order.
 | 10 | ~~**C3** the sixteen-byte value and `teko_wide.tk`~~ **landed**, D74 | `docs/specs/decimal.md` | M | C1 |
 | 11 | ~~**N3** `Guid`~~ **landed**, D75 | guid.md | M | C3, C1 |
 | 12 | ~~**N5** `DateTimeOffset`~~ **landed**, D76 | datetime-extras.md | M | C2, C3 |
-| 13 | **C4** the `decimal` arithmetic | `docs/specs/decimal.md` | L | C3 |
+| 13 | ~~**C4** the `decimal` arithmetic~~ **landed**, D77 | `docs/specs/decimal.md` | L | C3 |
 | 14 | **C5** `decimal` round and text | `docs/specs/decimal.md` | M | C4 |
 | 15 | **N6** `i128` and `u128` | small-ints.md | L | C3, C4 |
 | 16 | **N7** `string`, the value | string.md | L | — |

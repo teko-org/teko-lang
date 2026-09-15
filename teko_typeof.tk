@@ -106,6 +106,15 @@ i64 tk_prim_is(i64 ty);
 i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown);
 i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb);
 
+// docs/specs/decimal.md § 6 (C4, D77): the IMPLICIT half of a primitive's own
+// conversion table, which `tk_num_widen` below writes a CALL for instead of a
+// cast. The table is teko_prim.tk's and the wide set teko_wide.tk's, both
+// included after this file; one lookup, one symbol and one question is all
+// this file reads of them.
+i64  tk_prim_cast_find(i64 tty, i64 ety);
+uptr px_sym_at(i64 i);
+i64  tk_wide_is(i64 t);
+
 // docs/specs/enum.md § 6 (N2b, D47): `c.ToString()` on a receiver only the
 // oracle can type -- a qualified constant (`Color.Red.ToString()`) is one,
 // since `tk_struct_of_expr` (teko_struct.tk) does not recognize a retyped
@@ -507,6 +516,12 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     // mismatched value already gets.
     if (tk_prim_is(tty) || tk_prim_is(ety)) {
         if (tty == ety) return;
+        // D77: ...with the one exception C# §10.2.3 names, an INTEGER in a
+        // `decimal` slot. It is the same door `tk_num_widen` below opens for a
+        // float slot, and the caller splices the call it hands back; a slot
+        // whose primitive registered no conversion row -- `Guid`,
+        // `DateTimeOffset`, `TimeSpan` -- is refused exactly as before.
+        if (tk_num_widens(tty, ety)) return;
         uptr ename = type_name(ety);
         i64 ei = tk_struct_by_ty(ety);
         if (ei >= 0) ename = sr_name_at(ei);
@@ -539,8 +554,22 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
 // The rule itself is asked for on its own by a caller that cannot take the
 // node BACK -- an argument already spliced into a call two passes ago
 // (teko_prim.tk's `tk_prim_arg_widen`, D48) -- so the two never drift apart.
+// docs/specs/decimal.md § 6 (D77): an integer in a `decimal` slot converts
+// implicitly too -- C# §10.2.3 names both -- and the conversion is a CALL and
+// never a cast, because `MTASK_CAST` on a sixteen-byte value has no meaning
+// (`tw_cast`, teko_wide.tk). The QUESTION is asked of the primitive's own
+// conversion table, so this file names no primitive: a wide type that
+// registers no `i64` row converts from nothing, which is every wide type but
+// `decimal` today (`Guid`, `DateTimeOffset`).
+i64 tk_num_wide_widens(i64 tty, i64 ety) {
+    if (!tk_wide_is(tty)) return 0;
+    if (!tk_is_int_ty(ety)) return 0;
+    return tk_prim_cast_find(tty, ety) >= 0;
+}
+
 i64 tk_num_widens(i64 tty, i64 ety) {
     if (tty < 0) return 0;
+    if (tk_num_wide_widens(tty, ety)) return 1;
     if (type_kind(tty) != TK_FLOAT) return 0;
     return tk_is_int_ty(ety);
 }
@@ -566,6 +595,11 @@ i64 tk_num_widen(i64 tty, i64 ety, i64 e) {
     tk_line = nd_line(e);
     tk_file = nd_file(e);
     set_nd_next(e, 0);
+    // D77: the wide arm writes the CALL the conversion table names, and the
+    // `callp` clause below is not its business -- the symbol declares `i64`
+    // and the core already types an indirect call's result as one.
+    if (tk_num_wide_widens(tty, ety))
+        return tk_call(px_sym_at(tk_prim_cast_find(tty, ety)), e);
     if (tk_is_callp(e)) e = tk_cast(ety, e);
     return tk_cast(tty, e);
 }

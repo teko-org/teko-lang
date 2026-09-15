@@ -624,7 +624,31 @@ i64 tk_ops_promotes(i64 op) {
     return cmp_cond(op) >= 0;
 }
 
+// docs/specs/decimal.md § 5's last row, and D77's first ruling: a `decimal`
+// beside an integer converts the INTEGER, which is the same promotion one line
+// down and the reason teko_decimal.tk registers not one mixed operator row.
+// `d + 1`, `1 + d`, `d += 1` and `d++` (teko_loop.tk's own desugar, which
+// rewrites into this very node) are all covered by the twelve
+// `decimal`/`decimal` rows once this has run.
+//
+// It runs AHEAD of the float clause and ahead of `tk_ops_promotes`' own list,
+// because `%` is on neither: the list leaves `%` out for a reason of its own
+// -- this backend has no float remainder -- and a `decimal` remainder is an
+// ordinary call. An operator with no row of its own is untouched by the
+// conversion and refused a step later exactly as before: `d << 1` converts the
+// `1` and then finds no `<<` row.
+i64 tk_ops_promote_wide(i64 n) {
+    i64 ta = tk_ty_of(nd_a(n));
+    i64 tb = tk_ty_of(nd_b(n));
+    if (tk_num_widens(ta, tb)) { set_nd_b(n, tk_num_widen(ta, tb, nd_b(n))); return 1; }
+    if (tk_num_widens(tb, ta)) { set_nd_a(n, tk_num_widen(tb, ta, nd_a(n))); return 1; }
+    return 0;
+}
+
 void tk_ops_promote(i64 n) {
+    if (tk_wide_is(tk_ty_of(nd_a(n))) || tk_wide_is(tk_ty_of(nd_b(n)))) {
+        if (tk_ops_promote_wide(n)) return;
+    }
     if (!tk_ops_promotes(nd_op(n))) return;
     i64 ta = tk_ty_of(nd_a(n));
     i64 tb = tk_ty_of(nd_b(n));

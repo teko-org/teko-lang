@@ -225,22 +225,19 @@ not:
 | `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — a crumb of its own; no `teko_prim.tk` primitive has a `str` member yet, and the `enum` page's own N2b (built) does not carry over, since it is a parallel mechanism keyed on a struct-table row rather than a reuse of this table |
 | `t * 1.5`, `t / 1.5` (C#'s `operator *(TimeSpan, double)`) | ``teko: no operator `*` takes these operands`` — the spec's § 4 leaves the float multiply out |
 | `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
-| `+t` (C#'s unary plus) | ``teko: no operator `+` takes these operands`` — the unary minus is taught, its C# twin is not |
 | `new TimeSpan(h, m, s)` and the two longer constructors | `teko: wrong number of arguments for new` — one row, one argument: the tick constructor. Build it from `FromHours(h) + FromMinutes(m) + FromSeconds(s)` |
 | `switch` on a `TimeSpan` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a `TimeSpan` takes no integer operand |
 
 ## `decimal`, and the rest of `docs/specs/decimal.md`
 
-C3 landed the sixteen-byte value, its literal and its movement (D74,
-[the type reference](types.md#decimal)). The value MOVES and nothing more: C4 is the
-arithmetic and the conversions, C5 round and text ([decimal.md](../specs/decimal.md) § 12).
+C3 landed the sixteen-byte value, its literal and its movement (D74) and C4 the arithmetic,
+the comparisons and the four conversions (D77, [the type reference](types.md#decimal)). What
+is left is C5: round and text ([decimal.md](../specs/decimal.md) § 12).
 
 | written | what happens |
 |---|---|
-| `a + b`, `a - b`, `a * b`, `a / b`, `a % b`, `-a` (C4) | ``teko: no operator `+` takes these operands`` — `decimal` is registered as a primitive with an EMPTY member table, so it claims no operator at all. The unary minus is in this row too, so `-3.25m` is refused: the sign is part of the value's layout, never of its literal |
-| the six comparisons (C4) | the same message, naming the comparison. Equality is a call and never a `cmp`, because `0m`, `0.00m` and `-0m` are three bit patterns that are all equal |
-| `decimal d = 5;` (C#'s implicit integer conversion, C4) | `teko: a value of type i64 does not convert to decimal` |
-| `(i64) d`, `(f64) d`, `(decimal) x` (C4) | `teko: a decimal does not cast yet` — `MTASK_CAST` on a sixteen-byte value has no meaning; C4 turns each of them into a call |
+| `(str) d` | `teko: a decimal does not cast yet` — text is `ToString`, C5; the four casts § 6 opens are calls since C4 |
+| `decimal g = 3.25m;` at file scope | `global initializer must be constant`, from the core — the literal is the `N_IDENT` of its own blob global and a `decimal` has no folded form at all. `decimal g = 5;` gets past that rule (`5` IS an `N_INT`) and is refused by name instead: `teko: a global decimal takes no initializer`. A global is a slot and an assignment |
 | `decimal.Round(d)`, `Truncate`, `Floor`, `Ceiling`, `Abs`, `MaxValue`, `Zero` (C5) | `teko: unknown static member of decimal` — no row is registered, and no `syntax_expr("decimal")` either, so the receiver form costs nothing until C5 needs it |
 | `d.ToString()`, `decimal.Parse(s)`, `TryParse` (C5) | `teko: unknown member of decimal` and its static twin — the crumb every other primitive's text waits on too |
 | `const decimal RATE = 0.07m;` | `teko: const requires a constant expression` — a `const` is folded at compile time and the folder has no 128-bit arithmetic, so a `decimal` has no folded form. An array size is the same rule |

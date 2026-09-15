@@ -60,8 +60,9 @@ uptr tk_op_side_msg(uptr side, uptr sp);
 
 #define TK_MAXPRIMT 8                 // primitive types carrying a member table
 #define TK_MAXPRIMM 160               // member rows, over every primitive
-#define TK_MAXPRIMO 64                // operator rows, over every primitive (D76: 48 -> 64,
-                                       // N5's nine `DateTimeOffset` rows took it past 48)
+#define TK_MAXPRIMO 80                // operator rows, over every primitive (D76: 48 -> 64,
+                                       // N5's nine `DateTimeOffset` rows took it past 48;
+                                       // D77: 64 -> 80, C4's twelve `decimal` rows took 50 to 62)
 #define TK_MAXPRIMC 4096              // casts over a primitive the COMPILER wrote
 
 // what a row is reached as, and therefore what the site may write after it
@@ -1048,11 +1049,100 @@ i64 tk_prim_pend(i64 pi, i64 ty, uptr pty, uptr ppure, uptr pown) {
 // The check runs in the OPERATOR pass, which walks every node of every body
 // after the oracle has typed them and after every lowering has put its own
 // casts in the tree.
+//
+// ---- ...and the cast that IS a conversion, lowered to a call (D77) ----
+// A primitive that CONVERTS -- `decimal`, whose § 6 is four rows of C# §10.3 --
+// registers the pair here instead of being refused: `(i64) d` becomes
+// `tk_dec_to_i64(d)` and `(decimal) x` becomes `tk_dec_from_f64(x)`. It is a
+// CALL and not an instruction because `MTASK_CAST` on a sixteen-byte value has
+// no meaning at all (`tw_cast`, teko_wide.tk), and it is a table and not a
+// branch on `decimal` because this file names no primitive of its own.
+//
+// A target this table does not open keeps the refusal below, which is what
+// leaves `(str) d` -- `ToString` is C5 -- and every cast over a `Guid` or a
+// `DateTimeOffset` exactly as D74/D75/D76 left them.
+#define TK_MAXPRIMX 8                 // conversion rows, over every primitive
+
+i64  px_to[TK_MAXPRIMX];              // the type the cast NAMES
+i64  px_from[TK_MAXPRIMX];            // the type the value has
+uptr px_sym[TK_MAXPRIMX];
+i64  tk_nprimx = 0;
+
+i64  px_to_at(i64 i)   { return ld64(px_to + i * 8); }
+i64  px_from_at(i64 i) { return ld64(px_from + i * 8); }
+uptr px_sym_at(i64 i)  { return ld64(px_sym + i * 8); }
+
+void tk_prim_cast_op(i64 to, i64 from, uptr sym) {
+    if (tk_nprimx == TK_MAXPRIMX) err_at(tk_file, tk_line, "teko: too many primitive conversions");
+    st64(px_to + tk_nprimx * 8, to);
+    st64(px_from + tk_nprimx * 8, from);
+    st64(px_sym + tk_nprimx * 8, sym);
+    tk_nprimx = tk_nprimx + 1;
+}
+
+// the row whose two ends take these types, in registration order -- which is
+// why an INTEGER row is written before a float one: `tk_prim_slot_fits` lets a
+// float slot take an integer (`TimeSpan.FromHours(2)`'s own rule), so the
+// integer row has to be the first one asked about.
+i64 tk_prim_cast_find(i64 tty, i64 ety) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprimx) break;
+        if (tk_prim_slot_fits(px_to_at(i), tty) && tk_prim_slot_fits(px_from_at(i), ety)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the argument as the lowering symbol declares it. An `f32` source needs the
+// widening cast written down -- `tk_num_widen` converts an INTEGER and leaves
+// a float alone (teko_typeof.tk), and the raw four bytes of an `f32` in an
+// `f64` parameter would be read as a mantissa.
+i64 tk_prim_cast_arg(i64 want, i64 e, i64 ety) {
+    if (want == ety) return e;
+    if (type_kind(want) == TK_FLOAT && type_kind(ety) == TK_FLOAT) return tk_cast(want, e);
+    return tk_num_widen(want, ety, e);
+}
+
+// 1 when the node was lowered and the refusal below has nothing left to say.
+// The two directions are not the same rewrite:
+//
+//   (decimal) x   the cast NAMES a wide type, so no cast may survive at all
+//                 (`tw_cast` dies on one): the node BECOMES the call.
+//   (i32) d       the call answers `i64` and the cast the source wrote is what
+//                 narrows it, so the call is spliced UNDER the cast and the
+//                 cast becomes the compiler's own -- `(i64) d` is then an
+//                 identity the machine never emits.
+i64 tk_prim_cast_lower(i64 n, i64 tty, i64 ety) {
+    i64 xi = tk_prim_cast_find(tty, ety);
+    if (xi < 0) return 0;
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 pty = tty;
+    if (!tk_prim_is(pty)) pty = ety;
+    uptr sym = px_sym_at(xi);
+    tk_prim_need_include(pty, sym, line, fl);
+    tk_line = line;
+    tk_file = fl;
+    i64 a = nd_a(n);
+    set_nd_next(a, 0);
+    if (tk_wide_is(tty)) {
+        i64 call = tk_call(sym, tk_prim_cast_arg(px_from_at(xi), a, ety));
+        tk_node_replace(n, call);
+        tk_xt_put(n, tk_struct_by_ty(tty), tty, 0, TK_OWNED);
+        return 1;
+    }
+    set_nd_a(n, tk_call(sym, a));
+    tk_prim_own_cast(n);
+    return 1;
+}
+
 void tk_prim_cast_check(i64 n) {
     i64 tty = nd_type(n);
     i64 ety = tk_ty_of(nd_a(n));
     if (!tk_prim_is(tty) && !tk_prim_is(ety)) return;
     if (tk_prim_own_cast_is(n)) return;
+    if (tk_prim_cast_lower(n, tty, ety)) return;
     i64 pty = tty;
     if (!tk_prim_is(pty)) pty = ety;
     uptr nm = tk_prim_name(pty);
@@ -1164,10 +1254,26 @@ void tk_prim_binary(i64 n, i64 ta, i64 tb) {
     tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
 }
 
+// ---- unary `+`: the identity, and no row at all (D77, ruling 4) ----
+// C# declares `operator +(decimal)` and `operator +(TimeSpan)` and declares no
+// such thing on a `DateTime`, a `Guid` or a `DateTimeOffset`, and the question
+// the table already answers tells the two groups apart: a primitive that ADDS
+// TO ITSELF is a number, and a number's unary `+` is its own operand. A row
+// would be worse than useless on a wide type -- it would lower to a call that
+// copies sixteen bytes to hand them straight back.
+i64 tk_prim_unary_plus(i64 n, i64 ta) {
+    if (nd_op(n) != K_ADD) return 0;
+    if (tk_prim_op_find(K_ADD, 2, ta, ta) < 0) return 0;
+    tk_node_replace(n, nd_a(n));
+    tk_xt_put(n, tk_struct_by_ty(ta), ta, 0, TK_OWNED);
+    return 1;
+}
+
 void tk_prim_unary(i64 n, i64 ta) {
     i64 tok = nd_op(n);
     i64 line = nd_line(n);
     uptr fl = nd_file(n);
+    if (tk_prim_unary_plus(n, ta)) return;
     i64 ri = tk_prim_op_find(tok, 1, ta, 0 - 1);
     if (ri < 0) tk_prim_op_refuse(tok, line, fl);
     uptr sym = po_sym_at(ri);
@@ -1175,6 +1281,13 @@ void tk_prim_unary(i64 n, i64 ta) {
     tk_line = line;
     tk_file = fl;
     i64 ret = po_ret_at(ri);
-    tk_node_replace(n, tk_prim_ret(ret, tk_call(sym, tk_prim_raw(nd_a(n)))));
+    // D77: the operand travels the SAME road the binary one does
+    // (`tk_prim_binary` above). `tk_prim_raw` is `(i64) x`, which is `tw_cast`
+    // on a sixteen-byte value and dies there -- `-d` on a `decimal` is the
+    // first wide unary this compiler has, and it crosses under its own type
+    // because the lowering symbol declares that type (`decimal tk_dec_neg(decimal)`).
+    i64 a = tk_prim_conv(po_t0_at(ri), nd_a(n), ta);
+    set_nd_next(a, 0);
+    tk_node_replace(n, tk_prim_ret(ret, tk_call(sym, a)));
     tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
 }

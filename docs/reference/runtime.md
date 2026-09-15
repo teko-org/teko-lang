@@ -359,6 +359,40 @@ sixteen-byte FILE the way `decimal`/`Guid` each got one, only a third registrati
 slot — the core's own `MTASK_LOCAL_ADDR`, untouched by the wide machine — so surface code
 reaches the halves with no accessor and no intrinsic.
 
+### The decimal library
+
+`lib/decimal.tk` carries `decimal`'s own arithmetic on top of those three, and includes
+`rt.tk` itself for `panic` and for `tk_f64_bits`. Every operator and every conversion of
+[`decimal`](types.md#decimal) lowers to one of the symbols below, and **none of them is an
+instruction**: the whole of it is ordinary teko over 32-bit limbs held in `u64` locals — the
+technique `mc`'s own `<i128>` uses for a literal — so no leg needs a 128-bit instruction and
+`mc limits`' `intrin` row does not move (D77, [the specification](../specs/decimal.md) § 8).
+
+A working value is eight limbs of 32 bits, 256 bits in all, which is what the widest
+intermediate needs: an operand of `+` aligned by 10^28 (~2^189), the 192-bit product of `*`,
+and the 96-bit divisor shifted by 96 that bounds the quotient of `/`. The vectors are LOCAL
+arrays, so a nested call cannot find another call's scratch.
+
+| | |
+|---|---|
+| `decimal tk_dec_add(decimal a, decimal b)` / `tk_dec_sub` | the scales align to the larger one; panics `teko: decimal overflow` |
+| `decimal tk_dec_mul(decimal a, decimal b)` | the scales SUM, the mantissas multiply |
+| `decimal tk_dec_div(decimal a, decimal b)` | up to 28 places, the quotient bounded by 96 bits; panics `teko: decimal division by zero` |
+| `decimal tk_dec_rem(decimal a, decimal b)` | the sign of the DIVIDEND, the scale `max(sa, sb)`; the same panic on a zero divisor |
+| `decimal tk_dec_neg(decimal a)` | bit 63 of the high word, flipped |
+| `i64 tk_dec_cmp(decimal a, decimal b)` | `-1`/`0`/`1`: zero first (three patterns, one value), then the sign, then the magnitudes at a common scale |
+| `i64 tk_dec_eq` … `tk_dec_ge` | the six comparisons, each `tk_dec_cmp` and a test |
+| `decimal tk_dec_from_i64(i64 n)` | the IMPLICIT direction (C# §10.2.3), written by the compiler in every one of D33's nine slots |
+| `i64 tk_dec_to_i64(decimal a)` | `(i64) d`, truncating toward zero; panics `teko: decimal overflow` outside `i64` |
+| `f64 tk_dec_to_f64(decimal a)` | `(f64) d`; one rounding, not twenty-eight — the mantissa is divided once by the scale's own power of ten |
+| `decimal tk_dec_from_f64(f64 x)` | `(decimal) x`, the double's own value rounded to fifteen significant digits with the trailing zeros dropped, which is why `(decimal) 0.1` is `0.1m` |
+
+Everything a result goes through is `tk_dec_pack(uptr r, i64 scale, i64 sign)`: it reduces
+the scale by dividing by ten until the value fits both 28 places and 96 bits, rounding
+**half away from zero** on the last digit — the OPERATORS' rounding, C#'s own, and not
+`decimal.Round`'s half to even (C5). A value that cannot be reduced because it is already at
+scale zero is the overflow this type is loud about.
+
 `lib/guid.tk` carries `Guid`'s own surface code on top of those three, and needs `rt.tk` for
 `rt_alloc` and `rt_panic`. Every member and every operator of [`Guid`](types.md#guid) lowers
 to one of them.

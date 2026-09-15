@@ -47,3 +47,615 @@ void tk_dec_st(ptr p, decimal d) {
     st64(p, ld64(q));
     st64(p + 8, ld64(q + 8));
 }
+
+// ============================================================================
+// C4 -- THE ARITHMETIC (docs/specs/decimal.md § 4-§ 9, § 12; D77)
+// ============================================================================
+//
+// Everything below is ordinary teko over 32-bit limbs held in `u64` locals --
+// the technique `mc`'s own `<i128>` uses to convert a literal (`iw_muladd`,
+// already copied into `teko_decimal.tk` as `tk_dl_muladd`) -- and it is the
+// reason this crumb needs no 128-bit instruction on any of the five legs and
+// registers no intrinsic at all (D21, `mc limits`' `intrin` row unmoved).
+//
+// `rt.tk` is included for `panic`: every failure here is `rt_panic`, which
+// writes `teko: <cause>` on stderr and exits 70 -- the same road an array
+// guard already takes (docs/reference/memory.md).
+#include "rt.tk"
+
+// ---- the scratch vector ----
+// A working value is TK_DEC_NL limbs of 32 bits each, little-endian, one limb
+// per `u64` slot so that a 32x32 product plus two carries still fits the 64
+// bits a multiply has. Eight limbs is 256 bits, and 256 is what the widest
+// intermediate any operation below forms needs:
+//
+//   aligning an operand of `+`  a 96-bit mantissa times 10^28   ~ 2^189
+//   the product of `*`          96 bits by 96 bits              = 192 bits
+//   the divisor's own ceiling   a 96-bit divisor shifted by 96  = 192 bits
+//
+// The vectors are LOCAL arrays, never globals: `u64 a[8]` in a frame is its
+// own address (`tests/primitives_decimal_math.tk` walks a nested call), so
+// `tk_dec_add(tk_dec_mul(a, b), c)` cannot find another call's scratch.
+#define TK_DEC_NL 8
+
+u64  tk_dv_at(uptr v, i64 i)         { return ld64(v + i * 8); }
+void tk_dv_put(uptr v, i64 i, u64 x) { st64(v + i * 8, x); }
+
+void tk_dv_zero(uptr v) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        tk_dv_put(v, i, 0);
+        i = i + 1;
+    }
+}
+
+void tk_dv_copy(uptr d, uptr s) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        tk_dv_put(d, i, tk_dv_at(s, i));
+        i = i + 1;
+    }
+}
+
+i64 tk_dv_is_zero(uptr v) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        if (tk_dv_at(v, i)) return 0;
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 1 when the value needs more than the 96 bits a mantissa has
+i64 tk_dv_over96(uptr v) {
+    i64 i = 3;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        if (tk_dv_at(v, i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// -1, 0 or 1, from the top limb down
+i64 tk_dv_cmp(uptr a, uptr b) {
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 0) break;
+        u64 x = tk_dv_at(a, i);
+        u64 y = tk_dv_at(b, i);
+        if (x > y) return 1;
+        if (x < y) return 0 - 1;
+        i = i - 1;
+    }
+    return 0;
+}
+
+// a += b. The carry out of the TOP limb is a value past 256 bits, which no
+// caller can form (the table above) -- it is a guard and not a path.
+void tk_dv_add(uptr a, uptr b) {
+    u64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 s = tk_dv_at(a, i) + tk_dv_at(b, i) + c;
+        tk_dv_put(a, i, s & 0xffffffff);
+        c = s >> 32;
+        i = i + 1;
+    }
+    if (c) panic("decimal overflow");
+}
+
+// a -= b, with `a >= b` the caller's own business: the borrow out of the top
+// limb is read from the wrap and dropped, which is what makes the subtraction
+// of the smaller from the larger exact.
+void tk_dv_sub(uptr a, uptr b) {
+    u64 w = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 d = tk_dv_at(a, i) - tk_dv_at(b, i) - w;
+        tk_dv_put(a, i, d & 0xffffffff);
+        w = (d >> 32) & 1;
+        i = i + 1;
+    }
+}
+
+void tk_dv_inc(uptr a) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 s = tk_dv_at(a, i) + 1;
+        tk_dv_put(a, i, s & 0xffffffff);
+        if (s <= 0xffffffff) return;
+        i = i + 1;
+    }
+    panic("decimal overflow");
+}
+
+// a *= m for a multiplier below 2^32; answers the carry out of the top limb,
+// which is how a caller tells "it no longer fits" from a plain result.
+u64 tk_dv_muls(uptr a, u64 m) {
+    u64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 p = tk_dv_at(a, i) * m + c;
+        tk_dv_put(a, i, p & 0xffffffff);
+        c = p >> 32;
+        i = i + 1;
+    }
+    return c;
+}
+
+// a /= d for a divisor below 2^32; answers the remainder, which is the digit
+// every rounding decision below is made on
+u64 tk_dv_divs(uptr a, u64 d) {
+    u64 r = 0;
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 0) break;
+        u64 cur = (r << 32) | tk_dv_at(a, i);
+        tk_dv_put(a, i, cur / d);
+        r = cur % d;
+        i = i - 1;
+    }
+    return r;
+}
+
+void tk_dv_shl1(uptr a) {
+    u64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 x = (tk_dv_at(a, i) << 1) | c;
+        tk_dv_put(a, i, x & 0xffffffff);
+        c = (x >> 32) & 1;
+        i = i + 1;
+    }
+}
+
+// v <<= 96, which is exactly three limbs up: the ceiling a quotient of 96 bits
+// puts on the dividend (`tk_dec_div`)
+void tk_dv_shl96(uptr v) {
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 3) break;
+        tk_dv_put(v, i, tk_dv_at(v, i - 3));
+        i = i - 1;
+    }
+    tk_dv_put(v, 0, 0);
+    tk_dv_put(v, 1, 0);
+    tk_dv_put(v, 2, 0);
+}
+
+// r = a * b, the school product. `r` is neither `a` nor `b`, and the carry out
+// of the last limb is dropped because the only caller multiplies two 96-bit
+// mantissas, whose product is 192 bits.
+void tk_dv_mul(uptr r, uptr a, uptr b) {
+    tk_dv_zero(r);
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 c = 0;
+        i64 j = 0;
+        loop {
+            if (j >= TK_DEC_NL) break;
+            if (i + j >= TK_DEC_NL) break;
+            u64 p = tk_dv_at(a, i) * tk_dv_at(b, j) + tk_dv_at(r, i + j) + c;
+            tk_dv_put(r, i + j, p & 0xffffffff);
+            c = p >> 32;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// q = a / b, and `a` BECOMES the remainder. Long division one bit at a time
+// over the whole 256: no quotient-digit estimate to get wrong, and the cost --
+// 256 rounds of a shift, a compare and at most a subtract -- is the price this
+// crumb pays for an algorithm that is read once and trusted (C7 is the speed
+// crumb, docs/specs/decimal.md § 12).
+void tk_dv_divmod(uptr q, uptr a, uptr b) {
+    u64 r[TK_DEC_NL];
+    tk_dv_zero(q);
+    tk_dv_zero(r);
+    i64 i = TK_DEC_NL * 32 - 1;
+    loop {
+        if (i < 0) break;
+        tk_dv_shl1(r);
+        u64 bit = (tk_dv_at(a, i / 32) >> (i % 32)) & 1;
+        tk_dv_put(r, 0, tk_dv_at(r, 0) | bit);
+        if (tk_dv_cmp(r, b) >= 0) {
+            tk_dv_sub(r, b);
+            u64 one = 1;
+            tk_dv_put(q, i / 32, tk_dv_at(q, i / 32) | (one << (i % 32)));
+        }
+        i = i - 1;
+    }
+    tk_dv_copy(a, r);
+}
+
+// ---- the sixteen bytes, read and written (docs/specs/decimal.md § 1) ----
+// `&d` on a parameter of `decimal` type is the address of its own frame slot,
+// so the two halves are one `ld64` each and no accessor, no intrinsic and no
+// member of the type is needed to reach them.
+#define TK_DEC_MAXSCALE 28
+
+u64 tk_dec_lo(decimal d)    { ptr p = &d; return ld64(p); }
+u64 tk_dec_hi(decimal d)    { ptr p = &d; return ld64(p + 8); }
+i64 tk_dec_scale(decimal d) { return (tk_dec_hi(d) >> 32) & 0xff; }
+i64 tk_dec_sign(decimal d)  { return (tk_dec_hi(d) >> 63) & 1; }
+
+// bit 63 of the high word, as a `u64` the shift can be written with: a bare
+// `1 << 63` is an `i64` literal and this file never leaves the sign of a
+// mantissa to one
+u64 tk_dec_signbit() {
+    u64 one = 1;
+    return one << 63;
+}
+
+// 0m, 0.00m and -0m are three bit patterns and one value, which is C#'s rule
+// and the reason every comparison below asks this before it asks anything else
+i64 tk_dec_is_zero(decimal d) {
+    if (tk_dec_lo(d)) return 0;
+    return (tk_dec_hi(d) & 0xffffffff) == 0;
+}
+
+// the mantissa into a scratch vector, and back out of one
+void tk_dec_load(decimal d, uptr v) {
+    u64 lo = tk_dec_lo(d);
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, lo & 0xffffffff);
+    tk_dv_put(v, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(v, 2, tk_dec_hi(d) & 0xffffffff);
+}
+
+decimal tk_dec_build(uptr v, i64 scale, i64 sign) {
+    decimal d;
+    ptr p = &d;
+    u64 hi = tk_dv_at(v, 2) | (((u64) scale) << 32);
+    if (sign) hi = hi | tk_dec_signbit();
+    st64(p, tk_dv_at(v, 0) | (tk_dv_at(v, 1) << 32));
+    st64(p + 8, hi);
+    return d;
+}
+
+// v *= 10^n -- how a smaller-scaled operand is brought up to the scale of the
+// larger one. It is done in the SCRATCH and not in the mantissa, so an
+// alignment that would leave 96 bits is not an overflow at all: the sum is
+// formed wide and `tk_dec_pack` below takes the scale back down, which is what
+// `.NET`'s own `DecCalc` does before it gives up (D77, ruling 3).
+void tk_dec_raise(uptr v, i64 n) {
+    loop {
+        if (n <= 0) break;
+        if (tk_dv_muls(v, 10)) panic("decimal overflow");
+        n = n - 1;
+    }
+}
+
+// ---- the one place a result becomes a `decimal` ----
+// A scratch value and the scale it is at, reduced until BOTH fit: at most 28
+// decimal places, at most 96 bits of mantissa. Reducing is a division by ten,
+// and what the division leaves behind is the digit the result rounds on --
+// HALF AWAY FROM ZERO, which is the rule the OPERATORS carry
+// (docs/specs/decimal.md § 5; `decimal.Round` is half to even and is C5).
+//
+// Only the LAST remainder is read, and that is exact for this rule: a digit
+// above five rounds up and one below it rounds down whatever came before, and
+// a five rounds up as well -- there is no tie to break, which is the whole
+// difference from half to even.
+//
+// The carry of the rounding can itself leave 96 bits (999...9 + 1), so the
+// reduction is a loop and not a step; a value that cannot be reduced because
+// it is already at scale zero is the overflow this type is loud about.
+decimal tk_dec_pack(uptr r, i64 scale, i64 sign) {
+    loop {
+        u64 rem = 0;
+        loop {
+            if (scale <= TK_DEC_MAXSCALE && !tk_dv_over96(r)) break;
+            if (scale == 0) panic("decimal overflow");
+            rem = tk_dv_divs(r, 10);
+            scale = scale - 1;
+        }
+        if (rem < 5) break;
+        tk_dv_inc(r);
+        if (!tk_dv_over96(r)) break;
+    }
+    return tk_dec_build(r, scale, sign);
+}
+
+// ---- + and - (docs/specs/decimal.md § 5) ----
+// Both operands are aligned to the LARGER scale and the magnitudes are added
+// or subtracted with an explicit carry. `flip` is what makes one function of
+// the two: `a - b` is `a + (-b)`, and the sign of `b` is the only difference.
+decimal tk_dec_addsub(decimal a, decimal b, i64 flip) {
+    u64 va[TK_DEC_NL];
+    u64 vb[TK_DEC_NL];
+    tk_dec_load(a, va);
+    tk_dec_load(b, vb);
+    i64 sa = tk_dec_scale(a);
+    i64 sb = tk_dec_scale(b);
+    i64 s = sa;
+    if (sb > s) s = sb;
+    tk_dec_raise(va, s - sa);
+    tk_dec_raise(vb, s - sb);
+    i64 ga = tk_dec_sign(a);
+    i64 gb = tk_dec_sign(b) ^ flip;
+    i64 sign = ga;
+    if (ga == gb) {
+        tk_dv_add(va, vb);
+    } else {
+        i64 c = tk_dv_cmp(va, vb);
+        if (c > 0) {
+            tk_dv_sub(va, vb);
+        } else {
+            tk_dv_sub(vb, va);
+            tk_dv_copy(va, vb);
+            sign = gb;
+        }
+        if (c == 0) sign = 0;                 // `a - a` is +0, C#'s own answer
+    }
+    return tk_dec_pack(va, s, sign);
+}
+
+decimal tk_dec_add(decimal a, decimal b) { return tk_dec_addsub(a, b, 0); }
+decimal tk_dec_sub(decimal a, decimal b) { return tk_dec_addsub(a, b, 1); }
+
+// ---- * ----
+// The scales SUM and the mantissas multiply; `tk_dec_pack` is what brings a
+// product of more than 28 places, or of more than 96 bits, back into range.
+decimal tk_dec_mul(decimal a, decimal b) {
+    u64 va[TK_DEC_NL];
+    u64 vb[TK_DEC_NL];
+    u64 vr[TK_DEC_NL];
+    tk_dec_load(a, va);
+    tk_dec_load(b, vb);
+    tk_dv_mul(vr, va, vb);
+    return tk_dec_pack(vr, tk_dec_scale(a) + tk_dec_scale(b),
+                       tk_dec_sign(a) ^ tk_dec_sign(b));
+}
+
+// ---- / ----
+// The quotient's scale starts at `sa - sb` and the dividend buys the rest: it
+// is multiplied by ten for every place the result may still carry, as long as
+// the quotient stays inside 96 bits -- which is exactly `dividend < divisor *
+// 2^96`, the one comparison `tk_dv_shl96` exists for.
+//
+// `1m / 3m` therefore spends all 28 places and answers
+// 0.3333333333333333333333333333, and `1m / 3m * 3m` is
+// 0.9999999999999999999999999999 and not `1m`. That is C#'s answer and the
+// fixture asserts it (docs/specs/decimal.md § 5).
+decimal tk_dec_div(decimal a, decimal b) {
+    if (tk_dec_is_zero(b)) panic("decimal division by zero");
+    u64 va[TK_DEC_NL];
+    u64 vb[TK_DEC_NL];
+    u64 vq[TK_DEC_NL];
+    u64 vt[TK_DEC_NL];
+    u64 vc[TK_DEC_NL];
+    tk_dec_load(a, va);
+    tk_dec_load(b, vb);
+    i64 s = tk_dec_scale(a) - tk_dec_scale(b);
+    // a NEGATIVE scale is no representation at all: the dividend absorbs it,
+    // ten at a time, exactly as the literal does (teko_decimal.tk)
+    loop {
+        if (s >= 0) break;
+        if (tk_dv_muls(va, 10)) panic("decimal overflow");
+        s = s + 1;
+    }
+    tk_dv_copy(vc, vb);
+    tk_dv_shl96(vc);                          // the ceiling: divisor * 2^96
+    loop {
+        if (s >= TK_DEC_MAXSCALE) break;
+        tk_dv_copy(vt, va);
+        if (tk_dv_muls(vt, 10)) break;
+        if (tk_dv_cmp(vt, vc) >= 0) break;
+        tk_dv_copy(va, vt);
+        s = s + 1;
+    }
+    tk_dv_divmod(vq, va, vb);                 // `va` becomes the remainder
+    tk_dv_shl1(va);                           // twice it, against the divisor:
+    if (tk_dv_cmp(va, vb) >= 0) tk_dv_inc(vq);  // half away from zero
+    return tk_dec_pack(vq, s, tk_dec_sign(a) ^ tk_dec_sign(b));
+}
+
+// ---- % ----
+// C#'s own rule (D77, ruling 2): the sign is the DIVIDEND's and the scale is
+// `max(sa, sb)`, so `-7.5m % 2m` is `-1.5m`. The remainder is exact -- there
+// is nothing to round -- and `tk_dec_pack` only ever has work to do when the
+// alignment left the operands wider than a mantissa.
+decimal tk_dec_rem(decimal a, decimal b) {
+    if (tk_dec_is_zero(b)) panic("decimal division by zero");
+    u64 va[TK_DEC_NL];
+    u64 vb[TK_DEC_NL];
+    u64 vq[TK_DEC_NL];
+    tk_dec_load(a, va);
+    tk_dec_load(b, vb);
+    i64 sa = tk_dec_scale(a);
+    i64 sb = tk_dec_scale(b);
+    i64 s = sa;
+    if (sb > s) s = sb;
+    tk_dec_raise(va, s - sa);
+    tk_dec_raise(vb, s - sb);
+    tk_dv_divmod(vq, va, vb);
+    return tk_dec_pack(va, s, tk_dec_sign(a));
+}
+
+// ---- unary - ----
+// One bit, flipped. `-0m` is a live bit pattern and compares equal to `0m`,
+// which is C#'s rule and the reason equality is a call and never a `cmp`.
+decimal tk_dec_neg(decimal a) {
+    decimal d;
+    ptr p = &d;
+    st64(p, tk_dec_lo(a));
+    st64(p + 8, tk_dec_hi(a) ^ tk_dec_signbit());
+    return d;
+}
+
+// ---- the six comparisons ----
+// Zero first (three patterns, one value), then the sign, then the magnitudes
+// at a common scale -- which is what makes `1.0m == 1.00m` true with two
+// different mantissas.
+i64 tk_dec_cmp(decimal a, decimal b) {
+    i64 za = tk_dec_is_zero(a);
+    i64 zb = tk_dec_is_zero(b);
+    i64 ga = tk_dec_sign(a);
+    i64 gb = tk_dec_sign(b);
+    if (za && zb) return 0;
+    if (za) { if (gb) return 1; return 0 - 1; }
+    if (zb) { if (ga) return 0 - 1; return 1; }
+    if (ga != gb) { if (ga) return 0 - 1; return 1; }
+    u64 va[TK_DEC_NL];
+    u64 vb[TK_DEC_NL];
+    tk_dec_load(a, va);
+    tk_dec_load(b, vb);
+    i64 sa = tk_dec_scale(a);
+    i64 sb = tk_dec_scale(b);
+    i64 s = sa;
+    if (sb > s) s = sb;
+    tk_dec_raise(va, s - sa);
+    tk_dec_raise(vb, s - sb);
+    i64 c = tk_dv_cmp(va, vb);
+    if (ga) return 0 - c;
+    return c;
+}
+
+i64 tk_dec_eq(decimal a, decimal b) { return tk_dec_cmp(a, b) == 0; }
+i64 tk_dec_ne(decimal a, decimal b) { return tk_dec_cmp(a, b) != 0; }
+i64 tk_dec_lt(decimal a, decimal b) { return tk_dec_cmp(a, b) < 0; }
+i64 tk_dec_le(decimal a, decimal b) { return tk_dec_cmp(a, b) <= 0; }
+i64 tk_dec_gt(decimal a, decimal b) { return tk_dec_cmp(a, b) > 0; }
+i64 tk_dec_ge(decimal a, decimal b) { return tk_dec_cmp(a, b) >= 0; }
+
+// ---- the conversions (docs/specs/decimal.md § 6) ----
+// An integer converts IMPLICITLY, in every one of the nine slots D33
+// enumerated, and the compiler writes the call (`tk_num_widen`,
+// teko_typeof.tk); the other three directions are explicit and the compiler
+// writes the call under the cast the source spelled (`tk_prim_cast_check`,
+// teko_prim.tk). None of the four is a machine cast: `MTASK_CAST` on a
+// sixteen-byte value has no meaning (`tw_cast`, teko_wide.tk).
+decimal tk_dec_from_i64(i64 n) {
+    u64 va[TK_DEC_NL];
+    tk_dv_zero(va);
+    u64 m = n;
+    i64 sign = 0;
+    if (n < 0) {
+        sign = 1;
+        m = 0 - m;                            // in `u64`, so `i64`'s own floor works
+    }
+    tk_dv_put(va, 0, m & 0xffffffff);
+    tk_dv_put(va, 1, (m >> 32) & 0xffffffff);
+    return tk_dec_build(va, 0, sign);
+}
+
+// C# § 10.3: truncates TOWARD ZERO, and a value outside `i64` is an overflow
+// rather than a wrap
+i64 tk_dec_to_i64(decimal a) {
+    u64 va[TK_DEC_NL];
+    tk_dec_load(a, va);
+    i64 s = tk_dec_scale(a);
+    loop {
+        if (s <= 0) break;
+        tk_dv_divs(va, 10);
+        s = s - 1;
+    }
+    if (tk_dv_at(va, 2)) panic("decimal overflow");
+    u64 m = tk_dv_at(va, 0) | (tk_dv_at(va, 1) << 32);
+    // The range is read off BIT 63 and never with `m > lim`: `mc` compares
+    // every integer signed (`gen_binary`, src/gen_walk.mc -- `MTASK_CMP`
+    // carries a condition and no signedness), so a `u64` above 2^63 compares
+    // as a negative number. A shift is unsigned where a comparison is not,
+    // which is what this reads instead.
+    i64 top = (m >> 63) & 1;
+    if (tk_dec_sign(a)) {
+        // -2^63 is the one magnitude that sets that bit and still fits
+        if (top && (m << 1)) panic("decimal overflow");
+        return (i64) (0 - m);
+    }
+    if (top) panic("decimal overflow");
+    return (i64) m;
+}
+
+// C# § 10.3: may lose precision. The mantissa is assembled limb by limb and
+// divided ONCE by the scale's own power of ten, so the result carries one
+// rounding and not twenty-eight.
+f64 tk_dec_to_f64(decimal a) {
+    u64 va[TK_DEC_NL];
+    tk_dec_load(a, va);
+    f64 two32 = 4294967296.0;
+    f64 r = (f64) tk_dv_at(va, 2);
+    r = r * two32 + (f64) tk_dv_at(va, 1);
+    r = r * two32 + (f64) tk_dv_at(va, 0);
+    f64 p = 1.0;
+    i64 s = tk_dec_scale(a);
+    loop {
+        if (s <= 0) break;
+        p = p * 10.0;
+        s = s - 1;
+    }
+    r = r / p;
+    if (tk_dec_sign(a)) r = 0.0 - r;
+    return r;
+}
+
+// how far below one a `double` may sit before it is nothing but zero at
+// twenty-eight places: fifteen digits of significand under a scale of 28
+#define TK_DEC_F64FLOOR 45
+
+// C# § 10.3: the double's OWN value, rounded to fifteen significant digits --
+// which is why `(decimal) 0.1` is `0.1m` and not the
+// 0.1000000000000000055511151231 the sixteenth digit onwards would give.
+//
+// The value is brought into [10^14, 10^15) by multiplying or dividing by ten,
+// the fifteen digits are read off with one rounding, and the trailing zeros
+// are dropped so that the scale is the one C# reports.
+decimal tk_dec_from_f64(f64 x) {
+    u64 va[TK_DEC_NL];
+    tk_dv_zero(va);
+    u64 bits = tk_f64_bits(x);
+    if (((bits >> 52) & 0x7ff) == 0x7ff) panic("decimal overflow");   // NaN, infinity
+    i64 sign = 0;
+    if (x < 0.0) {
+        sign = 1;
+        x = 0.0 - x;
+    }
+    if (x == 0.0) return tk_dec_build(va, 0, sign);
+    f64 lo15 = 1.0;
+    i64 k = 0;
+    loop {
+        if (k >= 14) break;
+        lo15 = lo15 * 10.0;
+        k = k + 1;
+    }
+    f64 hi15 = lo15 * 10.0;
+    i64 s = 0;
+    loop {
+        if (x >= lo15) break;
+        if (s >= TK_DEC_F64FLOOR) return tk_dec_build(va, TK_DEC_MAXSCALE, sign);
+        x = x * 10.0;
+        s = s + 1;
+    }
+    loop {
+        if (x < hi15) break;
+        x = x / 10.0;
+        s = s - 1;
+    }
+    i64 m = (i64) (x + 0.5);                  // below 10^15, so the half is exact
+    loop {
+        if (s <= 0) break;
+        if (m % 10) break;
+        m = m / 10;
+        s = s - 1;
+    }
+    u64 um = m;
+    tk_dv_put(va, 0, um & 0xffffffff);
+    tk_dv_put(va, 1, (um >> 32) & 0xffffffff);
+    if (s < 0) {
+        tk_dec_raise(va, 0 - s);
+        s = 0;
+    }
+    return tk_dec_pack(va, s, sign);
+}

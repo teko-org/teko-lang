@@ -1,0 +1,163 @@
+// primitives_decimal_math.tk -- C4 of docs/specs/decimal.md (§ 5, § 8, § 11;
+// D77): the five arithmetic operators, the two unary ones and the six
+// comparisons, all of them a call into `lib/decimal.tk`'s 96-bit limb
+// arithmetic and none of them an instruction the machine has.
+//
+// The values are the ones that only come out right under C#'s own rules:
+//
+//   0.1m + 0.2m == 0.3m           exact base ten; an `f64` fails this
+//   1m / 3m * 3m                  0.9999999999999999999999999999m, 28 places,
+//                                 NOT 1m -- half away from zero on the last
+//                                 digit, the operators' own rounding (§ 5)
+//   2.5m * 4m == 10m              the scales SUM and the product is 100 at
+//                                 scale 1, which is `10.0m` and equals `10m`
+//   1.0m == 1.00m                 two mantissas, two scales, one value
+//   -7.5m % 2m == -1.5m           the sign of the DIVIDEND (D77, ruling 2)
+//
+// and the mixed forms -- `d + 1`, `2 * d`, `d += 1`, `d++` -- carry NO
+// operator row of their own: the integer is converted first (`tk_ops_promote`,
+// teko_ops.tk), which is C# §12.4.5's binary numeric promotion and the reason
+// teko_decimal.tk registers twelve rows and not thirty.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "decimal.tk"
+
+// the raw halves, the layout docs/specs/decimal.md § 1 fixes -- read here for
+// the SCALE alone, because a result's scale is as much of C#'s contract as its
+// value is and equality cannot see it
+i64 lo_of(decimal d) { ptr p = &d; return ld64(p); }
+i64 hi_of(decimal d) { ptr p = &d; return ld64(p + 8); }
+i64 scale_of(decimal d) { return (hi_of(d) >> 32) & 0xff; }
+i64 sign_of(decimal d) { return (hi_of(d) >> 63) & 1; }
+
+// a global: a `decimal` at file scope is a SLOT and an assignment, never an
+// initializer -- the literal is the `N_IDENT` of its own blob global and mc's
+// own `parse_global` takes none but an `N_INT` (D77, ruling 5)
+decimal g;
+
+decimal tax(decimal amount, decimal rate) { return amount * rate; }
+
+// the arithmetic under a wide RETURN, twice over in one expression: each call
+// site copies its sixteen bytes out of the buffer before the next branch
+decimal half(decimal d) { return d / 2m; }
+
+i64 main() {
+    // ---- + and -, exact in base ten
+    decimal a = 0.1m;
+    decimal b = 0.2m;
+    if (a + b != 0.3m) return 1;
+    if (scale_of(a + b) != 1) return 2;
+    if (0.3m - 0.1m != 0.2m) return 3;
+    if (1m - 1m != 0m) return 4;
+    if (sign_of(1m - 1m) != 0) return 5;          // `a - a` is +0, C#'s own
+
+    // the scales align to the LARGER one
+    if (1.5m + 2.25m != 3.75m) return 6;
+    if (scale_of(1.5m + 2.25m) != 2) return 7;
+
+    // ---- *, the scales summed
+    if (2.5m * 4m != 10m) return 8;
+    if (scale_of(2.5m * 4m) != 1) return 9;
+    if (1.5m * 1.5m != 2.25m) return 10;
+    if (0m * 5m != 0m) return 11;
+
+    // ...and the reduction a product past 28 places takes, rounding half away
+    // from zero (§ 5): 0.0...1m (28 places) squared is below the smallest
+    // place there is, and the half that is left rounds up
+    decimal tiny = 0.0000000000000000000000000001m;
+    if (tiny * tiny != 0m) return 12;
+    if (0.0000000000000000000000000005m * 1.0m != 0.0000000000000000000000000005m) return 13;
+
+    // ---- /, and the oracle the whole design turns on
+    if (5m / 2m != 2.5m) return 14;
+    if (1m / 3m * 3m == 1m) return 15;
+    if (1m / 3m * 3m != 0.9999999999999999999999999999m) return 16;
+    if (scale_of(1m / 3m) != 28) return 17;
+    if (10m / 4m != 2.5m) return 18;
+    if (1m / 8m != 0.125m) return 19;
+
+    // ---- %, the sign of the dividend and the larger scale
+    if (7.5m % 2m != 1.5m) return 20;
+    if (scale_of(7.5m % 2m) != 1) return 21;
+    if (-7.5m % 2m != -1.5m) return 22;
+    if (sign_of(-7.5m % 2m) != 1) return 23;
+    if (7.5m % -2m != 1.5m) return 24;             // C#: the divisor's sign is ignored
+    if (10m % 5m != 0m) return 25;
+
+    // ---- the two unary operators
+    decimal d = 7.5m;
+    if (-d != 0m - 7.5m) return 26;
+    if (sign_of(-d) != 1) return 27;
+    if (-(-d) != d) return 28;
+    if (+d != d) return 29;                        // the identity, and no call
+    if (-0m != 0m) return 30;                      // a live bit pattern, one value
+
+    // ---- the six comparisons, across scales
+    if (!(1.0m == 1.00m)) return 31;
+    if (1.0m != 1.00m) return 32;
+    if (!(1m < 2m)) return 33;
+    if (!(2m <= 2.00m)) return 34;
+    if (!(2m > 1.999m)) return 35;
+    if (!(2.00m >= 2m)) return 36;
+    if (!(-1m < 0m)) return 37;
+    if (!(-2m < -1m)) return 38;
+    if (0m != 0.00m) return 39;
+
+    // ---- an integer operand, on either side, with no row of its own
+    if (d + 1 != 8.5m) return 40;
+    if (1 + d != 8.5m) return 41;
+    if (2 * d != 15m) return 42;
+    if (d * 2 != 15m) return 43;
+    if (d - 1 != 6.5m) return 44;
+    if (15m / 2 != 7.5m) return 45;
+    if (7m % 2 != 1m) return 46;
+    if (!(d > 7)) return 47;
+    if (!(7 < d)) return 48;
+
+    // ---- the compound forms, which desugar into the node above
+    decimal acc = 1m;
+    acc += 0.5m;
+    if (acc != 1.5m) return 49;
+    acc += 1;
+    if (acc != 2.5m) return 50;
+    acc -= 0.5m;
+    if (acc != 2m) return 51;
+    acc -= 1;
+    if (acc != 1m) return 52;
+    acc++;
+    if (acc != 2m) return 53;
+    acc--;
+    if (acc != 1m) return 54;
+
+    // ---- a global slot, negative, and the sign bit the unary `-` writes
+    g = -3.25m;
+    if (g != 0m - 3.25m) return 56;
+    if (sign_of(g) != 1) return 57;
+    if (lo_of(g) != 325) return 58;
+    if (scale_of(g) != 2) return 59;
+    if (g + 3.25m != 0m) return 60;
+
+    // ---- a parameter, a return, and two wide returns in one expression
+    decimal price = 19.99m;
+    decimal total = price + tax(price, 0.07m);
+    if (total != 21.3893m) return 61;
+    if (half(10m) + half(4m) != 7m) return 62;
+    if (half(half(8m)) != 2m) return 63;
+
+    // ---- an array element and a field of a class, both arithmetic operands
+    decimal cell[2];
+    cell[0] = 1.25m;
+    cell[1] = 2.75m;
+    if (cell[0] + cell[1] != 4m) return 64;
+
+    // ---- the whole mantissa, and the edge of it
+    decimal big = 79228162514264337593543950335m;
+    if (big - 1m + 1m != big) return 65;
+    if (big / big != 1m) return 66;
+    if (big % big != 0m) return 67;
+    if (!(big > 0m)) return 68;
+
+    return 42;
+}

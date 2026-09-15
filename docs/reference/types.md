@@ -782,13 +782,14 @@ yet.
 ## `decimal`
 
 Sixteen bytes, sixteen-byte aligned, behind `#include "decimal.tk"`. It is C#'s type, and
-it exists because `0.1 + 0.2 == 0.3` is false in an `f64` and true in a `decimal` — but
-**today it only moves**: C3 ([the specification](../specs/decimal.md) § 12) carries the
-value and its literal, and the arithmetic, the comparisons, the conversions and the members
-are C4 and C5 ([not-yet.md](not-yet.md)).
+it exists because `0.1 + 0.2 == 0.3` is false in an `f64` and true in a `decimal`. It
+moves, it computes and it converts (C3 and C4, [the specification](../specs/decimal.md)
+§ 12); `decimal.Round`, `ToString` and `Parse` are C5 and are answered by name until then
+([not-yet.md](not-yet.md)).
 
 ```teko
 // expect-exit: 42
+#include "rt.tk"
 #include "decimal.tk"
 
 decimal rate;
@@ -806,15 +807,53 @@ i64 main() {
     if (ld64(p) != 1999) return 1;                // the low 64 bits of the mantissa
     if (((ld64(p + 8) >> 32) & 0xff) != 2) return 2;   // the scale
     if (ld64(&rate) != 7) return 3;               // `&` reaches a global's sixteen bytes too
+    if (0.1m + 0.2m != 0.3m) return 4;            // exact in base ten; an `f64` fails this
+    if (price + price * rate != 21.3893m) return 5;
+    if (1m / 3m * 3m == 1m) return 6;             // 0.9999999999999999999999999999m
+    decimal n = 5;                                // an integer converts, C# §10.2.3
+    if (n / 2m != 2.5m) return 7;
+    if ((i64) 2.7m != 2) return 8;                // explicit, truncating toward zero
     return 42;
 }
 ```
+
+**The operators** are C#'s, and every one of them is a call into `lib/decimal.tk`:
+
+| written | answers | rounding, and how it fails |
+|---|---|---|
+| `a + b`, `a - b` | `decimal` at `max(sa, sb)` | exact; `teko: decimal overflow`, exit 70 |
+| `a * b` | `decimal` at `sa + sb` | reduced half away from zero past 28 places; the same overflow |
+| `a / b` | `decimal`, up to 28 places | half away from zero; `teko: decimal division by zero`, exit 70 |
+| `a % b` | `decimal` at `max(sa, sb)`, the sign of the DIVIDEND | exact; the same division panic |
+| `-a` | `decimal` | one bit, flipped |
+| `+a` | `decimal` | the operand itself, with no call at all |
+| `==` `!=` `<` `<=` `>` `>=` | `i64` 0/1 | the scales align first, so `1.0m == 1.00m` |
+| `a + 1`, `1 + a` | `decimal` | the integer converts first, then the row above |
+
+`+ - *` are exact whenever the result fits 96 bits at the scale the operands imply; only a
+result past 28 decimal places rounds, and it rounds **half away from zero**, which is what
+`.NET`'s own `DecCalc` does for the operators. `1m / 3m * 3m` is therefore
+`0.9999999999999999999999999999m` and not `1m` — the same answer C# gives.
+`<<`, `>>`, `&`, `|`, `^` and `~` take no `decimal`, in C# or here.
+
+**The conversions** (C# §10.2.3 and §10.3), none of them an instruction:
+
+| from | to | how |
+|---|---|---|
+| any integer (`u8`..`i64`, `i32`) | `decimal` | **implicit**, in every one of D33's nine slots |
+| `decimal` | any integer | **explicit** `(i64) d`, truncating toward zero |
+| `f32`, `f64` | `decimal` | **explicit** `(decimal) x`, the double's own value rounded to 15 significant digits |
+| `decimal` | `f64`, `f32` | **explicit** `(f64) d`, may lose precision |
+| `decimal` | `str` | `.ToString()`, C5 |
+| `null`, a class, a struct, a `T[]` | `decimal` | refused |
 
 **The literal** is `<digits>[.<digits>][e[+|-]<digits>]m`, case-insensitive in the suffix:
 `1m`, `0.1m`, `19.99M`, `1.5e3m`, `15e-2m`. It is refused where it is written when the
 mantissa needs more than 96 bits (`teko: decimal literal out of range`) or the scale passes
 28 (`teko: a decimal carries at most 28 decimal places`). The **unary minus** is an
-operator, not part of the literal, so `-3.25m` is refused with the rest of the arithmetic.
+operator and not part of the literal, so `-3.25m` is `tk_dec_neg(3.25m)` — which is why a
+`decimal` GLOBAL is a slot and an assignment and never an initializer: a call is not a
+constant, and neither is the literal itself (it is the name of its own blob global).
 
 **The layout**, which `&d` reads back with two `ld64`s:
 
@@ -844,14 +883,15 @@ allocation (§ `struct` above): a `decimal` field would be a reference to sixtee
 arena, copied by aliasing rather than by value, and every `decimal` in a loop would be a
 block to reclaim. C# gives it value semantics and no heap.
 
-**What C3 refuses**, every one of them by name and at the line it was written:
+**What is still refused**, every one of them by name and at the line it was written:
 
 | written | message |
 |---|---|
-| `a + b`, `a - b`, `a * b`, `-a`, the six comparisons | ``teko: no operator `+` takes these operands`` |
-| `i64 n = d;` | `teko: a value of type decimal does not convert to i64` |
-| `decimal d = 5;`, `decimal d = 1.5;` | `teko: a value of type i64 does not convert to decimal` |
-| `(i64) d`, `(decimal) x` | `teko: a decimal does not cast yet` |
+| `d << 1`, `d & d`, `~d` | ``teko: no operator `<<` takes these operands`` |
+| `i64 n = d;`, `f64 x = d;` | `teko: a value of type decimal does not convert to i64` — the cast is the written form |
+| `decimal d = 1.5;` | `teko: a value of type f64 does not convert to decimal` — `(decimal) 1.5` is the written form |
+| `(str) d` | `teko: a decimal does not cast yet` — text is `ToString`, C5 |
+| `decimal g = 5;` at file scope | `teko: a global decimal takes no initializer` |
 | `d.Anything`, `decimal.Anything` | `teko: unknown member of decimal` and its static twin |
 | `const decimal R = 1m;` | `teko: const requires a constant expression` |
 | `case 1m:` | `teko: a case label must be a constant expression` |
