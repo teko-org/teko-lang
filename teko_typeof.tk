@@ -491,6 +491,16 @@ void tk_check_scalar_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     }
     if (type_kind(ety) == TK_FLOAT && type_kind(tty) != TK_FLOAT)
         tk_reject_compat(type_name(ety), type_name(tty), line, fl);
+    // D78: the two float widths, C# CS0664 -- `f32`/`f64` are both
+    // `TK_FLOAT`, so the clause above never reaches this pair, and an `f64`
+    // narrowing into an `f32` slot would otherwise fall through untouched
+    // into the raw bit copy `tk_num_widens` below does not guard. Only a
+    // NARROWING width is refused; the equal-width case (`tty == ety`) and the
+    // widening one (`type_width(tty) > type_width(ety)`) both return here and
+    // let `tk_num_widens`/`tk_num_widen` convert or pass the value through.
+    if (type_kind(ety) == TK_FLOAT && type_kind(tty) == TK_FLOAT
+            && type_width(tty) < type_width(ety))
+        tk_reject_compat(type_name(ety), type_name(tty), line, fl);
     if (tk_is_int_ty(tty) || type_kind(tty) == TK_FLOAT) {
         i64 ei = tk_struct_by_ty(ety);
         if (ei >= 0) tk_reject_compat(sr_name_at(ei), type_name(tty), line, fl);
@@ -572,7 +582,14 @@ i64 tk_num_widens(i64 tty, i64 ety) {
     if (tty < 0) return 0;
     if (tk_num_wide_widens(tty, ety)) return 1;
     if (type_kind(tty) != TK_FLOAT) return 0;
-    return tk_is_int_ty(ety);
+    if (tk_is_int_ty(ety)) return 1;
+    // D78: `f32` widens to `f64` the same way C# §10.2.3 widens `float` to
+    // `double` -- the narrowing direction is refused above, in
+    // `tk_check_scalar_compat`, so this door only ever opens for the safe
+    // one. `ety` may be a plain FLOAT LITERAL too (an `N_INT` whose `nd_val`
+    // is a bit pattern, not an integer, `lib/float.mc`), which is exactly
+    // why the kind is asked before the width.
+    return type_kind(ety) == TK_FLOAT && type_width(ety) < type_width(tty);
 }
 
 // an INDIRECT call declares its return type by the cast that sits DIRECTLY on

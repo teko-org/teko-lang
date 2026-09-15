@@ -628,6 +628,45 @@ void tk_rc_fn(i64 f) {
 // refused by the core as non-constant, and the only other initializer shape a
 // global has is `N_STR`, which no oracle types, so `tk_num_widens` never
 // answers 1 for it.
+
+// D78: `f64 G = 1.0f;`. The exponent rebias, IEEE-754 binary32 to binary64,
+// bit surgery rather than `fl_dec2bits` -- `1.0f`'s `nd_val` is already the
+// bit pattern `fl_lit` wrote (`lib/float.mc`), not a decimal value, and
+// feeding it to `fl_dec2bits` as an integer would read `0x3f800000` as the
+// decimal 1065353216. Sign carries over unchanged; a zero (biased exponent 0,
+// zero mantissa) and an inf/NaN (biased exponent all-ones) each keep their
+// own shape, rebiased or not; a SUBNORMAL binary32 (biased exponent 0, a
+// nonzero mantissa) has no direct rebias -- it is renormalized first, the
+// same shift-until-the-implicit-bit-is-set a `clz` would give, since binary64
+// has room for every subnormal binary32 as a NORMAL value.
+u64 tk_f32_bits_to_f64(u64 b32) {
+    u64 sign = (b32 >> 31) & 1;
+    u64 exp32 = (b32 >> 23) & 0xff;
+    u64 mant32 = b32 & 0x7fffff;
+    u64 exp64 = 0;
+    u64 mant64 = 0;
+    if (exp32 == 0xff) {                       // inf / NaN
+        exp64 = 0x7ff;
+        mant64 = mant32 << 29;
+    } else if (exp32 == 0 && mant32 == 0) {     // signed zero
+        exp64 = 0;
+    } else if (exp32 == 0) {                    // subnormal: renormalize
+        i64 shift = 0;
+        u64 m = mant32;
+        loop {
+            if (m & 0x800000) break;
+            m = m << 1;
+            shift = shift + 1;
+        }
+        exp64 = 897 - shift;                    // 1023 - 127 + 1 - shift
+        mant64 = (m & 0x7fffff) << 29;
+    } else {                                    // normal: rebias 127 -> 1023
+        exp64 = exp32 + 896;
+        mant64 = mant32 << 29;
+    }
+    return (sign << 63) | (exp64 << 52) | mant64;
+}
+
 void tk_rc_glb_widen(i64 tty, i64 e) {
     // D77: ...and the WIDE slot, where the same rewrite has no answer at all.
     // `decimal g = 5;` reaches here because `5` IS the `N_INT` the core's own
@@ -641,6 +680,14 @@ void tk_rc_glb_widen(i64 tty, i64 e) {
         err_at(nd_file(e), nd_line(e),
                tk_join3("teko: a global ", type_name(tty), " takes no initializer"));
     if (nd_kind(e) != N_INT) return;
+    // D78: an already-FLOAT literal (`1.0f` into an `f64` slot) carries a bit
+    // pattern in `nd_val`, not a decimal value -- the trap the integer path
+    // below would fall into (`tk_f32_bits_to_f64`'s own comment).
+    if (type_kind(nd_type(e)) == TK_FLOAT) {
+        set_nd_val(e, tk_f32_bits_to_f64(nd_val(e)));
+        set_nd_type(e, tty);
+        return;
+    }
     i64 v = nd_val(e);
     i64 neg = v < 0;
     u64 m = v;
