@@ -1,0 +1,101 @@
+// primitives_i128_text.tk -- N6b-3 of docs/specs/small-ints.md (§ 7; D85):
+// the text, and the members and statics -- `ToString`, `Parse`, `TryParse`,
+// `CompareTo`, `Equals`, `MinValue`, `MaxValue`, `Zero`, `One`. After this
+// crumb N6b owes nothing more (docs/reference/not-yet.md).
+//
+//   ToString / Parse round trip   MinValue, MaxValue, zero, -1, a 39-digit
+//                                 u128 (u128.MaxValue itself)
+//   TryParse                     good text, bad text ("x", "", "1 ", " 1",
+//                                 "+", "-"), one past MaxValue, "-1" on
+//                                 u128 (overflows), "-0" on u128 (0, true)
+//   CompareTo / Equals            -1/0/1, and the boolean pair
+//   the four statics               MinValue, MaxValue, Zero, One, both types
+//
+// `(str) x` stays refused -- only the wording moved, `decimal`'s own shape
+// (`tests/refuse/i128_cast_str.tk`).
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "wide.tk"
+
+i64 same(str a, str b) { return tk_str_eq(a, b); }
+
+i128 i128_min() { return (0i - 170141183460469231731687303715884105727i) - 1i; }
+i128 i128_max() { return 170141183460469231731687303715884105727i; }
+u128 u128_max() { return 340282366920938463463374607431768211455u; }
+
+i64 main() {
+    // ---- ToString ----
+    if (!same(i128_min().ToString(), "-170141183460469231731687303715884105728")) return 1;
+    if (!same(i128_max().ToString(), "170141183460469231731687303715884105727")) return 2;
+    if (!same((0i).ToString(), "0")) return 3;
+    if (!same((0i - 1i).ToString(), "-1")) return 4;
+    if (!same(u128_max().ToString(), "340282366920938463463374607431768211455")) return 5;
+    if (!same((0u).ToString(), "0")) return 6;
+
+    // ---- Parse: the round trip, and back ----
+    if (i128.Parse("-170141183460469231731687303715884105728") != i128_min()) return 7;
+    if (i128.Parse("170141183460469231731687303715884105727") != i128_max()) return 8;
+    if (i128.Parse("0") != 0i) return 9;
+    if (i128.Parse("-1") != 0i - 1i) return 10;
+    if (u128.Parse("340282366920938463463374607431768211455") != u128_max()) return 11;
+    if (u128.Parse("0") != 0u) return 12;
+    if (u128.Parse("-0") != 0u) return 13;          // D85, ruling 1: -0 parses to 0
+    if (i128.Parse("+5") != 5i) return 14;          // the sign grammar admits +
+
+    // ---- TryParse: 1 and the value, or 0 and Zero, never a panic ----
+    i128 v = 1i;
+    if (!i128.TryParse("42", out v)) return 15;
+    if (v != 42i) return 16;
+    v = 7i;
+    if (i128.TryParse("x", out v)) return 17;
+    if (v != 0i) return 18;                          // zeroed on failure
+    v = 7i;
+    if (i128.TryParse("", out v)) return 19;
+    if (v != 0i) return 20;
+    v = 7i;
+    if (i128.TryParse("1 ", out v)) return 21;       // trailing space
+    if (v != 0i) return 22;
+    v = 7i;
+    if (i128.TryParse(" 1", out v)) return 23;       // leading space
+    if (v != 0i) return 24;
+    v = 7i;
+    if (i128.TryParse("+", out v)) return 25;        // a sign with no digit
+    if (v != 0i) return 26;
+    v = 7i;
+    if (i128.TryParse("-", out v)) return 27;
+    if (v != 0i) return 28;
+    v = 7i;
+    // one past MaxValue: 2^127, a value `i128.Parse` never accepts
+    if (i128.TryParse("170141183460469231731687303715884105728", out v)) return 29;
+    if (v != 0i) return 30;
+
+    u128 uv = 1u;
+    if (u128.TryParse("-1", out uv)) return 31;      // overflows: magnitude nonzero
+    if (uv != 0u) return 32;
+    uv = 9u;
+    if (!u128.TryParse("-0", out uv)) return 33;
+    if (uv != 0u) return 34;
+
+    // ---- CompareTo / Equals ----
+    if (i128_min().CompareTo(i128_max()) != 0 - 1) return 35;
+    if (i128_max().CompareTo(i128_min()) != 1) return 36;
+    if (i128_max().CompareTo(i128_max()) != 0) return 37;
+    if (!i128_max().Equals(i128_max())) return 38;
+    if (i128_min().Equals(i128_max())) return 39;
+    if (u128_max().CompareTo(0u) != 1) return 40;
+    if (!(0u).Equals(0u)) return 41;
+
+    // ---- the four statics, both types ----
+    if (i128.MinValue != i128_min()) return 43;
+    if (i128.MaxValue != i128_max()) return 44;
+    if (i128.Zero != 0i) return 45;
+    if (i128.One != 1i) return 46;
+    if (u128.MinValue != 0u) return 47;
+    if (u128.MaxValue != u128_max()) return 48;
+    if (u128.Zero != 0u) return 49;
+    if (u128.One != 1u) return 50;
+
+    return 42;
+}
