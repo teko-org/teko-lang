@@ -7439,6 +7439,17 @@ move together. And `mc tool install` exists since mc 0.15.21 (M48 C3): `tekoc` a
 installable tool (`[project] kind = "exe"`, `[package].bin`, `[[permission]]`) is a crumb of its
 own, the last row of `docs/specs/roadmap-1.0.md` § What teko owes.
 
+**Amendment (2026-09-15) — the pin rises to 0.17.2.** mc 0.17.1 (the four `mc tool`
+defects, `tekoc-tool.md` § 10) and 0.17.2 (`mc pkg sync` with a vendored `deps/x` at another
+version: `deps/x is B, [deps] wants A: update the checkout or remove deps/x`, found by the std
+lockstep) are patches under the same frozen surface. The canary judged 0.17.1 `ok` (run
+34921240874); 0.17.2 was promoted by mc's timeout while this repository's poller was not
+watching, and its verdict was written afterwards by a manual dispatch. The whole local recipe is
+green on 0.17.2 over `a1cf0b52` (94 passed, 119 refused, 0 failed; `FIXPOINT OK`; docs ok) and
+`--dump-ast` is byte-identical between the compiler built by 0.17.0 and by 0.17.2 on every
+fixture. The move is D64's: `MC_VERSION` and `[package].mc` to 0.17.2, the four current-pin
+quotes with them; nothing in the modules moves.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
