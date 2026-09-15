@@ -88,7 +88,7 @@ overloads grow beside them. Nothing is renamed and nothing is removed.
 | `string` | `str`, `ptr`, `uptr` | **implicit**, one `ld64` of the `data` field | rule 3 |
 | `str`, `ptr`, `uptr` (not a literal) | `string` | **explicit**: `new string(p)`, which copies | rule 4 |
 | `string` | `string` | identity | |
-| `null` | `string` | **implicit** — a `string` is a reference and C# strings are nullable | D32 |
+| `null` | `string?` | **implicit** into the nullable slot only — `string s = null;` is refused, D43 supersedes D32's "C# strings are nullable" reading | D43 |
 | `string` | any number | refused: `teko: a value of type string does not convert to i64` | D34, already |
 | any number | `string` | refused: `teko: a value of type i64 does not convert to string` | D34, already |
 | `char` | `string` | `new string(c)` and `new string(c, i64 count)` | C#'s two constructors |
@@ -207,7 +207,7 @@ i64 main() {
 | `string + i64` and every other mixed `+` | ``teko: no operator `+` takes these operands`` (§ 8) |
 | `s[i] = c` | `teko: a string is immutable` |
 | `$"…"` | `teko: string interpolation is not taught yet` — **and the lexer gets there first today**, § 9 |
-| `s.Lenght` | `teko: string has no member Lenght` — the wording a class member already gets |
+| `s.Lenght` | `teko: unknown member of string: Lenght` — the wording a class member already gets (measured) |
 | `string` used without the include | ``teko: `string` needs #include "string.tk"`` |
 
 ## 6. `Length`, and what an index means
@@ -243,7 +243,7 @@ Split across two crumbs; § 12 says which is which.
 |---|---|---|
 | `string.Empty` | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
 | `string.Concat(string, string)` | `.ToString()` — identity | `.IndexOf(string)`, `.IndexOf(char)`, `.LastIndexOf(string)` |
-| `string.IsNullOrEmpty(string)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
+| `string.IsNullOrEmpty(string?)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
 | `string.Join(string, string[])` | `.GetHashCode()` | `.Trim()`, `.TrimStart()`, `.TrimEnd()` |
 | | | `.ToUpper()`, `.ToLower()` — **ASCII only**, § 10 |
 | | | `.Replace(string, string)`, `.Split(char)` → `string[]` |
