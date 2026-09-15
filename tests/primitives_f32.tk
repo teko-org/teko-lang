@@ -1,0 +1,76 @@
+// primitives_f32.tk -- D78: `f32` widens to `f64` implicitly (C# §10.2.3),
+// and the narrow direction is refused rather than run raw (C# CS0664). The
+// bit-pattern oracle is what proves the widen is a real IEEE-754 conversion
+// and not the raw four-byte-into-the-low-half copy `docs/reference/not-yet.md`
+// used to record: `2.5f`'s four bytes are `00 00 20 40`, and the value must
+// become `2.5`'s own eight bytes, `00 00 00 00 00 00 04 40`, not those four
+// followed by garbage.
+//
+// `byte32`/`byte64` read a local's own frame slot through `&x` and `ld8`, the
+// same technique `tests/primitives_guid_bytes.tk` and the `decimal` fixtures
+// already use.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+
+f64 G = 1.0f;                                    // D78 ruling 3: bit surgery at file scope
+f32 gs = 1;                                      // D33's own rule, unmoved: int literal, 24/8
+
+struct Box { public f64 w; }
+f64 gel[2];
+
+i64 byte32(f32 x, i64 i) { ptr p = &x; return ld8(p + i); }
+i64 byte64(f64 x, i64 i) { ptr p = &x; return ld8(p + i); }
+
+f64 arg_into(f64 v) { return v; }                // an f32 argument into an f64 parameter
+f32 giveback()      { return 2.5f; }             // an f32 return, widened at the caller
+
+i64 main() {
+    f32 b = 2.5f;
+    if (byte32(b, 0) != 0x00) return 1;
+    if (byte32(b, 1) != 0x00) return 2;
+    if (byte32(b, 2) != 0x20) return 3;
+    if (byte32(b, 3) != 0x40) return 4;
+
+    f64 e = b;                                   // the widen itself, a variable initializer
+    if (e != 2.5) return 5;
+    if (byte64(e, 0) != 0x00) return 6;
+    if (byte64(e, 5) != 0x00) return 7;
+    if (byte64(e, 6) != 0x04) return 8;
+    if (byte64(e, 7) != 0x40) return 9;
+
+    if (b != 2.5) return 10;
+    if (2.5 != b) return 11;
+    if (b + 1.0 != 3.5) return 12;
+
+    if (arg_into(b) != 2.5) return 13;
+    f64 got = giveback();
+    if (got != 2.5) return 14;
+
+    Box box = new Box();
+    box.w = b;                                   // a field store
+    if (box.w != 2.5) return 15;
+
+    gel[0] = b;                                  // an element store
+    if (gel[0] != 2.5) return 16;
+
+    if (G != 1.0) return 17;
+    if (byte64(G, 6) != 0xf0) return 18;
+    if (byte64(G, 7) != 0x3f) return 19;
+    G = b;                                       // a global, assigned rather than initialized
+    if (G != 2.5) return 20;
+
+    if (byte32(gs, 0) != 0x00) return 21;
+    if (byte32(gs, 1) != 0x00) return 22;
+    if (byte32(gs, 2) != 0x80) return 23;
+    if (byte32(gs, 3) != 0x3f) return 24;
+
+    f32 cast = (f32) 2.5;                        // the explicit road, unmoved
+    if (byte32(cast, 0) != 0x00) return 25;
+    if (byte32(cast, 1) != 0x00) return 26;
+    if (byte32(cast, 2) != 0x20) return 27;
+    if (byte32(cast, 3) != 0x40) return 28;
+
+    return 42;
+}
