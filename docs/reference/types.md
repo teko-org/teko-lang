@@ -1305,7 +1305,7 @@ class string {
 }
 ```
 
-**This page's own N7a share.** `new string(raw)` is the one constructor: it measures `raw`
+**This page's own N7a share.** `new string(raw)` is the constructor that takes text (the other, `new string()`, is the empty string, D86): it measures `raw`
 (a `str`) with `tk_str_len` and COPIES it, so mutating or releasing the source afterwards
 has no effect on the object. `.Length` is the code-point COUNT and `.Utf8Length` is the
 byte count — teko's `char` is a scalar code point, not a UTF-16 unit, so `.Length` keeps
