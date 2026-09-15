@@ -10,7 +10,11 @@
 // so a second WIDTH's own overflow trigger is not a second fixture: nothing
 // in `tk_div_min` branches on the width beyond `type_width` itself.
 //
-// The final line's divisor is the literal `2`: `tk_div_guard` never even
+// The `&&`/`||` rows are D82's own amendment (the PR's F1): a division in
+// the RHS of a short-circuit is guarded INSIDE the branch, so a left side
+// that stops short of it never runs the guard either.
+//
+// The literal-divisor row's divisor is the literal `2`: `tk_div_guard` never even
 // sees this division (`nd_kind(nd_b(n)) == N_INT`, its own header), so
 // `--dump-ast` carries it byte for byte what it was before this crumb.
 //
@@ -67,6 +71,28 @@ i64 main() {
 
     // ---- a literal divisor: no guard at all
     if (20 / 2 != 10) return 16;
+
+    // ---- D82 amended: a division behind `&&`/`||` is reached only when the
+    // short-circuit lets it through, guard included (`tk_div_lazy_lower`,
+    // teko_ternary.tk) -- every row here divides by a ZERO the left side
+    // stops short of
+    i64 n = 0;
+    i64 a = 10;
+    if (n != 0 && a / n > 1) return 17;
+    if (!(n == 0 || a / n > 1)) return 18;
+    while (n != 0 && a / n > 0) { return 19; }
+    i64 x = 1;
+    i64 y = 1;
+    if (!(x && (y || a / n > 0))) return 20;
+
+    // ---- a lazy right side whose DIVISOR has a side effect: evaluated
+    // exactly once, and only where the left side reaches it
+    calls = 0;
+    if (n != 0 && a / next() > 0) return 21;
+    if (calls != 0) return 22;
+    i64 m = 2;
+    if (m != 0 && a / next() > 100) return 23;
+    if (calls != 1) return 24;
 
     return 42;
 }

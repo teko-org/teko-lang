@@ -331,6 +331,91 @@ void tk_div_guard(i64 n, uptr dst) {
         st64(dst, list_append(ld64(dst), tk_if(cond, tk_div_panic("an integer division overflowed"))));
     }
 }
+
+// ---- D82 amended: an `&&`/`||` whose LAZY operand divides ----
+//
+// `tk_div_guard` appends its check to the list the ENCLOSING STATEMENT is
+// preceded by -- exactly right for a division that always runs, and exactly
+// wrong for one the source wrote behind `&&`/`||`: `if (n != 0 && a / n > 1)`
+// would check `n == 0` and panic ahead of the short-circuit the line was
+// written to rely on. `?:`, `??` and `?.` never had that defect, for one
+// reason: each is lowered into a REAL BRANCH before this walk ever reaches
+// what is inside its arms, and every hoist an arm needs lands in that
+// branch's own list (`tk_tern_lower`, `tk_nl_co_lower`).
+//
+// So `&&`/`||` is given the same treatment, with nothing new: an `&&`/`||`
+// whose RIGHT operand carries a division that needs a guard is rewritten,
+// ahead of the guard walk, into the branch form this file already builds --
+//
+//     x && y  ->  i64 t = 0; if (x) { <y's own hoists>; t = y; } else { t = 0; }
+//     x || y  ->  i64 t = 0; if (x) { t = 1; } else { <y's own hoists>; t = y; }
+//
+// -- with `t` read in its place. The LEFT operand always runs, so its own
+// guard keeps landing where it landed before, ahead of the whole statement.
+//
+// `tk_tern_lower` is NOT reused as it stands: it types the two arms and
+// refuses a pair that disagrees, while the `true`/`false` this rewrite needs
+// is the plain `TY_I64` truth value every comparison, `!`, `&&` and `||`
+// already carries (teko_type.tk's own `tk_bool_lit`) -- so the temporary is
+// `TY_I64` outright and no arm is typed at all.
+//
+// ONLY an `&&`/`||` that actually carries such a division is rewritten: every
+// other program's `--dump-ast` is byte for byte what it was.
+
+// a type that may still turn out to be one of teko's plain integers. An
+// operand still holding a `?:`/`??`/`?.` placeholder has no type yet
+// (`tk_ty_of` answers -1 for a call to a name nothing declares) and the
+// question below is asked one step BEFORE this walk lowers it, so -1 counts
+// in: at worst an `&&` whose right operand divides two DECIMALS reached
+// through a ternary takes the branch form too, which moves that program's own
+// dump and nothing about what it does.
+i64 tk_div_lazy_ty(i64 t) { return t < 0 || tk_is_int_ty(t); }
+
+// does `e` -- a whole lazy operand, at any depth -- carry a division
+// `tk_div_guard` would build a check around? The same predicate the guard
+// itself applies (`tk_div_applies`, plus its own literal-divisor exit), read
+// one step early.
+i64 tk_div_lazy_needs(i64 e) {
+    loop {
+        if (e == 0) return 0;
+        if (nd_kind(e) == N_BINARY && (nd_op(e) == K_DIV || nd_op(e) == K_MOD)
+            && nd_kind(nd_b(e)) != N_INT && tk_div_project_file(nd_file(e))
+            && tk_div_lazy_ty(tk_ty_of(nd_a(e))) && tk_div_lazy_ty(tk_ty_of(nd_b(e))))
+            return 1;
+        if (tk_div_lazy_needs(nd_a(e))) return 1;
+        if (tk_div_lazy_needs(nd_b(e))) return 1;
+        if (tk_div_lazy_needs(nd_c(e))) return 1;
+        if (tk_div_lazy_needs(nd_d(e))) return 1;
+        e = nd_next(e);
+    }
+}
+
+// `x && y` / `x || y` into the branch above, `n` itself becoming a reference
+// to the temporary that branch writes.
+void tk_div_lazy_lower(i64 n, uptr dst) {
+    i64 andand = nd_op(n) == K_ANDAND;
+    i64 x = nd_a(n);
+    i64 y = nd_b(n);
+    tk_tern_scan(x, dst);                  // the left runs either way
+    i64 lazyOut = 0;
+    tk_tern_scan(y, &lazyOut);             // the right, only where it is reached
+    tk_tern_at(n);
+    uptr t = gensym_new();
+    tk_ty_scope_add(t, TY_I64);
+    i64 shortv = 1;                        // what the left alone already decides
+    if (andand) shortv = 0;
+    i64 taken = list_append(lazyOut, tk_tern_assign(t, y));
+    i64 other = list_append(0, tk_tern_assign(t, tk_int(shortv)));
+    i64 thenOut = other;
+    i64 elseOut = taken;
+    if (andand) { thenOut = taken; elseOut = other; }
+    i64 ifn = tk_if(x, tk_blk(thenOut));
+    set_nd_c(ifn, tk_blk(elseOut));
+    st64(dst, list_append(ld64(dst), tk_var(TY_I64, t, tk_int(0))));
+    st64(dst, list_append(ld64(dst), ifn));
+    tk_node_replace(n, tk_id(t));
+}
+
 void tk_tern_hoist_var(i64 n, uptr dst);
 void tk_tern_stmt(i64 n, uptr pre);
 i64  tk_tern_stmts(i64 head);
@@ -399,6 +484,13 @@ void tk_tern_scan(i64 n, uptr dst) {
             tk_nl_qd_lower(n, dst);
         } else if (nd_kind(n) == N_VAR) {
             tk_tern_hoist_var(n, dst);
+        // D82 amended: an `&&`/`||` whose RIGHT operand divides is lowered
+        // into the branch form FIRST, so the guard the walk below builds
+        // lands inside the branch instead of ahead of the whole statement
+        // (`tk_div_lazy_lower`, right above `tk_tern_hoist_var`).
+        } else if (nd_kind(n) == N_BINARY && (nd_op(n) == K_ANDAND || nd_op(n) == K_OROR)
+                   && tk_div_lazy_needs(nd_b(n))) {
+            tk_div_lazy_lower(n, dst);
         } else {
             tk_tern_scan(nd_a(n), dst);
             tk_tern_scan(nd_b(n), dst);
