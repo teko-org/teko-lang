@@ -351,6 +351,19 @@ while IFS="	" read -r md line blk; do
     echo "ok $name (runs, exit $got)"
 done < "$tmp/manifest"
 nblocks=$(grep -c . "$tmp/manifest")
+
+# ---- 6. the manifest lists every module the compiler is made of ----
+# `mc.toml`'s `[package].files` is what the registry's validator checks out;
+# a module `teko.tk` includes, or a `lib/*.tk` a program includes, that is
+# not listed there compiles here and is refused THERE (`teko/teko_wide.tk:1:
+# not declared in teko's [package].files`, registry job 69, v0.13.0).
+missing=0
+listed=$(awk '/^files *= *\[/{f=1;next} f&&/^\]/{f=0} f{gsub(/[ ",]/,"");print}' mc.toml)
+for m in $(grep -o '#include "[^"]*"' teko.tk | sed 's/#include //;s/"//g') $(ls lib/*.tk) core_teko.mc mc_teko.tk teko.tk; do
+    echo "$listed" | grep -qx "$m" || { echo "manifest: $m is not in mc.toml [package].files" >&2; missing=$((missing+1)); }
+done
+if [ "$missing" = 0 ]; then echo "manifest ok: every module and lib file is in [package].files"; else fails=$((fails+1)); fi
+
 echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
 # ------------------------------------------------------------------- verdict
