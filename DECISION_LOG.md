@@ -9029,11 +9029,19 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    ternary would take the branch form too — same behaviour, a moved dump, and no fixture in
    the corpus has that shape.
 
-10. **F5, left as it is with its ceiling stated: `tk_div_project_file` excludes mc's own
-    resolved library tree by the hard-coded substring `lib/mc/v`** (ruling 6). A project of
-    its own that happened to keep sources in a directory literally named `lib/mc/v…` would
-    be excluded from the guard along with mc's, and a locked `[deps]` package resolved to
-    some third root is not covered either (this repository has no `[deps]` yet).
+10. **F5, rewritten 2026-09-15: `tk_div_project_file` excludes mc's own resolved library
+    tree by the hard-coded substring `/mc/v`** (ruling 6; it was `lib/mc/v` from the crumb's
+    landing until this date). mc resolves that tree from TWO roots — beside the compiler
+    (`build/lib/mc/v<ver>/lib/…`) and from the package cache
+    (`$HOME/.mc/libs/mc/v<ver>/lib/…`, `libs` plural) — and `lib/mc/v` matched only the
+    first: with `~/.mc/libs/mc/v1.0.0` populated (any `mc pkg sync` on a machine does that)
+    the bootstrap resolved `<mc/core_min>` through the cache and the guard read
+    `machine_arm64_float.mc:616`'s plain division as the project's own — measured on a clean
+    `65d54f40`, `teko: an integer division needs #include rt.tk`; CI never sees it (no cache
+    on a runner). `/mc/v` is the part both roots share. The ceiling: a project of its own
+    kept under a path containing `/mc/v…` would be excluded from the guard along with mc's,
+    and a locked `[deps]` package resolved to some third root is not covered either (this
+    repository has no `[deps]` yet).
     The runtime's own `panic` (ruling 5) is recognised the same way, by the suffix
     `lib/rt.tk` of the file its declaration was read from, over EVERY declaration of the
     name in the unit (`tk_div_rt_panic`, not `decl_find`'s first hit: an unrelated overload
