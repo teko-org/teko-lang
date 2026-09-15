@@ -5044,3 +5044,157 @@ anywhere in the 68.
 `29248ab977bb2c3e1d08bde7af8b616aa9e4a573fceb71620b4e1c7ac444d6eb` -- `teko_class.tk`,
 `teko_typeof.tk`, `teko_rc.tk` and `docs/reference/types.md` are listed files, so the hash
 moves by design.
+
+### D88 · `string`, the literal: interning, the two conversions in D33's nine slots, and the include refusal measured against D48's own limit (N7b, 2026-09-15)
+`docs/specs/string.md` §§ 3-5, 8-9, N7 splits in two on the D81→D83/D84/D85 precedent
+(D86): N7a landed the class alone; N7b is everything that reaches INTO it from outside —
+a `"..."` literal written where a `string` is expected, the two implicit conversions
+`string`/`str` share in every one of D33's nine slots, and the `#include` refusal § 5
+names. Depends on N7a and on nothing else.
+
+**The literal interns, never allocates.** `teko_string.tk` (new module, no `syntax`, no
+`type_alias`, no `type_new`, no `pass()` of its own — every helper is a plain function
+called from the module that already asks `tk_num_widen`, teko_typeof.tk, at that slot): a
+`"..."` node reaching a `string`-typed slot is looked up in a per-unit table by VALUE
+(byte-exact, never NUL-shortcut — a literal may carry an embedded NUL) and, on the first
+occurrence, built into a module-private global with the shape § 4 shows —
+
+```
+uptr $tk_str_0[6] = { 0, 1099511627776, 2, 2, "hi", 0 };
+//                    vt  pinned count   nb nc  bytes  owned
+```
+
+— word 0 left at its default zero (`&global` inside a global initializer is `initializer
+must be constant`, measured, and it is never read: the count is pinned so `rc_dec` can
+never walk it to zero, and `string`'s methods are not virtual), the four class fields
+placed by their OWN byte offset (`tk_field_find`/`fd_off_at`, teko_struct.tk) rather than a
+hardcoded word index, so a reordering of `lib/string.tk`'s own field declarations moves
+nothing here. A repeat occurrence answers the SAME name — `string a = "hi"; string b =
+"hi";` are one object, `(uptr) a == (uptr) b`, proved through a cast rather than `==`,
+which is by value (§ 8) and would not tell two independent objects with the same bytes
+apart. `$tk_str_<n>`'s `$` is the gensym rule D87 states and `teko_decimal.tk`'s own
+`tk_dl_name` already carries; the class row itself is looked up by NAME every time
+(`tk_struct_find_exact("string")`), the same "late" shape a library-declared `enum`'s
+column reads through in D48's own `tk_prim_late`/`tk_prim_ty`, since `string` has no id of
+its own until a program's `#include "string.tk"` declares it.
+
+**The two conversions ride every one of D33's nine slots**, beside the `tk_num_widen` call
+each already makes: an initializer, an assignment and a `return` (`teko_rc.tk`); an
+argument of a free/method call (same file), of a virtual call (`teko_expr.tk`) and of an
+interface call (`teko_iface.tk`); an element of a `params T[]` (`teko_params.tk`); a field
+store, both the parse-time-typed door and the pass-time deferred judge (`teko_typeof.tk`'s
+`tk_field_store_val`/`tk_fs_convert` — an array element rides the SAME door, D50's own
+rule that an element is a slot like any other, so no `teko_heaparr.tk` line is needed); and
+a binary — `operator+`/`operator==`/`!=` are D8's own static-member resolution
+(`teko_ops.tk`'s `tk_op_slot_fits`/`tk_op_slot_dist`, extended by one clause each so a
+literal operand matches a `string` row the way an integer literal already matches any core
+integer, and `tk_ops_binary` interns the matched operand once the row is picked, since
+`tk_ops_emit` passes the operands straight through to the call it builds). `??`
+(`teko_null.tk`'s `tk_nl_co_lower`) rides the same two calls on its right arm, over the
+UNWRAPPED payload type — a reference `T?` is `T`'s own pointer (Q1a), so the interned node,
+typed plain `string`, needs no box of its own once it fits; `tk_str_lit_fits` reads that
+unwrap itself (`tk_is_nl`/`nl_of_at`, teko_struct.tk) so `string? s = "hi";` interns too,
+which the spec's own fixture exercises. `?:` does NOT ride it: `tk_tern_lower`
+(`teko_ternary.tk`) needs its two arms' types already equal, for any type, and converts
+none of them — `cond ? 1 : 2.5` refuses the identical way `cond ? "yes" : s` does, a
+pre-existing general limit this crumb did not touch. Neither does an OVERLOADED call's own
+argument matching (`tk_ov_args_fit`, `teko_over.tk`): overload SELECTION is a different
+question from the nine slots' own conversion, asked before any declaration is chosen, and
+a name declared once — `greet(string who)`, § 5's own sample — already interns. Both gaps
+are `not-yet.md` rows rather than chased, neither one of D33's own nine.
+
+**The CHECK that gates all nine is one line, not nine.** `tk_check_compat`
+(teko_typeof.tk), the judge every one of those slots already calls before its own
+`tk_num_widen`, gains `if (tk_str_lit_fits(tty, en)) return;` beside the `null`/Q1b
+clauses already there — a `str` value that is NOT a literal keeps refusing exactly as it
+did (`tests/refuse/string_str_implicit.tk`'s own `str p = "raw"; string v = p;` still
+`teko: a value of type uptr does not convert to string`, unmoved: interning reads the
+SOURCE NODE, `nd_kind(en) == N_STR`, never the value). `tk_fs_converts` (the deferred
+field-store gate) grows the identical clause plus its mirror for the borrow direction, for
+the one case a literal or a `string` value reaches a field through a node the PARSER could
+not type at the door.
+
+**`string` → `str`/`ptr`/`uptr` is one `ld64`, by field name.** `tk_str_borrow(tty, ety,
+e)` fires wherever a slot declared `uptr` (which `str`/`ptr` alias, teko_type.tk) receives
+a `string`-typed value, replacing the object reference with `ld64(e + fd_off_at(data
+field))` — the fix to the `not-yet.md` row D86 left standing ("a class reference is a
+`uptr`... `puts(s)` prints garbage bytes"), now correct for every existing class passed
+where a `str` is expected, `string` included.
+
+**Two regressions the gate's own fixtures caught, and the general rule each one left.**
+`tk_rc_call_args` (teko_rc.tk) walks EVERY `N_CALL` of every function body it is given, by
+parameter INDEX, against whatever `decl_find` resolves — generated bodies and the
+reclaim's own generated calls included, since one pass owns the whole tree once it starts.
+(1) A METHOD call's own RECEIVER is parameter 0, declared `uptr` (`this`,
+`tk_this_name()`, teko_class.tk) — `a.Length` on a `string a` matched `tk_str_borrows`
+(`uptr` beside `string`) and rewrote the RECEIVER into `ld64(a + 32)` before calling
+`string_get_Length`, reading `a`'s own `data` field's address as if it were the object
+(measured: `tests/surface_string_interop.tk` regressed from `42` to `1`, a wrong
+`.Length`). (2) `tk_this_assign`'s own store — an `st64` call `tk_rc_store` renames to
+`rt_store`/`rt_store_own` IN PLACE, on the SAME node this function reads right after in
+one walk iteration — and a GENERATED function's own body (`tkarr_put_string`, an
+array-of-`string` element writer, teko_heaparr.tk) both call `lib/rt.tk` primitives whose
+own parameter is `uptr` GENERICALLY: `rt_own`/`rt_store`/`rt_store_own`/`rt_drop`/
+`rt_park`/`rt_free`/`rc_inc`/`rc_dec` take the slot, the value, any counted reference at
+all, never text. `s = v;` on a `string` field and `arr[i] = "…";` on a `string[]` both
+matched `tk_str_borrows` there too and stored the VALUE's `data` pointer instead of the
+object (measured: `tests/surface_string_rc.tk` a bus error on the field,
+`tests/surface_string_value.tk`'s own `params string[]` row the same on the array). Both
+are the identical rule stated once: the `str`/`ptr`/`uptr` conversion is never a GENERIC
+pointer sink's business, a parameter named `this` or one of `lib/rt.tk`'s eight named
+primitives, only a genuinely typed `str` parameter's — `tk_rc_call_args` excludes both by
+name now (`tk_decl_param_node(d, i)`'s own name, and `tk_str_is_rt_plumbing`,
+teko_string.tk).
+
+**The include refusal is measured, not built — D48's limit holds for a class the way it
+held for an `enum`.** § 5/§ 9 name `` teko: `string` needs #include "string.tk" ``; D48
+(2026-09-08, retired-log record) already proved the identical question impossible for
+`DateTimeKind`, a type an `#include`d LIBRARY file declares: the only door to a
+program-wide hint is `syntax_expr`/`type_alias`/`type_new`, and all three claim the WORD
+(`word_add`), which would make `class string { ... }`'s own name refuse itself the moment
+`lib/string.tk` is parsed (`tk_newname`, teko_struct.tk, `teko: the name is already a
+type`) — re-measured directly on this pin rather than assumed. `string` named with no
+`#include "string.tk"` therefore stays the core's own `expected ; after expression`, and
+both this page and `not-yet.md` are corrected to say so rather than name a message that
+does not exist. A library type is told apart by the library, D48's own sentence.
+
+**`$"…"` re-measured on this crumb's own pin (`mc` 1.0.1) and still `invalid hole`** —
+`puts($"hi {n}")` dies at the `$` exactly as the pre-0.15.25 lexer did, CONTRADICTING
+`docs/specs/string.md` § 9's own record that the wait ended at `mc` 0.16.1 (D64). Not
+chased: N7b claims no `$`, and doing so with the lexer still raising `invalid hole` first
+would move `mc limits`' `syntax` row for no reachable gain. Recorded in the page itself for
+N10 to re-measure first, with a minimal pure-`mc` reproducer if the contradiction holds
+(D2).
+
+**`passes` did not move**, against the page's own forecast of one new pass: every
+conversion above rides a CALL made from inside a pass already registered — nothing here
+needed a walk of its own.
+
+**Fixtures.** `tests/surface_string_value.tk` (a literal into a `string` slot in every one
+of the nine slots, plus the `string` → `str` direction through `tk_str_len`, `42`);
+`tests/surface_string_intern.tk` (two occurrences of one literal are the same object,
+proved through `(uptr)`; a different literal is a different one; `rt_live()`/`rt_used()`
+unmoved across a hundred uses of the same literal, in a loop and through a `string?` slot
+assigned and released, `42`). `tests/refuse/string_str_implicit.tk`'s own comment
+corrected to what is true now (a literal interns; a `str` variable still does not fit);
+its message and line are unmoved.
+
+**Proof** (`mc` 1.0.1, macos/aarch64, base `origin/main` `433b18d3`, D87 merged in with no
+conflict): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` → **127 passed, 141 refused as expected, 0 failed** (125/141 on the base —
+the two new fixtures, no refusal added or removed); `sh scripts/bootstrap.sh --os macos
+--arch aarch64` → `FIXPOINT OK` (105.3s); `sh scripts/check-docs.sh` → `docs ok: 703 links,
+78 fragments, 412 diagnostics, 141 refusals, 154 samples, manifest listed`; `mc build .
+--config mc.macos.toml --limits` (`rm -rf build` first) verdict `ok`, `tests/hello.tk`'s
+own leg — the one that reads the TAUGHT compiler's own registrations —
+`passes`(15)/`syntax`(20)/`alias`(25)/`types`(18)/`intrin`(8)/`on_stmt`(4) every one
+exactly where the base leaves them (`heap`, never cited); `--dump-ast --include=lib
+--include=tests`, base vs head, over all 125 pre-existing `tests/*.tk` fixtures — the 122
+that name no `string` and N7a's own five that do — **byte-identical, all 125**: no base
+fixture writes a LITERAL into a `string` slot, so none of their dumps could move by
+construction, proved rather than assumed. `mc pkg hash .`: base
+`677f62c7bde9591323f4e77faa6552b2d476e6ed11eb126592f54080bd9ea8ac`, head
+`3d98c2ef5f2992f7a9c33bfbee62efa764b6abb2d8c9407c5208443ff5787f3a` — `teko.tk`,
+`teko_string.tk` (new), `teko_typeof.tk`, `teko_rc.tk`, `teko_expr.tk`, `teko_iface.tk`,
+`teko_null.tk`, `teko_ops.tk`, `teko_params.tk` and `mc.toml` are listed files, so the hash
+moves by design.
