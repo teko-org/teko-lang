@@ -9624,9 +9624,9 @@ against the enclosing class -- `return this;` fails `teko: a value of type uptr 
 convert to <Class>` on every class in the tree, not only `string`. `.ToString()` returns
 `new string(data)`, a fresh copy of the same bytes, rather than `this`.
 
-**Proof** (mc 1.0.0, macos/aarch64, head `370c647c` before the merge below): `mc build .
+**Proof** (mc 1.0.1, macos/aarch64, on PR #747's head after the review's fixes): `mc build .
 --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` ->
-**121 passed, 140 refused as expected, 0 failed** (118/134 before this crumb, +3 run
+**124 passed, 141 refused as expected, 0 failed** (121/135 before this crumb, +3 run
 fixtures, +6 refuse fixtures); `--dump-ast --include=lib --include=tests` **byte-identical**
 on every one of the 118 pre-existing `tests/*.tk` fixtures -- no base fixture includes
 `lib/string.tk`, so the proof is by construction, confirmed rather than assumed;

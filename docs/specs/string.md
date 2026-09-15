@@ -235,13 +235,21 @@ receiver typed `string`
 lowers to `tk_string_at(s, i)`. That is a targeted addition and **not** a general indexer —
 `this[i]` on a user class stays untaught, and stays a `not-yet.md` row.
 
+**Ordering (D86, the review's question).** `.CompareTo` is ordinal over the UTF-8 BYTES,
+unsigned: the first byte that differs decides, a common prefix loses to the shorter string.
+That is code-point order. C#'s `String.CompareOrdinal` orders UTF-16 code units, which agrees
+everywhere except where a code point above U+FFFF meets one in U+E000..U+FFFF: UTF-16 puts the
+surrogate pair (`D800`..`DBFF`) first, UTF-8 puts the four-byte sequence (`F0`..) last.
+teko keeps code-point order — the same reason § 6 keeps code points for `.Length` — and
+states the divergence rather than emulating a surrogate sort.
+
 ## 7. The API
 
 Split across two crumbs; § 12 says which is which.
 
 | static | instance — N7 | instance — N8 |
 |---|---|---|
-| `string.Empty` | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
+| `string.Empty`, `new string()` (the same value) | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
 | `string.Concat(string, string)` | `.ToString()` — identity | `.IndexOf(string)`, `.IndexOf(char)`, `.LastIndexOf(string)` |
 | `string.IsNullOrEmpty(string?)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
 | `string.Join(string, string[])` | `.GetHashCode()` | `.Trim()`, `.TrimStart()`, `.TrimEnd()` |
@@ -423,8 +431,9 @@ the class from outside it — a literal, an implicit conversion, the include che
 ### N7a — the class and its members (L) — **landed, D86**
 
 `lib/string.tk`'s class with `nbytes`/`nchars`/`data`/`owned`, the constructor (`new
-string(raw)` from a `str`, rule 4 — the ONE road N7a builds an instance with) and
-destructor, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/`.CompareTo`/`.GetHashCode()`,
+string(raw)` from a `str`, rule 4 — the road N7a builds an instance with — and `string()`,
+the no-argument form, which is the EMPTY string rather than the zeroed object teko's
+allocator would otherwise hand out, D86) and destructor, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/`.CompareTo`/`.GetHashCode()`,
 `operator+` and `operator==`/`!=`, `string.Empty`/`Concat`/`IsNullOrEmpty`. **Depends on
 nothing** — not on `docs/specs/decimal.md`, not on `docs/specs/datetime.md`, not on `enum`.
 

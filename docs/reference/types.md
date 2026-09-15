@@ -1341,7 +1341,8 @@ i64 main() {
 
 | member | is |
 |---|---|
-| `new string(raw)` | the one constructor: copies a `str` |
+| `new string(raw)` | copies a `str` |
+| `new string()` | the empty string — never a zeroed object (D86) |
 | `.Length`, `.Utf8Length` | code points, bytes — both `O(1)` |
 | `.ToString()`, `.Equals(string)`, `.CompareTo(string)` (ordinal), `.GetHashCode()` | |
 | `operator+` | concatenation, a fresh `string` |

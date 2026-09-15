@@ -303,7 +303,7 @@ without `#include "string.tk"`.
 | written | what happens today, and why |
 |---|---|
 | `string s = "hi";` | `teko: a value of type uptr does not convert to string` — the literal is a `str` until N7b's interning lands; `new string("hi")` is the road today |
-| `puts(s)`, `panic(s)`, `tk_str_len(s)`, `extern ... (str ...)` given a `string` | `teko: a value of type string does not convert to i64`-shaped refusals at the call site — the implicit `string` → `str` conversion is N7b's; `s.ToString()` still answers `string`, not `str`, so there is no road around it in N7a |
+| `puts(s)`, `panic(s)`, `tk_str_len(s)`, `extern ... (str ...)` given a `string` | **accepted, and wrong** (measured): a class reference is a `uptr`, and `str`/`ptr`/`uptr` are one type to mc, so the callee reads the OBJECT HEADER as text — `puts(s)` prints garbage bytes, `tk_str_len(s)` answers the header's length. Pre-existing for every class passed where a `str` is expected; named here because `string` makes the slip likely. N7a offers no road back to a `str` (`.ToString()` answers a `string`); the implicit `string` → `str` conversion is N7b's, and until it lands keep text that a `str` slot needs as a `str` |
 | `string` named with no `#include "string.tk"` | a plain parse error today (`string` is an ordinary, undeclared identifier) rather than the friendly `` teko: `string` needs #include "string.tk" `` the design names — N7b's own mechanism, not reachable yet |
 
 **N8** owes § 6-7's index and method surface, all of it over the class N7a already
@@ -314,7 +314,7 @@ declares:
 | `s[i]` | `` teko: `[` needs an array `` — `tk_bracket` (`teko_params.tk`, not `teko_array.tk`: the spec's own citation is corrected in this crumb) gains no `string`-receiver row until N8 |
 | `s[i] = c` | the same, ahead of N8's own `teko: a string is immutable` |
 | `.Substring`, `.IndexOf`, `.LastIndexOf`, `.Contains`, `.StartsWith`, `.EndsWith`, `.Trim`/`.TrimStart`/`.TrimEnd`, `.ToUpper`/`.ToLower`, `.Replace`, `.Split`, `.PadLeft`/`.PadRight` | `teko: unknown member of string: <name>` — N8's own method surface |
-| `string.Join(string, string[])` | the same — a static N8 owes beside the instance methods |
+| `string.Join(string, string[])` | `teko: unknown member: Join` (a static's wording carries no type) — a static N8 owes beside the instance methods |
 
 `$"..."` (N10) and `"n=" + 5` (needing a universal `ToString`/`object`, § 11) are neither
 N7a's nor N7b's nor N8's; both stay exactly where
