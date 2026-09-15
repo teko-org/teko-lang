@@ -1,0 +1,72 @@
+// surface_divguard.tk -- D82: every ordinary division still answers exactly
+// what it always did. The guard `teko_ternary.tk`'s `tk_div_guard` hoists
+// ahead of a non-literal divisor costs nothing to a division that never
+// trips it -- this fixture is the proof, one row per width and per shape the
+// guard has to leave alone.
+//
+// `i32_min() / -2` exercises a NARROW signed width's own `tk_div_min`
+// (`type_width` 4, not 8) without tripping it -- the same formula
+// `tests/surface_divovf.tk` already proves correct at `i64.MinValue / -1`,
+// so a second WIDTH's own overflow trigger is not a second fixture: nothing
+// in `tk_div_min` branches on the width beyond `type_width` itself.
+//
+// The final line's divisor is the literal `2`: `tk_div_guard` never even
+// sees this division (`nd_kind(nd_b(n)) == N_INT`, its own header), so
+// `--dump-ast` carries it byte for byte what it was before this crumb.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 calls = 0;
+i64 next() { calls = calls + 1; return 2; }
+
+i64 div_i64(i64 a, i64 b) { return a / b; }
+i64 mod_i64(i64 a, i64 b) { return a % b; }
+u64 div_u64(u64 a, u64 b) { return a / b; }
+i32 div_i32(i32 a, i32 b) { return a / b; }
+u32 div_u32(u32 a, u32 b) { return a / b; }
+i16 div_i16(i16 a, i16 b) { return a / b; }
+u16 div_u16(u16 a, u16 b) { return a / b; }
+i8  div_i8(i8 a, i8 b)    { return a / b; }
+u8  div_u8(u8 a, u8 b)    { return a / b; }
+
+i64 i64_min() { return (0 - 9223372036854775807) - 1; }
+i32 i32_min() { return 0 - 2147483648; }
+
+i64 main() {
+    // ---- every width, a non-literal (parameter) divisor
+    if (div_i64(20, 3) != 6) return 1;
+    if (div_u64(20, 3) != 6) return 2;
+    if (div_i32(20, 3) != 6) return 3;
+    if (div_u32(20, 3) != 6) return 4;
+    if (div_i16(20, 3) != 6) return 5;
+    if (div_u16(20, 3) != 6) return 6;
+    if (div_i8(20, 3) != 6) return 7;
+    if (div_u8(20, 3) != 6) return 8;
+
+    // ---- truncation toward zero, not floor (C#'s own rule for both)
+    if (div_i64(0 - 7, 2) != 0 - 3) return 9;
+    if (mod_i64(0 - 7, 2) != 0 - 1) return 10;
+
+    // ---- MinValue / 1: only -1 is the dangerous divisor
+    if (div_i64(i64_min(), 1) != i64_min()) return 11;
+
+    // ---- a NARROW width's own MinValue, divided by something other than
+    // -1: the guard is built (i32's own tk_div_min) and never trips
+    if (div_i32(i32_min(), 0 - 2) != 1073741824) return 12;
+
+    // ---- the largest u64: no sign to guard, only the zero check applies
+    u64 umax = 18446744073709551615;
+    if (div_u64(umax, 2) != 9223372036854775807) return 13;
+
+    // ---- the divisor is a CALL with a side effect: evaluated exactly once
+    calls = 0;
+    if (div_i64(10, next()) != 5) return 14;
+    if (calls != 1) return 15;
+
+    // ---- a literal divisor: no guard at all
+    if (20 / 2 != 10) return 16;
+
+    return 42;
+}

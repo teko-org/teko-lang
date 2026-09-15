@@ -148,6 +148,167 @@ void tk_tern_scan(i64 n, uptr dst);
 // reads the tables of every module the parse builds), so the one question this
 // file asks it -- is this slot a primitive with members -- is declared here
 i64 tk_prim_is(i64 ty);
+
+// ---- D82: `/` and `%` over a plain integer refuse zero, and (signed) the
+// one quotient the machine cannot hold ----
+//
+// The core owns a plain int/int `/` and `%` untouched (teko_ops.tk's own
+// `tk_ops_binary`, `if (sa < 0 && sb < 0) return;`) and hands it straight to
+// `sdiv`/`idiv` -- which answer three DIFFERENT things for the same source
+// depending on which CI leg runs it (aarch64's `sdiv` answers 0 for `/0` and
+// the dividend for `%0`; x86_64's `idiv` traps, SIGFPE, exit 136; and
+// `MinValue / -1` overflows the quotient register on x86_64 while aarch64
+// answers `MinValue` back in silence). D3: C# throws `DivideByZeroException`
+// and, on both its own ISAs, `OverflowException` for the second -- so this is
+// the delta the core's own grammar does not carry, taught here rather than
+// worked around per-backend (D2).
+//
+// THE DOOR is this pass's own walk: it already visits every function
+// (`tk_ternary_pass`, no longer skipped when nothing writes `?`/`??`/`?.` --
+// see that function's own header) and every expression in it
+// (`tk_tern_scan`), so a division reached while scanning is guarded right
+// there, ahead of the statement that holds it, the same `*dst` accumulator a
+// hoisted ternary condition already joins.
+//
+// WHY THE OPERANDS ARE SCANNED FIRST. `tk_tern_scan`'s own generic branch
+// recurses into every child before this file ever asks what kind of node it
+// is looking at (`teko_ternary.tk`'s own dispatch, below) -- so a division
+// nested in a ternary arm, or a ternary nested in a division's own operand,
+// is already lowered into a plain reference by the time `tk_div_guard` reads
+// its type. Asking `tk_ty_of` any earlier would answer -1 for an
+// unresolved `tk_ternary(...)` placeholder and silently skip the guard.
+//
+// A LITERAL nonzero divisor needs no guard at all -- `x / 2` is left exactly
+// as the core wrote it, and it is what keeps `--dump-ast` unmoved for the
+// common case and for most of the compiler's own divisions (D82's own gate
+// entry: every one of them divides by a `#define`d constant). A literal ZERO
+// divisor is not specially skipped -- it falls into the same guard as a
+// variable would, which folds to an unconditional panic once the ordinary
+// path is taken; mc's own compile-time folder (`fold_binary`, `src/parse.mc`)
+// still catches the case where BOTH sides are constant, ahead of codegen,
+// with no `teko:` prefix -- left exactly as it is (D2), and never reached by
+// this guard because `fold()` runs after every pass.
+//
+// THE DIVISOR AND (for the overflow check) THE DIVIDEND are each read AT
+// MOST twice -- once by the guard, once by the division itself -- so an
+// expression with a side effect (`a / next()`) is hoisted into a fresh local
+// ahead of the guard, the initializer consumed exactly once; a bare name is
+// safe to read twice as it stands and is never hoisted.
+//
+// `panic` IS PROGRAM CODE (`lib/rt.tk`), not something every unit carries --
+// measured: none of the compiler's OWN 84 divisions (`teko_*.tk`,
+// `core_teko.mc`, `user.mc`, the very files `scripts/bootstrap.sh` compiles
+// with itself for the fixed point) has a non-literal divisor, so this guard
+// never actually fires while teko compiles its own source and `panic` never
+// needs to be declared there. A PROGRAM that divides by something the folder
+// cannot see through and never wrote `#include "rt.tk"` (directly or through
+// `decimal.tk`/`time.tk`/...) is refused here instead, by name, rather than
+// left to fail later with "call to unknown function: panic".
+i64 tk_div_min(i64 ty) {
+    i64 w = type_width(ty);
+    return tk_int(0 - (1 << (w * 8 - 1)));
+}
+
+// a reference to `e` safe to read a SECOND time: a bare name is read again as
+// it stands (the ORIGINAL node stays exactly where it was, in `n`'s own
+// operand slot); anything else is hoisted into a temporary declared ahead of
+// the statement, `e` itself becoming its initializer -- so it runs exactly
+// once -- and `n`'s own operand slot (`isA`: `nd_a`, else `nd_b`) is
+// rewritten to a fresh reference to the same temp, since the node just
+// consumed can no longer sit in two places in the tree.
+uptr tk_div_hoist(i64 e, i64 ty, uptr dst) {
+    uptr t = gensym_new();
+    tk_ty_scope_add(t, ty);
+    st64(dst, list_append(ld64(dst), tk_var(ty, t, e)));
+    return t;
+}
+
+// `panic("<msg>")`, fenced in its own block the way `tk_if`'s `then` already
+// wants it
+i64 tk_div_panic(uptr msg) {
+    return tk_blk(list_append(0, tk_stmt(tk_call("panic", tk_str(msg)))));
+}
+
+// D2 draws the line at mc's own bundled core, and getting there right takes
+// BOTH oracles this project already has, not either alone -- measured on the
+// fixed point (`scripts/bootstrap.sh` compiles `mc_teko.tk`, which reaches
+// `<mc/core_min>`):
+//
+//   1. `src/arena.mc`'s own `buf_pad` divides by a PARAMETER (`buf_len(b) %
+//      align`), reached through the compiler's OWN blob, and announced by
+//      `lex_file()` under a bare canonical name (`mc/arena`, no directory,
+//      no extension -- hooks.md's own "a normalised path... the canonical
+//      bundled name... for a bundled one"). `tk_origin_of_file`
+//      (teko_access.tk) answers WRONG for exactly this shape: with a bare
+//      (no-directory) entry and config, the pair `scripts/bootstrap.sh`
+//      derives when it runs from the repository root, its own fallback
+//      ("the project is the whole [current] directory") calls `mc/arena`
+//      project code too, since it does not start with `.`. The narrower
+//      question this file actually needs already has an exact answer:
+//      `tk_fwd_is_source_name` (teko_fwd.tk) is the SAME `.tk`-suffix filter
+//      `source_claim` uses to tell a real file from a bundled canonical name
+//      -- none of the latter ends in `.tk` or `.mc` -- `.mc` joins it here
+//      for `core_teko.mc`/`user.mc`, this project's own two non-`.tk` files.
+//
+//   2. mc's own LIBRARY TREE, resolved onto disk rather than carried in the
+//      blob (`lib/machine_arm64_float.mc`, reached the same way), announces
+//      a REAL path, extension included -- `.mc`, same as this project's
+//      own -- so the suffix filter alone answers 1 for it too. It is
+//      `tk_origin_of_file`'s OWN first line that gets this one right: the
+//      resolved path is absolute, and an absolute path is never this
+//      project's own (that function's own comment).
+//
+// Neither oracle alone is enough; both together are, since each one is
+// wrong only on the shape the other one reads correctly.
+i64 tk_div_project_file(uptr f) {
+    if (f == 0) return 0;
+    if (!tk_origin_of_file(f)) return 0;
+    if (tk_fwd_is_source_name(f)) return 1;
+    i64 n = cstrlen(f);
+    return n >= 3 && ld8(f + n - 3) == '.' && ld8(f + n - 2) == 'm' && ld8(f + n - 1) == 'c';
+}
+
+// both operands are one of teko's own plain integer ids (`tk_is_int_ty`'s
+// positive list) -- never a nullable, an enum, a primitive or a struct
+// operator row, every one of which claims the node in `tk_ops_binary`
+// (teko_ops.tk) well ahead of the core's own `sdiv`/`idiv`, so guarding
+// those here would guard a call that is never emitted.
+i64 tk_div_applies(i64 n) {
+    return tk_div_project_file(nd_file(n))
+        && tk_is_int_ty(tk_ty_of(nd_a(n))) && tk_is_int_ty(tk_ty_of(nd_b(n)));
+}
+
+// the guard for ONE `N_BINARY` node already known to be `/` or `%` over two
+// plain integers, its own operands already fully lowered by the caller.
+void tk_div_guard(i64 n, uptr dst) {
+    i64 a = nd_a(n);
+    i64 b = nd_b(n);
+    if (nd_kind(b) == N_INT && nd_val(b) != 0) return;   // a literal, nonzero: no guard
+    i64 ta = tk_ty_of(a);
+    i64 tb = tk_ty_of(b);
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+    if (decl_find("panic") < 0)
+        err_at(tk_file, tk_line, "teko: an integer division needs #include rt.tk");
+    i64 sgn = type_signed(ta);
+    uptr an = 0;
+    if (sgn) {
+        if (nd_kind(a) == N_IDENT) an = nd_name(a);
+        else { an = tk_div_hoist(a, ta, dst); set_nd_a(n, tk_id(an)); }
+    }
+    uptr bn;
+    if (nd_kind(b) == N_IDENT) bn = nd_name(b);
+    else { bn = tk_div_hoist(b, tb, dst); set_nd_b(n, tk_id(bn)); }
+
+    i64 zc = tk_bin(K_EQ, tk_id(bn), tk_int(0));
+    st64(dst, list_append(ld64(dst), tk_if(zc, tk_div_panic("division by zero"))));
+    if (sgn) {
+        i64 c1 = tk_bin(K_EQ, tk_id(bn), tk_int(0 - 1));
+        i64 c2 = tk_bin(K_EQ, tk_id(an), tk_div_min(ta));
+        i64 cond = tk_bin(K_ANDAND, c1, c2);
+        st64(dst, list_append(ld64(dst), tk_if(cond, tk_div_panic("an integer division overflowed"))));
+    }
+}
 void tk_tern_hoist_var(i64 n, uptr dst);
 void tk_tern_stmt(i64 n, uptr pre);
 i64  tk_tern_stmts(i64 head);
@@ -221,6 +382,12 @@ void tk_tern_scan(i64 n, uptr dst) {
             tk_tern_scan(nd_b(n), dst);
             tk_tern_scan(nd_c(n), dst);
             tk_tern_scan(nd_d(n), dst);
+            // D82: a division's own operands are recursed into ABOVE, same as
+            // any other composite node -- the guard itself is read only once
+            // the children are already lowered (this file's own header, right
+            // above `tk_div_min`, says why the order matters).
+            if (nd_kind(n) == N_BINARY && (nd_op(n) == K_DIV || nd_op(n) == K_MOD) && tk_div_applies(n))
+                tk_div_guard(n, dst);
         }
         n = nd_next(n);
     }
@@ -316,11 +483,18 @@ void tk_tern_fn(i64 f) {
     tk_nscope = 0;
 }
 
-// a unit that never writes `?`, `??` or `?.` leaves untouched -- the two
-// counters count what the parser built, and nothing here runs without at
-// least one of them (Q2 rides this walk, teko_null.tk)
+// D82's own reason this walk is no longer conditional on `tk_ntern`/
+// `tk_nl_nops`: `/` and `%` are core grammar, parsed with no hook of their
+// own (unlike `?`/`??`/`?.`, each a `syntax_infix` placeholder this file's
+// own parser hands counts), so there is no cheap counter to ask instead of
+// looking -- and a unit that skips the walk skips the guard along with it.
+// A unit that writes none of `?`, `??`, `?.` and no division that needs a
+// guard still costs one pass over its own functions, the same a program
+// with no `if` still pays teko_rc.tk (whose own walk never had a fast exit
+// to begin with) -- division is common enough (the compiler's own source
+// included) that the old fast exit bought little a plain program would
+// notice.
 i64 tk_ternary_pass(i64 root) {
-    if (tk_ntern == 0 && tk_nl_nops == 0) return root;
     i64 f = root;
     loop {
         if (f == 0) break;

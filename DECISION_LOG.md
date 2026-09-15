@@ -8778,3 +8778,165 @@ accept + 121 refuse, as they stand on `a1d9ca46`), base compiler built in its ow
 ruling asked for is empty in the strongest sense -- there is no diff at all.
 
 What is left open: N6b, whole, and the `u128` implicit-conversion width of ruling 6.
+
+### D82 · integer division by zero, and `MinValue / -1`, panic on every leg -- the machine's answer is no longer the language's (2026-09-15)
+
+Measured on `main` (`8d95c1ff`), aarch64 and x86_64 alike: a plain int `/`/`%` (`i64`,
+`u64`, `i32`, `i16`, `i8`, `u8`, every core width teko has) reached the machine's own
+`sdiv`/`idiv` untouched (`tk_ops_binary`, teko_ops.tk, `if (sa < 0 && sb < 0) return;`).
+`sdiv` (aarch64) answers `0` for `x / 0` and `x` for `x % 0`, in silence; `idiv` (x86_64)
+raises `#DE`, SIGFPE, exit 136 on Linux; `MinValue / -1` overflows the quotient register on
+x86_64 while aarch64 answers `MinValue` back, also in silence. Three different answers to
+the same source depending on which CI leg ran it, and none of them is C#'s: D3 says the
+surface follows C#, which throws `DivideByZeroException` for the first and, on **both** its
+own ISAs, `OverflowException` for the second (`int.MinValue / -1` throws under the CLR on
+x86 and ARM alike, the runtime itself absorbing the ISA's own difference where teko had not
+yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) already panicked
+`division by zero`; only the five core widths were still the machine's own word.
+
+1. **`mc` is target-defined here, and says nothing for the channel — so this is taught, not
+   reported.** `docs/core-language.md:86-108`, `docs/reference/language.md:273-279` and
+   `machine.md:444-448` all describe `/`/`%` by the ISA's own instruction, with no promise
+   about a zero divisor or an overflowing quotient; the mc project's own notices file has
+   nothing open on it either. D2's rule is a defect gets a reproducer and a report; a
+   deliberately unspecified corner the surface language wants to promise something over is
+   the ordinary work of a taught delta (D3), the same reasoning `decimal`'s and `i128`'s own
+   guards already used.
+
+2. **The door is `teko_ternary.tk`'s own pass, extended, not a new one.** `tk_ternary_pass`
+   used to skip its whole walk when a unit wrote none of `?`, `??`, `?.` (`tk_ntern == 0 &&
+   tk_nl_nops == 0`) — a division needs no hook of its own to be COUNTED (`/`/`%` are core
+   grammar, no `syntax_infix` fires for either), so there is no cheap signal to test instead
+   of walking, and the bail is gone: the pass now visits every function unconditionally, the
+   same way `teko_rc.tk`'s own walk always has. `tk_tern_scan`'s existing generic recursion
+   (already visiting every child of every node when nothing else claims it) is the SAME walk
+   a division's own operands ride — a guard is built AFTER the recursion into `nd_a`/`nd_b`,
+   so a ternary or a nested division inside either operand is already lowered into a plain
+   reference by the time the guard reads its type; asking earlier would answer -1 for an
+   unresolved `tk_ternary(...)` placeholder and silently skip the guard. `mc limits`: `passes`
+   and `on_stmt` are BYTE FOR BYTE unmoved (measured against `8d95c1ff`, below) — the walk
+   this crumb needed already existed.
+
+3. **A literal nonzero divisor carries no guard; mc's own compile-time fold keeps the fully
+   constant case.** `x / 2` is left exactly as the core wrote it — `nd_kind(nd_b(n)) ==
+   N_INT && nd_val(b) != 0` returns before anything is built — which is what keeps
+   `--dump-ast` unmoved for the common case (measured: enumeration below). A literal ZERO
+   divisor is NOT specially skipped: it falls into the ordinary guard, which becomes an
+   unconditional panic once built (`if (0 == 0) panic(...)`) — correct, if unusual, code for
+   a division that is always going to fail. `x / 0` with BOTH sides constant is still mc's
+   own `fold_binary`/`const_bin` refusal (`division by zero`, no `teko:` prefix, `mc/src/
+   parse.mc`), unreachable here since `fold()` runs after every `pass()` — this crumb's guard
+   never even sees a node `fold()` is about to fold away.
+
+4. **The divisor, and (signed, non-literal) the dividend, are each read at most twice, so
+   each is hoisted into a temporary exactly when it is not already safe to read twice.** A
+   bare name is read again as it stands; the temp declared for anything else consumes the
+   original node as its own initializer (so it runs exactly once) and the division's own
+   operand slot is rewritten to a fresh reference to the same temp — the node just consumed
+   cannot sit in two places in the tree. The overflow check (`b == -1 && a == MinValue`)
+   reads the dividend only for a SIGNED type (`type_signed`, mc's own predicate) with a
+   non-literal divisor; an unsigned width builds no overflow check and never reads the
+   dividend a second time at all. `MinValue` is built per WIDTH (`type_width`, not a fixed
+   `i64`), computed as `0 - (1 << (w*8-1))` in the host's own two's complement arithmetic —
+   the identity `-MinValue == MinValue` (D81's own fixed point) makes the SAME formula answer
+   right at every width from 1 to 8 bytes without a per-width branch, so `i32.MinValue /
+   -1` panics through the identical code path `i64.MinValue / -1` does
+   (`tests/surface_divguard.tk` exercises the narrow width at a divisor OTHER than `-1`,
+   proving the guard does not false-positive there; a second exit-70 fixture for a second
+   width would prove nothing the formula's own uniformity does not already).
+
+5. **`panic` is program code, not something every unit carries — the guard checks
+   `decl_find("panic")` and refuses BY NAME when it is missing, rather than assuming.**
+   Measured: none of the compiler's own ~11 real divisions (`teko_*.tk`/`core_teko.mc`/
+   `user.mc`, every one of them by a `#define`d constant or the literal `10` of a digit
+   extraction) has a non-literal divisor, so the guard never actually fires while teko
+   compiles its own source and `panic` never needs to be declared there — `tests/hello.tk`-
+   style code with no `#include` at all keeps compiling. A PROGRAM that divides by something
+   the folder cannot see through and never wrote `#include "rt.tk"` (directly or through
+   `decimal.tk`/`time.tk`/...) is refused `teko: an integer division needs #include rt.tk`
+   instead of failing later with "call to unknown function: panic" — the third road the
+   crumb's own task asked to choose between, decided in the program's favour: an assumption
+   that `<sys>`'s raw `write`/`exit` are always available is not sound either (a program with
+   no `#include` at all, `tests/hello.tk`'s own shape, has neither).
+
+6. **mc's own bundled core needed a SEPARATE exclusion, found only by running the fixed
+   point, not by reasoning about it first.** The fixed point (`scripts/bootstrap.sh`) failed
+   twice before this ruling closed:
+   - `src/arena.mc`'s own `buf_pad` (`<mc/core_min>`, reached from `mc_teko.tk`) divides by a
+     PARAMETER (`buf_len(b) % align`) and is announced under a bare canonical name
+     (`mc/arena`, no directory, no extension — hooks.md's own "the canonical bundled name...
+     for a bundled one"). `tk_origin_of_file` (teko_access.tk, the SAME oracle `internal`
+     reads) answers this WRONG: with the bare (no-directory) entry and config
+     `scripts/bootstrap.sh` derives from the repository root, its own fallback ("the project
+     is the whole [current] directory") calls `mc/arena` project code too, since it does not
+     start with `.`.
+   - Fixed by filtering on the SAME `.tk`-suffix oracle `source_claim` already uses
+     (`tk_fwd_is_source_name`, teko_fwd.tk), `.mc` joining it for `core_teko.mc`/`user.mc` --
+     but mc's own LIBRARY TREE, resolved onto disk rather than carried in the blob
+     (`lib/machine_arm64_float.mc`, reached the same include), announces a REAL path with
+     the SAME extension this project's own files carry, so the suffix filter alone answered
+     1 for it too.
+   - `tk_origin_of_file`'s OWN first line gets THAT one right (an absolute path is never this
+     project's own), so the final oracle (`tk_div_project_file`, teko_ternary.tk) is BOTH:
+     `tk_origin_of_file(f) && (tk_fwd_is_source_name(f) || f ends ".mc")`. Neither alone is
+     enough; each is wrong on exactly the shape the other reads correctly. D2 draws the line
+     at mc's own bundled/resolved core either way — a defect there (if `buf_pad` genuinely
+     divides by zero somewhere) is minicompiler/mc's to report, never teko's to silently
+     reinterpret.
+
+7. **`lib/wide.tk`'s `i128` amends D81's ruling 3: `MinValue / -1i` panics too, and `%` was
+   never a row to amend (D81's own eleven-op table has no `%` for either wide type — N6b's).**
+   Measured before writing the fixture: NOTHING in this repository ever asserted the wrap
+   `tests/primitives_i128_math.tk`'s own header claimed for it (`-7i / 2i == -3i` is the only
+   division row there; "the WRAP at 2^127" section tests `+ - *`, never `/`) — so no row
+   moved, only the missing assertion was added
+   (`tests/primitives_i128_divovf.tk`). `tk_w_sdiv_ovf` reads the two ORIGINAL 128-bit
+   operands directly, ahead of the magnitude split every divide takes: `MinValue` is bit 127
+   set and nothing else, `-1` is every bit set, both by the same 32-bit limb layout
+   `tk_w_isneg` already reads. `u128` gets no such check: an unsigned divide never overflows
+   its own width.
+
+8. **Five fixtures, no refusal fixtures.** `tests/surface_divzero.tk` (70), `tests/
+   surface_remzero.tk` (70), `tests/surface_divovf.tk` (70, `i64.MinValue / m` with `m` a
+   parameter), `tests/surface_divguard.tk` (42: every width with a non-literal divisor,
+   truncation toward zero, `MinValue / 1`, a narrow width's own `MinValue` divided by
+   something other than `-1`, a divisor with a side effect evaluated exactly once, `u64.
+   MaxValue / 2`, a literal divisor path left untouched), `tests/primitives_i128_divovf.tk`
+   (70). The `#include rt.tk` refusal has no fixture of its own: every fixture this crumb
+   writes needs `panic` anyway, so a dedicated `tests/refuse/` case would test nothing this
+   ruling's own reasoning (point 5) does not already cover by construction; a future crumb
+   that finds a program genuinely missing the include is free to add one.
+
+9. **This entry is D82**, after D81.
+
+#### The gate, mc 0.17.2, macos/aarch64
+
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **107 passed, 130 refused as expected, 0 failed** (102 + 5, unchanged
+121 + 9); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK** (stage 1
+through 3 each compile `mc_teko.tk` clean, `teko2.o == teko3.o`, `--dump-asm` diff empty,
+teko1 compiles all 107+130 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
+ok: 697 links, 74 fragments, 410 diagnostics, 130 refusals, 152 samples, manifest listed`.
+
+`mc limits . --config mc.macos.toml`, `rm -rf build` first on both legs, base `8d95c1ff`
+against this branch: `passes` **15 -> 15 (unmoved)**, `on_stmt` **4 -> 4 (unmoved)**,
+`intrin` **8 -> 8 (unmoved)**, `syntax` **20 -> 20 (unmoved)**, `alias` **25 -> 25
+(unmoved)**, `types` **18 -> 18 (unmoved)** — every row this crumb could have grown stayed
+exactly where D81 left it; no `type_new`, no `syntax`/`syntax_infix`, no new `pass()` or
+`on_stmt()` registration anywhere in this crumb.
+
+`--dump-ast --include=lib --include=tests` over all 235 `.tk` files under `tests/` as they
+stand on `8d95c1ff`, base compiler built in its own worktree: **232 of 235 byte-identical**.
+The three that differ — `tests/primitives_i128.tk`, `tests/primitives_i128_divzero.tk`,
+`tests/primitives_i128_math.tk`, every one of them `#include "wide.tk"` — differ by the
+SAME 61 lines each: the new `tk_w_sdiv_ovf` function and the one `if (tk_w_sdiv_ovf(a, b))
+panic(...)` line `tk_w_sdiv` gained (ruling 7). **Not one of the 102 accept fixtures'
+own AST moved from the plain-integer guard** (ruling 2-4): measured, every division already
+in the corpus divides by a literal. This crumb changes accepted RUN-TIME behaviour on
+purpose (a program dividing a non-literal divisor by zero now panics instead of reading the
+machine's own answer) without moving a single byte of any existing fixture's own AST — the
+two are not in tension, since no existing fixture exercises the case that changed.
+
+What is left open: nothing new. The `#include rt.tk` road (ruling 5) is a design choice this
+entry records rather than a gap; a program that needs it and does not have it is refused by
+name, not left to guess.

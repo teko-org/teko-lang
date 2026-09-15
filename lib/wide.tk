@@ -151,9 +151,25 @@ void tk_w_udiv(uptr q, uptr a, uptr b) {
     tk_w_mask(q);
 }
 
+// D82's own amendment to D81's ruling 3: `MinValue / -1` no longer wraps.
+// Checked on the ORIGINAL operands, ahead of the magnitude split below (which
+// disturbs neither): `MinValue` is bit 127 set and nothing else, `-1` is
+// every bit set, both by the same limb layout `tk_w_isneg` already reads --
+// the one 128-bit value whose OWN negation is a no-op (`tk_w_neg`'s header)
+// divided by the one divisor whose magnitude is 1, exactly the pair every
+// other integer width in this project already guards (`teko_ternary.tk`'s
+// own `tk_div_guard`, D82).
+i64 tk_w_sdiv_ovf(uptr a, uptr b) {
+    return tk_dv_at(a, 0) == 0 && tk_dv_at(a, 1) == 0 && tk_dv_at(a, 2) == 0
+        && tk_dv_at(a, 3) == 0x80000000
+        && tk_dv_at(b, 0) == 0xffffffff && tk_dv_at(b, 1) == 0xffffffff
+        && tk_dv_at(b, 2) == 0xffffffff && tk_dv_at(b, 3) == 0xffffffff;
+}
+
 // ...and the signed one: magnitudes, then the sign of the quotient. The
 // operands are the caller's own scratch and are consumed.
 void tk_w_sdiv(uptr q, uptr a, uptr b) {
+    if (tk_w_sdiv_ovf(a, b)) panic("an integer division overflowed");
     i64 sa = tk_w_isneg(a);
     i64 sb = tk_w_isneg(b);
     if (sa) tk_w_neg(a);

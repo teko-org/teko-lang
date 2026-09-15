@@ -101,6 +101,18 @@ already had. Teaching promotion for the two newest types while the three older o
 the old rule would be the real inconsistency, and it would change the base grammar (the
 `+` in `a + b` is `mc`'s own, D3).
 
+### Integer division
+
+D82: `/` and `%` panic rather than answer whatever the machine's own `sdiv`/`idiv` gave
+(the two ISAs used to disagree — see [diagnostics.md](diagnostics.md#integer-division)).
+A **literal** nonzero divisor (`x / 2`) carries no guard: the core owns it exactly as it
+did before this crumb, and `--dump-ast` is unmoved.
+
+| expression | is |
+|---|---|
+| `a / b`, `a % b` | any integer width; `b == 0` is `teko: division by zero`, exit 70 |
+| `a / b`, `a % b`, `b` a non-literal, signed only | `b == -1 && a == <the type's own MinValue>` is `teko: an integer division overflowed`, exit 70 |
+
 ### `i8` and `i16`
 
 C#'s `sbyte` and `short`: signed, one and two bytes wide. Unlike the seven aliases above,
@@ -1207,7 +1219,7 @@ constants land.
 | written | answers | how it fails |
 |---|---|---|
 | `a + b`, `a - b`, `a * b` | `i128` / `u128` | **wraps** modulo 2^128 — C#'s unchecked default, and teko has no `checked` word |
-| `a / b` | `i128` / `u128` | truncates toward zero, signed for `i128` and unsigned for `u128`; `b == 0` is `teko: division by zero`, exit 70 |
+| `a / b` | `i128` / `u128` | truncates toward zero, signed for `i128` and unsigned for `u128`; `b == 0` is `teko: division by zero`, exit 70; `i128.MinValue / -1i` is `teko: an integer division overflowed`, exit 70 (D82, `u128` has no such row) |
 | `-a` | `i128` / `u128` | wraps: `-MinValue` is `MinValue` |
 | `+a` | the operand | no call at all |
 | `==` `!=` `<` `<=` `>` `>=` | `i64` 0/1 | signed for `i128`, unsigned for `u128`: the same sixteen bytes read `-1i` and `340282366920938463463374607431768211455u` |
@@ -1242,6 +1254,7 @@ same pair. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are **not taught yet**
 | `extern i128 f();` | ``teko: an `extern` takes no i128`` — the sixteen-byte convention is teko's own, not a C ABI |
 | `new i128()` | `teko: new i128() is not taught; write 0i` |
 | `x / 0i` | `teko: division by zero`, exit 70 |
+| `i128.MinValue / -1i` | `teko: an integer division overflowed`, exit 70 (D82) |
 
 ---
 

@@ -259,10 +259,13 @@ the handler declines everything that does not end in `i` or `u`.
 
 Surface teko in `lib/wide.tk`, over 32-bit limbs held in `u64` locals — `docs/specs/decimal.md`
 § 8's technique, and about 300 lines rather than 900, because there is no scale to align
-and no decimal rounding to do. Overflow **wraps**, which is C#'s unchecked default and
+and no decimal rounding to do. `+ - *` **wrap**, which is C#'s unchecked default and
 `Int128`'s own documented behaviour outside a `checked` block; teko has no `checked` word
 (`docs/specs/decimal.md` § 9), so wrapping is the only behaviour there is and the fixture
-asserts it. Division by zero panics, exit 70.
+asserts it. Division by zero panics, exit 70, and (D82's own amendment, § below)
+`i128.MinValue / -1i` panics rather than wraps — the one quotient the division does NOT
+share with `+ - *`, since C# itself throws `OverflowException` there and nowhere else in
+the unchecked default.
 
 **N6a's amendments, from building it (D81).** The limb helpers are not rewritten: C4's own
 `tk_dv_*` block moved into `lib/limbs.tk` and `decimal.tk` and `wide.tk` both include it, so
@@ -272,8 +275,20 @@ conversions. The limbs stay 32 bits wide for a second reason this page did not k
 compares every integer SIGNED, `u64` included (measured on mc 0.17.2, reported), so `a < b`
 on two `u64` halves answers backwards the moment bit 63 is set — no compare in `lib/wide.tk`
 ever meets a value with that bit set. The panic reads `teko: division by zero`, with no type
-word: `i64 / 0` has no guard at all in teko today (it is the machine's own `sdiv`, which
-answers 0 on aarch64), so there was no existing wording to join.
+word: `i64 / 0` had no guard at all when this page was written (it was the machine's own
+`sdiv`, which answers 0 on aarch64), so there was no existing wording to join — D82 closes
+that gap for every plain integer width and joins THIS wording, unchanged.
+
+**D82's amendment: `MinValue / -1i` panics too.** Measured after N6a landed: nothing in this
+repository ever asserted the wrap `+ - *` still have (`tests/primitives_i128_math.tk`'s own
+"the WRAP at 2^127" section tests `+`, `-`, `*`, never `/`), so the ruling above changes no
+fixture, only the missing one D82 added
+(`tests/primitives_i128_divovf.tk`). `tk_w_sdiv_ovf` (`lib/wide.tk`) reads the two ORIGINAL
+128-bit operands directly, ahead of the magnitude split every divide takes: `MinValue` is
+bit 127 set and nothing else, `-1` is every bit set, both by the same limb layout
+`tk_w_isneg` already reads — the one value whose own negation is a no-op divided by the one
+divisor whose magnitude is 1. `u128` gets no such check: an unsigned divide never overflows
+its own width, the same reason it carries no `-a` row's own overflow either.
 
 **`#include <i128>` is never written.** Measured on mc 0.17.2: `<float>` and `<i128>` cannot
 coexist in one compiler — the opcode ranges collide on x86_64 (`FX_BASE` 100 ==
@@ -366,6 +381,7 @@ reaches.
 | `tests/primitives_i128_math.tk` | **N6a, landed.** `+ - * /`, unary `-` and the six comparisons against values chosen so a 64-bit implementation gives a different answer; `MaxValue + 1i` wraps to `MinValue` and `-MinValue` is `MinValue`; `u128` division and the four orderings are unsigned where `i128`'s are signed; the promotion `x + 1`/`2 * x` and every cast round trip. `% & \| ^ ~ << >>` are N6b's | `42` |
 | `tests/primitives_i128_text.tk` | **N6b.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
 | `tests/primitives_i128_divzero.tk` | **N6a, landed.** `7i / zero()`, the divisor behind a call the folder cannot see through | `70` |
+| `tests/primitives_i128_divovf.tk` | **D82.** `i128.MinValue / negone()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_parse_bad.tk` | **N6b.** `i128.Parse("x")` | `70` |
 
 N6a's nine refusal fixtures, each with its exact message and line:
