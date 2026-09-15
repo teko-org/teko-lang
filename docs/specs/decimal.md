@@ -1,12 +1,12 @@
 # `decimal`
 
-**C3 and C4 are built (D74, D77); C5 and C7 are designed, not built.** The sixteen-byte
-value, its literal, its movement, the eleven operators and the four conversions compile
-today and are documented where a reader looks for them,
-[the type reference](../reference/types.md#decimal); the MEMBERS — `Round`, `Truncate`,
-`ToString`, `Parse` and the statics (§ 7) — do not, and the samples that use them carry
-`// no-run` for that reason ([the specs index](README.md),
-[not-yet.md](../reference/not-yet.md)).
+**C3, C4 and C5 are built (D74, D77, D79); C7 alone is designed, not built.** The
+sixteen-byte value, its literal, its movement, the eleven operators, the four conversions,
+the rounding, the text and every member of § 7 compile today and are documented where a
+reader looks for them, [the type reference](../reference/types.md#decimal). What is left is
+C7, a SPEED crumb nothing depends on: the limb arithmetic replaced by each machine's own
+128-bit instructions, with every fixture unchanged at the same exit code ([the specs
+index](README.md), [not-yet.md](../reference/not-yet.md)).
 
 `decimal` is C#'s, exactly ([the surface policy](surface.md), rule 1): 128 bits, a 96-bit
 mantissa, a scale of 0 to 28, a sign, **exact base-ten arithmetic**, and an overflow that
@@ -156,7 +156,7 @@ Out of range is refused where it is written:
 **Legal.**
 
 ```teko
-// no-run
+// expect-exit: 42
 #include "decimal.tk"
 
 decimal tax(decimal amount, decimal rate) {
@@ -271,19 +271,53 @@ resolves through the member table.
 | `decimal.Round(d)`, `Round(d, i64 places)` | `.CompareTo(decimal)`, `.Equals(decimal)` |
 | `decimal.Truncate(d)`, `Floor(d)`, `Ceiling(d)`, `Abs(d)` | `.Scale` `i64`, `.Sign` `i64` |
 | `decimal.Parse(str)`, `TryParse(str, out decimal)` | — |
-| `decimal.ToDouble(d)`, `FromDouble(f64)` | — |
+
+**Amended by C5 (D79, ruling 1): `decimal.ToDouble(d)` and `FromDouble(f64)` are NOT
+registered.** They are `(f64) d` and `(decimal) x`, two of the four conversion rows § 6
+already opens and C4 already landed, under C#'s other spelling of them; a member row would
+be a second door to one road. They are named in
+[not-yet.md](../reference/not-yet.md) with that reason, so the refusal is not a surprise.
 
 `Math.Round(d)` and `Math.Round(d, n)` are C#'s other spelling of the same two functions,
 and they need no mechanism at all: `Math` is an ordinary teko class in `lib/math.tk` whose
 `public static decimal Round(decimal d)` forwards. A static method on a declared class is
-a construct that already runs today.
+a construct that already runs today. C5 landed that file with `Round` in both arities plus
+`Truncate`, `Floor`, `Ceiling` and `Abs`; `public`, because an `internal` class answers
+only to code of its own project.
+
+**Rounding** (D79, ruling 3). `Round` is half to **even** at `0..28` places, C#'s
+`MidpointRounding.ToEven`, against the operators' own half away from zero (§ 5) — both are
+fixtures with values that only pass under the right rule. The scale never GROWS, so
+`Round(1.5m, 3)` is `1.5m` at scale 1 and not `1.500m`. `Truncate`, `Floor` and `Ceiling`
+answer at scale **0** and follow C# on a negative: `Floor(-1.5m)` is `-2m`, `Ceiling(-1.5m)`
+is `-1m`, `Truncate(-1.5m)` is `-1m`. A `places` outside `0..28` is a run-time panic,
+`teko: the decimal places are out of range` — the argument is an ordinary `i64` and nothing
+at compile time knows what a parameter holds.
 
 **Text.** `ToString()` writes the shortest exact form — the mantissa with the point placed
 by the scale, a leading `-` when negative, trailing zeros kept because `1.10m` and `1.1m`
-are different values with the same number. `Parse` accepts what `ToString` writes plus an
-optional exponent, panics on anything else (`teko: the string is not a decimal`), and
-`TryParse(s, out v)` answers `0`/`1`. `tk_dec_fmt(ptr buf, decimal d)` is the
-allocation-free half, the split `<float_rt>` makes between `putf64` and `fmt_f64`.
+are different values with the same number. A ZERO carries no sign (D79, ruling 4): `-0m`
+writes `"0"`, which is consistent with `-0m == 0m`, while `0.00m` writes `"0.00"` because
+the scale is part of the value. `ToString(i64 places)` is C#'s `"F<n>"` — rounded to
+`places` by the rule above, then padded with zeros in the TEXT, never in the mantissa, so
+`decimal.MaxValue.ToString(2)` is 29 digits and two zeros. It shares `Round`'s range panic,
+because it rounds first: one cause, one message.
+
+`Parse` accepts what `ToString` writes plus an optional exponent —
+`[+|-] digits [ . digits ] [ (e|E) [+|-] digits ]`, with `.5` and `5.` accepted as C#
+accepts them — and **nothing else**: no surrounding whitespace and no separator of any kind,
+since culture and grouping are § 9's own exclusion (D79, ruling 5). Two failures are two
+causes: text that is no decimal panics `teko: the string is not a decimal`, and a number
+that IS one and does not fit — a mantissa past 96 bits, or a scale past 28 places once the
+exponent moved it — panics `teko: decimal overflow`. **Exact or refused**: this type never
+rounds a number the writer wrote out in full, and `ToString` never produces one, so the
+round trip is closed. `TryParse(s, out v)` reads both as false, answers `0`/`1` and never
+panics. `tk_dec_fmt(ptr buf, decimal d)` is the allocation-free half, the split
+`<float_rt>` makes between `putf64` and `fmt_f64`.
+
+`CompareTo` answers `-1`/`0`/`1` over the VALUE, whatever the scales, and `Equals` asks
+exactly what `==` asks; `.Sign` is the value's and not the sign BIT, so `-0m` answers `0`
+(D79, ruling 6).
 
 ## 8. The arithmetic, and where it lives
 
@@ -338,9 +372,12 @@ verdict is `ok` on both sides.
 | `tokens` (teko's own row) | 103 | 104 | the `m` suffix the literal reader claims |
 | every other row | — | unmoved | |
 
-What C4 and C5 add on top of this is still an estimate: `syntax` +2 for the receiver form,
-and `nodes`/`funcs`/`globals` up by about 900 lines of library. Every `decimal` literal in a
-program is one more global.
+What C5 actually added, measured on `a1cf0b52` and on the crumb: `syntax` **17 → 18** —
+ONE row and not two, because the table is keyed by NAME and `syntax_expr("decimal")` and
+`syntax_stmt("decimal")` share it — with `intrin`, `passes`, `types` and `alias` all
+unmoved and the verdict `ok` on both sides. The compiler unit itself grows with the
+library: `nodes` 198544 → 199142, `funcs` 4127 → 4132, `globals` 1375 → 1377, `strings`
+2880 → 2914. Every `decimal` literal in a program is one more global.
 
 The machine module adds **no** row: a derived table shadows the name it registers and does
 not consume a `machines` slot. Three tables, zero rows.
@@ -357,6 +394,7 @@ not consume a `machines` slot. Three tables, zero rows.
 | `tests/primitives_decimal_overflow.tk` | `79228162514264337593543950335m + 1m` | `70` |
 | `tests/primitives_decimal_divzero.tk` | `1m / 0m` | `70` |
 | `tests/primitives_decimal_parse_bad.tk` | `decimal.Parse("x")` | `70` |
+| `tests/primitives_decimal_places_bad.tk` | `decimal.Round(d, 29)` — the places guard `ToString(n)` shares | `70` |
 
 ## 12. The crumbs
 
@@ -414,7 +452,7 @@ runtime.md, and the conversion table in types.md.
   answering (C# declares that operator too, and declares none on `DateTime`/`Guid`);
 - the four casts are a **table** (`tk_prim_cast_op`, `teko_prim.tk`) and not a branch on
   `decimal`, so a target the table does not name keeps C3's own
-  `teko: a decimal does not cast yet` — which is what `(str) d` still earns;
+  `teko: a decimal does not cast yet` — the wording `(str) d` earned until C5 filled the read and build clauses; since D79 it reads `` teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it ``;
 - a `decimal` **global takes no initializer** (§ 9's row, one line lower than the design
   put it): `decimal g = 3.25m;` dies in mc's own `parse_global`, which demands an `N_INT`,
   and `decimal g = 5;` — the one spelling that gets past it — is refused by name. A global
@@ -423,12 +461,28 @@ runtime.md, and the conversion table in types.md.
   and no signedness), so no comparison in `lib/decimal.tk` reads a 64-bit value that may
   set bit 63; the one range check that needs it reads the bit with a shift instead.
 
-### C5 — round and text (M)
+### C5 — round and text (M) — **landed, D79**
 
 `Round`/`Truncate`/`Floor`/`Ceiling`/`Abs`, `ToString`/`Parse`/`TryParse`, `lib/math.tk`.
 
-**Gate:** `primitives_decimal_round.tk`, `_text.tk`, `_parse_bad.tk`. **Owes:** runtime.md
-and a guide section.
+**Gate:** `primitives_decimal_round.tk`, `_text.tk`, `_parse_bad.tk`, `_places_bad.tk`, all
+five legs. **Owed and paid:** [runtime.md](../reference/runtime.md#the-decimal-library),
+[types.md](../reference/types.md#decimal), [diagnostics.md](../reference/diagnostics.md),
+[not-yet.md](../reference/not-yet.md), [the guide](../guide/10-values-and-types.md) and
+[primitives.md](../internals/primitives.md)'s ceilings.
+
+What it measured, `mc limits . --config mc.macos.toml` on `a1cf0b52` and on the crumb,
+verdict `ok` on both sides: `syntax` **17 → 18**, the one row a receiver costs, keyed by
+name (`syntax_expr("decimal")` and `syntax_stmt("decimal")` are one row, the two D74 left
+unspent); `intrin` **8 → 8**, `passes` **15 → 15**, `types` **16 → 16**, `alias`
+**23 → 23**, all unmoved. `TK_MAXPRIMM` went 160 → 192 in `teko_prim.tk`: the nineteen rows
+took the table from 141 to 160, the old cap exactly full.
+
+One defect of the shared mechanism was found and fixed rather than worked around (D79):
+`tk_prim_arg_widen` wrote a CAST for an argument widening into a WIDE column, where the
+conversion is a CALL — `decimal.Round(d, 2)` is the first row in this compiler whose
+ARGUMENT is sixteen bytes, and every integer argument the parser could not type died in
+codegen on `tw_cast`'s own guard.
 
 ### C7 — the native wide instructions (S, optional, not required by anything)
 

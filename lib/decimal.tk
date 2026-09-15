@@ -176,10 +176,12 @@ void tk_dv_inc(uptr a) {
     panic("decimal overflow");
 }
 
-// a *= m for a multiplier below 2^32; answers the carry out of the top limb,
-// which is how a caller tells "it no longer fits" from a plain result.
-u64 tk_dv_muls(uptr a, u64 m) {
-    u64 c = 0;
+// a = a * m + add for a multiplier and an addend below 2^32; answers the carry
+// out of the top limb, which is how a caller tells "it no longer fits" from a
+// plain result. `add` is what a digit reader needs (D79): `tk_dec_scan` must
+// answer 0 where `tk_dv_add` would panic, because `TryParse` never panics.
+u64 tk_dv_muladds(uptr a, u64 m, u64 add) {
+    u64 c = add;
     i64 i = 0;
     loop {
         if (i >= TK_DEC_NL) break;
@@ -190,6 +192,9 @@ u64 tk_dv_muls(uptr a, u64 m) {
     }
     return c;
 }
+
+// a *= m, the addend-free half every operator writes
+u64 tk_dv_muls(uptr a, u64 m) { return tk_dv_muladds(a, m, 0); }
 
 // a /= d for a divisor below 2^32; answers the remainder, which is the digit
 // every rounding decision below is made on
@@ -692,4 +697,386 @@ decimal tk_dec_from_f64(f64 x) {
         s = 0;
     }
     return tk_dec_pack(va, s, sign);
+}
+
+// ============================================================================
+// C5 -- ROUND AND TEXT (docs/specs/decimal.md § 7, § 8, § 11, § 12; D79)
+// ============================================================================
+//
+// The API of § 7, all of it over the same limb vector the arithmetic above
+// works in and none of it an intrinsic: the five statics that ARE values, the
+// five that reshape one, the two that read it, and the text in both
+// directions. `teko_decimal.tk` is where each one becomes a member row.
+
+// ---- the five constant statics ----
+// Each is a CALL and not a folded constant: sixteen bytes have no
+// `MTASK_CONST` (`tw_const`, teko_wide.tk), so `decimal.One` writes its value
+// into the return buffer like any other `decimal`-valued function -- the shape
+// `Guid.Empty` already has (lib/guid.tk).
+decimal tk_dec_zero() {
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    return tk_dec_build(v, 0, 0);
+}
+
+decimal tk_dec_one() {
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, 1);
+    return tk_dec_build(v, 0, 0);
+}
+
+decimal tk_dec_minusone() {
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, 1);
+    return tk_dec_build(v, 0, 1);
+}
+
+// 79228162514264337593543950335 = 2^96 - 1 at scale zero: every one of the
+// three mantissa limbs full, which is what C# calls `decimal.MaxValue`.
+void tk_dec_full(uptr v) {
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, 0xffffffff);
+    tk_dv_put(v, 1, 0xffffffff);
+    tk_dv_put(v, 2, 0xffffffff);
+}
+
+decimal tk_dec_max() {
+    u64 v[TK_DEC_NL];
+    tk_dec_full(v);
+    return tk_dec_build(v, 0, 0);
+}
+
+decimal tk_dec_min() {
+    u64 v[TK_DEC_NL];
+    tk_dec_full(v);
+    return tk_dec_build(v, 0, 1);
+}
+
+// ---- Round, HALF TO EVEN (docs/specs/decimal.md § 5, § 7) ----
+// The other rounding rule this type carries: the OPERATORS round half away
+// from zero (`tk_dec_pack` above), and `decimal.Round` rounds half to EVEN --
+// C#'s `MidpointRounding.ToEven` default, and the one the owner named. Both
+// are fixtures with values that only pass under the right rule.
+//
+// The scale never GROWS (C#): `Round(1.5m, 3)` is `1.5m` at scale 1 and not
+// `1.500m`, so a value already at or below `places` is handed straight back.
+//
+// Three facts decide a digit: the first DISCARDED digit, whether anything
+// below it was non-zero, and the parity of what is kept. The parity is read
+// off limb zero, because a binary value and its last decimal digit have the
+// same one -- ten is even -- and that is one test instead of a division.
+decimal tk_dec_round_at(decimal d, i64 places) {
+    if (places < 0 || places > TK_DEC_MAXSCALE)
+        panic("the decimal places are out of range");
+    i64 s = tk_dec_scale(d);
+    if (s <= places) return d;
+    u64 v[TK_DEC_NL];
+    tk_dec_load(d, v);
+    u64 dig = 0;                              // the digit the decision is made on
+    i64 rest = 0;                             // anything non-zero BELOW it
+    loop {
+        if (s <= places) break;
+        if (dig) rest = 1;
+        dig = tk_dv_divs(v, 10);
+        s = s - 1;
+    }
+    i64 up = 0;
+    if (dig > 5) up = 1;
+    if (dig == 5 && rest) up = 1;
+    if (dig == 5 && !rest && (tk_dv_at(v, 0) & 1)) up = 1;     // the tie: to even
+    // at least one division happened, so the value is below 2^96/10 and the
+    // carry of this increment cannot leave the mantissa
+    if (up) tk_dv_inc(v);
+    return tk_dec_build(v, places, tk_dec_sign(d));
+}
+
+decimal tk_dec_round(decimal d) { return tk_dec_round_at(d, 0); }
+
+// ---- Truncate, Floor and Ceiling ----
+// One function and C#'s three answers, told apart by the SIGN a discarded
+// fraction grows the magnitude for: a negative value goes away from zero under
+// `Floor` (`Floor(-1.5m)` is `-2m`), a positive one under `Ceiling`
+// (`Ceiling(1.5m)` is `2m`), and `Truncate` -- which passes a sign no value
+// has -- always goes toward zero. All three answer at SCALE ZERO, as C# does:
+// `Floor(1.50m)` is `1m` and not `1.0m`.
+decimal tk_dec_intpart(decimal d, i64 way) {
+    u64 v[TK_DEC_NL];
+    tk_dec_load(d, v);
+    i64 s = tk_dec_scale(d);
+    i64 frac = 0;
+    loop {
+        if (s <= 0) break;
+        if (tk_dv_divs(v, 10)) frac = 1;
+        s = s - 1;
+    }
+    i64 g = tk_dec_sign(d);
+    if (frac && g == way) tk_dv_inc(v);
+    return tk_dec_build(v, 0, g);
+}
+
+decimal tk_dec_trunc(decimal d) { return tk_dec_intpart(d, 0 - 1); }
+decimal tk_dec_floor(decimal d) { return tk_dec_intpart(d, 1); }
+decimal tk_dec_ceil(decimal d)  { return tk_dec_intpart(d, 0); }
+
+// ---- Abs and Sign ----
+// The sign is ONE bit and `Abs` clears it: `tk_dec_signbit() - 1` is the other
+// sixty-three, written that way because a `~` over a `u64` literal is a
+// spelling this file does not need.
+decimal tk_dec_abs(decimal d) {
+    decimal r;
+    ptr p = &r;
+    st64(p, tk_dec_lo(d));
+    st64(p + 8, tk_dec_hi(d) & (tk_dec_signbit() - 1));
+    return r;
+}
+
+// `.Sign` is C#'s `-1`/`0`/`1` over the VALUE and not the sign BIT: `-0m` is
+// zero and answers 0, which is the same rule every comparison here reads
+// (`tk_dec_cmp`). `tk_dec_sign` above is the raw bit and stays the private
+// half.
+i64 tk_dec_signum(decimal d) {
+    if (tk_dec_is_zero(d)) return 0;
+    if (tk_dec_sign(d)) return 0 - 1;
+    return 1;
+}
+
+// ---- the text (docs/specs/decimal.md § 7) ----
+// The SHORTEST EXACT form: the mantissa with the point placed by the scale, a
+// leading `-` when the value is below zero, and TRAILING ZEROS KEPT -- `1.50m`
+// writes "1.50", because `1.50m` and `1.5m` are two values with two scales and
+// text that dropped the zero would read back as the other one. `0m`, `-0m` and
+// `0.00m` write "0", "0" and "0.00": the sign is the VALUE's, so a zero never
+// carries one (D79, ruling 4).
+//
+// The longest form is 31 characters -- a sign, 29 mantissa digits, a point --
+// and 30 for the other shape a scale of 28 gives ("0." and 28 places), so 32
+// bytes hold every `decimal` this type has with its terminator.
+#define TK_DEC_STRMAX 32
+
+i64 tk_dec_isdig(i64 c) { return c >= '0' && c <= '9'; }
+
+// `d` into `buf`, NUL-terminated, returning the length. This is the
+// allocation-free half, the split `<float_rt>` makes between `putf64` and
+// `fmt_f64` (§ 7); `buf` needs TK_DEC_STRMAX bytes.
+i64 tk_dec_fmt(ptr buf, decimal d) {
+    u64 v[TK_DEC_NL];
+    tk_dec_load(d, v);
+    u8 dig[TK_DEC_STRMAX];
+    i64 nd = 0;
+    // least significant first, and always one digit: a zero mantissa writes
+    // "0" rather than nothing at all
+    loop {
+        u64 r = tk_dv_divs(v, 10);
+        st8(dig + nd, '0' + r);
+        nd = nd + 1;
+        if (tk_dv_is_zero(v)) break;
+    }
+    i64 scale = tk_dec_scale(d);
+    i64 k = 0;
+    if (tk_dec_sign(d) && !tk_dec_is_zero(d)) {
+        st8(buf + k, '-');
+        k = k + 1;
+    }
+    i64 ip = nd - scale;                      // integer digits the mantissa has
+    if (ip <= 0) {
+        st8(buf + k, '0');                    // "0.05", never ".05"
+        k = k + 1;
+    } else {
+        i64 i = 0;
+        loop {
+            if (i >= ip) break;
+            st8(buf + k, ld8(dig + nd - 1 - i));
+            k = k + 1;
+            i = i + 1;
+        }
+    }
+    if (scale > 0) {
+        st8(buf + k, '.');
+        k = k + 1;
+        i64 z = 0 - ip;                       // the zeros between point and mantissa
+        loop {
+            if (z <= 0) break;
+            st8(buf + k, '0');
+            k = k + 1;
+            z = z - 1;
+        }
+        i64 nf = scale;                       // fraction digits the mantissa carries
+        if (nf > nd) nf = nd;
+        i64 j = 0;
+        loop {
+            if (j >= nf) break;
+            st8(buf + k, ld8(dig + nf - 1 - j));
+            k = k + 1;
+            j = j + 1;
+        }
+    }
+    st8(buf + k, 0);
+    return k;
+}
+
+// `.ToString()`. The buffer is heap-owned and the caller keeps it past this
+// call's own return, exactly as `tk_guid_tostring` (lib/guid.tk) hands one
+// back: `str` is a `uptr` with a NUL terminator and no `string` object exists.
+str tk_dec_tostring(decimal d) {
+    uptr buf = rt_alloc(TK_DEC_STRMAX);
+    tk_dec_fmt(buf, d);
+    return buf;
+}
+
+// `.ToString(places)`: C#'s `"F<n>"` -- the value rounded to `places` (half to
+// even, the rule above) and then written with EXACTLY that many decimals, the
+// missing ones padded with zeros. The padding is done in the TEXT and never in
+// the mantissa: `decimal.MaxValue.ToString(28)` is 29 digits and 28 zeros, a
+// number no 96-bit mantissa could hold.
+//
+// `places` outside 0..28 is the same cause as `Round`'s and answers in the
+// same words, which is why this function asks no question of its own: the
+// rounding above is reached first and panics there (D79, ruling 4).
+str tk_dec_tostring_n(decimal d, i64 places) {
+    decimal r = tk_dec_round_at(d, places);
+    uptr buf = rt_alloc(TK_DEC_STRMAX + TK_DEC_MAXSCALE + 1);
+    i64 k = tk_dec_fmt(buf, r);
+    i64 have = tk_dec_scale(r);
+    if (places > 0 && have == 0) {
+        st8(buf + k, '.');
+        k = k + 1;
+    }
+    loop {
+        if (have >= places) break;
+        st8(buf + k, '0');
+        k = k + 1;
+        have = have + 1;
+    }
+    st8(buf + k, 0);
+    return buf;
+}
+
+// ---- Parse and TryParse ----
+// The grammar is what `ToString` writes plus an optional exponent, and nothing
+// else (docs/specs/decimal.md § 9: culture, grouping and currency are a
+// formatting library and not a primitive):
+//
+//     [+|-] digits [ . digits ] [ (e|E) [+|-] digits ]
+//
+// with at least one digit somewhere around the point, NO surrounding space and
+// NO separator of any kind. `.5` and `5.` are accepted, as C# accepts them.
+//
+// The answer is three-valued, because two failures are two causes: 0 for text
+// that is no decimal at all, -1 for a number that IS one and does not fit (a
+// mantissa past 96 bits, or a scale past 28 places after the exponent moved
+// it). `Parse` panics with the cause and `TryParse` reads both as false, which
+// is what makes it a function that never panics.
+i64 tk_dec_scan(ptr p, str s) {
+    i64 i = 0;
+    i64 sign = 0;
+    i64 c = ld8(s);
+    if (c == '+' || c == '-') {
+        if (c == '-') sign = 1;
+        i = 1;
+    }
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    i64 nd = 0;                               // digits read, on both sides
+    i64 scale = 0;
+    i64 over = 0;                             // past the 256 bits of the scratch
+    loop {
+        c = ld8(s + i);
+        if (!tk_dec_isdig(c)) break;
+        if (tk_dv_muladds(v, 10, c - '0')) over = 1;
+        nd = nd + 1;
+        i = i + 1;
+    }
+    if (ld8(s + i) == '.') {
+        i = i + 1;
+        loop {
+            c = ld8(s + i);
+            if (!tk_dec_isdig(c)) break;
+            if (tk_dv_muladds(v, 10, c - '0')) over = 1;
+            nd = nd + 1;
+            scale = scale + 1;
+            i = i + 1;
+        }
+    }
+    if (nd == 0) return 0;                    // "", "-", ".", "e3"
+    i64 exp = 0;
+    c = ld8(s + i);
+    if (c == 'e' || c == 'E') {
+        i = i + 1;
+        i64 eneg = 0;
+        c = ld8(s + i);
+        if (c == '+' || c == '-') {
+            if (c == '-') eneg = 1;
+            i = i + 1;
+        }
+        i64 ne = 0;
+        loop {
+            c = ld8(s + i);
+            if (!tk_dec_isdig(c)) break;
+            // the exponent is read WHOLE, so `0.<10000 zeros>1e10001` lands at
+            // scale 0 as written; past a billion it saturates, which is only
+            // ever an overflow or a zero below (Copilot on #733)
+            if (exp < 1000000000) exp = exp * 10 + (c - '0');
+            ne = ne + 1;
+            i = i + 1;
+        }
+        if (ne == 0) return 0;                // "1e", "1e+"
+        if (eneg) exp = 0 - exp;
+    }
+    if (ld8(s + i) != 0) return 0;            // trailing text of any kind
+    scale = scale - exp;
+    i64 zero = tk_dv_is_zero(v);
+    // a NEGATIVE scale is no representation at all: the mantissa absorbs it,
+    // ten at a time, exactly as the literal does (teko_decimal.tk) -- and a
+    // non-zero mantissa needing more than 29 tens is an overflow before the
+    // first multiply, while a zero is a zero at any scale
+    if (scale < 0 && zero) scale = 0;
+    if (scale < 0 - 29) return 0 - 1;
+    loop {
+        if (scale >= 0) break;
+        if (tk_dv_muladds(v, 10, 0)) over = 1;
+        scale = scale + 1;
+    }
+    if (zero && scale > TK_DEC_MAXSCALE) scale = TK_DEC_MAXSCALE;
+    if (over || tk_dv_over96(v)) return 0 - 1;
+    // EXACT or refused (D79, ruling 5): a scale past 28 places is a value this
+    // type cannot hold, and rounding it here would answer a number the writer
+    // never wrote. `ToString` never produces one, so the round trip is closed.
+    if (scale > TK_DEC_MAXSCALE) return 0 - 1;
+    tk_dec_st(p, tk_dec_build(v, scale, sign));
+    return 1;
+}
+
+// `decimal.Parse(s)`: the value, or a panic (exit 70) -- C#'s own `Parse`,
+// whose failure is an exception and not a sentinel no caller could tell from a
+// parsed value.
+decimal tk_dec_parse(str s) {
+    decimal d;
+    ptr q = &d;
+    st64(q, 0);
+    st64(q + 8, 0);
+    i64 r = tk_dec_scan(q, s);
+    if (r == 0) panic("the string is not a decimal");
+    if (r < 0) panic("decimal overflow");
+    return d;
+}
+
+// `decimal.TryParse(s, out d)`: 1 and the value, or 0 and `decimal.Zero` --
+// C#'s pair, and the one road into this type that never panics. `o` is an
+// `out decimal`, judged at the call site by teko_ref.tk's own pass, which is
+// what the hand-written parser (teko_decimal.tk) hands it.
+i64 tk_dec_tryparse(str s, out decimal o) {
+    decimal d;
+    ptr q = &d;
+    st64(q, 0);
+    st64(q + 8, 0);
+    if (tk_dec_scan(q, s) != 1) {
+        st64(q, 0);                           // the scan writes nothing on failure
+        st64(q + 8, 0);
+        o = d;
+        return 0;
+    }
+    o = d;
+    return 1;
 }

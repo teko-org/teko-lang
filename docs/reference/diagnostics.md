@@ -669,17 +669,18 @@ of day takes. It is listed in [runtime.md](runtime.md#the-time-library) beside t
 three derived machines copy its sixteen bytes between frame slots, globals, arguments and
 the return buffer ([`teko_wide.tk`](../../teko_wide.tk), D74). C4 adds the ARITHMETIC — the
 five operators, the two unary ones, the six comparisons and the four conversions, all of
-them a call into `lib/decimal.tk` (D77) — and leaves the MEMBER table empty, so `Round`,
-`ToString` and `Parse` are still answered by name
-([the specification](../specs/decimal.md) § 4, [not-yet.md](not-yet.md)).
+them a call into `lib/decimal.tk` (D77) — and C5 the MEMBER table: nineteen rows, the
+rounding, the text and the statics (D79,
+[the specification](../specs/decimal.md) § 7, [not-yet.md](not-yet.md)).
 
-- `"teko: a decimal does not cast yet"` — a cast whose target the conversion table does not
-  name, `(str) d` being the one the surface reaches (text is `ToString`/`Parse`, C5). The
-  four casts § 6 opens — ``(i64) d``, ``(f64) d``, ``(decimal) n``, ``(decimal) x`` — are
-  each a CALL now and never reach this row; `MTASK_CAST` on a sixteen-byte value still has
-  no meaning. A primitive registered with **no** reader and **no** constructor names neither
-  in this refusal, which is why it is shorter than `DateTime`'s own (`tk_prim_cast_check`,
-  [`teko_prim.tk`](../../teko_prim.tk)).
+- ``"teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it"``
+  — a cast whose target the conversion table does not name, `(str) d` being the one
+  the surface reaches. The four casts § 6 opens — ``(i64) d``, ``(f64) d``, ``(decimal) n``,
+  ``(decimal) x`` — are each a CALL and never reach this row; `MTASK_CAST` on a sixteen-byte
+  value still has no meaning. The two clauses are the type's own `pt_read`/`pt_build`
+  columns, filled by C5 (`tk_prim_cast_check`, [`teko_prim.tk`](../../teko_prim.tk)); C3 and
+  C4 registered neither and got the shorter *a decimal does not cast yet* instead, because a
+  message naming a member the type does not have yet would be wrong.
 - `"teko: a global "` — completed by *decimal takes no initializer*. A `decimal` has no
   folded form, so a global of that type is a slot and an assignment: `decimal g = 3.25m;`
   dies one phase earlier with mc's own `global initializer must be constant` (the literal is
@@ -731,7 +732,7 @@ them a call into `lib/decimal.tk` (D77) — and leaves the MEMBER table empty, s
   for the quoted form, and this message's own wording is unchanged because the quotes moved
   from the column to the one reader.
 
-Two are **run-time panics** of `lib/decimal.tk`, both exit 70 and both on stderr with no
+Four are **run-time panics** of `lib/decimal.tk`, all exit 70 and all on stderr with no
 `file:line` ([runtime.md](runtime.md#the-decimal-library)):
 
 - `"teko: decimal overflow"` — a result that needs more than the 96 bits of a mantissa at a
@@ -742,6 +743,18 @@ Two are **run-time panics** of `lib/decimal.tk`, both exit 70 and both on stderr
   (`tk_dec_pack`, `tk_dec_to_i64`, `tk_dec_from_f64`).
 - `"teko: decimal division by zero"` — `d / 0m` and `d % 0m`. `0m`, `0.00m` and `-0m` are
   three bit patterns and one zero, and all three reach it (`tk_dec_is_zero`).
+- `"teko: the string is not a decimal"` — `decimal.Parse(s)` on text the grammar does not
+  read: a letter, an empty string, a space, a thousands separator, two points, an `e` with
+  no digits after it. C#'s own `Parse` raises `FormatException` there and never answers a
+  sentinel value no caller could tell from a parsed one; `decimal.TryParse(s, out d)` is the
+  other half and answers 0 without panicking (`tk_dec_scan`, D79). A string the grammar DOES
+  read and the type cannot hold — a mantissa past 96 bits, a scale past 28 places once the
+  exponent moved it — is `decimal overflow` above instead: two failures, two causes.
+- `"teko: the decimal places are out of range"` — `decimal.Round(d, n)` and
+  `d.ToString(n)` with `n` outside `0..28`, which is the whole range a scale has. It is a
+  run-time guard because the argument is an ordinary `i64` and nothing at compile time knows
+  what a parameter holds; `ToString` shares the message because it rounds first, and one
+  cause reads better as one message (D79, ruling 4).
 
 Five more are **guards on the machine**, in the same file. Every one of them is unreachable
 from the surface — teko refuses each construct earlier, with a line and a name — and they
@@ -758,7 +771,7 @@ sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
   is `tk_dec_neg` and `+d` is the operand itself, written by the unary lowering with no row
   at all (`tk_prim_unary_plus`, D77).
 - `"teko: a cast is not defined on a sixteen-byte value yet"` — `MTASK_CAST`; the four casts
-  § 6 opens are calls and the rest is `teko: a decimal does not cast yet`.
+  § 6 opens are calls and the rest is `` teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it `` (the shorter *does not cast yet* was C3/C4's, before the read and build clauses existed).
 - `"teko: a constant is not defined on a sixteen-byte value yet"` — `MTASK_CONST`. A
   `decimal` has no folded form at all, so the surface refusals are
   `teko: const requires a constant expression` and
@@ -1839,10 +1852,10 @@ truncation; the fix is to split the unit.
 | `"teko: too many bare continues inside a switch"` | 128 |
 | `"teko: loops nested too deep"` | 32 open at one point of one function |
 | `"teko: too many primitive types"` | 8 primitives with a member table (D74's own row was stale at 8; still 8 with `DateTimeOffset`, seven of the eight now spent) |
-| `"teko: too many primitive members"` | 160 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74) |
+| `"teko: too many primitive members"` | 192 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74; D79 raises 160 to 192, C5's nineteen `decimal` rows having filled the old cap exactly) |
 | `"teko: too many primitive operators"` | 80 rows, over every primitive (D76: raised from 48, itself a stale `32` this table carried since before D74 — `DateTimeOffset`'s nine rows took the true count past 48; D77: raised to 80, `decimal`'s twelve rows took 50 to 62) |
 | `"teko: too many primitive conversions"` | 8 rows of the cast-to-call table, over every primitive — the four `decimal` registers today (D77). A cast whose target the table does not name is refused, never lowered, so the ceiling is a COMPILER one and no source can reach it |
-| `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row |
+| `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row — 101 spent after C5 (D79) |
 | `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
 | `"teko: too many primitive arguments of unknown type"` | 128 arguments of primitive or `enum` position, in one unit, whose type only the pass can tell |
 | `"teko: too many casts over a primitive in one unit"` | 4096 casts the compiler wrote itself, in one compilation unit |

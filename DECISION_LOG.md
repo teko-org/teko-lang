@@ -7439,6 +7439,17 @@ move together. And `mc tool install` exists since mc 0.15.21 (M48 C3): `tekoc` a
 installable tool (`[project] kind = "exe"`, `[package].bin`, `[[permission]]`) is a crumb of its
 own, the last row of `docs/specs/roadmap-1.0.md` § What teko owes.
 
+**Amendment (2026-09-15) — the pin rises to 0.17.2.** mc 0.17.1 (the four `mc tool`
+defects, `tekoc-tool.md` § 10) and 0.17.2 (`mc pkg sync` with a vendored `deps/x` at another
+version: `deps/x is B, [deps] wants A: update the checkout or remove deps/x`, found by the std
+lockstep) are patches under the same frozen surface. The canary judged 0.17.1 `ok` (run
+34921240874); 0.17.2 was promoted by mc's timeout while this repository's poller was not
+watching, and its verdict was written afterwards by a manual dispatch. The whole local recipe is
+green on 0.17.2 over `a1cf0b52` (94 passed, 119 refused, 0 failed; `FIXPOINT OK`; docs ok) and
+`--dump-ast` is byte-identical between the compiler built by 0.17.0 and by 0.17.2 on every
+fixture. The move is D64's: `MC_VERSION` and `[package].mc` to 0.17.2, the four current-pin
+quotes with them; nothing in the modules moves.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
@@ -8377,14 +8388,132 @@ instructions two small clauses added, and not offered as proof of anything: the 
 fix is correct is the two reproducers above turning from a silent pass into the width
 refusal, the two new fixtures, and the unmoved `--dump-ast` of the 92 fixtures that predate
 it.
-**Amendment (2026-09-15) — the pin rises to 0.17.2.** mc 0.17.1 (the four `mc tool`
-defects, `tekoc-tool.md` § 10) and 0.17.2 (`mc pkg sync` with a vendored `deps/x` at another
-version: `deps/x is B, [deps] wants A: update the checkout or remove deps/x`, found by the std
-lockstep) are patches under the same frozen surface. The canary judged 0.17.1 `ok` (run
-34921240874); 0.17.2 was promoted by mc's timeout while this repository's poller was not
-watching, and its verdict was written afterwards by a manual dispatch. The whole local recipe is
-green on 0.17.2 over `a1cf0b52` (94 passed, 119 refused, 0 failed; `FIXPOINT OK`; docs ok) and
-`--dump-ast` is byte-identical between the compiler built by 0.17.0 and by 0.17.2 on every
-fixture. The move is D64's: `MC_VERSION` and `[package].mc` to 0.17.2, the four current-pin
-quotes with them; nothing in the modules moves.
 
+---
+
+### D79 · `decimal` rounds, is written and is read back — C5, and the wide argument column the mechanism owed (2026-09-15)
+
+> C4 (D77) left `decimal` computing and converting with an EMPTY member table: `Round`,
+> `ToString`, `Parse` and the statics were all `teko: unknown static member of decimal`,
+> and the two `syntax` rows a receiver costs were unspent on purpose (D74). C5 spends them
+> and registers nineteen rows of `docs/specs/decimal.md` § 7 — the whole API, every one of
+> them an ordinary call into `lib/decimal.tk`, no intrinsic, no pass, no machine. The
+> crumb's own surprise was on the mechanism's side and is ruling 8 below: `decimal.Round(d,
+> 2)` is the first row in this compiler whose ARGUMENT is sixteen bytes, and the shared
+> widening wrote a cast where a call was needed.
+
+**Ruling 1 — `decimal.ToDouble(d)` and `decimal.FromDouble(f64)` are not registered, and
+§ 7 is amended to say so.** They are `(f64) d` and `(decimal) x`, two of the four
+conversion rows C4 already landed, under C#'s other spelling. A member row would be a
+second door to one road, and a second door is a second thing to keep right. They earn
+`teko: unknown static member of decimal` with the reason written down in
+`docs/reference/not-yet.md`.
+
+**Ruling 2 — `TK_MAXPRIMM` is 192.** The nineteen rows take the member table from 141 to
+160, which is exactly the cap D76 set, so the next primitive would have hit a ceiling for
+no reason but arithmetic. Measured with a counter printed at the end of `teko_init()`, not
+by counting registration lines: `nprimm=160`, `nprimp=101` of 128, `nprimo=62` of 80,
+`nprimt=7` of 8, `nprimx=5` of 8. Raising a `#define` costs the array it sizes and nothing
+else.
+
+**Ruling 3 — `Round` is half to EVEN; `Truncate`, `Floor` and `Ceiling` are C#'s, at scale
+zero; the scale never grows.** This type now carries two rounding rules and they are both
+C#'s: the OPERATORS round half away from zero (`tk_dec_pack`, D77) and `decimal.Round`
+rounds half to even, `MidpointRounding.ToEven`, which is the owner's own naming of it.
+`Round(1.5m, 3)` answers `1.5m` at scale 1 — a scale never GROWS — and `Round(2.675m, 2)`
+answers `2.68m`, because `2.675` is exact in base ten, so the tie is real and the kept `7`
+is odd. The parity of what is kept is read off limb zero: ten is even, so a binary value
+and its last decimal digit share a parity, which is one test instead of a division.
+`Floor(-1.5m)` is `-2m`, `Ceiling(-1.5m)` is `-1m`, `Truncate(-1.5m)` is `-1m`, and all
+three answer at scale 0 (`Floor(1.50m)` is `1m`), which is what C# answers. One function
+writes all three (`tk_dec_intpart`), told apart by the SIGN a discarded fraction grows the
+magnitude for; `Truncate` passes a sign no value has.
+
+**Ruling 4 — a zero carries no sign in the text, `ToString(n)` is C#'s `"F<n>"`, and a
+places count outside `0..28` is ONE panic.** `-0m` writes `"0"`, which is consistent with
+`-0m == 0m` being true and with `.Sign` answering 0 for it; `0.00m` writes `"0.00"`,
+because the scale is part of the value and a trailing zero is not noise (`1.50m` and `1.5m`
+are two values). `ToString(places)` rounds by ruling 3 and then pads with zeros in the
+TEXT, never in the mantissa — `decimal.MaxValue.ToString(2)` is 29 digits and two zeros, a
+number no 96-bit mantissa holds. The dispatch proposed a second message for its range
+(`the decimal format is out of range`); there is one cause here — a places count outside
+the range a scale has — so there is one message,
+`teko: the decimal places are out of range`, reached by `ToString` through the rounding it
+does first. One cause, one message, one fixture (D20's own economy).
+
+**Ruling 5 — `Parse` is exact or refused, and its grammar has no culture in it.**
+`[+|-] digits [ . digits ] [ (e|E) [+|-] digits ]`, with `.5` and `5.` accepted as C#
+accepts them, and NOTHING else: no surrounding whitespace, no thousands separator, no
+currency sign — § 9 already excludes formatting from this type and this is that exclusion
+read on the way in. Two failures stay two causes, which is why `tk_dec_scan` answers three
+values: `teko: the string is not a decimal` for text that is none, and
+`teko: decimal overflow` for a number that IS one and does not fit — a mantissa past 96
+bits, or a scale past 28 places once the exponent moved it. C# would round the second case;
+teko refuses it, because this type is exact or loud and rounding a number the writer wrote
+out in full is the silently-wrong answer this project does not ship. `ToString` never
+produces such a string, so the round trip is closed. `TryParse` reads both as false,
+answers `0`/`1` and never panics — the hand-parsed `out` argument is
+`Guid.TryParse`'s own shape (D75).
+
+**Ruling 6 — `CompareTo` and `.Sign` read the VALUE.** `CompareTo` is `tk_dec_cmp`, already
+scale-insensitive, and `Equals` is `tk_dec_eq`, which is what `==` asks: no new function for
+either. `.Scale` is the raw scale byte (`tk_dec_scale`), and `.Sign` is a NEW function
+(`tk_dec_signum`) precisely because `tk_dec_sign` is the sign BIT and answers 1 for `-0m`,
+where C#'s `.Sign` answers 0.
+
+**Ruling 7 — `lib/math.tk` lands, `public`, and teaches nothing.** § 7 names it inside C5,
+so it lands with C5: `Math.Round` in both arities plus `Truncate`, `Floor`, `Ceiling` and
+`Abs` over a `decimal`, forwarding to the statics. It is the one library file that needs no
+mechanism at all — a static method on a declared class is a construct this compiler already
+runs — so nothing in it is registered and `mc limits` does not move for it. It is `public`
+because an `internal` class answers only to code of its own project (`tk_check_type_use_from`,
+`teko_access.tk`), and a program that includes a library is not one; measured, since the
+first draft was `internal` and `--dump-ast` refused the fixture with
+`teko: Math is internal to another project` while `mc build` — one project — accepted it.
+C#'s other forty `Math` overloads are a library crumb of their own and are named in
+`not-yet.md`.
+
+**Ruling 8 — a WIDE column converts its argument with a CALL, and `tk_prim_arg_widen` wrote
+a cast.** This is the defect the crumb found, fixed at the root rather than avoided.
+`tk_prim_arg_widen` (`teko_prim.tk`) is where an argument whose type the parser could not
+settle gets its widening once the pass knows it; it built an `N_CAST` to the column's type,
+which is right for a float column and meaningless for a sixteen-byte one — `MTASK_CAST` over
+a wide value has no lowering and `tw_cast` (`teko_wide.tk`) `die`s on it. Nothing had ever
+exercised it: `Guid`'s statics take a `str` and `decimal` had no member rows at all, so
+`decimal.Round(d, 2)` is the first wide ARGUMENT in this compiler. Measured on the branch,
+before the rows were written: every integer argument the parser cannot type — a local, a
+parameter, a `u8`, an array element, a call — died in codegen with `teko: a cast is not
+defined on a sixteen-byte value yet`, while a LITERAL passed, because the parser types it
+and `tk_rc_call_args` (`teko_rc.tk`) writes the conversion against the declaration instead.
+The fix is `tk_num_widen` (`teko_typeof.tk`), which already answers both shapes since D77,
+with `tk_node_replace` putting its node in place of the argument's — the identity and the
+sibling link a node already spliced into a call's list must keep. One rule, one place, and
+the float arm is untouched: all 92 pre-existing fixtures dump byte-identically.
+
+**Ruling 9 — `(str) d` now names the pair that does the work.** With `pt_read`/`pt_build`
+filled, the cast refusal is
+``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it``
+instead of C3's shorter *a decimal does not cast yet* — the same `Guid`-shaped wording D75
+introduced, and `tests/refuse/decimal_str_cast.tk` moves with it in the same commit.
+
+**What it cost.** `mc limits . --config mc.macos.toml` on `a1cf0b52` and on the crumb,
+verdict `ok` on both sides: `syntax` **17 → 18** — ONE row and not two, because the table is
+keyed by NAME and `syntax_expr("decimal")`/`syntax_stmt("decimal")` share it — with
+`intrin` **8**, `passes` **15**, `types` **16** and `alias` **23** all unmoved, which is
+D21's own row among them. The compiler unit grows with the library it carries: `nodes`
+198544 → 199142, `funcs` 4127 → 4132, `globals` 1375 → 1377, `strings` 2880 → 2914.
+
+**What proves it.** `tests/primitives_decimal_round.tk` (53 checks, exit 42),
+`_text.tk` (57, 42), `_parse_bad.tk` (70) and `_places_bad.tk` (70), plus the reworded
+`tests/refuse/decimal_str_cast.tk`: 98 passed, 119 refused as expected, 0 failed.
+`FIXPOINT OK`. `--dump-ast` of all 217 fixtures under the base compiler and under this one:
+212 byte-identical, and the five that move are the four new fixtures (which the base
+compiler refuses by name) and the refusal whose wording ruling 9 changed.
+
+**One adjacent finding, reported and not fixed here.** `.` sinks THROUGH a prefix `- ! ~`
+(`teko_prefix.tk`, delivery 5) so that `-a.x` means `-(a.x)` as C# does — and the node shape
+cannot tell a bare prefix from a PARENTHESIZED one, so `(-d).ToString()` also reads as
+`-(d.ToString())`. It predates this crumb and is not `decimal`'s: measured on `a1cf0b52`,
+`(-t).Hours` on a `TimeSpan` reads as `-(t.Hours)` the same way. On a `decimal` the
+consequence is louder, because the `-` then lands on a `str` and the read segfaults, so
+every fixture here binds a negative receiver to a local first and says why.
