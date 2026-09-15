@@ -948,6 +948,80 @@ and `"X"` are three more spellings of the same sixteen bytes and are not taught.
 
 ---
 
+## `DateTimeOffset`
+
+Sixteen bytes, sixteen-byte aligned, behind `#include "time.tk"`. It is C#'s
+`System.DateTimeOffset`: a UTC instant, `+0`, and its offset in minutes, `+8`. It is the
+THIRD `TK_WIDE` type after `decimal` and `Guid`, so it moves on exactly the machine those two
+brought ([`teko_wide.tk`](../../teko_wide.tk), D74/D75/D76) — read "It moves by address"
+above, word for word.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "time.tk"
+
+i64 main() {
+    DateTime dt = new DateTime(2024, 2, 29, 13, 45, 30);
+    DateTimeOffset o = new DateTimeOffset(dt, TimeSpan.FromHours(0 - 3));
+    if (o.UtcDateTime.Hour != 16) return 1;          // 13:45 at -03:00 is 16:45 UTC
+
+    DateTimeOffset p = new DateTimeOffset(o.UtcDateTime, TimeSpan.Zero);
+    if (o != p) return 2;                            // the same instant: equal
+
+    if (!tk_str_eq(o.ToString(), "2024-02-29T13:45:30.0000000-03:00")) return 3;
+    if (DateTimeOffset.Parse(o.ToString()) != o) return 4;
+    return 42;
+}
+```
+
+**The two halves.** `+0` is a `DateTime` whose `Kind` is always `Utc`; `+8` is the offset in
+SIGNED MINUTES, `-840 .. 840` (`-14:00 .. +14:00`), C#'s own bound. `.DateTime` and
+`.LocalDateTime` re-apply the offset and hand back an Unspecified `DateTime`; `.UtcDateTime`
+hands back the `+0` half as it is. `.Year` … `.Millisecond` read that same re-applied, LOCAL
+reading. Two values that name the same instant under different offsets are **equal** and
+compare equal — the six comparisons and `CompareTo` read the instant and ignore the offset,
+C#'s own rule.
+
+**The API.**
+
+| static | instance |
+|---|---|
+| `DateTimeOffset.MinValue`, `MaxValue`, `UnixEpoch` | `.Offset` → `TimeSpan`, `.TotalOffsetMinutes` → `i64` |
+| `new DateTimeOffset(DateTime, TimeSpan)` | `.UtcDateTime`, `.LocalDateTime`, `.DateTime` → `DateTime` |
+| `DateTimeOffset.FromUnixTimeSeconds(i64)`, `FromUnixTimeMilliseconds(i64)` | `.Year` … `.Millisecond`, of the local reading |
+| `DateTimeOffset.Parse(str)`, `TryParse(str, out DateTimeOffset)` | `.ToUnixTimeSeconds()`, `.ToUnixTimeMilliseconds()` |
+| `DateTimeOffset.Now`, `UtcNow` — **not taught** ([not-yet.md](not-yet.md)) | `.ToOffset(TimeSpan)`, `.CompareTo`, `.Equals`, `.ToString()`, `.ToString(str)` |
+
+C#'s `new DateTimeOffset(i64 ticks, TimeSpan)` overload is **not taught**: the one `new` row
+this table carries takes a `DateTime`, and `new DateTimeOffset(new DateTime(t), ts)` is the
+written form ([not-yet.md](not-yet.md)).
+
+**The text.** `ToString()` and `ToString("o")` write the round-trip form,
+`yyyy-MM-ddTHH:mm:ss.fffffff+HH:MM`, 33 characters, the local reading plus its own offset
+suffix; `ToString("s")` writes `yyyy-MM-ddTHH:mm:ss`, 19 characters, no fraction and no
+offset. `Parse` accepts exactly those two shapes and panics on anything else
+(`teko: the string is not a DateTimeOffset`, exit 70); a 19-character string is read as UTC,
+offset zero, since teko has no time-zone database to read a bare wall-clock string against.
+`TryParse` answers `0`/`1` and writes `MinValue` on failure instead of panicking.
+
+**What N5 refuses**, every one of them by name and at the line it was written:
+
+| written | message |
+|---|---|
+| `a + b`, `a * b`, the arithmetic C# has none of | ``teko: no operator `+` takes these operands`` |
+| `i64 n = o;` | `teko: a value of type DateTimeOffset does not convert to i64` |
+| `DateTimeOffset o = 5;` | `teko: a value of type i64 does not convert to DateTimeOffset` |
+| `(i64) o`, `(DateTimeOffset) n` | ``teko: a DateTimeOffset does not cast; `.UtcDateTime` reads it and `new DateTimeOffset(...)` builds it`` |
+| `o.Anything`, `DateTimeOffset.Anything` | `teko: unknown member of DateTimeOffset` and its static twin |
+| `new DateTimeOffset()` | `teko: new DateTimeOffset() is not taught; write DateTimeOffset.MinValue` (D76: a wide type's zero-argument constructor names its own zero instead of the identity cast every eight-byte primitive gets) |
+| `new DateTimeOffset(ticks, ts)` on an `i64 ticks` | `teko: a value of type i64 does not convert to DateTime` — the one `new` row takes a `DateTime` first, and the C# ticks overload is not taught |
+| `extern i64 f(DateTimeOffset o);` | ``teko: an `extern` takes no DateTimeOffset`` |
+| an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
+| `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `DateTime.Now` is blocked on |
+
+---
+
 ## Members
 
 The same member grammar serves a struct and a class.

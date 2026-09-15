@@ -218,7 +218,7 @@ not:
 | `DateTime.Now`, `UtcNow`, `Today` (C6) | `teko: DateTime.Now is not taught yet` and its two siblings — a wall clock is one symbol per operating system (`clock_gettime`, `GetSystemTimePreciseAsFileTime`), and teko declares it itself as an `extern` chosen by the target host (C6, the owner's ruling of 2026-09-08) |
 | `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — a crumb of its own; the `enum` page's own N2b landed a PARALLEL mechanism keyed on a struct-table row, not `teko_prim.tk`'s lowering table `TimeSpan`/`DateTime` use, so it does not carry over automatically |
 | `DateTime.SpecifyKind(d, k)`, `d.Subtract(x)` | `teko: unknown static member of DateTime: SpecifyKind` / `teko: unknown member of DateTime: Subtract` — neither is registered. A row's parameters may differ in type since N2c (`new DateTime(ticks, kind)` is the first one that does), so `SpecifyKind` is now only a row nobody has written; `Subtract` still needs two overloads of ONE arity, which the mechanism picks by argument COUNT alone. `SpecifyKind(d, k)` is `new DateTime(d.Ticks, k)` and `Subtract` is `-` |
-| `ToLocalTime`, `ToUniversalTime`, `DateTimeOffset` | not taught: a time-zone database is not a language feature, which rules the first two out; `DateTimeOffset` needs none (its `.LocalDateTime` reads the offset the value carries) and is the one crumb still open on [datetime-extras.md](../specs/datetime-extras.md) (N5), queued behind C3, the sixteen-byte machine. `DateOnly` landed with N4a ([datetime.md](datetime.md#dateonly)) and `TimeOnly` with N4b ([datetime.md](datetime.md#timeonly)) |
+| `ToLocalTime`, `ToUniversalTime` | not taught: a time-zone database is not a language feature. `DateTimeOffset` (N5, D76, [the type reference](types.md#datetimeoffset)) needs none of it — its `.LocalDateTime` reads the offset the value carries and nothing more — and landed whole; `DateOnly` landed with N4a ([datetime.md](datetime.md#dateonly)) and `TimeOnly` with N4b ([datetime.md](datetime.md#timeonly)) |
 | `d.ToString()`, `DateOnly.Parse(s)`, `TryParse` on a `DateOnly` | `teko: unknown member of DateOnly` / `teko: unknown static member of DateOnly` — the same crumb the `DateTime` row above waits on, for the same reason: no `teko_prim.tk` primitive has a `str` member yet |
 | `t.ToString()`, `TimeOnly.Parse(s)`, `TryParse` on a `TimeOnly` | `teko: unknown member of TimeOnly` / `teko: unknown static member of TimeOnly` — the same crumb, the same reason; `d.ToDateTime(t)` itself IS taught now (N4b, [datetime.md § `TimeOnly`](datetime.md#timeonly)) |
 | `switch` on a `DateTime` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a date takes no integer operand |
@@ -267,6 +267,19 @@ one function that reads the host's entropy.
 | `g.ToByteArray()`, `new Guid(byte[])` | `teko: unknown member of Guid` / `teko: this primitive has no constructor` — the byte-order question of § 1 becomes visible the moment either exists, and neither is asked for |
 | version 1, 3, 5 and 7 `Guid`s | not taught: v1 needs a MAC address and a clock, v3/v5 need MD5/SHA-1, v7 needs a clock, and all of them are a library over `NewGuid`'s own primitive |
 | `a < b` matching C#'s field-wise `CompareTo` | **not a gap, a recorded divergence**: teko orders by the bytes as they print, unsigned and left to right ([the specification](../specs/guid.md) § 1, § 6) |
+
+## `DateTimeOffset`, and the rest of `docs/specs/datetime-extras.md`
+
+N5 landed the type whole (D76, [the type reference](types.md#datetimeoffset)): the sixteen
+bytes, the constructor, every reader, the Unix conversions, `ToOffset`, the six comparisons,
+the two arithmetic operators and both text forms. What is left is C#'s wall clock and one
+overload the design narrows on purpose.
+
+| written | what happens |
+|---|---|
+| `DateTimeOffset.Now`, `UtcNow` (C6) | `teko: DateTimeOffset.Now is not taught yet` and its sibling — the same wall clock `DateTime.Now` is blocked on (C6, the owner's ruling of 2026-09-08); teko has no time-zone database either, so "now" needs a host clock before it needs a zone |
+| `new DateTimeOffset(i64 ticks, TimeSpan)` | `teko: a value of type i64 does not convert to DateTime` — C#'s raw-ticks overload is **not taught**; the one `new` row this table carries takes a `DateTime` first, and `tk_prim_pick` chooses a `"new"` row by ARGUMENT COUNT alone, so an `i64` written there is an ordinary mismatch against that row's own first position rather than a row of its own. `new DateTimeOffset(new DateTime(t), ts)` is the written form |
+| `new DateTimeOffset()` | `teko: new DateTimeOffset() is not taught; write DateTimeOffset.MinValue` — D76's shared guard for every wide type's zero-argument constructor (`decimal`, `Guid`, `DateTimeOffset`): the identity cast to zero every OTHER primitive answers `new T()` with has no sixteen-byte form, so the type's own named zero is the written form instead |
 
 ## Dependency injection
 

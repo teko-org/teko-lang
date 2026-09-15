@@ -302,6 +302,40 @@ Fifteen panics live here, all exit **70**:
 | `teko: a year count is out of range` | `AddYears` outside ±10000 |
 | `teko: a time of day is out of range` | a tick count outside `0 .. 863999999999`: `new TimeOnly(ticks)` or `TimeOnly.FromTimeSpan(ts)` |
 
+...and the `DateTimeOffset` half (N5, D76): sixteen bytes, `+0` a `DateTime` whose `Kind`
+is always `Utc` (the instant), `+8` the offset in signed minutes. Every function below takes
+and answers the `DateTimeOffset` STRUCT itself, never the raw halves — D75's rule for a wide
+value's own member row — and reads or writes them through `tk_dto_instant`/`tk_dto_offmin`.
+The calendar is not rewritten a third time: every component is `tk_dt_*` above, called on
+the LOCAL reading (the instant plus the offset, an ordinary Unspecified tick count).
+
+| signature | is |
+|---|---|
+| `DateTimeOffset tk_dto_make(i64 instant, i64 offmin)` | the two halves into one value, unchecked — every caller has already checked |
+| `i64 tk_dto_instant(DateTimeOffset)` `i64 tk_dto_offmin(DateTimeOffset)` | the two halves back out |
+| `i64 tk_dto_local_ticks(DateTimeOffset)` | the instant plus the offset: what `.Year` … `.Millisecond` and the text both read |
+| `i64 tk_dto_check_offset(i64 ts)` | the offset validator: a whole minute, `-14:00 .. +14:00`; panics `teko: that UTC offset does not exist` otherwise |
+| `DateTimeOffset tk_dto_min()` `tk_dto_max()` `tk_dto_unixepoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
+| `DateTimeOffset tk_dto_new(i64 dt, i64 ts)` | `new DateTimeOffset(DateTime, TimeSpan)`: the `DateTime` read as a LOCAL reading at `ts`'s offset, the instant that minus the offset |
+| `DateTimeOffset tk_dto_from_unix_seconds(i64)` `tk_dto_from_unix_ms(i64)` | the two `FromUnixTime*` builders, range-checked before the multiply |
+| `i64 tk_dto_to_unix_seconds(DateTimeOffset)` `tk_dto_to_unix_ms(DateTimeOffset)` | their inverse |
+| `i64 tk_dto_offset(DateTimeOffset)` | `.Offset`, minutes back into ticks |
+| `i64 tk_dto_utcdatetime(DateTimeOffset)` `tk_dto_localdatetime(DateTimeOffset)` | `.UtcDateTime`; `.DateTime`/`.LocalDateTime` under one function, `Kind` Unspecified |
+| `i64 tk_dto_year(DateTimeOffset)` `tk_dto_month` `tk_dto_day` `tk_dto_hour` `tk_dto_minute` `tk_dto_second` `tk_dto_ms` | the components, of the local reading, through `tk_dt_*` above |
+| `DateTimeOffset tk_dto_to_offset(DateTimeOffset, i64 ts)` | `.ToOffset`: the instant kept, the offset changed |
+| `DateTimeOffset tk_dto_add(DateTimeOffset, i64 t)` `tk_dto_sub_ts(DateTimeOffset, i64 t)` | `o + t`, `o - t`: the offset kept, the instant moved, through `tk_dt_add`/`tk_dt_sub_ts` |
+| `i64 tk_dto_sub(DateTimeOffset, DateTimeOffset)` | `o - o`: a `TimeSpan`, through `tk_dt_sub` |
+| `i64 tk_dto_eq(DateTimeOffset, DateTimeOffset)` `tk_dto_ne` `tk_dto_lt` `tk_dto_le` `tk_dto_gt` `tk_dto_ge` `tk_dto_cmp` | the instant only, offset ignored, through `tk_dt_eq` … `tk_dt_cmp` |
+| `i64 tk_dto_put_num(ptr buf, i64 v, i64 w)` | zero-padded decimal digits, `w` wide — the inverse of `tk_dto_scan_num` |
+| `str tk_dto_tostring_o(DateTimeOffset)` `tk_dto_tostring_s(DateTimeOffset)` `str tk_dto_tostring(DateTimeOffset)` `str tk_dto_tostring_fmt(DateTimeOffset, str f)` | the `"o"` (33 characters) and `"s"` (19) forms; `ToString()` is `"o"`; panics `teko: the DateTimeOffset format is not taught` on anything else |
+| `i64 tk_dto_try_scan(str s, ptr utcp, ptr offp)` | the inverse of the two `tostring_*`; `"s"` reads as UTC, offset zero |
+| `DateTimeOffset tk_dto_parse(str s)` | the value, or panics `teko: the string is not a DateTimeOffset` |
+| `i64 tk_dto_tryparse(str s, out DateTimeOffset o)` | `1` and the value, or `0` and `MinValue` written through `o` |
+
+`DTO_MAX_OFFSET_MIN` (840, `14 * 60`), `DTO_UNIX_EPOCH_SEC`, `DTO_UNIX_EPOCH_MS`,
+`DTO_MAX_UNIX_SEC`, `DTO_MIN_UNIX_SEC`, `DTO_MAX_UNIX_MS` and `DTO_MIN_UNIX_MS` come with the
+file, the same as the constants above.
+
 ---
 
 ## The wide libraries
@@ -309,13 +343,16 @@ Fifteen panics live here, all exit **70**:
 `lib/decimal.tk` and `lib/guid.tk` are what a `TK_WIDE` type owes the **program**: a machine
 emits code for the program being compiled, and the three things a sixteen-byte value needs
 are declarations of the program's own ([`teko_wide.tk`](../../teko_wide.tk), D74/D75).
-Each file declares the same three, under its own names.
+Each file declares the same three, under its own names. `DateTimeOffset`'s own three are the
+same shape, but live in `lib/time.tk` rather than in a file of their own — N5 folds the third
+wide type into the include `DateTime`/`TimeSpan` already read, since there is no third
+sixteen-byte FILE the way `decimal`/`Guid` each got one, only a third registration (D76).
 
 | | |
 |---|---|
-| `decimal tk_dec_retbuf;` / `Guid tk_guid_retbuf;` | the buffer a sixteen-byte RETURN travels through. The callee copies its value here and returns the ADDRESS; the call site copies it out into the call depth's own slot immediately after the branch, which is what makes ONE buffer safe under recursion and under nesting. It is **per type**, so a program that returns a `Guid` and never mentions `decimal` includes `guid.tk` alone. A program that forgot it is refused by name: `teko: include "guid.tk" before returning a sixteen-byte value` |
-| `decimal tk_dec_ld(ptr p)` / `Guid tk_guid_ld(ptr p)` | the INDIRECT load: two `ld64`s over the address of the sixteen bytes. `tk_ldn` ([`teko_struct.tk`](../../teko_struct.tk)) lowers every field, array element, `ref`/`out` pointee and closure capture of a wide type to it, because no raw `ldW` moves sixteen bytes and the width table would answer `ld64` and move half the value in silence |
-| `void tk_dec_st(ptr p, decimal d)` / `void tk_guid_st(ptr p, Guid g)` | the store, the same two words the other way |
+| `decimal tk_dec_retbuf;` / `Guid tk_guid_retbuf;` / `DateTimeOffset tk_dto_retbuf;` | the buffer a sixteen-byte RETURN travels through. The callee copies its value here and returns the ADDRESS; the call site copies it out into the call depth's own slot immediately after the branch, which is what makes ONE buffer safe under recursion and under nesting. It is **per type**, so a program that returns a `Guid` and never mentions `decimal` includes `guid.tk` alone. A program that forgot it is refused by name: `teko: include "guid.tk" before returning a sixteen-byte value` |
+| `decimal tk_dec_ld(ptr p)` / `Guid tk_guid_ld(ptr p)` / `DateTimeOffset tk_dto_ld(ptr p)` | the INDIRECT load: two `ld64`s over the address of the sixteen bytes. `tk_ldn` ([`teko_struct.tk`](../../teko_struct.tk)) lowers every field, array element, `ref`/`out` pointee and closure capture of a wide type to it, because no raw `ldW` moves sixteen bytes and the width table would answer `ld64` and move half the value in silence |
+| `void tk_dec_st(ptr p, decimal d)` / `void tk_guid_st(ptr p, Guid g)` / `void tk_dto_st(ptr p, DateTimeOffset o)` | the store, the same two words the other way |
 
 `&d` on a local or on a parameter of wide type is the address of its own sixteen-byte frame
 slot — the core's own `MTASK_LOCAL_ADDR`, untouched by the wide machine — so surface code

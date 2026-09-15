@@ -18,7 +18,7 @@ looking up a construct must never find a plan described as if it worked.
 | [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and `NewGuid` over teko's own entropy `extern` |
 | [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation over the `$` token `mc` 0.15.25 lets a module claim |
 | [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **all of it is built** ([nullable.md](../reference/nullable.md), D43/D44/D45/D46); what is left of the page is the lifted `==` (Q4a) |
-| [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict |
+| [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict — **all three are built** (D54, D58, D76); the page stays open only for the fold into `datetime.md` § 15 |
 | [tekoc-tool.md](tekoc-tool.md) | `tekoc` — the taught compiler as an installable `mc` tool: two packages, the manifest, the library tree the install stages, the permission set, and the crumbs that land it |
 | [roadmap-1.0.md](roadmap-1.0.md) | **a draft**: what v1.0.0 should require, and what of it depends on `mc` |
 
@@ -48,7 +48,7 @@ fixes the order.
 | 9b | ~~**N4b** `TimeOnly`~~ **landed**, D58 | datetime-extras.md | M | C2 |
 | 10 | ~~**C3** the sixteen-byte value and `teko_wide.tk`~~ **landed**, D74 | `docs/specs/decimal.md` | M | C1 |
 | 11 | ~~**N3** `Guid`~~ **landed**, D75 | guid.md | M | C3, C1 |
-| 12 | **N5** `DateTimeOffset` | datetime-extras.md | M | C2, C3 |
+| 12 | ~~**N5** `DateTimeOffset`~~ **landed**, D76 | datetime-extras.md | M | C2, C3 |
 | 13 | **C4** the `decimal` arithmetic | `docs/specs/decimal.md` | L | C3 |
 | 14 | **C5** `decimal` round and text | `docs/specs/decimal.md` | M | C4 |
 | 15 | **N6** `i128` and `u128` | small-ints.md | L | C3, C4 |

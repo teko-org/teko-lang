@@ -672,6 +672,17 @@ registered as a primitive with an **empty** member table
   value has no meaning. A primitive registered with **no** reader and **no** constructor
   names neither in this refusal, which is why it is shorter than `DateTime`'s own
   (`tk_prim_cast_check`, [`teko_prim.tk`](../../teko_prim.tk)).
+- `"teko: new "` — completed by *`decimal() is not taught; write 0m`*, and the same
+  template's own two other spellings, *`Guid() is not taught; write Guid.Empty`* (below) and
+  *`DateTimeOffset() is not taught; write DateTimeOffset.MinValue`* ([below](#datetimeoffset),
+  D76). `new T()` with no arguments is C#'s own parameterless value constructor and every
+  OTHER primitive answers it with the identity cast to zero (`TimeSpan.Zero`,
+  `DateTime.MinValue`) — but that cast is `tk_cast(ty, tk_int(0))`, and for a WIDE type it
+  would reach `tw_cast`'s own `die` (`teko_wide.tk`): there is no zero BIT PATTERN a
+  sixteen-byte cast could write, since a wide value moves by address and never through a
+  register. `tk_prim_new` refuses it by name instead, reading the type's own named zero from
+  a fourth column of `tk_prim_type` (`pt_zero`, D76) — one guard, in the shared code, for
+  every wide type at once.
 - `"teko: decimal literal out of range"` — the mantissa is 96 bits and the literal needs
   more. The digits are accumulated into four 32-bit limbs and a carry out of the top one is
   remembered rather than dropped, so `1e40m` is refused instead of wrapping.
@@ -683,13 +694,18 @@ registered as a primitive with an **empty** member table
   the return) and no C ABI shares it, so the two would disagree at run time rather than at
   the declaration. Refused where the type and the word `extern` are both in hand
   (`tk_ov_extern_wide`, [`teko_over.tk`](../../teko_over.tk)).
-- `"teko: include \""` — completed by *decimal.tk" before returning a sixteen-byte value*: a
+- `"teko: include "` — completed by *"decimal.tk" before returning a sixteen-byte value*: a
   wide return travels through `tk_dec_retbuf`, a global the **program** declares, and
   `lib/decimal.tk` is where it is declared. It is the rule `lib/rt.tk` already has for an
   `enum`'s own lowering symbols. The buffer and the file named are **per type** since D75,
   so a function that returns a `Guid` reads
   *teko: include "guid.tk" before returning a sixteen-byte value* and is never pointed at a
-  file it does not use.
+  file it does not use. D76: the include COLUMN itself is bare everywhere now
+  (`tk_prim_type`'s `inc` argument) — `teko_time.tk` used to bake its own quotes in
+  (`tk_time_include()`), which would have doubled them for a WIDE type registered under that
+  column (`DateTimeOffset`, below); every caller now asks `tk_prim_inc_q` (`teko_prim.tk`)
+  for the quoted form, and this message's own wording is unchanged because the quotes moved
+  from the column to the one reader.
 
 Five more are **guards on the machine**, in the same file. Every one of them is unreachable
 from the surface — teko refuses each construct earlier, with a line and a name — and they
@@ -734,6 +750,11 @@ name, the five machine guards as guards. What is its own is short.
 - `"teko: a value of type "` — completed by *X does not convert to Guid*: the second
   argument of `TryParse` is an `out` of a `Guid` slot and of nothing else, checked against
   the pointee `tk_ref_addr` hands back.
+- ``"teko: new Guid() is not taught; write Guid.Empty"`` — D76's own shared guard (`"teko: new
+  "`, [above](#decimal-the-sixteen-byte-value)): `Guid` registers no `new` row at all, so
+  before D76 this reached `teko: this primitive has no constructor` instead — untested by any
+  fixture until now, since no program had written it — and the shared wording is a strictly
+  better answer, naming the static that reads as the type's own zero.
 
 Two more are **run-time panics** of `lib/guid.tk`, both exit 70 and both on stderr with no
 `file:line` — the same abort every other guard in this port takes
@@ -745,6 +766,46 @@ Two more are **run-time panics** of `lib/guid.tk`, both exit 70 and both on stde
 - `"teko: the Guid format is not taught"` — `g.ToString(fmt)` on a format outside `"D"` and
   `"N"`. `"B"`, `"P"` and `"X"` are three more spellings of the same sixteen bytes and are
   not taught ([the specification](../specs/guid.md) § 6).
+
+## `DateTimeOffset`
+
+`DateTimeOffset` is the third `TK_WIDE` type, after `decimal` and `Guid`
+([the specification](../specs/datetime-extras.md), N5, D76), registered LAST in
+`tk_time_init()` so its columns can name the live ids `DateTime` and `TimeSpan` carry. Every
+refusal the two sections above document that is about the sixteen bytes rather than about
+`decimal` or `Guid` reaches it too — the `extern` one by name, the five machine guards as
+guards, the shared `"teko: new "` wording above. What is its own is short: one compile-time
+refusal beyond the shared ones, and three run-time panics.
+
+- ``"teko: a DateTimeOffset does not cast; `.UtcDateTime` reads it and `new DateTimeOffset(...)` builds it"`` —
+  `(i64) o` and `(DateTimeOffset) n` written by hand. Sixteen bytes are no number, and unlike
+  `decimal` this type teaches both a reader and a builder already, so the refusal names them
+  (`tk_prim_cast_check`, D75's own mechanism).
+- ``"teko: DateTimeOffset.Now is not taught yet"`` — a `TK_PMSOON` row, blocked on the same
+  wall clock `DateTime.Now` already is ([datetime.md](datetime.md) § 8). `UtcNow` is the same
+  row under the other name.
+- ``"teko: a value of type i64 does not convert to DateTime"`` — the `new DateTimeOffset(i64
+  ticks, TimeSpan)` overload C# has is **not taught** (`docs/reference/not-yet.md`); the one
+  row this table carries is `new DateTimeOffset(DateTime, TimeSpan)`, and `tk_prim_pick`
+  chooses a `"new"` row by ARGUMENT COUNT alone, so an `i64` written where the row's own first
+  position asks for a `DateTime` reaches this ordinary mismatch instead of a row of its own.
+  `new DateTimeOffset(new DateTime(t), ts)` is the written form.
+
+Three are **run-time panics** of `lib/time.tk`, all exit 70 and all on stderr with no
+`file:line` ([runtime.md](runtime.md#the-time-library)):
+
+- `"teko: that UTC offset does not exist"` — the constructor's second argument, or
+  `.ToOffset`'s, outside `-14:00 .. +14:00` or not a whole minute (`tk_dto_check_offset`).
+- `"teko: the DateTimeOffset format is not taught"` — `o.ToString(fmt)` on a format outside
+  the lowercase `"o"` and `"s"` § 5 of the specification names; C#'s own format characters are
+  case-sensitive for these two, and none of C#'s other calendar formats is taught.
+- `"teko: the string is not a DateTimeOffset"` — `DateTimeOffset.Parse(s)` on anything that is
+  not exactly one of the two strings `ToString()` writes (33 characters with a fraction and an
+  offset, or 19 without either); `DateTimeOffset.TryParse(s, out o)` is the pair that answers
+  `0` and writes `DateTimeOffset.MinValue` instead. A 19-character string is read as UTC,
+  offset zero — teko has no time-zone database to read a bare wall-clock string against
+  ([the specification](../specs/datetime-extras.md) § 8), and zero is the one offset every
+  reader agrees on.
 
 ## Properties
 
@@ -1690,7 +1751,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many consts"` | 128 member constants |
 | `"teko: too many compiler-written nulls in one unit"` | 64 ternaries over a reference type in one unit |
 | `"teko: too many top-level consts"` | 128 |
-| `"teko: too many wide types"` | 4 sixteen-byte types registered with `tk_wide_add` (`decimal` today; `Guid`, `DateTimeOffset` and `i128` are the three the design names next). It is a COMPILER ceiling, not a program's: it fires at `teko_init()` time and no source can reach it |
+| `"teko: too many wide types"` | 4 sixteen-byte types registered with `tk_wide_add` (`decimal`, `Guid` and `DateTimeOffset` today, three of the four; `i128` is the one the design names next). It is a COMPILER ceiling, not a program's: it fires at `teko_init()` time and no source can reach it |
 | `"teko: too many local arrays"` | 1024 declarations in scope |
 | `"teko: too many global arrays"` | 512 in one source |
 | ``"teko: too many global `T[]` of heap"`` | 32 in one source |
@@ -1734,9 +1795,9 @@ truncation; the fix is to split the unit.
 | `"teko: too many switch expression arms"` | 64 |
 | `"teko: too many bare continues inside a switch"` | 128 |
 | `"teko: loops nested too deep"` | 32 open at one point of one function |
-| `"teko: too many primitive types"` | 8 primitives with a member table |
-| `"teko: too many primitive members"` | 96 rows, over every primitive |
-| `"teko: too many primitive operators"` | 32 rows, over every primitive |
+| `"teko: too many primitive types"` | 8 primitives with a member table (D74's own row was stale at 8; still 8 with `DateTimeOffset`, seven of the eight now spent) |
+| `"teko: too many primitive members"` | 160 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74) |
+| `"teko: too many primitive operators"` | 64 rows, over every primitive (D76: raised from 48, itself a stale `32` this table carried since before D74 — `DateTimeOffset`'s nine rows took the true count past 48) |
 | `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row |
 | `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
 | `"teko: too many primitive arguments of unknown type"` | 128 arguments of primitive or `enum` position, in one unit, whose type only the pass can tell |

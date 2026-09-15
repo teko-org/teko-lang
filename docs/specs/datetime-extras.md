@@ -1,12 +1,16 @@
 # `DateOnly`, `TimeOnly` and `DateTimeOffset`
 
-**Designed, partly built: `DateOnly` (N4a) landed under D54, `TimeOnly` (N4b) under D58.**
-What each does today is [datetime.md § `DateOnly`](../reference/datetime.md#dateonly) and
-[§ `TimeOnly`](../reference/datetime.md#timeonly); the fixtures are
-`tests/surface_dateonly.tk`, `tests/surface_dateonly_panic.tk`,
-`tests/surface_timeonly.tk`, `tests/surface_timeonly_panic.tk` and the ten under
-`tests/refuse/` the two crumbs share. `DateTimeOffset` (N5) is still design and nothing
-more, so every sample that names it carries `// no-run`.
+**Built, all three: `DateOnly` (N4a) landed under D54, `TimeOnly` (N4b) under D58,
+`DateTimeOffset` (N5) under D76.** What each does today is
+[datetime.md § `DateOnly`](../reference/datetime.md#dateonly),
+[§ `TimeOnly`](../reference/datetime.md#timeonly) and
+[the type reference § `DateTimeOffset`](../reference/types.md#datetimeoffset); the fixtures
+are `tests/surface_dateonly.tk`, `tests/surface_dateonly_panic.tk`,
+`tests/surface_timeonly.tk`, `tests/surface_timeonly_panic.tk`, `tests/primitives_dto.tk`,
+`tests/primitives_dto_bad_offset.tk`, and the eighteen under `tests/refuse/` the three
+crumbs share. The illustrative samples below that mix all three types still carry `// no-run`
+— they were written before any of the three landed and a few of their details drifted (the
+amendments say where) — but nothing in this page describes unbuilt surface any more.
 
 **Four amendments N4a made to this page as written**, each marked where it appears below:
 `DateOnly` registers **no arithmetic operator at all** and its six comparisons lower to
@@ -33,6 +37,29 @@ to it (§ 4); `TimeOnly.ToString()`'s own row is removed from that same table fo
 `ToString`/`Parse` amendment's own reason; and § 6's `types +3`/`syntax +3` are this PAGE's
 total across all three crumbs, not one crumb's — N4b's own share of it is `+1`/`+1`, one
 `type_new` and one type word.
+
+**Six amendments N5 made**, each marked where it appears: `Parse`/`TryParse`/`ToString` ARE
+taught for `DateTimeOffset` (§ 4, § 5) — the page's own § 2 and § 4 comments
+`` `.DayNumber` reads it `` / "no primitive here has a `str` member yet" describe `DateOnly`
+and were never meant to bind `DateTimeOffset`, but the wording was easy to misread as a
+blanket claim, so it is narrowed here: text landed with N5, D75's own wide-receiver
+mechanism carrying it, not a fourth crumb of its own; `new DateTimeOffset(i64 ticks,
+TimeSpan)`, this page's own § 4 table row, is **not taught** — `tk_prim_pick` chooses a
+`"new"` row by argument COUNT alone and the one row this table carries is `new
+DateTimeOffset(DateTime, TimeSpan)`, so a second row of the same arity was never going to be
+told apart from it; `new DateTimeOffset()` reaches a NEW shared wording, `` `new T()` is not
+taught; write `DateTimeOffset.MinValue` `` — a guard `teko_prim.tk` grew for every wide
+type at once (`decimal`'s `new decimal()` and `Guid`'s `new Guid()` earn the same template's
+own two other spellings), because the identity-cast-to-zero every OTHER primitive's `new
+T()` answers with has no sixteen-byte form; `TK_MAXPRIMO` (the operator-row table) rose from
+48 to 64, since the true count before this crumb was already 41 and N5's own nine rows took
+it past the old ceiling — `docs/reference/diagnostics.md`'s own row for it had drifted to a
+stale `32` since before D74 and is corrected here too; the include COLUMN every primitive's
+`tk_prim_type` row carries is BARE everywhere now, never pre-quoted — `teko_time.tk` used to
+bake its own quotes in, which a `DateTimeOffset` registered under that same column and read
+by `teko_wide.tk`'s return-buffer refusal would have doubled (`include ""time.tk""`); and the
+fixtures landed as `tests/primitives_dto.tk`/`tests/primitives_dto_bad_offset.tk`, matching
+§ 7's own names exactly, with no drift there.
 
 **This page is a proposed section of [datetime.md](datetime.md)**, not a design of its own.
 That page designs `DateTime` and `TimeSpan` and lists
@@ -78,7 +105,11 @@ hands back the `+0` half as it is.
 
 ## 2. The surface
 
-**Legal.** The `DateOnly` half runs today (N4a); everything below it is still design.
+**Legal.** All three types run today. The two blocks below still carry `// no-run`: they
+were written before any of the three existed and the second compares `o.ToString()` against
+a literal with `!=`, which is a POINTER comparison and not what `tk_str_eq` is for
+(`tests/primitives_dto.tk`, the real oracle, uses the right one) — illustrative code, not a
+fixture, and not promoted to one.
 
 ```teko
 // expect-exit: 42
@@ -206,7 +237,7 @@ keeps it rather than inventing an operator C# does not have.
 |---|---|
 | `DateTimeOffset.MinValue`, `MaxValue`, `UnixEpoch` | `.Offset` → `TimeSpan`, `.TotalOffsetMinutes` → `i64` |
 | `new DateTimeOffset(DateTime, TimeSpan)` | `.UtcDateTime` `.LocalDateTime` `.DateTime` → `DateTime` |
-| `new DateTimeOffset(i64 ticks, TimeSpan)` | `.Year` … `.Millisecond`, of the **local** reading |
+| `new DateTimeOffset(i64 ticks, TimeSpan)` — **not taught** (D76): `tk_prim_pick` chooses a `"new"` row by argument count alone, so a second row of arity 2 was never going to be told apart from the row above; write `new DateTimeOffset(new DateTime(t), ts)` | `.Year` … `.Millisecond`, of the **local** reading |
 | `DateTimeOffset.FromUnixTimeSeconds(i64)`, `FromUnixTimeMilliseconds(i64)` | `.ToUnixTimeSeconds()`, `.ToUnixTimeMilliseconds()` |
 | `DateTimeOffset.Parse(str)`, `TryParse(str, out DateTimeOffset)` | `.ToOffset(TimeSpan)`, `.CompareTo`, `.Equals`, `.ToString()` |
 | `DateTimeOffset.Now`, `UtcNow` — **blocked** | |
@@ -225,11 +256,15 @@ All three extend `datetime.md` § 7's two formats and add nothing new:
 |---|---|---|
 | `DateOnly` | `2024-02-29` | 10 characters; `"o"` and `"s"` are the same string. **Not in N4a**: the text crumb every primitive waits on |
 | `TimeOnly` | `13:45:30.1234567` | 16 characters; `"s"` drops the fraction, giving `13:45:30` |
-| `DateTimeOffset` | `2024-02-29T13:45:30.1234567-03:00` | `"o"`; `"s"` is the 19-character form with no offset, as C# does |
+| `DateTimeOffset` | `2024-02-29T13:45:30.1234567-03:00` | `"o"`, **built** (D76); `"s"` is the 19-character form with no offset, as C# does, also built |
 
 `Parse` accepts exactly what `ToString` writes, panics on anything else
 (`teko: the string is not a date`, `teko: the string is not a time of day`), and `TryParse`
-answers `0`/`1` and writes `MinValue` on failure — the same pair, the same reason.
+answers `0`/`1` and writes `MinValue` on failure — the same pair, the same reason. For
+`DateTimeOffset` (built) the panic reads `teko: the string is not a DateTimeOffset`, `Parse`
+accepts BOTH the 33-character `"o"` form and the 19-character `"s"` one, and the second is
+read as UTC, offset zero — teko has no time-zone database to read a bare wall-clock string
+against (§ 8).
 
 ## 6. What it costs in `mc limits`
 
@@ -297,18 +332,23 @@ with `passes` and `intrin` **not moved**; `sh scripts/check-docs.sh` green.
 [runtime.md](../reference/runtime.md), and the removal of the "left out" row in
 `not-yet.md`. All landed with D58.
 
-### N5 — `DateTimeOffset` (M)
+### N5 — `DateTimeOffset` (M) — **landed**, D76
 
 One `type_new` of sixteen bytes, the offset validation, the instant-based comparison, the
-Unix conversions, `ToOffset` and the `"o"` format with its offset suffix. **Depends on
-`docs/specs/datetime.md`'s C2 and on `docs/specs/decimal.md`'s C3** — the second only for
-the sixteen-byte machine, which by then already carries `decimal` and `Guid`.
+Unix conversions, `ToOffset` and the `"o"`/`"s"` formats with `Parse`/`TryParse` over both
+(the amendment above). **Depended on `docs/specs/datetime.md`'s C2 and on
+`docs/specs/decimal.md`'s C3** — the second only for the sixteen-byte machine, which by the
+time this landed already carried `decimal` and `Guid` too.
 
 **Gate:** `primitives_dto.tk` at `42` **on all five legs** — a sixteen-byte value's ABI is
-what a single leg cannot prove — `_bad_offset.tk` at `70`, and everything N4 gated on.
-**Owes:** the section in types.md, diagnostics.md, runtime.md, the `Now`/`UtcNow` row in
-[not-yet.md](../reference/not-yet.md), and the removal of the "left out" row in
-`datetime.md` § 8.
+what a single leg cannot prove — `primitives_dto_bad_offset.tk` at `70`, everything N4
+gated on, and eight fixtures under `tests/refuse/dto_*.tk`.
+**Owes, all landed with D76:** the section in [types.md](../reference/types.md), the
+refusals in [diagnostics.md](../reference/diagnostics.md) (including the stale
+`TK_MAXPRIMM`/`TK_MAXPRIMO` numbers that table had carried since before D74), the functions
+in [runtime.md](../reference/runtime.md), the `Now`/`UtcNow` row, the ticks-constructor row
+and the `new T()` row in [not-yet.md](../reference/not-yet.md), and the removal of the row
+that named `DateTimeOffset` as still open in that same page.
 
 ## 9. Risks and law tensions
 

@@ -408,3 +408,9 @@ seventeenth, `.ToDateTime(TimeOnly)`, added with N4b once the argument's type ex
 TK_SINT)`, twenty rows of its own and the `tk_to_*` half of `lib/time.tk`, registered
 BEFORE `DateOnly` so that seventeenth row's own column reads a live id. Both are designed in
 [datetime-extras.md](../specs/datetime-extras.md).
+
+`DateTimeOffset` — a UTC instant plus its offset, sixteen bytes and the THIRD `TK_WIDE`
+type after `decimal` and `Guid` — is registered in this same `tk_time_init()`, LAST, so its
+own rows can name `DateTime` and `TimeSpan` as live ids; it is documented in full on
+[the type reference](types.md#datetimeoffset) rather than here, since every wide type's own
+page is there (N5, D76).
