@@ -167,7 +167,7 @@ i64 main() {
     if (c.StartsWith("hi") == false) return 7;
 
     puts(c);                                     // a `string` in a `str` slot
-    if (tk_str_len(c) != 8) return 8;            // the same, into rt.tk
+    if (tk_str_len(c) != 8) return 8;            // ...and in rt.tk's own text readers
 
     string d = new string("raw");                // an explicit copy of a `str`
     if (d != "raw") return 9;
@@ -194,7 +194,7 @@ i64 main() {
     str p = "raw";
     string v = p;                 // teko: a value of type uptr does not convert to string
     s[0] = 'H';                   // teko: a string is immutable
-    string w = $"n={n}";          // teko: string interpolation is not taught yet
+    string w = $"n={n}";          // invalid hole -- the lexer gets there first (§ 9)
     return 0;
 }
 ```
@@ -206,9 +206,9 @@ i64 main() {
 | a non-literal `str` in a `string` slot | `teko: a value of type uptr does not convert to string` — `new string(p)` is the copy |
 | `string + i64` and every other mixed `+` | ``teko: no operator `+` takes these operands`` (§ 8) |
 | `s[i] = c` | `teko: a string is immutable` |
-| `$"…"` | `teko: string interpolation is not taught yet` — **and the lexer gets there first today**, § 9 |
+| `$"…"` | `invalid hole` — the lexer gets there first, re-measured on the N7b pin (`mc` 1.0.1) and still true, § 9 |
 | `s.Lenght` | `teko: unknown member of string: Lenght` — the wording a class member already gets (measured) |
-| `string` used without the include | ``teko: `string` needs #include "string.tk"`` |
+| `string` used without the include | the core's own `expected ; after expression` — **not** the hint above this row, D48's limit re-measured for a class rather than an `enum` (D88, § 5's own correction just above) |
 
 ## 6. `Length`, and what an index means
 
@@ -297,6 +297,16 @@ the whole recipe, D29/D35/D37). **D64 raised the pin to 0.16.1, so that wait is 
 N10 is now blocked by nothing but its own crumb, and this page's refusal (`teko: string
 interpolation is not taught yet`) is reachable the day the module claims `$`. The
 measurement above is kept as the record of what the 0.15.23 lexer did.
+
+**Re-measured on N7b's own pin, and still `invalid hole` (D88).** `mc` 1.0.1, no module
+registering `syntax_expr("$", …)`: `puts($"hi {n}")` dies at the `$` with `invalid hole`,
+the exact pre-0.15.25 wording this section says the pin left behind. This CONTRADICTS the
+paragraph above's own claim that the wait ended at 0.16.1 — N7b did not chase the
+contradiction down (out of its own boundary: N7b interns a literal into a `string` slot,
+it does not claim `$`), and did not add the `syntax_expr("$", …)` registration either,
+since doing so with the lexer still raising `invalid hole` first would prove nothing and
+would move `mc limits`' `syntax` row for no reachable gain. Left for N10 to re-measure
+first, with a minimal pure-`mc` reproducer if the contradiction holds (D2).
 
 **What it lowers to, so the crumb is ready the day it lands.** `$"a{x}b{y}"` becomes a
 chain of `string.Concat` over the literal pieces and one formatter per hole, chosen **by
@@ -437,12 +447,10 @@ allocator would otherwise hand out, D86) and destructor, `.Length`/`.Utf8Length`
 `operator+` and `operator==`/`!=`, `string.Empty`/`Concat`/`IsNullOrEmpty`. **Depends on
 nothing** — not on `docs/specs/decimal.md`, not on `docs/specs/datetime.md`, not on `enum`.
 
-**What N7a does NOT build**, left to N7b: the literal interning of § 4, the two implicit
-conversions of § 3 in D33's nine slots, and the `` `string` needs #include "string.tk" ``
-named refusal — until N7b lands, `string s = "hi";` (a literal, no explicit `new`) is
-refused the ordinary way any `str` fails to fit a class slot, and `string` used with no
-`#include "string.tk"` is a plain parse error rather than the named message this page
-designs (`docs/reference/not-yet.md` § `string` carries both, measured).
+**What N7a did NOT build**, left to N7b (landed below, D88): the literal interning of § 4
+and the two implicit conversions of § 3 in D33's nine slots — both now in place — and the
+`` `string` needs #include "string.tk" `` named refusal, which N7b measured NOT reachable
+(D48's own limit, § 5's row corrected rather than built).
 
 **Gate, measured:** `surface_string_interop.tk`, `_concat.tk` and `_rc.tk` at `42`, plus six
 `tests/refuse/` fixtures for every refusal reachable through the class alone
@@ -476,19 +484,70 @@ receiver) types as `uptr` rather than as the enclosing class — `teko_class.tk`
 parameter is declared `param_new(TY_UPTR, ...)` and no bare-`this` node is ever re-typed
 against it — so `.ToString()` returns a fresh copy of the same bytes rather than `this`.
 
-### N7b — the literal, the conversions, the `#include` check (L)
+### N7b — the literal, the conversions, the `#include` check (L) — **landed, D88**
 
 `teko_string.tk` (new module): the literal interning of § 4 (an `N_STR` in a `string` slot
-becomes an `N_IDENT` naming a module-private, gensym'd global), the two implicit
-conversions of § 3 in the nine slots `tk_num_widen`'s own siblings reach, and the named
-`#include` refusal. Depends on N7a.
+becomes an `N_IDENT` naming a module-private, gensym'd global, deduped by value), the two
+implicit conversions of § 3 in the nine slots `tk_num_widen`'s own siblings reach, and the
+measurement of the named `#include` refusal against D48's own limit (§ 5 above, this
+page's own row corrected rather than the message built — it is not reachable, and D48
+already proved why for the identical shape, `DateTimeKind`). Depends on N7a.
 
-**Gate:** `surface_string_value.tk` and `_intern.tk` at `42`; every N7a fixture unmoved;
-`--dump-ast` byte-identical on every fixture that names no `string`; `FIXPOINT OK`; `mc
-limits` verdict `ok` with `passes` **+1** (one module) and `intrin`/`alias` not moved (the
-conversions ride the nine slots that exist). **Owes:** the borrowed-pointer lifetime rule
-in [memory.md](../reference/memory.md), [guide/10-values-and-types.md](../guide/10-values-and-types.md),
-and `not-yet.md`'s N7b rows deleted once they are true.
+**`passes` did NOT move**, against this page's own forecast: every one of the nine slots'
+conversions rides a CALL already made from inside an EXISTING pass (`teko_rc.tk`'s own
+pass, `teko_typeof.tk`'s deferred judge that already rides `tk_over_pass`, `teko_ops.tk`'s
+`tk_ops_pass`, `teko_null.tk`'s `??` lowering inside `tk_tern_scan`'s walk,
+`teko_params.tk`'s pack), so `teko_string.tk` registers no pass of its own — the forecast
+above assumed a module means a pass, and this one does not.
+
+**A regression the gate caught, and the general rule it left behind.** `tk_rc_call_args`
+(teko_rc.tk) walks EVERY `N_CALL` of every function body by parameter INDEX, generated
+bodies and generated plumbing calls included — a method's own RECEIVER at parameter 0
+(declared `uptr`, `this`), and `lib/rt.tk`'s reference-management primitives
+(`rt_own`/`rt_store`/`rt_store_own`/`rt_drop`/`rt_park`/`rt_free`/`rc_inc`/`rc_dec`, every
+one of them taking its argument as a `uptr` GENERICALLY). A `string`-typed value crossing
+either one matched `tk_str_borrows` (`uptr` beside `string`) before this crumb excluded
+them by name, and read `.data` off the receiver or the plumbing's own argument instead of
+keeping the object reference — `a.Length` on a `string a` and `s = v;= string` field store
+both measured broken (a wrong `.Length`, then a bus error) before the two exclusions
+landed. Neither is a new mechanism of its own; both are the same rule stated once: the
+`str`/`ptr`/`uptr` conversion is never a GENERIC pointer sink's business, only a genuinely
+typed `str` parameter's.
+
+**Two measured gaps outside D33's nine slots, left as `not-yet.md` rows rather than
+chased:** an OVERLOADED free/method call still fails to match a literal against a
+`string` parameter (`tk_ov_args_fit`, `teko_over.tk` — overload SELECTION, a different
+question from the nine slots' own conversion; a name declared once, `greet(string who)` of
+§ 5's own sample, already works); and `c ? "yes" : s` still refuses (`teko_ternary.tk`'s
+`tk_tern_lower` needs its two arms' types already equal, for any type, `string` included —
+`??`, a different mechanism, is this crumb's own and closed).
+
+**`$"…"` re-measured on the N7b pin (`mc` 1.0.1) and still `invalid hole`**, contradicting
+this page's own § 9 claim that the wait ended at `mc` 0.16.1 (D64) — recorded there rather
+than chased, since claiming `$` needs a `syntax_expr` registration this crumb has no
+reachable use for while the lexer still raises `invalid hole` first, and diagnosing why is
+N10's own first step.
+
+**Gate** (`mc` 1.0.1, macos/aarch64): `mc build . --config mc.macos.toml` clean;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **129 passed, 143 refused as
+expected, 0 failed** (125/141 on the base: `surface_string_value.tk`, `_intern.tk`,
+`_capture.tk` and `_op_str.tk` added, plus `refuse/string_user_class.tk` and
+`refuse/string_user_class_wide.tk`; `string_str_implicit.tk`'s own comment corrected — the
+refusal itself unmoved, a NON-literal `str` still does not fit); `--dump-ast --include=lib
+--include=tests` **byte-identical** on all 125 pre-existing fixtures against the base
+compiler, N7a's own five `string`-including ones among them — none of them writes a LITERAL
+into a `string` slot, so none of their dumps could move by construction; `sh
+scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh`
+→ `docs ok: 703 links, 78 fragments, 412 diagnostics, 143 refusals, 154 samples, manifest
+listed`; `mc build . --config mc.macos.toml --limits` (`rm -rf build` first) — the
+`build/teko.mc` leg verdict `ok`, and on the `tests/hello.tk` leg, the one that reads the
+TAUGHT compiler's own registrations, `passes`(15)/`syntax`(20)/`alias`(25)/`types`(18)/
+`intrin`(8)/`on_stmt`(4) every one exactly where the base leaves them (that leg's verdict
+is `grew` on the base too, unmoved). **Owes, left
+out of this crumb's own boundary:** the borrowed-pointer lifetime rule in
+[memory.md](../reference/memory.md) and
+[guide/10-values-and-types.md](../guide/10-values-and-types.md) — neither named by this
+crumb's own dispatch, both still true and both N8-adjacent.
 
 ### N8 — the methods, and the index (L)
 

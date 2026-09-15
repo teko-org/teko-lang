@@ -1,0 +1,297 @@
+// teko_string.tk -- N7b of docs/specs/string.md (D88): everything that
+// reaches INTO the `string` class N7a built (D86, lib/string.tk) from
+// OUTSIDE it -- literal interning (§ 4), the two implicit conversions of § 3
+// in D33's nine slots, and the measurement of the include refusal § 5 names.
+//
+// This file declares no type, no `syntax_expr`, no `syntax_stmt`, no
+// `type_alias` and registers no pass of its own: `string` is an ORDINARY
+// class, taught only when a program writes `#include "string.tk"` (N7a's own
+// rule), and this module is a library of plain functions every call site
+// that already asks `tk_num_widen` (teko_typeof.tk) also asks. `mc limits`'
+// `syntax`/`alias`/`types`/`on_stmt`/`passes` rows are every one of them
+// unmoved by this file, and a program that never writes `string` never calls
+// a function of it: `tk_str_class_si()` answers -1 the moment
+// `tk_struct_find_exact("string")` does, and every helper below is a no-op
+// from its very first line when that is so -- which is the same proof N7a's
+// own D86 measured for the class itself ("no base fixture includes
+// lib/string.tk, so none of their dumps could move by construction").
+//
+// ---- the include refusal, measured rather than built (D48's own limit,
+// restated) ----
+// docs/specs/string.md § 5/§ 9 names `` teko: `string` needs #include
+// "string.tk" `` for a program that writes `string` without the include.
+// D48 (2026-09-08) already litigated the identical question for
+// `DateTimeKind`, a type an `#include`d LIBRARY file declares rather than a
+// `type_new` the compiler registers at `teko_init()`: the only door such a
+// message could stand behind is `syntax_expr`/`type_alias`/`type_new`, and
+// ALL THREE call `word_add`, which turns the word into a TOKEN program-wide
+// -- so `tk_class()`'s own `tk_newname("class")` (teko_struct.tk), reading
+// the class's NAME two lines later in `lib/string.tk` itself, would refuse
+// `string` there with `teko: the name is already a type` the moment this
+// file's own `teko_init()` claimed the word first. D48 measured this exact
+// failure for `enum DateTimeKind` (`lib/time.tk:204: teko: name of enum
+// expected: DateTimeKind`) and ruled it out; nothing about `mc` 1.0.1 (this
+// crumb's own pin) or about a CLASS rather than an ENUM changes the
+// mechanism `tk_newname` reads (`teko_struct.tk:1509` onward, this crumb's
+// own re-measurement, unchanged from D48's). `string` named with no
+// `#include "string.tk"` therefore stays the core's own
+// `expected ; after expression` -- D86's own N7a proof already measured
+// this, and this crumb changes nothing about it. A library type is told
+// apart by the library, D48's own sentence, and `string` is exactly that.
+
+// ---- the class row, looked up by name every time it is asked ----
+// `string` is an ordinary class: no id of its own exists until a program's
+// own `#include "string.tk"` declares it, so there is nothing to cache
+// across compilations and nothing this module may assume ahead of the
+// lookup -- the same "late" shape D48's own `tk_prim_late`/`tk_prim_ty`
+// (teko_prim.tk) reads a library-declared `enum`'s row through, minus the
+// column machinery that mechanism needs for a compiler-registered primitive
+// and this one does not.
+// the suffix test `tk_div_rt_panic` (teko_ternary.tk) already asks of a
+// declaration's own file -- "was this name read from the library that
+// defines it?". That module is included after this one, so the name is
+// declared ahead the way `tk_this_name` is declared ahead in teko_class.tk.
+i64 tk_div_ends(uptr f, uptr suf);
+
+// the library class's own layout, and the ONE shape this module knows how to
+// build an interned literal out of: the vtable word, the pinned count, and
+// `lib/string.tk`'s four fields (`nbytes`/`nchars`/`data`/`owned`) -- six
+// words, measured through `sr_size_at` rather than assumed, and the bound of
+// `tk_str_intern_build`'s own buffer at the same time. A field added to
+// `lib/string.tk` raises this number; until it does, the gate below answers
+// "not the library's class" and every `string` fixture refuses out loud
+// rather than writing past the buffer in silence.
+#define TK_STR_WORDS 6
+
+i64 tk_str_lib_layout(i64 si) {
+    if (sr_size_at(si) != TK_STR_WORDS * 8) return 0;
+    if (tk_field_find(si, "nbytes") < 0) return 0;
+    if (tk_field_find(si, "nchars") < 0) return 0;
+    if (tk_field_find(si, "data")   < 0) return 0;
+    if (tk_field_find(si, "owned")  < 0) return 0;
+    return 1;
+}
+
+// `string` is the LIBRARY's class or it is not `string` at all. The lookup
+// reads a NAME, and a program is free to declare a class of that name of its
+// own -- `class string { public i64 a; }` with no `#include "string.tk"` in
+// sight -- on which neither conversion nor the interning may fire: it is an
+// ordinary user class, and `string s = "hi";` refuses on it with the same
+// `teko: a value of type uptr does not convert to string` any other class
+// gets. The test is PROVENANCE plus LAYOUT, the shape `tk_div_rt_panic`
+// asks of `panic`: the declaration was read from `lib/string.tk` (a suffix,
+// so an include from any root still names it -- `sr_hfile_at`, the file the
+// class's own header was read from, teko_struct.tk) AND the row measures the
+// six words above with all four fields present. Failing either half is not
+// this module's business at all, which is what keeps the interned global's
+// buffer in bounds BY CONSTRUCTION: a `class string` of sixteen `i64` fields
+// crashed the compiler outright before this gate existed.
+i64 tk_str_class_si() {
+    i64 si = tk_struct_find_exact("string");
+    if (si < 0) return 0 - 1;
+    if (!tk_div_ends(sr_hfile_at(si), "lib/string.tk")) return 0 - 1;
+    if (!tk_str_lib_layout(si)) return 0 - 1;
+    return si;
+}
+
+// a `string?` slot takes what a `string` slot takes (Q1a: `T -> T?` is
+// implicit, and a REFERENCE `T?` is `T`'s own pointer, no box -- so the
+// interned node, typed plain `string` below, needs no wrap of its own once
+// it fits here). `tk_is_nl`/`nl_of_at` (teko_struct.tk, included ahead of
+// this file) are the exact unwrap `tk_check_scalar_compat`'s own Q1b clause
+// already reads for a BOXED `T?`; this is its reference-shaped twin.
+i64 tk_str_slot_ty(i64 tty) {
+    i64 ti = tk_struct_by_ty(tty);
+    if (tk_is_nl(ti)) return nl_of_at(ti);
+    return tty;
+}
+
+i64 tk_str_lit_fits(i64 tty, i64 en) {
+    if (en == 0) return 0;
+    if (nd_kind(en) != N_STR) return 0;
+    i64 si = tk_str_class_si();
+    if (si < 0) return 0;
+    return tk_str_slot_ty(tty) == sr_ty_at(si);
+}
+
+i64 tk_str_borrows(i64 tty, i64 ety) {
+    if (tty != TY_UPTR) return 0;
+    i64 si = tk_str_class_si();
+    if (si < 0) return 0;
+    return ety == sr_ty_at(si);
+}
+
+// ---- the literal, interned by VALUE, one global per distinct literal
+// per compilation unit (§ 4, D87's `$` gensym rule -- the shape
+// teko_decimal.tk's own `tk_dl_name` already carries for the same reason) ----
+#define TK_MAXSTRLIT 512              // distinct literals reaching a `string` slot, one unit
+
+uptr tsl_bytes[TK_MAXSTRLIT];
+i64  tsl_len[TK_MAXSTRLIT];
+uptr tsl_name[TK_MAXSTRLIT];
+i64  tk_nstrlit = 0;
+
+uptr tsl_bytes_at(i64 i) { return ld64(tsl_bytes + i * 8); }
+i64  tsl_len_at(i64 i)   { return ld64(tsl_len + i * 8); }
+uptr tsl_name_at(i64 i)  { return ld64(tsl_name + i * 8); }
+
+// compared by LENGTH and bytes rather than by `str_eq`, so two literals of
+// different lengths part at once. (The core records a literal's length with
+// `cstrlen`, `teko_struct.tk`'s `tk_str`, so an embedded NUL already ends the
+// literal before this compare runs -- no byte past one is carried anywhere.)
+i64 tk_str_lit_eq(uptr a, i64 la, uptr b, i64 lb) {
+    if (la != lb) return 0;
+    i64 i = 0;
+    loop {
+        if (i >= la) break;
+        if (ld8(a + i) != ld8(b + i)) return 0;
+        i = i + 1;
+    }
+    return 1;
+}
+
+// the number of UTF-8 LEAD bytes in `n` bytes at `buf` -- a byte whose top
+// two bits are not `10` opens a code point, the one-pass substitute for a
+// full decode `lib/string.tk`'s own `tk_string_utf8count` uses at RUN time.
+// Written again here, at COMPILE time: this file is part of the compiler
+// binary itself and never links against the program it builds, so it cannot
+// call across that boundary into a `.tk` source `./build/teko` is about to
+// compile.
+i64 tk_str_lit_nchars(uptr buf, i64 n) {
+    i64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if ((ld8(buf + i) & 192) != 128) c = c + 1;
+        i = i + 1;
+    }
+    return c;
+}
+
+// `$tk_str_<n>`, the gensym `$` the lexer never forms into an identifier
+// (D87, decimal.md § 3's own precedent)
+uptr tk_str_gensym() {
+    u8 nb[24];
+    i64 nn = 0;
+    i64 v = tk_nstrlit;
+    loop {
+        st8(nb + nn, '0' + v % 10);
+        v = v / 10;
+        nn = nn + 1;
+        if (v == 0) break;
+    }
+    uptr name = xalloc(9 + nn);
+    mem_copy(name, "$tk_str_", 8);
+    i64 k = 0;
+    loop {
+        if (k >= nn) break;
+        st8(name + 8 + k, ld8(nb + nn - 1 - k));
+        k = k + 1;
+    }
+    st8(name + 8 + nn, 0);
+    return name;
+}
+
+// builds the interned global for a NEW literal and returns its name -- the
+// initializer list § 4 shows:
+//
+//   uptr $tk_str_0[6] = { 0, 1099511627776, 2, 2, "hi", 0 };
+//   //                    vt  pinned count   nb nc  bytes  owned
+//
+// word 0 (the vtable) is left at its default zero -- `&global` inside a
+// global initializer is `initializer must be constant` (measured, § 4), so
+// there is no road to a non-zero one, and it is never read: the count is
+// pinned at 2^40 so `rc_dec` can never walk it to zero, and `string`'s
+// methods are not virtual (lib/string.tk's own header). The FOUR class
+// fields are placed by their OWN byte offset (`tk_field_find`/`fd_off_at`,
+// teko_struct.tk), not by a hardcoded word index, so a reordering of
+// `lib/string.tk`'s own field declarations moves nothing here; `owned` is
+// left at zero (its own default), which is the whole of "an interned
+// literal frees nothing" (§ 4).
+uptr tk_str_intern_build(uptr bytes, i64 len, i64 e, i64 si, i64 sty) {
+    i64 nel = sr_size_at(si) / 8;     // TK_STR_WORDS: `tk_str_class_si` measured it
+    i64 words[TK_STR_WORDS];
+    i64 wi = 0;
+    loop {
+        if (wi >= nel) break;
+        st64(words + wi * 8, tk_int(0));
+        wi = wi + 1;
+    }
+    st64(words + 8, tk_int(1099511627776));       // word 1: the pinned reference count
+    i64 fi = tk_field_find(si, "nbytes");
+    if (fi >= 0) st64(words + (fd_off_at(fi) / 8) * 8, tk_int(len));
+    fi = tk_field_find(si, "nchars");
+    if (fi >= 0) st64(words + (fd_off_at(fi) / 8) * 8, tk_int(tk_str_lit_nchars(bytes, len)));
+    fi = tk_field_find(si, "data");
+    if (fi >= 0) {
+        set_nd_next(e, 0);
+        st64(words + (fd_off_at(fi) / 8) * 8, e);
+    }
+    i64 g = tk_nd(N_GLOBAL);
+    uptr name = tk_str_gensym();
+    set_nd_name(g, name);
+    set_nd_type(g, TY_UPTR);
+    set_nd_val(g, nel);
+    i64 head = 0;
+    i64 tail = 0;
+    wi = 0;
+    loop {
+        if (wi >= nel) break;
+        i64 w = ld64(words + wi * 8);
+        if (tail) set_nd_next(tail, w); else head = w;
+        tail = w;
+        wi = wi + 1;
+    }
+    set_nd_a(g, head);
+    tk_top_emit(g);
+    st64(tsl_bytes + tk_nstrlit * 8, bytes);
+    st64(tsl_len + tk_nstrlit * 8, len);
+    st64(tsl_name + tk_nstrlit * 8, name);
+    tk_nstrlit = tk_nstrlit + 1;
+    return name;
+}
+
+// the dedup lookup: two occurrences of `"hi"` in one unit name ONE global
+// (§ 4, "interning is by value, per compilation unit"). `e` is only ever
+// READ by the builder on the first occurrence -- a repeat's own literal node
+// is discarded, unlinked from anywhere, exactly as any other node this
+// project abandons once superseded.
+uptr tk_str_intern_name(uptr bytes, i64 len, i64 e, i64 si, i64 sty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstrlit) break;
+        if (tk_str_lit_eq(tsl_bytes_at(i), tsl_len_at(i), bytes, len)) return tsl_name_at(i);
+        i = i + 1;
+    }
+    if (tk_nstrlit == TK_MAXSTRLIT)
+        err_at(nd_file(e), nd_line(e), "teko: too many distinct string literals");
+    return tk_str_intern_build(bytes, len, e, si, sty);
+}
+
+i64 tk_str_intern(i64 tty, i64 ety, i64 e) {
+    if (e == 0) return e;
+    if (!tk_str_lit_fits(tty, e)) return e;
+    i64 si = tk_str_class_si();
+    i64 sty = sr_ty_at(si);
+    uptr name = tk_str_intern_name(nd_name(e), nd_val(e), e, si, sty);
+    i64 id = tk_nd(N_IDENT);
+    set_nd_name(id, name);
+    set_nd_type(id, sty);
+    return id;
+}
+
+// rule 3's own field load -- `ld64` is one of the eight intrinsics already
+// taught (`mc limits`' `intrin` row, unmoved), and the offset comes from the
+// class's own field table rather than the layout comment in lib/string.tk's
+// header, so the two can never drift apart in silence.
+i64 tk_str_borrow(i64 tty, i64 ety, i64 e) {
+    if (e == 0) return e;
+    if (!tk_str_borrows(tty, ety)) return e;
+    i64 si = tk_str_class_si();
+    i64 fi = tk_field_find(si, "data");
+    if (fi < 0) return e;
+    tk_line = nd_line(e);
+    tk_file = nd_file(e);
+    set_nd_next(e, 0);
+    return tk_call("ld64", tk_bin(K_ADD, e, tk_int(fd_off_at(fi))));
+}

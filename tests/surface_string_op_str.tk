@@ -1,0 +1,62 @@
+// surface_string_op_str.tk -- verifier finding 2 of PR #749 (N7b, D88): an
+// operator row whose parameter is `str`, matched by a `"..."` literal.
+//
+// The literal clause of `tk_op_slot_fits` (teko_ops.tk) used to answer for a
+// literal BEFORE the exact `pt == t` test below it, which swallowed every
+// `str` row -- `t + "abc"` against `operator+(Tag, str)` refused with
+// `teko: no operator `+` takes these operands`, in a program that never
+// names `string` at all. The rule now, C#'s own and D88's: a literal IS a
+// `str` (D33 rule 1), so its EXACT row is matched first, in round 0, and
+// only a site with no exact row reads it as the `string` its bytes become.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+// a `str` row with no `string` beside it -- the shape that refused outright
+class Tag {
+    public i64 v;
+    public Tag(i64 v) { this.v = v; }
+    public static i64 operator+(Tag a, str b) { return a.v + tk_str_len(b); }
+}
+
+// both rows on one class: a literal takes the EXACT `str` one, a `string`
+// value takes the `string` one
+class Pick {
+    public i64 v;
+    public Pick(i64 v) { this.v = v; }
+    public static i64 operator+(Pick a, str b)    { return a.v + 1; }
+    public static i64 operator+(Pick a, string b) { return a.v + 2; }
+}
+
+// a `string` row alone: a literal still reaches it, one round later
+class Only {
+    public i64 v;
+    public Only(i64 v) { this.v = v; }
+    public static i64 operator+(Only a, string b) { return a.v + b.Length; }
+}
+
+i64 main() {
+    Tag t = new Tag(39);
+    if (t + "abc" != 42) return 1;
+
+    str raw = "abc";
+    if (t + raw != 42) return 2;
+
+    Pick p = new Pick(41);
+    if (p + "abc" != 42) return 3;                // exact `str` wins: 41 + 1
+
+    string s = new string("abc");
+    if (p + s != 43) return 4;                    // the `string` row: 41 + 2
+
+    Only o = new Only(39);
+    if (o + "abc" != 42) return 5;                // no exact row, so the literal interns
+
+    // review thread 7: a `string` VALUE against the `(Tag, str)` row borrows
+    // its text -- the operand slot is one the program declares (D88)
+    Tag t7 = new Tag(39);
+    string sv = new string("abc");
+    if (t7 + sv != 42) return 30;
+    return 42;
+}

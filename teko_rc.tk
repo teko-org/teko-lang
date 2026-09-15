@@ -167,6 +167,8 @@ void tk_rc_var(i64 n) {
         i64 ety = tk_ty_of(e);
         tk_check_compat(nd_type(n), ety, e, nd_line(n), nd_file(n));
         e = tk_num_widen(nd_type(n), ety, e);     // `f64 y = 1;` is one point zero
+        e = tk_str_intern(nd_type(n), ety, e);    // `string s = "hi";` interns (N7b)
+        e = tk_str_borrow(nd_type(n), ety, e);    // `str p = s;` reads `.data` (N7b)
         e = tk_nl_wrap(nd_type(n), ety, e);       // `i64? n = 5;` builds the box (Q1b)
         set_nd_a(n, e);
     }
@@ -215,6 +217,8 @@ void tk_rc_assign(i64 n) {
         i64 aty = tk_ty_of(nd_a(n));
         tk_check_compat(tty, aty, nd_a(n), nd_line(n), nd_file(n));
         set_nd_a(n, tk_num_widen(tty, aty, nd_a(n)));        // `y = 5;` on an `f64 y`
+        set_nd_a(n, tk_str_intern(tty, aty, nd_a(n)));       // `s = "hi";` on a `string s` (N7b)
+        set_nd_a(n, tk_str_borrow(tty, aty, nd_a(n)));       // `p = s;` on a `str p` (N7b)
         set_nd_a(n, tk_nl_wrap(tty, aty, nd_a(n)));          // `n = 7;` on an `i64? n`
     }
     if (tty < 0) return;
@@ -247,6 +251,8 @@ void tk_rc_return(i64 n, i64 p0) {
         i64 ety = tk_ty_of(e);
         tk_check_compat(tk_rc_ret, ety, e, nd_line(n), nd_file(n));
         e = tk_num_widen(tk_rc_ret, ety, e);      // `return 7;` from an `f64` function
+        e = tk_str_intern(tk_rc_ret, ety, e);     // `return "hi";` from a `string` one (N7b)
+        e = tk_str_borrow(tk_rc_ret, ety, e);     // `return s;` from a `str` one (N7b)
         e = tk_nl_wrap(tk_rc_ret, ety, e);        // ...and from an `i64?` one (Q1b)
         set_nd_a(n, e);
     }
@@ -362,6 +368,80 @@ void tk_rc_park(i64 n) {
     tk_nparked = tk_nparked + 1;
 }
 
+// ---- which parameter the `str`/`string` conversions are about (N7b) ----
+// This walk runs over EVERY `N_CALL` of every body it is given, and by then
+// most of them are the COMPILER's own: `tk_rc_store` above renames an
+// `st64`-shaped call into `rt_store`/`rt_store_own` in place, on the very
+// node the walk reads right after; `tk_cap_own`/`tk_cap_put` (lib/rt.tk) is
+// what a closure's captures are written with, one call per capture
+// (teko_deleg.tk); `rt_own`/`rc_inc`/`rc_dec`/`rt_park` are the reclaim's
+// own; and a GENERATED body such as `tkarr_put_string` (teko_heaparr.tk) is
+// walked exactly like a program's own. Every one of those takes its argument
+// as a `uptr` GENERICALLY -- the slot, the value, any counted reference at
+// all, never text -- so `tk_str_borrow` matching there read `.data` off a
+// `string` and stored the BYTES where the object belonged: a bus error on a
+// field store, a corrupt array of `string`, and a closure capturing a
+// `string` by value straight into SIGSEGV (`rc_inc` on `data`).
+//
+// So the question is asked POSITIVELY, about the slot rather than about a
+// list of names: the conversion is a genuinely USER-DECLARED parameter's
+// business, and nothing else is.
+//
+//   * the declaration was not read from `lib/rt.tk` -- the runtime is the
+//     compiler's own, never a user slot, and the file is the same fact
+//     `tk_div_rt_panic` (teko_ternary.tk) reads to tell the runtime's
+//     `panic` from a program's own. A `string` DOES still reach a
+//     `str` parameter of the runtime, one hop away and explicitly:
+//     `str p = s; tk_str_len(p);` converts at the local's own slot.
+//   * the parameter NODE exists -- an argument past the declared list
+//     (`decl_param_type`'s own answer, no node behind it) is nothing this
+//     conversion knows the shape of.
+//   * its name is not a compiler gensym -- `$` is the prefix the lexer
+//     never forms into an identifier (D87), so a `$` name is the
+//     compiler's by construction.
+//   * it is not the RECEIVER. A method's parameter 0 is `this`
+//     (`tk_this_name`, teko_this.tk), declared `uptr` -- the same `uptr`
+//     `str`/`ptr` alias -- and `a.Length` on a `string a` rewrote the
+//     receiver into `ld64(a + 32)`, calling `string_get_Length` on the
+//     `data` field's address instead of the object.
+// `lib/rt.tk`'s own functions declare `uptr` GENERICALLY -- the slot, the
+// value, any counted reference (`rt_own`, `rc_inc`, `tk_cap_own`) -- and mc
+// aliases `str` to that same type, so the declaration cannot say which of
+// the runtime's parameters take TEXT. The ones that do are a closed list of
+// the runtime's own: `panic`, `tk_str_len`, `tk_str_slice`, `tk_str_eq` and
+// the enum readers. A `string` handed to one of THOSE borrows its text (a
+// `panic(s)` that printed the object header would be a silently wrong
+// answer, D3); handed to any other runtime function it stays the object.
+// ...keyed by function AND parameter index: the enum readers take their
+// text at one slot and generic handles (`names`, `vals`, `outp`) at the
+// others, and a `string` reaching one of those must stay the object.
+i64 tk_rc_rt_text(uptr nm, i64 i) {
+    if (str_eq(nm, "panic")) return i == 0;
+    if (str_eq(nm, "rt_panic")) return i == 0;   // the same sink `panic` forwards to
+    if (str_eq(nm, "tk_str_len")) return i == 0;
+    if (str_eq(nm, "tk_str_slice")) return i == 0;
+    if (str_eq(nm, "tk_str_eq")) return i == 0 || i == 1;
+    if (str_eq(nm, "tk_enum_find")) return i == 2;             // (names, n, s)
+    if (str_eq(nm, "tk_enum_parse")) return i == 3 || i == 4;  // (names, vals, n, s, msg)
+    if (str_eq(nm, "tk_enum_tryparse8")) return i == 3;        // (names, vals, n, s, outp)
+    if (str_eq(nm, "tk_enum_tryparse16")) return i == 3;
+    if (str_eq(nm, "tk_enum_tryparse32")) return i == 3;
+    if (str_eq(nm, "tk_enum_tryparse64")) return i == 3;
+    return 0;
+}
+
+i64 tk_rc_str_slot(i64 d, i64 i) {
+    if (d < 0) return 0;
+    if (tk_div_ends(nd_file(d), "lib/rt.tk") && !tk_rc_rt_text(nd_name(d), i)) return 0;
+    i64 pn = tk_decl_param_node(d, i);
+    if (pn < 0) return 0;
+    uptr nm = nd_name(pn);
+    if (nm == 0) return 0;
+    if (ld8(nm) == '$') return 0;
+    if (str_eq(nm, tk_this_name())) return 0;
+    return 1;
+}
+
 // D226 compat crumb: a CALL's own arguments against the callee's declared
 // parameter types, by INDEX -- `tk_decl_param_ty` (teko_ref.tk over the core's
 // own `decl_param_type`, K2w) answers for whatever `decl_find` resolves, and by the time this pass runs every
@@ -436,7 +516,10 @@ void tk_rc_call_args(i64 n) {
             continue;
         }
         tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
-        i64 fixed = tk_nl_wrap(pt, at, tk_num_widen(pt, at, a));
+        i64 widened = tk_num_widen(pt, at, a);
+        if (tk_rc_str_slot(d, i))
+            widened = tk_str_borrow(pt, at, tk_str_intern(pt, at, widened));
+        i64 fixed = tk_nl_wrap(pt, at, widened);
         if (fixed != a) {
             set_nd_next(fixed, nxt);
             if (prev == 0) set_nd_a(n, fixed);

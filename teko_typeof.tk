@@ -656,6 +656,12 @@ void tk_check_compat(i64 tty, i64 ety, i64 en, i64 line, uptr fl) {
     // question below would ask about `i64`, which names no row, and would
     // refuse the very value the slot takes.
     if (tk_is_nl(ti) && tk_nl_boxes(nl_of_at(ti))) return;
+    // N7b (docs/specs/string.md § 3 rule 2): a `"..."` LITERAL is the one
+    // `uptr` value this row question accepts -- it INTERNS (teko_string.tk's
+    // own `tk_str_intern`, called beside every `tk_num_widen` this judge
+    // feeds) rather than converting, so the check is asked before the row
+    // question below ever reads a plain `uptr` as a mismatch.
+    if (tk_str_lit_fits(tty, en)) return;
     if (ety < 0) return;
     if (tty == ety) return;
     i64 ei = tk_struct_by_ty(ety);
@@ -757,6 +763,8 @@ i64 tk_fs_defer(i64 fty, i64 v, i64 line, uptr fl) {
 i64 tk_fs_converts(i64 fty, i64 vty, i64 n) {
     if (tk_is_null_lit(n)) return 0;
     if (tk_num_widens(fty, vty)) return 1;
+    if (tk_str_lit_fits(fty, n)) return 1;        // N7b: a literal `str` interns into a `string` field
+    if (tk_str_borrows(fty, vty)) return 1;       // N7b: a `string` value into a str/ptr/uptr field
     if (fty == vty) return 0;
     i64 ti = tk_struct_by_ty(fty);
     if (!tk_is_nl(ti)) return 0;
@@ -854,7 +862,7 @@ i64 tk_field_store_val(i64 fty, i64 v, i64 line, uptr fl) {
     tk_check_field_store(fty, v, line, fl);
     // Q1b: `h.count = 5;` on an `i64? count` field writes the box right here,
     // the same way the widening beside it writes the float conversion.
-    return tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, v));
+    return tk_nl_wrap(fty, vty, tk_str_borrow(fty, vty, tk_str_intern(fty, vty, tk_num_widen(fty, vty, v))));
 }
 
 // ---- the walk a pass drives ----
@@ -949,7 +957,7 @@ void tk_ty_pass_walk(i64 root, uptr visit) {
 void tk_fs_convert(i64 fty, i64 vty, i64 n) {
     if (!tk_fs_converts(fty, vty, n)) return;
     i64 inner = tk_nd_moved(n);
-    i64 r = tk_nl_wrap(fty, vty, tk_num_widen(fty, vty, inner));
+    i64 r = tk_nl_wrap(fty, vty, tk_str_borrow(fty, vty, tk_str_intern(fty, vty, tk_num_widen(fty, vty, inner))));
     tk_node_replace(n, r);
     // what was built carries the registrations, and what ends up in the TREE
     // is the node the slot already points at (`tk_pend_do`'s own rule, above)
