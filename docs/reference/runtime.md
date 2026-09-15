@@ -382,7 +382,8 @@ arrays, so a nested call cannot find another call's scratch.
 | `decimal tk_dec_neg(decimal a)` | bit 63 of the high word, flipped |
 | `i64 tk_dec_cmp(decimal a, decimal b)` | `-1`/`0`/`1`: zero first (three patterns, one value), then the sign, then the magnitudes at a common scale |
 | `i64 tk_dec_eq` … `tk_dec_ge` | the six comparisons, each `tk_dec_cmp` and a test |
-| `decimal tk_dec_from_i64(i64 n)` | the IMPLICIT direction (C# §10.2.3), written by the compiler in every one of D33's nine slots |
+| `decimal tk_dec_from_i64(i64 n)` | the IMPLICIT direction (C# §10.2.3), written by the compiler in every one of D33's nine slots, for every integer source but `u64` |
+| `decimal tk_dec_from_u64(u64 n)` | the same direction from a `u64` SOURCE, whose magnitude an `i64` cannot hold: the limbs are filled from the two 32-bit halves and no sign question is asked (D77, ruling 8) |
 | `i64 tk_dec_to_i64(decimal a)` | `(i64) d`, truncating toward zero; panics `teko: decimal overflow` outside `i64` |
 | `f64 tk_dec_to_f64(decimal a)` | `(f64) d`; one rounding, not twenty-eight — the mantissa is divided once by the scale's own power of ten |
 | `decimal tk_dec_from_f64(f64 x)` | `(decimal) x`, the double's own value rounded to fifteen significant digits with the trailing zeros dropped, which is why `(decimal) 0.1` is `0.1m` |

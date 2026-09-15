@@ -235,6 +235,7 @@ a different type.
 | from | to | how | why |
 |---|---|---|---|
 | any integer (`u8`..`i64`, `i32`) | `decimal` | **implicit**, in every one of the nine slots D33 enumerated | C# §10.2.3 |
+| `u64` | `decimal` | the same, through a conversion row of its own (`tk_dec_from_u64`) | an `i64` cannot hold `u64`'s magnitude; a shared row would read 2^63 as a negative number (D77, ruling 8) |
 | `decimal` | any integer | **explicit**: `(i64) d` | C# §10.3, truncates toward zero |
 | `f32`, `f64` | `decimal` | **explicit**: `(decimal) x` | C# §10.3; the double's own value, rounded to 15 significant digits, as C# does |
 | `decimal` | `f64`, `f32` | **explicit**: `(f64) d` | C# §10.3, may lose precision |
@@ -242,7 +243,7 @@ a different type.
 | `null`, a class, a struct, a `T[]` | `decimal` | refused | D32/D34 |
 
 The implicit direction is `tk_num_widen`'s sibling: a `tk_dec_widen` in teko_typeof.tk that
-wraps an integer node in a call to `tk_dec_from_i64`, handed **back** to the caller to
+wraps an integer node in a call to `tk_dec_from_i64` (`tk_dec_from_u64` from a `u64`), handed **back** to the caller to
 splice, which is the shape every one of the nine slots already knows how to use. The
 explicit direction is `tk_cast`'s: a cast whose target or source is `decimal` becomes a call
 (`tk_dec_to_i64`, `tk_dec_from_f64`, `tk_dec_to_f64`) instead of a machine cast, because
