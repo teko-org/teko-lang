@@ -53,11 +53,15 @@ with that line in its stderr (D52).
   written where an `i64`/`f64` is declared (D34). All four hold in every slot: an
   argument (of a free function, a method, a virtual call, an interface call), an
   overload's parameter, an element of a `params` list, an assignment, an initializer, a
-  field store, a GLOBAL slot's own initializer and assignment, and a `return`
-  ([parameters.md](parameters.md#what-a-literal-converts-to)). `i64 n = 2.5;`,
-  `solo(null)`, `i64 n = f;` with `f` a class value, and `f32 c = 2.5;` are the four
-  shortest forms of it, all written out in
-  [types.md](types.md#f32-and-f64).
+  field store, a GLOBAL slot's own initializer and assignment, a `return`
+  ([parameters.md](parameters.md#what-a-literal-converts-to)), and the NULLABLE VALUE
+  payload a `T?` boxes (Q1b, [nullable.md](../specs/nullable.md) § 4) — `f32? x = 2.5;`
+  reads under the nullable's own name, `teko: a value of type f64 does not convert to
+  f32?`, judged by the same width rule the plain slot is (D78,
+  `tests/refuse/f32_from_f64_nullable.tk`), and a `params f32[]` element the same way
+  (`tests/refuse/f32_params_from_f64.tk`). `i64 n = 2.5;`, `solo(null)`, `i64 n = f;` with
+  `f` a class value, and `f32 c = 2.5;` are the four shortest forms of it, all written out
+  in [types.md](types.md#f32-and-f64).
 - **The same rules, at file scope** (D53): a global slot is judged exactly as a local is, so
   each one has a fixture of its own under `tests/refuse/`.
 

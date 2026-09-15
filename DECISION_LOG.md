@@ -484,7 +484,7 @@ widened: `f(3)` with `f(f64)` and `f(uptr)` declared still reads
 `teko: no overload of f matches these arguments`, since a better-conversion rule (§12.6.4.4)
 is a decision of its own; a name declared once always converts.
 [`docs/reference/not-yet.md`](docs/reference/not-yet.md) § *Numeric conversions* carries
-that and the five other gaps measured here, `f32`→`f64` among them.
+that and the five other gaps measured here, `f32`→`f64` among them [closed by D78, below].
 
 **A NEGATIVE `i32` widened to a float is wrong on `aarch64`, and it is `mc`'s own defect,
 not taught here.** `tests/primitives_float.tk` was rewritten again to add `i32` at the four
@@ -8301,3 +8301,79 @@ row. The compiler build itself grows where code was added and nowhere else: `nod
 → 170359, `funcs` 3378 → 3379, `ins` 234647 → 234873, `symbols` 6657 → 6658; `globals`
 983 → 983 and `defines` 1287 → 1287 are unmoved (`tk_f32_bits_to_f64` is a function, not a
 new global).
+
+**Copilot findings on #731 — the width rule reached every SLOT `tk_num_widen`/
+`tk_check_scalar_compat` cover directly, but two slots answer through a DIFFERENT gate
+first and neither one asked the question.** Both reproduced on `97eb5933` before they were
+fixed, both refused after.
+
+1. **A `T?` VALUE payload is a slot too (Q1b), and `tk_nl_check_value` never asks
+   `tk_check_scalar_compat` at all — it asks `tk_nl_fits` (`teko_null.tk`), a parallel rule
+   written before this crumb existed, and that rule's float clause was `type_kind(pty) ==
+   TK_FLOAT` returning 1 for ANY float `ety`, width unasked.** `f32? x = 2.5;` compiled,
+   and `tk_nl_wrap` handed `tk_num_widen(f32, f64, e)` a pair `tk_num_widens` correctly
+   refuses to convert (narrowing), so the node crossed unconverted into the box — the exact
+   raw-bit bug this whole crumb exists to kill, alive one layer down. The fix reuses the
+   same oracle rather than re-deriving the rule a second time: `tk_nl_fits`'s float branch
+   now asks `tk_num_widens(pty, ety)` for a float/float pair (the equal-width case already
+   returned at the function's first line, so what is left to ask is exactly the widen/
+   narrow question), an integer source still fits either width unconditionally, matching
+   `tk_check_scalar_compat`'s own shape one line up. Reported under the nullable's own
+   name, the slot the source actually wrote — `teko: a value of type f64 does not convert
+   to f32?` — since `tk_nl_check_value` already names `ti` and not the payload.
+   `tests/refuse/f32_from_f64_nullable.tk` (new); `tests/primitives_f32.tk` gains an
+   `f64? y = b;` row (bits read back through `.Value`, codes 31-33) proving the WIDENING
+   direction still boxes the converted value and not the narrower one's raw bits, and an
+   unmoved `f32? z = 2.5f;` row (codes 34-35, equal width, no conversion).
+
+2. **A `params f64[]` element is a slot too, and `tk_pm_check_elem` asks
+   `tk_pm_elem_fits` (`teko_params.tk`) before `tk_pm_pack` ever reaches its own
+   `tk_num_widen` call — and the typed-value arm of `tk_pm_elem_fits` rejected ANY float
+   mismatch outright** (`type_kind(aty) == TK_FLOAT || type_kind(ety) == TK_FLOAT) return
+   0`), a clause written for an untyped integer literal's tie-break that a typed float
+   value fell through into as well. `total(1.0, b)` on an `f32 b` against a declared
+   `params f64[]` read `teko: a value of type f32 does not convert to f64` — backwards from
+   D78's own ruling 1, which widens exactly that pair everywhere else. The fix is one
+   clause ahead of the literal-only arms, asked at every stage and not `loose` only (a
+   typed float carries no literal tie-break to protect): `type_kind(aty) ==
+   TK_FLOAT && type_kind(ety) == TK_FLOAT` asks `tk_num_widens(ety, aty)`, the identical
+   oracle. `tk_pm_pack`'s own `tk_num_widen(ety, tty, t)` call was already unconditional
+   and already general — nothing in it named integers specifically — so once the gate
+   stopped refusing the pair early, the cast it inserts was already the right one; no
+   second change was needed there. `tests/refuse/f32_params_from_f64.tk` (new, `params
+   f32[]` given the untyped `2.5`, still narrowing and still refused); `tests/
+   primitives_f32.tk` gains a `total(params f64[] xs)` helper and two rows, `total(1.0,
+   b)` (code 29) and `total(b, b)` (code 30), both elements `f32` widening into the
+   `f64[]` the pack builds.
+
+Neither fix touches `tk_num_widen`, `tk_num_widens` or `tk_check_scalar_compat` themselves
+— both gates now ask the SAME oracle those already answer through, rather than repeating
+its rule a third and a fourth time with their own drift.
+
+**The gate, re-run with both fixes in:** `mc build . --config mc.macos.toml` clean; `sh
+scripts/fixtures.sh ./build/teko mc.macos.toml` → **94 passed, 119 refused as expected, 0
+failed** (94 + 0 and 117 + 2, the two new refuse fixtures); `sh scripts/bootstrap.sh --os
+macos --arch aarch64` → **FIXPOINT OK**; `sh scripts/check-docs.sh` → `docs ok: 673 links,
+64 fragments, 406 diagnostics, 119 refusals, 150 samples, manifest listed`.
+
+`--dump-ast` of every fixture that exists on `f335f9d0` (`--include=lib --include=tests`,
+single-file mode, base and this crumb each its own worktree): **92 of 93 byte-identical,
+the same one fixture as the crumb's own first pass** (`primitives_decimal_order.tk`,
+unrelated — the literal edit and the `fcvt` D78's own arithmetic fix inserts, already
+justified above). Neither Copilot fix moved a SECOND fixture's dump: no fixture on `main`
+before this PR exercised a `T?` value payload or a `params f64[]` element with a REAL `f32`
+source (both gaps were reachable only through code this PR itself adds), so there is
+nothing already accepted for either fix to silently move.
+
+`mc build . --config mc.macos.toml --compiler-only --limits`, `rm -rf build` first on both
+legs, `97eb5933` (this PR before the two fixes) → after: `intrin` 0 → 0, `types` 1 → 1,
+`syntax` 0 → 0, `alias` 1 → 1, `passes` 0 → 0 — every budget row this repository's own laws
+(D21, zero new intrinsics) are measured against **unmoved**. `nodes` 170359 → 170388 (+29),
+`funcs` 3379 → 3379 (unmoved — both fixes extend an existing function's body, neither adds
+one), `ins` 234873 → 234921 (+48), `symbols` 6658 → 6658 (unmoved). `heap` (the one row `mc
+limits` reports in bytes, never elements) moved from 100645536 to 100747472, +101936 bytes,
++0.10% — stated here as what it is, the proportional cost of the ~30 nodes and ~50
+instructions two small clauses added, and not offered as proof of anything: the proof this
+fix is correct is the two reproducers above turning from a silent pass into the width
+refusal, the two new fixtures, and the unmoved `--dump-ast` of the 92 fixtures that predate
+it.
