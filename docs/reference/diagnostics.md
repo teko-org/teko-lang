@@ -876,8 +876,8 @@ Three are **run-time panics** of `lib/time.tk`, all exit 70 and all on stderr wi
 section documents that is about the sixteen bytes rather than about `decimal` reaches them
 too — the `extern` one and the global-initializer one by name, the five machine guards as
 guards, the shared `"teko: new "` wording. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are landed
-too now (N6b-1, D83): each type carries twenty-five rows, eleven of N6a's plus fourteen of
-N6b-1's, and no MIXED row of any kind — `i128 + u128` still earns
+too now (N6b-1, D83): each type carries eighteen rows, eleven of N6a's plus seven of
+N6b-1's (fourteen over the two types), and no MIXED row of any kind — `i128 + u128` still earns
 ``teko: no operator `+` takes these operands`` because C# refuses the same expression
 without a cast. What is their own is short, and most of what a reader will meet is a
 refusal that already existed: `x.ToString()` earns `teko: unknown member of i128`, and

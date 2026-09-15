@@ -270,7 +270,7 @@ N6b's, and every row below is refused by name until it lands:
 
 | written | what happens |
 |---|---|
-| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128` |
+| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128: ToString` (the member's own name after the colon) |
 | `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128: <name>` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
 | `(f64) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` — the float rows are N6b's |
 | `(decimal) x` | ``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it`` — the refusal names the TARGET when the target is a primitive; `(i128) d` earns `teko: an i128 does not cast yet` for the same missing row |

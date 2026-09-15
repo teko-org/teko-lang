@@ -110,7 +110,7 @@ did before this crumb, and `--dump-ast` is unmoved.
 
 | expression | is |
 |---|---|
-| `a / b`, `a % b`, `b` a non-literal | the eight core widths; `b == 0` is `teko: division by zero`, exit 70 (a literal `0` divisor is refused at compile time: `teko: division by zero` at the line when the dividend is not constant, mc's own `division by zero` when both sides are; `i128`/`u128` `/` is `lib/wide.tk`'s own guard, and their `%` is not taught yet, N6b) |
+| `a / b`, `a % b`, `b` a non-literal | the eight core widths; `b == 0` is `teko: division by zero`, exit 70 (a literal `0` divisor is refused at compile time: `teko: division by zero` at the line when the dividend is not constant, mc's own `division by zero` when both sides are; `i128`/`u128` `/` and `%` are `lib/wide.tk`'s own guard, D81/D83: the same two messages at run time, and no compile-time answer for a literal `0`) |
 | `a / b`, `a % b`, `b` a non-literal, signed only | `b == -1 && a == <the type's own MinValue>` is `teko: an integer division overflowed`, exit 70 — for `%` too, as .NET throws `OverflowException` for `int.MinValue % -1` on both its ISAs (the C# specification ties the remainder's overflow to the quotient's) |
 
 ### `i8` and `i16`
@@ -1248,7 +1248,7 @@ same pair.
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
 | `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
 | `(f64) x`, `(str) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` (`a u128` for the other) |
-| `x.ToString()` | `teko: unknown member of i128` — N6b |
+| `x.ToString()` | `teko: unknown member of i128: ToString` — N6b |
 | `i128.MaxValue` | `teko: unknown static member of i128: MaxValue` — N6b |
 | `170141183460469231731687303715884105728i` | `teko: an i128 literal is out of range` |
 | `const i128 K = 1i;`, `case 1i:` | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic |

@@ -9115,9 +9115,10 @@ name, not left to guess.
 > the cap already had room for (D81 raised it there for exactly this).
 
 N6b-1 is the first crumb of N6b, `docs/specs/small-ints.md` § 6's second half. It depends on
-N6a (D81) for the eight-limb scratch and touches nothing else N6a built: `/` and the four
-orderings are still the only two places `i128` and `u128` differ in the arithmetic, and `%`,
-`<<`/`>>`'s LOGICAL half, and `& | ^ ~` join neither list. What is still N6b's own --
+N6a (D81) for the eight-limb scratch and touches nothing else N6a built. The places where
+`i128` and `u128` differ grow from two to four: `/` and the four orderings (D81), and now `%`
+(the remainder's sign, ruling 2) and `>>` (arithmetic against logical, ruling 3); `<<`, `&`,
+`|`, `^` and `~` are the same bits for both and join neither list. What is still N6b's own --
 `ToString`/`Parse`/`TryParse`, § 7's members and statics, the `decimal`/`f64` conversions --
 is left out on purpose and stays a row of `docs/reference/not-yet.md`.
 
@@ -9199,10 +9200,11 @@ fixtures.sh ./build/teko mc.macos.toml` -> **115 passed, 133 refused as expected
 `primitives_i128_removf.tk` at 70; zero new refuse fixtures -- nothing this crumb adds is
 refused by name); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
 `sh scripts/check-docs.sh` -> `docs ok: 696 links, 74 fragments, 411 diagnostics, 133
-refusals, 152 samples, manifest listed`; `mc limits` verdict `ok` on both legs, every row
+refusals, 152 samples, manifest listed`; `mc limits` on both legs (the `tests/hello.tk` leg's verdict is `grew`, exit 3, identically
+on base and head -- the budget tables diff clean), every row
 against `12bc95f9` unmoved except the size-of-surface-code ones (`nodes`, `funcs`, `lowered`,
-`ins`, `symbols`, `globals`) -- `intrin` **8**, `passes` **15**, `syntax` **20**, `alias`
-**25**, `types` **18**, `on_stmt` **4**, measured on both legs and identical to the base;
+`ins`, `symbols`, `globals`) -- on the `hello.tk` leg `intrin` **8**, `passes` **15**,
+`syntax` **20**, `alias` **25**, `types` **18**, `on_stmt` **4**, identical to the base;
 `TK_MAXPRIMO` **98**/128 (84 before), every other primitive cap unmoved by this crumb.
 `--dump-ast --include=lib --include=tests` (single-file mode, base `12bc95f9` and this
 branch each its own worktree): **112 of 112 pre-existing `tests/*.tk` and 133 of 133
