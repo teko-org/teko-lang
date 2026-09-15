@@ -110,7 +110,7 @@ did before this crumb, and `--dump-ast` is unmoved.
 
 | expression | is |
 |---|---|
-| `a / b`, `a % b`, `b` a non-literal | the eight core widths; `b == 0` is `teko: division by zero`, exit 70 (a literal `0` divisor is refused at compile time: `teko: division by zero` at the line when the dividend is not constant, mc's own `division by zero` when both sides are; `i128`/`u128` `/` is `lib/wide.tk`'s own guard, and their `%` is not taught yet, N6b) |
+| `a / b`, `a % b`, `b` a non-literal | the eight core widths; `b == 0` is `teko: division by zero`, exit 70 (a literal `0` divisor is refused at compile time: `teko: division by zero` at the line when the dividend is not constant, mc's own `division by zero` when both sides are; `i128`/`u128` `/` and `%` are `lib/wide.tk`'s own guard, D81/D83: the same two messages at run time, and no compile-time answer for a literal `0`) |
 | `a / b`, `a % b`, `b` a non-literal, signed only | `b == -1 && a == <the type's own MinValue>` is `teko: an integer division overflowed`, exit 70 — for `%` too, as .NET throws `OverflowException` for `int.MinValue % -1` on both its ISAs (the C# specification ties the remainder's overflow to the quotient's) |
 
 ### `i8` and `i16`
@@ -1220,14 +1220,16 @@ constants land.
 |---|---|---|
 | `a + b`, `a - b`, `a * b` | `i128` / `u128` | **wraps** modulo 2^128 — C#'s unchecked default, and teko has no `checked` word |
 | `a / b` | `i128` / `u128` | truncates toward zero, signed for `i128` and unsigned for `u128`; `b == 0` is `teko: division by zero`, exit 70; `i128.MinValue / -1i` is `teko: an integer division overflowed`, exit 70 (D82, `u128` has no such row) |
+| `a % b` | `i128` / `u128` | truncating, and the sign follows the DIVIDEND alone — unlike `/`'s `sign(a) != sign(b)` on the quotient; `b == 0` and `i128.MinValue % -1i` fail the same two ways `/` does (D83, D82's ruling 7) |
+| `a << n`, `a >> n` | `i128` / `u128` | `>>` is ARITHMETIC (sign-filled) for `i128` and LOGICAL (zero-filled) for `u128`; the count converts to the SAME wide type before the row is looked up (never `i64`) and the wrapper masks its own low 7 bits — `count & 127`, .NET's `Int128`/`UInt128` shift mask, so a negative count falls out under it too (D83) |
+| `a & b`, `a \| b`, `a ^ b`, `~a` | `i128` / `u128` | the same bits either way, limb-wise |
 | `-a` | `i128` / `u128` | wraps: `-MinValue` is `MinValue` |
 | `+a` | the operand | no call at all |
 | `==` `!=` `<` `<=` `>` `>=` | `i64` 0/1 | signed for `i128`, unsigned for `u128`: the same sixteen bytes read `-1i` and `340282366920938463463374607431768211455u` |
 | `a + 1`, `1 + a` | `i128` / `u128` | the integer converts first, then the row above |
 
 `i128 + u128` takes **no** row and is refused without a cast, which is C#'s rule for the
-same pair. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are **not taught yet**
-([not-yet.md](not-yet.md)).
+same pair.
 
 **The conversions**, none of them an instruction — every one is a call:
 
@@ -1243,11 +1245,11 @@ same pair. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are **not taught yet**
 
 | written | message |
 |---|---|
-| `a % b`, `a << 1`, `a & b`, `~a` | ``teko: no operator `%` takes these operands`` — N6b |
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
 | `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
 | `(f64) x`, `(str) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` (`a u128` for the other) |
-| `x.ToString()`, `i128.MaxValue` | `teko: unknown member of i128` and its static twin — N6b |
+| `x.ToString()` | `teko: unknown member of i128: ToString` — N6b |
+| `i128.MaxValue` | `teko: unknown static member of i128: MaxValue` — N6b |
 | `170141183460469231731687303715884105728i` | `teko: an i128 literal is out of range` |
 | `const i128 K = 1i;`, `case 1i:` | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic |
 | `i128 g = 5;` at file scope | `teko: a global i128 takes no initializer` — a wide global is a slot and an assignment |

@@ -9114,3 +9114,119 @@ operand, and nothing in it divides by a literal zero.
 What is left open: nothing new. The `#include rt.tk` road (ruling 5) is a design choice this
 entry records rather than a gap; a program that needs it and does not have it is refused by
 name, not left to guess.
+
+---
+
+### D83 · the seven remaining operators of `i128`/`u128` -- a shift count is the SAME wide type as the value, and `%`'s sign follows the dividend alone (N6b-1, 2026-09-15)
+
+> `%`, `<<`, `>>`, `&`, `|`, `^`, `~` land on both wide types, over a bit-level shift and a
+> limb-wise bitwise core added to `lib/wide.tk`, and fourteen new operator rows -- seven per
+> type, registered from a SECOND function (`tk_i128_rows_bits`) because `mc` caps a call at
+> twelve parameters and eighteen names plus the type does not fit the one `tk_i128_rows`
+> already had. Zero mc changes, zero new intrinsics: every operator is ordinary teko over
+> `lib/limbs.tk`'s long division and `lib/wide.tk`'s own eight-limb scratch. `mc limits`'
+> `intrin` row is 8 before and 8 after; `TK_MAXPRIMO`'s fill moves from 84 to 98 of the 128
+> the cap already had room for (D81 raised it there for exactly this).
+
+N6b-1 is the first crumb of N6b, `docs/specs/small-ints.md` § 6's second half. It depends on
+N6a (D81) for the eight-limb scratch and touches nothing else N6a built. The places where
+`i128` and `u128` differ grow from two to four: `/` and the four orderings (D81), and now `%`
+(the remainder's sign, ruling 2) and `>>` (arithmetic against logical, ruling 3); `<<`, `&`,
+`|`, `^` and `~` are the same bits for both and join neither list. What is still N6b's own --
+`ToString`/`Parse`/`TryParse`, § 7's members and statics, the `decimal`/`f64` conversions --
+is left out on purpose and stays a row of `docs/reference/not-yet.md`.
+
+#### The rulings this crumb was dispatched with, and what each became
+
+1. **The shift count is the SAME wide type as the value, never `i64` -- because it has no
+   choice.** `x << 2` reaches the operator table already promoted: `tk_ops_promote` runs its
+   WIDE arm first for every operator (`teko_ops.tk`), so the bare `2` on the right becomes an
+   `i128` before `tk_prim_op_find` ever looks at a row, and a `(t, TY_I64)` row would simply
+   never be reached (`tk_prim_slot_fits`, `teko_prim.tk`). The row is `(t, t)`, same as every
+   other binary one, and the WRAPPER (`lib/wide.tk`) is where the count is read back down to
+   a machine shift amount: its own low 7 bits, `tk_i128_lo(cnt) & 127` (or `tk_u128_lo` for
+   the unsigned side). This is .NET's own rule and not an invention -- `Int128`/`UInt128`'s
+   shift operators mask their amount to 7 bits the same way, and a negative count falls out
+   under the mask exactly as a count past 127 does: measured, `1i << negcnt` with `negcnt`
+   every bit set answers `i128.MinValue` (`& 127` on all-ones is 127, and `1i << 127i` is the
+   sign bit alone), and `1i << 129i` answers `2i` (`129 & 127` is 1).
+
+2. **`>>` is arithmetic for `i128` and logical for `u128`, one core serving both.** The core
+   below the wrapper (`tk_w_shr`) shifts the WHOLE eight-limb scratch right, filling from the
+   top with whatever limbs 4..7 already hold -- zero, since `tk_w_vec` zeroes them on the way
+   in, which is `u128`'s own answer with no extra step. `i128`'s own `tk_w_sar` fills limbs
+   4..7 with the sign (`tk_w_isneg`, the same bit `tk_w_neg` already reads) BEFORE calling the
+   same `tk_w_shr`, so the identical bit-by-bit move that pulls zero in for `u128` pulls one
+   bits in here instead: one core, one fill, no second shift routine. `<<` needs no such
+   split -- both types wrap modulo 2^128 the same way `+`/`-`/`*` already do -- and shares one
+   `tk_w_shl` for both. Both cores shift the WHOLE scratch, not just the four live limbs, so a
+   left shift's overflow past bit 127 lands in limbs 4..7 where `tk_w_mask` (every wrapper's
+   own last line, as every other operator's already is) drops it -- the same wrap `docs/specs/
+   small-ints.md` § 6 already fixed.
+
+3. **`%`'s sign follows the DIVIDEND alone, never `sign(a) != sign(b)` as `/`'s quotient
+   does.** `lib/limbs.tk`'s `tk_dv_divmod(q, a, b)` already leaves the remainder in `a` once
+   it returns (N6a's own scout finding, unchanged since C4): a plain `tk_w_umod` is `tk_w_udiv`
+   called for its side effect on `a`, the quotient `q` built and dropped. The signed core
+   (`tk_w_smod`) takes the two operands' magnitudes exactly as `tk_w_sdiv` does, but restores
+   the sign onto the REMAINDER using the DIVIDEND's own sign bit (`sa`) and never the
+   divisor's -- `-7i % 2i == -1i`, `7i % -2i == 1i`, C#'s own rule for `%` and the one place
+   this operator's sign differs from `/`'s. Truncating division needs `a == (a/b)*b + a%b`,
+   which only the dividend's own sign on the remainder satisfies.
+
+4. **`i128.MinValue % -1i` panics too, reusing `tk_w_sdiv_ovf` UNCHANGED -- D82's ruling 7
+   said `%` was never a row to amend before this crumb added one, and this is that
+   amendment.** The quotient `%` would need to compute the remainder from is the one value
+   the width cannot hold, so `tk_w_smod` reads the ORIGINAL operands through `tk_w_sdiv_ovf`
+   before either sign is touched, exactly where `tk_w_sdiv` already does -- `tests/
+   primitives_i128_removf.tk` is the assertion D82's own entry noted `%` had never had.
+   `u128` gets no such check: an unsigned remainder never overflows its own width, the same
+   asymmetry `/` already has.
+
+5. **`mc` caps a call at twelve parameters, so `tk_i128_rows` could not simply grow.**
+   Eleven names plus `t` already filled it exactly; eighteen names plus `t` for the twenty-
+   five-row table this crumb was first drafted as (measured: `teko_i128.tk:246: at most 12
+   parameters`, `mc`'s own limit, not this repository's). The eleven-row function is
+   untouched and a second one, `tk_i128_rows_bits`, carries the seven new names over eight
+   parameters -- two calls per type instead of one, same shape, same `tk_prim_op` table
+   underneath.
+
+6. **The message drift `i128.MaxValue` had is fixed in passing, not left for a future
+   crumb to trip over again.** Measured: `i128.MaxValue` (a static member N6a's own header
+   already documented as unregistered) answers `teko: unknown static member of i128: MaxValue`
+   (`tk_prim_no_static`, `teko_prim.tk`), not the `teko: unknown member of i128` three pages
+   claimed (`teko_i128.tk`'s own header comment, `docs/reference/types.md`, `docs/reference/
+   not-yet.md`) -- an instance-member and a static-member refusal are two different functions
+   in this compiler (`tk_prim_no_member`/`tk_prim_no_static`) and always were; nothing here
+   changes which one a static member reaches, only the three descriptions of it.
+   `docs/internals/primitives.md`'s ceilings table is a second, older drift the same pass
+   found: it still read `TK_MAXPRIMT` 8, `TK_MAXPRIMO` 80 and `TK_MAXPRIMX` 8 with "holds 5
+   of 8", D81's own numbers from before it raised every one of the three caps to 16, 128 and
+   16 -- `teko_prim.tk`'s own running `#define` comments already carried the true count and
+   this page had simply fallen behind them. Fixed to the code's own numbers, with this
+   crumb's own delta -- `TK_MAXPRIMO` 84 to 98 -- appended in the same running style.
+
+**Proof of this crumb** (mc 0.17.5, macos/aarch64, head `dce502fb`, merged with `origin/main`
+at `12bc95f9` -- D82's fourth review, `tests/surface_removf.tk` and `tests/surface_divnested
+.tk` -- before this gate ran): `mc build . --config mc.macos.toml` clean; `sh scripts/
+fixtures.sh ./build/teko mc.macos.toml` -> **115 passed, 133 refused as expected, 0 failed**
+(112 + 3 new: `primitives_i128_bits.tk` at 42, `primitives_i128_remzero.tk` and
+`primitives_i128_removf.tk` at 70; zero new refuse fixtures -- nothing this crumb adds is
+refused by name); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`;
+`sh scripts/check-docs.sh` -> `docs ok: 696 links, 74 fragments, 411 diagnostics, 133
+refusals, 152 samples, manifest listed`; `mc limits` on both legs (the `tests/hello.tk` leg's verdict is `grew`, exit 3, identically
+on base and head -- the budget tables diff clean), every row
+against `12bc95f9` unmoved except the size-of-surface-code ones (`nodes`, `funcs`, `lowered`,
+`ins`, `symbols`, `globals`) -- on the `hello.tk` leg `intrin` **8**, `passes` **15**,
+`syntax` **20**, `alias` **25**, `types` **18**, `on_stmt` **4**, identical to the base;
+`TK_MAXPRIMO` **98**/128 (84 before), every other primitive cap unmoved by this crumb.
+`--dump-ast --include=lib --include=tests` (single-file mode, base `12bc95f9` and this
+branch each its own worktree): **112 of 112 pre-existing `tests/*.tk` and 133 of 133
+`tests/refuse/*.tk` byte-identical** -- no pre-existing program's tree moved a node, which
+this crumb's own shape predicts: no row it added can fire on source that predates it, since
+every one of the seven operators was a compile-time refusal on every such program before this
+crumb and a lowered call after it, and nothing that used to refuse now silently accepts (the
+133 refusals are the same 133, unmoved).
+
+What is left open: the rest of N6b (`ToString`/`Parse`/`TryParse`, the members and statics,
+the `decimal`/`f64` conversions) is the next crumb, unblocked and unchanged by this one.

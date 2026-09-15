@@ -12,13 +12,15 @@
 //
 // The representation is docs/specs/small-ints.md § 6's: sixteen bytes,
 // sixteen-byte aligned, little-endian, the low half at `+0` and the high half
-// at `+8`. `i128` and `u128` are THE SAME BITS and differ in exactly two
-// places here -- `/` and the four ordering comparisons -- which is why the core
-// below is written once over a vector and each type gets a four-line wrapper.
+// at `+8`. `i128` and `u128` are THE SAME BITS and differ in exactly four
+// places here -- `/` and the four ordering comparisons (D81), `%` (the
+// remainder's sign) and `>>` (arithmetic against logical, D83) -- which is why
+// the core below is written once over a vector and each type gets a four-line
+// wrapper.
 //
-// What is NOT here is N6b's: `%`, `<<`, `>>`, `&`, `|`, `^`, `~`, `ToString`,
-// `Parse`, `TryParse`, the members and the `decimal`/`f64` conversions
-// (docs/reference/not-yet.md).
+// N6b's `%`, `<<`, `>>`, `&`, `|`, `^`, `~` are here too (D83). What is still
+// NOT here is the rest of N6b: `ToString`, `Parse`, `TryParse`, the members
+// and the `decimal`/`f64` conversions (docs/reference/not-yet.md).
 #include "limbs.tk"
 
 // ---- the three declarations a wide type owes the PROGRAM ----
@@ -190,6 +192,147 @@ i64 tk_w_scmp(uptr a, uptr b) {
     return tk_dv_cmp(a, b);
 }
 
+// a %= b, unsigned: `tk_dv_divmod` already leaves the remainder in `a`
+// (`lib/limbs.tk`), so `tk_w_udiv`'s own zero guard is all a plain remainder
+// needs -- the quotient it also computes has nowhere else to live and is
+// simply not read back.
+void tk_w_umod(uptr a, uptr b) {
+    u64 q[TK_DEC_NL];
+    tk_w_udiv(q, a, b);
+}
+
+// a %= b, signed: the sign follows the DIVIDEND alone (C#'s own rule for
+// `%`, unlike `/`'s `sa != sb` on the quotient) -- truncating division keeps
+// `a == (a/b)*b + a%b`, which only the dividend's own sign on the remainder
+// satisfies. `tk_w_sdiv_ovf` is read unchanged: the one quotient `i128.MinValue
+// % -1i` would need is the one value the width cannot hold, exactly D82's
+// ruling 7, which named `%` as a row this crumb still owed.
+void tk_w_smod(uptr a, uptr b) {
+    if (tk_w_sdiv_ovf(a, b)) panic("an integer division overflowed");
+    i64 sa = tk_w_isneg(a);
+    i64 sb = tk_w_isneg(b);
+    if (sa) tk_w_neg(a);
+    if (sb) tk_w_neg(b);
+    u64 q[TK_DEC_NL];
+    tk_w_udiv(q, a, b);
+    if (sa) tk_w_neg(a);
+}
+
+// ---- bitwise: `& | ^ ~`, the SAME bits for `i128` and `u128`. The two
+// types differ in four places -- `/` and the four orderings (D81), `%` and
+// `>>` (D83, above) -- and bitwise joins none of them. Limbs 4..7 are already zero
+// (`tk_w_vec`'s own zeroing), so `& | ^` never touch them; `~` alone needs
+// the mask afterward to keep them that way.
+void tk_w_and(uptr a, uptr b) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_W_NL) break;
+        tk_dv_put(a, i, tk_dv_at(a, i) & tk_dv_at(b, i));
+        i = i + 1;
+    }
+}
+
+void tk_w_or(uptr a, uptr b) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_W_NL) break;
+        tk_dv_put(a, i, tk_dv_at(a, i) | tk_dv_at(b, i));
+        i = i + 1;
+    }
+}
+
+void tk_w_xor(uptr a, uptr b) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_W_NL) break;
+        tk_dv_put(a, i, tk_dv_at(a, i) ^ tk_dv_at(b, i));
+        i = i + 1;
+    }
+}
+
+void tk_w_not(uptr v) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_W_NL) break;
+        tk_dv_put(v, i, (~tk_dv_at(v, i)) & 0xffffffff);
+        i = i + 1;
+    }
+}
+
+// ---- shifts: `<<` and the two `>>`s (D83) ----
+// `n` is already masked to its low 7 bits by the WRAPPER below, never here:
+// a shift count reaches the operator table as the SAME wide type as the
+// value (`tk_ops_promote`'s wide arm runs first, teko_ops.tk, so a `(t,
+// TY_I64)` row would never fire), and .NET's own `Int128`/`UInt128` shift
+// operators mask their amount to 7 bits the same way -- a negative count
+// falls out under the mask exactly as a count past 127 does.
+//
+// Both cores below shift the WHOLE eight-limb scratch, not just the four
+// live limbs: a left shift's overflow lands in limbs 4..7, where
+// `tk_w_mask` already drops it, the same wrap every other operator ends in.
+// `n` is never negative and never above 127, so every limb index below
+// stays in range unchecked.
+void tk_w_shl(uptr v, u64 n) {
+    u64 r[TK_DEC_NL];
+    u64 limbs = n / 32;
+    u64 bits = n % 32;
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 0) break;
+        i64 src = i - limbs;
+        u64 hi = 0;
+        if (src >= 0) hi = tk_dv_at(v, src);
+        u64 lo = 0;
+        if (bits != 0 && src > 0) lo = tk_dv_at(v, src - 1);
+        u64 x = hi;
+        if (bits != 0) x = (hi << bits) | (lo >> (32 - bits));
+        tk_dv_put(r, i, x & 0xffffffff);
+        i = i - 1;
+    }
+    tk_dv_copy(v, r);
+    tk_w_mask(v);
+}
+
+// LOGICAL right shift: fills from the top with zero, which is what a
+// right-shifted limb 4..7 already holds -- `u128`'s own shift, and the
+// second half of `i128`'s arithmetic one below.
+void tk_w_shr(uptr v, u64 n) {
+    u64 r[TK_DEC_NL];
+    u64 limbs = n / 32;
+    u64 bits = n % 32;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        i64 src = i + limbs;
+        u64 lo = 0;
+        if (src < TK_DEC_NL) lo = tk_dv_at(v, src);
+        u64 hi = 0;
+        if (bits != 0 && src + 1 < TK_DEC_NL) hi = tk_dv_at(v, src + 1);
+        u64 x = lo;
+        if (bits != 0) x = (lo >> bits) | (hi << (32 - bits));
+        tk_dv_put(r, i, x & 0xffffffff);
+        i = i + 1;
+    }
+    tk_dv_copy(v, r);
+    tk_w_mask(v);
+}
+
+// ARITHMETIC right shift, `i128`'s own: limbs 4..7 are filled with the sign
+// BEFORE the logical shift above runs, so the same bit-by-bit move that
+// pulls zero in for `u128` pulls one bits in here instead -- one core, one
+// fill, read off `tk_w_isneg` exactly as `tk_w_neg` does.
+void tk_w_sar(uptr v, u64 n) {
+    if (tk_w_isneg(v)) {
+        i64 i = TK_W_NL;
+        loop {
+            if (i >= TK_DEC_NL) break;
+            tk_dv_put(v, i, 0xffffffff);
+            i = i + 1;
+        }
+    }
+    tk_w_shr(v, n);
+}
+
 // ---- i128: the wrappers ----
 void tk_iv(i128 v, uptr o) { tk_w_vec(tk_i128_lo(v), tk_i128_hi(v), o); }
 i128 tk_iw(uptr v) { return tk_i128_of(tk_w_lo(v), tk_w_hi(v)); }
@@ -236,6 +379,64 @@ i128 tk_i128_neg(i128 a) {
     u64 x[TK_DEC_NL];
     tk_iv(a, x);
     tk_w_neg(x);
+    return tk_iw(x);
+}
+
+i128 tk_i128_mod(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_smod(x, y);
+    return tk_iw(x);
+}
+
+// the count is the SECOND operand's own low 64 bits, masked to 7 (D83)
+i128 tk_i128_shl(i128 a, i128 cnt) {
+    u64 x[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_w_shl(x, tk_i128_lo(cnt) & 127);
+    return tk_iw(x);
+}
+
+i128 tk_i128_shr(i128 a, i128 cnt) {
+    u64 x[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_w_sar(x, tk_i128_lo(cnt) & 127);
+    return tk_iw(x);
+}
+
+i128 tk_i128_and(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_and(x, y);
+    return tk_iw(x);
+}
+
+i128 tk_i128_or(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_or(x, y);
+    return tk_iw(x);
+}
+
+i128 tk_i128_xor(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_xor(x, y);
+    return tk_iw(x);
+}
+
+i128 tk_i128_not(i128 a) {
+    u64 x[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_w_not(x);
     return tk_iw(x);
 }
 
@@ -302,6 +503,64 @@ u128 tk_u128_neg(u128 a) {
     u64 x[TK_DEC_NL];
     tk_uv(a, x);
     tk_w_neg(x);
+    return tk_uw(x);
+}
+
+u128 tk_u128_mod(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_umod(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_shl(u128 a, u128 cnt) {
+    u64 x[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_w_shl(x, tk_u128_lo(cnt) & 127);
+    return tk_uw(x);
+}
+
+// LOGICAL, unlike `i128`'s own: `u128` has no sign to fill from
+u128 tk_u128_shr(u128 a, u128 cnt) {
+    u64 x[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_w_shr(x, tk_u128_lo(cnt) & 127);
+    return tk_uw(x);
+}
+
+u128 tk_u128_and(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_and(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_or(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_or(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_xor(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_xor(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_not(u128 a) {
+    u64 x[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_w_not(x);
     return tk_uw(x);
 }
 

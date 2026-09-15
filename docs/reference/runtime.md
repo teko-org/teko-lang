@@ -395,16 +395,18 @@ four intrinsics, and its machine handlers break 34 of this repository's fixtures
 | | |
 |---|---|
 | `tk_i128_add`, `_sub`, `_mul`, `_div`, `_neg` | `+ - * /` and unary `-`. `+ - * -` wrap modulo 2^128 — C#'s unchecked default. `/` truncates toward zero and takes the sign from the two operands; `/ 0i` panics `teko: division by zero`, exit 70, and (D82) `MinValue / -1i` panics `teko: an integer division overflowed`, exit 70 rather than wrapping — the one quotient the other operations do not share |
+| `tk_i128_mod` | `%`, truncating: `tk_dv_divmod` already leaves the remainder where it computed it (`lib/limbs.tk`), so this is `/`'s own magnitude split with the SIGN OF THE DIVIDEND alone on the way out — unlike `/`'s `sign(a) != sign(b)`. `% 0i` and `MinValue % -1i` panic the same two ways `/` does (D83, D82's ruling 7 amended) |
+| `tk_i128_shl`, `tk_i128_shr` | `<<` and `>>`, `>>` ARITHMETIC (sign-filled). The count is the SAME wide type as the value (`tk_ops_promote`'s wide arm runs first), so the wrapper reads its own low 7 bits — `count & 127`, .NET's own `Int128` shift mask; a negative count falls out under the same mask (D83) |
+| `tk_i128_and`, `_or`, `_xor`, `_not` | `& \| ^ ~`, limb-wise over the four live limbs |
 | `tk_i128_cmp`, `_eq`, `_ne`, `_lt`, `_le`, `_gt`, `_ge` | the six comparisons, SIGNED: the sign bits decide first and the limbs after them |
-| `tk_u128_*` | the same twelve, with `/` and the four orderings UNSIGNED. `+ - *` and unary `-` are the same bits either way and the wrappers differ only in the type they build |
+| `tk_u128_*` | the same eighteen, with `/`, `%` and the four orderings UNSIGNED and `>>` LOGICAL (zero-filled) rather than arithmetic. `+ - *`, unary `-` and `& \| ^ ~` are the same bits either way and the wrappers differ only in the type they build |
 | `tk_i128_from_i64` / `_from_u64` / `tk_u128_from_i64` / `_from_u64` | an integer widened. The SIGNED source sign-extends and the UNSIGNED one does not, which is why there are four and not two: a `u64` at or above 2^63 through a signed door is a negative 128-bit value, in silence (D77's ruling 8, the shape every wide type takes for this question) |
 | `tk_i128_to_i64` / `tk_u128_to_i64` | back to 64 bits, truncating — C#'s own unchecked narrowing. `(u64) x` and `(i32) x` ride these too: the call answers an `i64` and the cast the source wrote narrows it |
 | `tk_i128_from_u128` / `tk_u128_from_i128` | the two directions that move no bit at all |
 | `tk_i128_lo`/`_hi`, `tk_u128_lo`/`_hi`, `tk_i128_of`, `tk_u128_of` | the two halves of the layout § 6 fixes, read off `&v` and written back |
 
-`%`, `<<`, `>>`, `&`, `|`, `^`, `~`, `ToString`, `Parse`, `TryParse`, the members and the
-`decimal`/`f64` conversions are **N6b** and are not here
-([not-yet.md](not-yet.md)).
+`ToString`, `Parse`, `TryParse`, the members and the `decimal`/`f64` conversions are still
+**N6b's own remainder** and are not here ([not-yet.md](not-yet.md)).
 
 ### The decimal library
 

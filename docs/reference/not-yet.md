@@ -260,18 +260,18 @@ for every `TK_WIDE` type at once, and `tests/primitives_decimal_out.tk` is its o
 ## `i128` and `u128`: what N6b still owes
 
 N6a landed the two types, their literal, `+ - * /`, unary `-`, the six comparisons and the
-explicit casts to and from a 64-bit integer and between the two
-(D81, [the type reference](types.md#i128-and-u128)). N6b is the rest of
-[small-ints.md](../specs/small-ints.md) § 6–§ 8, and every row below is refused by name
-until it lands.
+explicit casts to and from a 64-bit integer and between the two (D81, [the type
+reference](types.md#i128-and-u128)). N6b's first crumb (N6b-1, D83) landed `%`, `<<`, `>>`,
+`&`, `|`, `^` and `~` too — `%` truncating with the sign of the DIVIDEND alone, `>>`
+arithmetic for `i128` and logical for `u128`, and a shift count masked to its own low 7
+bits (`count & 127`, .NET's own `Int128`/`UInt128` mask), since the count converts to the
+SAME wide type before the operator row is looked up and never to `i64`. What is still
+N6b's, and every row below is refused by name until it lands:
 
 | written | what happens |
 |---|---|
-| `a % b` | ``teko: no operator `%` takes these operands`` — the remainder is a long division that keeps what it discards, and `lib/limbs.tk`'s `tk_dv_divmod` already answers it; only the row and the wrapper are missing |
-| `a << n`, `a >> n` | ``teko: no operator `<<` takes these operands`` — `>>` is arithmetic for an `i128` and logical for a `u128`, which is one of the three places the two types differ |
-| `a & b`, `a \| b`, `a ^ b`, `~a` | ``teko: no operator `&` takes these operands`` — the same bits either way, so one implementation serves both |
-| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128` |
-| `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
+| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128: ToString` (the member's own name after the colon) |
+| `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128: <name>` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
 | `(f64) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` — the float rows are N6b's |
 | `(decimal) x` | ``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it`` — the refusal names the TARGET when the target is a primitive; `(i128) d` earns `teko: an i128 does not cast yet` for the same missing row |
 | `(str) x` | `teko: an i128 does not cast yet` — text is `.ToString()`/`i128.Parse(s)`, and both are N6b, so the type registers no reader and no builder clause yet |

@@ -21,10 +21,11 @@
 // `iw_*` machine handlers break 34 of this repository's fixtures. teko
 // registers the two types ITSELF, exactly as it registered `decimal`.
 //
-// What stays out is N6b's, and is refused by name until it lands:
+// `% << >> & | ^ ~` landed too (D83, `tk_i128_rows_bits` below).
+// What stays out is the rest of N6b's, and is refused by name until it lands:
 //
-//   x % y, x << 1, x & y, ~x    teko_ops.tk    no operator `%` takes these operands
-//   x.ToString(), i128.Parse    teko_expr.tk   unknown member of i128
+//   x.ToString()                teko_expr.tk   unknown member of i128
+//   i128.Parse, i128.MaxValue   teko_prim.tk   unknown static member of i128: <name>
 //   (decimal) x, (f64) x        teko_prim.tk   an i128 does not cast yet
 //   const i128 K = 1i;          teko_const.tk  const requires a constant expression
 //   case 1i:                    teko_switch.tk a case label must be a constant expression
@@ -38,8 +39,9 @@
 //   +8  bits  64..127   the high half, whose bit 63 is an `i128`'s sign
 //
 // The two types are THE SAME BITS. They differ in `/` and in the four ordering
-// comparisons, and in nothing else this crumb builds -- `lib/wide.tk` writes
-// the core once and gives each type a wrapper.
+// comparisons (D81), in `%` (the remainder's sign) and in `>>` (arithmetic
+// against logical, D83), and in nothing else -- `lib/wide.tk` writes the core
+// once and gives each type a wrapper.
 i64 tk_ty_i128 = 0;
 i64 tk_ty_u128 = 0;
 
@@ -214,10 +216,11 @@ void tk_i128_init() {
     tk_prim_type(tk_ty_i128, "i128", "wide.tk", 0, 0, "0i");
     tk_prim_type(tk_ty_u128, "u128", "wide.tk", 0, 0, "0u");
     syntax_lit(&tk_w128_lit);
-    // the type word in EXPRESSION and STATEMENT position. N6a registers no
-    // member at all, so `i128.MaxValue` answers `teko: unknown member of i128`
-    // -- which is what a reader needs to hear until N6b registers it -- rather
-    // than a parse error about a stray type name.
+    // the type word in EXPRESSION and STATEMENT position. Neither N6a nor
+    // this crumb registers a MEMBER, so `i128.MaxValue` answers
+    // `teko: unknown static member of i128: MaxValue` (`tk_prim_no_static`,
+    // teko_prim.tk) -- which is what a reader needs to hear until N6b's own
+    // rest registers it -- rather than a parse error about a stray type name.
     syntax_expr("i128", &tk_prim_expr);
     syntax_stmt("i128", &tk_prim_stmt);
     syntax_expr("u128", &tk_prim_expr);
@@ -253,6 +256,23 @@ void tk_i128_rows(i64 t, uptr add, uptr sub, uptr mul, uptr div, uptr neg,
     tk_prim_op(K_GE, 2, t, t, ge, TY_I64, 0);
 }
 
+// N6b's seven rows (D83), a second function because `mc` caps a call at
+// twelve parameters and eighteen names plus `t` does not fit one. `x << 2` is
+// covered the same way `x + 1` is: `tk_ops_promote`'s wide arm widens `2` to
+// the wide type FIRST, so the SHIFT COUNT lands on this table as the same
+// wide type as `x`, never `i64` -- and the wrapper (`lib/wide.tk`) reads that
+// 128-bit count's own low 7 bits, the mask D83 gives every shift.
+void tk_i128_rows_bits(i64 t, uptr mod, uptr shl, uptr shr, uptr band,
+                       uptr bor, uptr bxor, uptr bnot) {
+    tk_prim_op(K_MOD, 2, t, t, mod, t, 0);
+    tk_prim_op(K_SHL, 2, t, t, shl, t, 0);
+    tk_prim_op(K_SHR, 2, t, t, shr, t, 0);
+    tk_prim_op(K_AND, 2, t, t, band, t, 0);
+    tk_prim_op(K_OR,  2, t, t, bor, t, 0);
+    tk_prim_op(K_XOR, 2, t, t, bxor, t, 0);
+    tk_prim_op(K_TILDE, 1, t, 0 - 1, bnot, t, 0);
+}
+
 void tk_i128_ops() {
     tk_i128_rows(tk_ty_i128, "tk_i128_add", "tk_i128_sub", "tk_i128_mul",
                  "tk_i128_div", "tk_i128_neg", "tk_i128_eq", "tk_i128_ne",
@@ -260,6 +280,10 @@ void tk_i128_ops() {
     tk_i128_rows(tk_ty_u128, "tk_u128_add", "tk_u128_sub", "tk_u128_mul",
                  "tk_u128_div", "tk_u128_neg", "tk_u128_eq", "tk_u128_ne",
                  "tk_u128_lt", "tk_u128_le", "tk_u128_gt", "tk_u128_ge");
+    tk_i128_rows_bits(tk_ty_i128, "tk_i128_mod", "tk_i128_shl", "tk_i128_shr",
+                      "tk_i128_and", "tk_i128_or", "tk_i128_xor", "tk_i128_not");
+    tk_i128_rows_bits(tk_ty_u128, "tk_u128_mod", "tk_u128_shl", "tk_u128_shr",
+                      "tk_u128_and", "tk_u128_or", "tk_u128_xor", "tk_u128_not");
 
     // § 8's conversions. The `u64` SOURCE row comes FIRST on each target, for
     // D77's ruling 8: a column naming `TY_I64` takes every integer teko has

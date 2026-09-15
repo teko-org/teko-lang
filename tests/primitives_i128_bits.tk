@@ -1,0 +1,89 @@
+// primitives_i128_bits.tk -- N6b of docs/specs/small-ints.md (§ 6; D83):
+// `%`, `<<`, `>>`, `&`, `|`, `^`, `~` on both `i128` and `u128`, at values
+// where a 64-bit implementation would answer differently.
+//
+//   MinValue >> 1i          arithmetic for `i128`: stays negative, sign-fill
+//   the SAME bits as u128   logical for `u128`: the top bit clears instead
+//   1i << 63i, 1i << 65i    crosses the 64-bit limb boundary either way
+//   1i << 129i              masked to `129 & 127 == 1`: `1i << 1i == 2i`
+//   a NEGATIVE shift count  masked the same way -- `-1i`'s low bits are all
+//                           set, so `& 127` answers 127
+//   -7i % 2i, 7i % -2i      the sign of the REMAINDER follows the DIVIDEND
+//                           alone, never `sign(a) != sign(b)` as `/` does
+//   ~0i, ~0u                every bit flipped: `-1i` and `u128.MaxValue`'s
+//                           own bits (`0u - 1u`, since N6b has no `MaxValue`
+//                           static yet)
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "wide.tk"
+
+i128 i128_min() { return (0i - 170141183460469231731687303715884105727i) - 1i; }
+i128 i128_max() { return 170141183460469231731687303715884105727i; }
+u128 u128_max() { return 340282366920938463463374607431768211455u; }
+
+i64 main() {
+    // ---- % : truncating, the sign of the DIVIDEND only
+    if (7i % 2i != 1i) return 1;
+    if ((0i - 7i) % 2i != 0i - 1i) return 2;
+    if (7i % (0i - 2i) != 1i) return 3;
+    if ((0i - 7i) % (0i - 2i) != 0i - 1i) return 4;
+    if (36893488147419103230i % 18446744073709551615i != 0i) return 5;   // across 64 bits
+    u128 umx = u128_max();
+    if (umx % 2u != 1u) return 6;
+    if (18446744073709551615u * 2u % 7u != 2u) return 7;
+
+    // ---- << : across the 64-bit limb boundary, both directions
+    if (1i << 63i != 9223372036854775808i) return 8;
+    if (1i << 64i != 18446744073709551616i) return 9;
+    if (1i << 65i != 36893488147419103232i) return 10;
+    i128 top62 = 1i << 62i;
+    if (top62 << 2i != 1i << 64i) return 11;
+    // wraps at 2^128, the same unchecked default every other operator has
+    i128 mx = i128_max();
+    if ((mx << 1i) != (0i - 2i)) return 12;
+
+    // ---- shift count, masked to 7 bits (D83)
+    if (1i << 129i != 2i) return 13;                    // 129 & 127 == 1
+    i128 negcnt = 0i - 1i;                               // all bits set
+    if (1i << negcnt != i128_min()) return 14;           // & 127 == 127
+    u128 uone = 1u;
+    if (uone << 129u != 2u) return 15;
+
+    // ---- >> : arithmetic for i128, logical for u128, the SAME starting bits
+    i128 mn = i128_min();
+    if (mn >> 1i != (0i - 85070591730234615865843651857942052864i)) return 16;
+    if (!(mn >> 1i < 0i)) return 17;                     // stays negative
+    if (0i - 8i >> 1i != 0i - 4i) return 18;
+    if (0i - 1i >> 127i != 0i - 1i) return 19;           // every bit fills with 1
+    u128 samebits = (u128) mn;                           // same bits, u128's own rule
+    u128 ur = samebits >> 1u;
+    if (!(ur > 0u)) return 20;                           // cleared, not sign-filled
+    if (ur != 85070591730234615865843651857942052864u) return 21;
+    if (umx >> 127u != 1u) return 22;
+
+    // ---- & | ^ ~
+    if ((6i & 3i) != 2i) return 23;
+    if ((6i | 1i) != 7i) return 24;
+    if ((6u | 1u) != 7u) return 43;                      // the unsigned OR row of its own
+    if (((uone << 127u) | 1u) != (uone << 127u) + 1u) return 44;
+    if ((6i ^ 3i) != 5i) return 25;
+    if (~0i != 0i - 1i) return 26;
+    if (~(0i - 1i) != 0i) return 27;
+    if (~mx != mn) return 28;
+    if ((~0u) != (0u - 1u)) return 29;                   // u128.MaxValue-equivalent
+    if ((umx & 1u) != 1u) return 30;
+    if ((umx ^ umx) != 0u) return 31;
+
+    // ---- an integer beside a wide value: converted, never a mixed row
+    i128 x = 6i;
+    if ((x % 4) != 2i) return 32;
+    if ((x << 1) != 12i) return 33;
+    if ((x >> 1) != 3i) return 34;
+    if ((x & 3) != 2i) return 35;
+    if ((x | 1) != 7i) return 36;
+    if ((x ^ 3) != 5i) return 37;
+
+    return 42;
+}

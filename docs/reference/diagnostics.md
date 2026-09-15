@@ -875,12 +875,13 @@ Three are **run-time panics** of `lib/time.tk`, all exit 70 and all on stderr wi
 ([the specification](../specs/small-ints.md) § 6, N6a, D81), so every refusal the `decimal`
 section documents that is about the sixteen bytes rather than about `decimal` reaches them
 too — the `extern` one and the global-initializer one by name, the five machine guards as
-guards, the shared `"teko: new "` wording. What is their own is short, and most of what a
-reader will meet is a refusal that already existed: `x % y`, `x << 1` and `x & y` earn
-``teko: no operator `%` takes these operands``, `x.ToString()` earns
-`teko: unknown member of i128`, and `i128 + u128` earns
-``teko: no operator `+` takes these operands`` because the two carry eleven rows EACH and
-not one mixed row — C# refuses the same expression without a cast.
+guards, the shared `"teko: new "` wording. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are landed
+too now (N6b-1, D83): each type carries eighteen rows, eleven of N6a's plus seven of
+N6b-1's (fourteen over the two types), and no MIXED row of any kind — `i128 + u128` still earns
+``teko: no operator `+` takes these operands`` because C# refuses the same expression
+without a cast. What is their own is short, and most of what a reader will meet is a
+refusal that already existed: `x.ToString()` earns `teko: unknown member of i128`, and
+`i128.MaxValue` earns `teko: unknown static member of i128: MaxValue`, its static twin.
 
 - `"teko: an i128 literal is out of range"` — an `i128` literal is the MAGNITUDE only, so
   the ceiling is 2^127−1 and `170141183460469231731687303715884105728i` is one too many. A
@@ -908,15 +909,19 @@ with ["Integer division"](#integer-division) above, whose guards over the eight 
 are a different source — built by `teko_ternary.tk` into the program and calling the
 runtime's `panic` (D82):
 
-- `"teko: division by zero"` — `x / 0i` and `x / 0u`. The divisor is asked about BEFORE the
-  long division runs, because `tk_dv_divmod` over a zero divisor answers every bit set
-  rather than failing, and a wrong quotient is worse than an abort. C# raises
-  `DivideByZeroException` here; teko has no exceptions, so it panics.
-- `"teko: an integer division overflowed"` — `i128.MinValue / -1i`. D81's ruling 3, amended
-  by D82: the two operands are read directly, ahead of the magnitude split every other
-  divide takes (`MinValue` is bit 127 set and nothing else, `-1` is every bit set — the one
-  value whose own negation is a no-op divided by the one divisor whose magnitude is 1).
-  `u128` has no such row: an unsigned divide never overflows its own width.
+- `"teko: division by zero"` — `x / 0i` and `x / 0u`, and (N6b-1, D83) `x % 0i` and
+  `x % 0u`, the same guard: `tk_w_udiv` is asked about the divisor BEFORE the long division
+  runs, because `tk_dv_divmod` over a zero divisor answers every bit set rather than
+  failing, and a wrong quotient is worse than an abort. C# raises `DivideByZeroException`
+  here; teko has no exceptions, so it panics.
+- `"teko: an integer division overflowed"` — `i128.MinValue / -1i`, and (N6b-1, D83)
+  `i128.MinValue % -1i` — the quotient `%` would need is the one value the width cannot
+  hold, so `tk_w_smod` reads `tk_w_sdiv_ovf` unchanged, before either operand's sign is
+  touched. D81's ruling 3, amended by D82: the two operands are read directly, ahead of the
+  magnitude split every other divide takes (`MinValue` is bit 127 set and nothing else,
+  `-1` is every bit set — the one value whose own negation is a no-op divided by the one
+  divisor whose magnitude is 1). `u128` has no such row: an unsigned divide never overflows
+  its own width.
 
 ## Properties
 

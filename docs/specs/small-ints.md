@@ -379,7 +379,10 @@ reaches.
 | `tests/primitives_small_int_convert.tk` | an `i8` and an `i16` convert to `f64` in all nine slots D33 enumerated; a positive value only on the `aarch64` path the `not-yet.md` row names; nothing narrows back | `42` |
 | `tests/primitives_small_int_wrap.tk` | `(i8) 100 + (i8) 100` is `200` in flight and `-56` stored back; `(i16) 32767 + (i16) 1` is `-32768` stored back | `42` |
 | `tests/primitives_i128.tk` | **N6a, landed.** a literal above `2^64` round-trips through a local, a parameter, a return, a class field, a struct field, a global, a fixed `i128[]` element, a heap `i128[]` element and a `ref`/`out` pointee; a recursive `i128` function proves the return buffer; a `decimal` in the same program proves three wide types share one machine | `42` |
-| `tests/primitives_i128_math.tk` | **N6a, landed.** `+ - * /`, unary `-` and the six comparisons against values chosen so a 64-bit implementation gives a different answer; `MaxValue + 1i` wraps to `MinValue` and `-MinValue` is `MinValue`; `u128` division and the four orderings are unsigned where `i128`'s are signed; the promotion `x + 1`/`2 * x` and every cast round trip. `% & \| ^ ~ << >>` are N6b's | `42` |
+| `tests/primitives_i128_math.tk` | **N6a, landed.** `+ - * /`, unary `-` and the six comparisons against values chosen so a 64-bit implementation gives a different answer; `MaxValue + 1i` wraps to `MinValue` and `-MinValue` is `MinValue`; `u128` division and the four orderings are unsigned where `i128`'s are signed; the promotion `x + 1`/`2 * x` and every cast round trip | `42` |
+| `tests/primitives_i128_bits.tk` | **N6b-1, landed (D83).** `% << >> & \| ^ ~` on both types at values a 64-bit implementation answers differently: `>>` arithmetic on a negative `i128` against the same bits `>>` logical on a `u128`; `<<` across the 64-bit limb boundary; a shift count past 127 and a negative one, both masked to 7 bits; `%`'s sign follows the dividend alone | `42` |
+| `tests/primitives_i128_remzero.tk` | **N6b-1, landed (D83).** `7i % zero()`, the divisor behind a call the folder cannot see through | `70` |
+| `tests/primitives_i128_removf.tk` | **N6b-1, landed (D83).** `i128.MinValue % negone()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_text.tk` | **N6b.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
 | `tests/primitives_i128_divzero.tk` | **N6a, landed.** `7i / zero()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_divovf.tk` | **D82.** `i128.MinValue / negone()`, the divisor behind a call the folder cannot see through | `70` |
@@ -444,12 +447,24 @@ nine refusal fixtures at their exact messages and lines, **on all five legs**; `
 OK`; `mc limits` with `intrin` and `passes` unmoved, `types`/`syntax`/`alias` each +2;
 `--dump-ast` byte-identical over all 220 base fixtures.
 
+### ~~N6b-1 — the seven remaining operators (S)~~ landed, D83
+
+`%`, `<<`, `>>`, `&`, `|`, `^`, `~`: a shift/bitwise core over `lib/wide.tk`'s existing
+eight-limb scratch, `%` over `lib/limbs.tk`'s `tk_dv_divmod` (which already leaves the
+remainder where it computed it), and a second `tk_i128_rows_bits` in `teko_i128.tk`
+registering the fourteen new rows -- `mc` caps a call at twelve parameters, so the eleven
+of N6a and the seven of N6b-1 could not share one function. `>>` is arithmetic for `i128`
+and logical for `u128`; the shift count is the SAME wide type as the value (`tk_ops_promote`
+widens it before the row is looked up), so the wrapper masks the count's own low 7 bits.
+Depends on N6a. **Gate as run:** `tests/primitives_i128_bits.tk`, `_remzero.tk` and
+`_removf.tk` at their codes; `FIXPOINT OK`; `mc limits` with `intrin`, `passes`, `syntax`,
+`alias`, `types` and `on_stmt` unmoved; `--dump-ast` byte-identical over every base fixture.
+
 ### N6b — the rest of `i128` and `u128` (M)
 
-`%`, `<<`, `>>`, `&`, `|`, `^`, `~`; `ToString`/`Parse`/`TryParse` and § 7's members and
-statics; the `decimal` and `f64` conversions of § 8. Depends on N6a and, for the `decimal`
-direction, on C5. Every one of them is refused by name today
-([not-yet.md](../reference/not-yet.md)).
+`ToString`/`Parse`/`TryParse` and § 7's members and statics; the `decimal` and `f64`
+conversions of § 8. Depends on N6a and, for the `decimal` direction, on C5. Every one of
+them is refused by name today ([not-yet.md](../reference/not-yet.md)).
 
 ## 13. Risks and law tensions
 

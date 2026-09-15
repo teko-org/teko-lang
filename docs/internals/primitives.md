@@ -220,10 +220,10 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 
 | table | cap | counts |
 |---|---|---|
-| `TK_MAXPRIMT` | 8 | primitive types with a member table |
+| `TK_MAXPRIMT` | 16 | primitive types with a member table |
 | `TK_MAXPRIMM` | 192 | member rows, over every primitive |
-| `TK_MAXPRIMO` | 80 | operator rows, over every primitive |
-| `TK_MAXPRIMX` | 8 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
+| `TK_MAXPRIMO` | 128 | operator rows, over every primitive |
+| `TK_MAXPRIMX` | 16 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 | `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
 | `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
@@ -235,10 +235,15 @@ them to 3, 82 and 28, with 51 parameter positions and no late type of its own. T
 and third caps were 96 and 32 until that crumb and are 160 and 48 now — `TimeOnly` (N4b)
 would have overflowed both, and raising a `#define` costs nothing but the array it sizes.
 The operator cap was raised twice more for the same reason: to 64 by D76, whose nine
-`DateTimeOffset` rows took the true count past 48, and to **80** by D77, whose twelve
-`decimal` rows took it from 50 to 62. `TK_MAXPRIMX` is D77's own table and holds **5** of 8
-— four `decimal` conversions plus the `u64` source's own row. The MEMBER cap was raised once,
-by D79: C5's nineteen `decimal` rows take the total to **160 of 160**, the old cap exactly
+`DateTimeOffset` rows took the true count past 48, and to 80 by D77, whose twelve `decimal`
+rows took it from 50 to 62. Both `TK_MAXPRIMT` and `TK_MAXPRIMX` were raised again by D81 —
+8 to 16 — when `i128`/`u128` (N6a) took the type table's fill to 8 of 16 and the conversion
+table's own to 13 of 16 (`teko_prim.tk`'s own `#define` comments carry the running count,
+which this page had fallen behind); N6a's twenty-two operator rows took `TK_MAXPRIMO`'s own
+fill from 62 to 84, past the 80 cap, which D81 raised to **128**. N6b-1 (D83), the operators
+`%`, `<<`, `>>`, `&`, `|`, `^`, `~` on both wide types, added fourteen more operator rows,
+taking the fill to **98 of 128** — no cap move needed. The MEMBER cap was raised once, by
+D79: C5's nineteen `decimal` rows take the total to **160 of 160**, the old cap exactly
 full, so it is **192** now and 101 of the 128 parameter positions are spent. Measured with a
 counter printed at the end of `teko_init()`, not by counting registration lines.
 `TimeOnly` itself (N4b) brings the totals to **4, 103 and 35**, with **71** parameter
