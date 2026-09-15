@@ -5,7 +5,7 @@ hook modules. This guide covers the workflow for working on the language port.
 
 ## Prerequisites
 
-- **`mc` toolchain**: pinned version in `MC_VERSION` (one line, e.g., `0.17.2`).
+- **`mc` toolchain**: pinned version in `MC_VERSION` (one line, e.g., `0.17.5`).
   Download from [releases](https://github.com/minicompiler/mc/releases); verify the SHA256.
   ```sh
   mc --version          # must match MC_VERSION

@@ -7466,6 +7466,22 @@ tree builds and passes the whole recipe on 0.17.0 and on 0.17.2 with byte-identi
 `--dump-ast` (D72's first amendment); `mc pkg hash .` moves (the manifest's bytes are part of
 it) and nothing else does.
 
+**Third amendment (2026-09-15) — the pin rises to 0.17.5.** mc 0.17.3 and 0.17.4 changed the
+arity of `cmp_cond`, a public symbol `teko_typeof.tk` calls (`cmp_cond(op)` became
+`cmp_cond(op, unsigned)` with contract v6's unsigned compares); the canary refused both
+(`canary/0.17.3.json`, `canary/0.17.4.json`: `wrong number of arguments`), mc kept them
+pre-releases, restored `cmp_cond(op)` in 0.17.5 (mc #95) and made its own `check-freeze`
+record arity from then on. The canary judged 0.17.5 `ok` (run 34961800863, verdict written
+six minutes after the publish) and mc promoted the release on that verdict. The whole local
+recipe is green on 0.17.5 over `8d95c1ff` (102 passed, 130 refused, 0 failed; `FIXPOINT OK`;
+docs ok), and `--dump-ast` is byte-identical between the compiler built by 0.17.2 and by
+0.17.5 on all 232 fixtures. The move is D64's again: `MC_VERSION` to 0.17.5 and the
+current-pin quotes with it (`site.yml`, `CONTRIBUTING.md`, `build.md`, `00-getting-started.md`);
+`[package].mc` stays 0.17.0 (the second amendment); nothing in the modules moves. Contract v6
+compares `u64`/`uptr` unsigned from 0.17.3 on — the pages that recorded the signed compare
+(`small-ints.md`, `lib/limbs.tk`) now say which side of the fix each pin is on, and the 32-bit
+limbs stay, because the minimum still admits 0.17.0.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
