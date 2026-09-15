@@ -1,0 +1,68 @@
+// surface_string_rc.tk -- N7a of docs/specs/string.md (§ 1, § 15): the
+// reclaim serves this class exactly as it serves any other -- a `string` IS
+// a counted teko class (§ 1's own argument for choosing the class over a
+// `type_new` primitive: only a class has a row `tk_is_counted` answers for),
+// so nothing here is new mechanism, and this fixture is the proof of that
+// claim rather than an assertion of it.
+//
+// Three things: `rt_live()` back at its floor once a block's own strings
+// drop; a `string` held in a class FIELD outliving the block that built it,
+// the exact shape `docs/reference/memory.md`'s `Box`/`Cell` fixture already
+// proves for a user class; and `GetHashCode` answering the same digits for
+// two independently built, byte-equal strings.
+
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+class Holder {
+    public string s;
+    public Holder(string v) { s = v; }
+}
+
+i64 main() {
+    i64 floor = rt_live();
+
+    // ---- 1. a block's own strings drop at `}` ----
+    {
+        string a = new string("temp");
+        string b = a + a;
+        string c = string.Concat(a, b);
+        if (c.Length != 12) return 1;
+    }
+    if (rt_live() != floor) return 2;
+
+    // ---- 1b. the same, churned in a loop -- the reproducer's failure mode
+    // at scale, D55's own fixture shape ----
+    i64 i = 0;
+    loop {
+        if (i >= 50) break;
+        string t = new string("churn") + new string("!");
+        if (t.Length != 6) return 3;
+        i = i + 1;
+    }
+    if (rt_live() != floor) return 4;
+
+    // ---- 2. a string kept in a FIELD survives the block that built it ----
+    Holder? h;
+    {
+        string kept = new string("kept");
+        h = new Holder(kept);
+    }
+    if (rt_live() == floor) return 5;             // the holder and its field are still live
+    if (h.Value.s.Length != 4) return 6;
+    if ((h.Value.s == new string("kept")) != 1) return 7;
+
+    h = null;                                     // releases the holder and its field
+    if (rt_live() != floor) return 8;
+
+    // ---- 3. GetHashCode: equal values hash equal ----
+    string x = new string("same value");
+    string y = new string("same value");
+    if (x.GetHashCode() != y.GetHashCode()) return 9;
+    string z = new string("different");
+    if (x.GetHashCode() == z.GetHashCode() && (x == z) == 0) return 10;
+
+    return 42;
+}
