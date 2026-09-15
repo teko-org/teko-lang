@@ -195,7 +195,15 @@ i64 tk_prim_is(i64 ty);
 // ahead of the guard, the initializer consumed exactly once; a bare name is
 // safe to read twice as it stands and is never hoisted.
 //
-// `panic` IS PROGRAM CODE (`lib/rt.tk`), not something every unit carries --
+// `panic` IS PROGRAM CODE (`lib/rt.tk`), not something every unit carries, and
+// the guard checks WHOSE it is, not merely that the name exists: the
+// declaration `decl_find` answers with has to have been read from `lib/rt.tk`
+// itself (`nd_file` of the declaration node, `tk_div_ends`). A program that
+// declares its own `i64 panic(str)` and never includes the runtime is refused
+// here rather than compiled into a guard that calls a no-op and lets the
+// division run (`tests/refuse/divzero_own_panic.tk`); a program that declares
+// one AND includes the runtime is mc's own `function declared twice`, ahead
+// of this pass (measured). --
 // measured: none of the compiler's OWN 84 divisions (`teko_*.tk`,
 // `core_teko.mc`, `user.mc`, the very files `scripts/bootstrap.sh` compiles
 // with itself for the fixed point) has a non-literal divisor, so this guard
@@ -282,6 +290,27 @@ i64 tk_div_has(uptr hay, uptr needle) {
     }
 }
 
+// does `f` END in `suf`? The one question below asks of a file name: is the
+// `panic` this guard is about to call the RUNTIME's own (`lib/rt.tk`), the
+// path `lex_file` normalises every include of it to -- measured: a fixture
+// writing `#include "../lib/rt.tk"`, and `lib/decimal.tk` writing
+// `#include "rt.tk"`, both announce the declaration under `lib/rt.tk`
+// exactly. A suffix, not a substring, so a name only CONTAINING it does not
+// pass, and not an equality, so a program reached from another root
+// (`../teko/lib/rt.tk`) still names the same runtime.
+i64 tk_div_ends(uptr f, uptr suf) {
+    if (f == 0) return 0;
+    i64 n = cstrlen(f);
+    i64 m = cstrlen(suf);
+    if (n < m) return 0;
+    i64 i = 0;
+    loop {
+        if (i >= m) return 1;
+        if (ld8(f + n - m + i) != ld8(suf + i)) return 0;
+        i = i + 1;
+    }
+}
+
 i64 tk_div_project_file(uptr f) {
     if (f == 0) return 0;
     if (tk_div_has(f, "lib/mc/v")) return 0;
@@ -328,7 +357,8 @@ void tk_div_guard(i64 n, uptr dst) {
     i64 tb = tk_ty_of(b);
     tk_line = nd_line(n);
     tk_file = nd_file(n);
-    if (decl_find("panic") < 0)
+    i64 pd = decl_find("panic");
+    if (pd < 0 || !tk_div_ends(nd_file(pd), "lib/rt.tk"))
         err_at(tk_file, tk_line, "teko: an integer division needs #include rt.tk");
     i64 sgn = type_signed(ta);
     uptr an = 0;
