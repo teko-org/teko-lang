@@ -1,5 +1,5 @@
 #!/bin/sh
-# check-docs.sh [MC] -- the docs gate. Five checks, in this order, run from the
+# check-docs.sh [MC] -- the docs gate. Six checks, in this order, run from the
 # repository root as the `docs` job in .github/workflows/ngen.yml does:
 #
 #   1. links        every relative markdown link under docs/ and site/, plus the two root
@@ -26,6 +26,10 @@
 #                    (built with the taught compiler and RUN, exit code compared) or
 #                    `// no-run` (an illustrative fragment, left uncompiled); anything
 #                    else fails the check.
+#   6. manifest     every module `teko.tk` includes, every `lib/*.tk`, and the three
+#                    roots (`core_teko.mc`, `mc_teko.tk`, `teko.tk`) are listed in
+#                    `mc.toml`'s `[package].files` -- the registry's validator checks
+#                    out only what is listed (v0.13.0 was refused for a missing row).
 mc="${1:-mc}"
 
 if command -v "$mc" >/dev/null 2>&1; then
@@ -368,7 +372,7 @@ echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
 # ------------------------------------------------------------------- verdict
 if [ "$fails" -eq 0 ]; then
-    echo "docs ok: $nlinks links, $nfrags fragments, $ndiag diagnostics, $nrefuse refusals, $nblocks samples"
+    echo "docs ok: $nlinks links, $nfrags fragments, $ndiag diagnostics, $nrefuse refusals, $nblocks samples, manifest listed"
     exit 0
 fi
 echo "$fails documentation check(s) failed"
