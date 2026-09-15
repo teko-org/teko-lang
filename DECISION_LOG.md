@@ -7450,6 +7450,19 @@ green on 0.17.2 over `a1cf0b52` (94 passed, 119 refused, 0 failed; `FIXPOINT OK`
 fixture. The move is D64's: `MC_VERSION` and `[package].mc` to 0.17.2, the four current-pin
 quotes with them; nothing in the modules moves.
 
+**Second amendment (2026-09-15) — the minimum is not the pin.** Two releases were refused by
+the registry's validator for the same reason: its sandbox ran the mc one patch behind the
+pin (`teko 0.12.4 needs mc >= 0.16.1 (this is mc 0.16.0)`, job 64; `teko 0.15.0 needs mc >=
+0.17.2 (this is mc 0.17.0)`, job 80). A minimum that follows the pin turns every mc patch into
+a registry outage until the sandbox catches up, for nothing: the hooks build on every 0.17.x,
+because the surface is frozen since 0.17.0. The rule is now: `[package].mc` names the OLDEST
+mc of the frozen surface the hooks build on — `0.17.0` — and `MC_VERSION`, the pin CI tests,
+moves freely above it. The two move together again only when a hook the modules use is born
+in a later mc, which the freeze rules out before 1.0.0. Measured before the change: the same
+tree builds and passes the whole recipe on 0.17.0 and on 0.17.2 with byte-identical
+`--dump-ast` (D72's first amendment); `mc pkg hash .` moves (the manifest's bytes are part of
+it) and nothing else does.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
