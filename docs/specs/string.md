@@ -167,7 +167,8 @@ i64 main() {
     if (c.StartsWith("hi") == false) return 7;
 
     puts(c);                                     // a `string` in a `str` slot
-    if (tk_str_len(c) != 8) return 8;            // the same, into rt.tk
+    str raw_c = c;                               // ...and one hop for rt.tk's own,
+    if (tk_str_len(raw_c) != 8) return 8;        // whose `uptr` is generic (D88)
 
     string d = new string("raw");                // an explicit copy of a `str`
     if (d != "raw") return 9;
@@ -529,17 +530,21 @@ reachable use for while the lexer still raises `invalid hole` first, and diagnos
 N10's own first step.
 
 **Gate** (`mc` 1.0.1, macos/aarch64): `mc build . --config mc.macos.toml` clean;
-`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **126 passed, 141 refused as expected,
-0 failed** (124/141 before this crumb: `surface_string_value.tk` and `_intern.tk` added,
-`string_str_implicit.tk`'s own comment corrected — the refusal itself unmoved, a
-NON-literal `str` still does not fit); `--dump-ast --include=lib --include=tests`
-**byte-identical** on all 124 pre-existing fixtures against the base compiler, N7a's own
-five `string`-including ones among them — none of them writes a LITERAL into a `string`
-slot, so none of their dumps could move by construction; `sh scripts/bootstrap.sh --os
-macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 703 links, 78
-fragments, 412 diagnostics, 141 refusals, 153 samples, manifest listed`; `mc build .
---config mc.macos.toml --limits` verdict `ok`, `passes`(15)/`syntax`(20)/`alias`(25)/
-`types`(18)/`intrin`(8)/`on_stmt`(4) every one exactly where N7a left them. **Owes, left
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **129 passed, 143 refused as
+expected, 0 failed** (125/141 on the base: `surface_string_value.tk`, `_intern.tk`,
+`_capture.tk` and `_op_str.tk` added, plus `refuse/string_user_class.tk` and
+`refuse/string_user_class_wide.tk`; `string_str_implicit.tk`'s own comment corrected — the
+refusal itself unmoved, a NON-literal `str` still does not fit); `--dump-ast --include=lib
+--include=tests` **byte-identical** on all 125 pre-existing fixtures against the base
+compiler, N7a's own five `string`-including ones among them — none of them writes a LITERAL
+into a `string` slot, so none of their dumps could move by construction; `sh
+scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh`
+→ `docs ok: 703 links, 78 fragments, 412 diagnostics, 143 refusals, 154 samples, manifest
+listed`; `mc build . --config mc.macos.toml --limits` (`rm -rf build` first) — the
+`build/teko.mc` leg verdict `ok`, and on the `tests/hello.tk` leg, the one that reads the
+TAUGHT compiler's own registrations, `passes`(15)/`syntax`(20)/`alias`(25)/`types`(18)/
+`intrin`(8)/`on_stmt`(4) every one exactly where the base leaves them (that leg's verdict
+is `grew` on the base too, unmoved). **Owes, left
 out of this crumb's own boundary:** the borrowed-pointer lifetime rule in
 [memory.md](../reference/memory.md) and
 [guide/10-values-and-types.md](../guide/10-values-and-types.md) — neither named by this

@@ -5198,3 +5198,91 @@ construction, proved rather than assumed. `mc pkg hash .`: base
 `teko_string.tk` (new), `teko_typeof.tk`, `teko_rc.tk`, `teko_expr.tk`, `teko_iface.tk`,
 `teko_null.tk`, `teko_ops.tk`, `teko_params.tk` and `mc.toml` are listed files, so the hash
 moves by design.
+
+**Amendment (2026-09-15, PR #749's independent verifier and the six Copilot threads).**
+Three of the mechanisms above were measured WRONG against the base, each with a
+reproducer that compiled and ran right on `433b18d3` and broke on `d1e48882`. All three
+are fixed in the same crumb, and the rulings replace the paragraphs they touch.
+
+1. **The reclaim's plumbing is told apart POSITIVELY, by the slot, never by a list of
+names.** `tk_str_is_rt_plumbing` was a denylist of eight `lib/rt.tk` names, and the set it
+claimed was "closed and named" was not: `tk_cap_own` (`lib/rt.tk:319`, `uptr
+tk_cap_own(uptr p, i64 off, uptr v)`) is what `teko_deleg.tk`'s own capture writer emits
+for EVERY counted by-value capture, and it was not on the list — `string s = new
+string("captured"); D d = (i64 x) use (s) => x + s.Length;` stored `s`'s `data` pointer in
+the closure slot and handed THAT to `rc_inc`: base `42`, head SIGSEGV. The denylist is
+gone. `tk_rc_str_slot(d, i)` (teko_rc.tk, beside its one caller) asks the question the
+other way round — the `string` → `str`/`ptr`/`uptr` conversion is a genuinely
+USER-DECLARED parameter's business and nothing else's — out of four facts, no name among
+them: the declaration was not read from `lib/rt.tk` (`nd_file` of the declaration node
+through `tk_div_ends`, the same provenance oracle `tk_div_rt_panic` reads to tell the
+runtime's `panic` from a program's own, teko_ternary.tk); the parameter NODE exists (an
+argument past the declared list has no shape this conversion knows); its name does not
+begin with `$` (D87's gensym prefix, which the lexer never forms into an identifier, so a
+`$` name is the compiler's by construction); and it is not `this` (`tk_this_name`,
+teko_this.tk — a method's parameter 0, declared `uptr`, which is why `a.Length` on a
+`string a` used to call `string_get_Length` on the `data` field's ADDRESS). The CEILING
+this draws is named rather than hidden: a `string` handed straight to a `lib/rt.tk`
+function no longer borrows — `tk_str_len(s)` is spelled `str p = s; tk_str_len(p);`, or
+through a `str` parameter of the program's own, one hop either way, and
+`docs/reference/not-yet.md` § string carries the row. `puts(s)` is unaffected (the core
+declares it, not `lib/rt.tk`). Fixture: `tests/surface_string_capture.tk` (`42`) — a
+`string` captured by value, an interned literal captured, two captures in one closure, a
+closure returned from a block and called after it closed, `rt_live()` back to its baseline
+once the work returns. By REFERENCE is not a road at all: `use (&s)` on a counted type is
+the pre-existing `` teko: a capture by reference of a counted type is not taught yet: s ``.
+
+2. **An operator's EXACT row is matched before the contextual `string` one.**
+`tk_op_slot_fits` answered for a `"..."` operand before the `pt == t` test below it, which
+swallowed every `str` row: `class Tag { public static i64 operator+(Tag a, str b) {...} }`
+with `t + "abc"` went from `42` on the base to `` teko: no operator `+` takes these
+operands `` on the head — in a program that never names `string` at all, since
+`tk_str_lit_fits` answers 0 with no `lib/string.tk` in the unit. The rule, C#'s own: a
+literal IS a `str` (D33 rule 1), so its exact row is matched in round 0 like any other
+operand, and only a site with no exact row reads it, in round 1, as the `string` its bytes
+become — the LITERAL round the integer literal's own clause already uses for exactly the
+same reason. `tk_op_slot_dist` mirrors it: `pt == t` is 0 and a string literal on a
+`string` row is 1, one hop from its own `str`, so the BASE round's tie-break weighs
+`operator+(Pick, str)` over `operator+(Pick, string)` the same way. Fixture:
+`tests/surface_string_op_str.tk` (`42`) — the `str`-only row, both rows on one class (the
+literal takes `str`, a `string` value takes `string`), and a `string`-only row a literal
+still reaches one round later.
+
+3. **`string` is `lib/string.tk`'s class or it is not `string` at all.**
+`tk_str_class_si()` was `tk_struct_find_exact("string")`, a NAME: a program's own `class
+string { public i64 a; }` with no `#include "string.tk"` collected the literal conversion
+and compiled `string s = "hi";` against a fabricated global (the base refused it, `teko: a
+value of type uptr does not convert to string`), and a `class string` of sixteen `i64`
+fields made `tk_str_intern_build` write nine words past its own `i64 words[8]` buffer —
+the COMPILER segfaulted. The lookup now asks PROVENANCE and LAYOUT: `sr_hfile_at(si)`, the
+file the class's header was read from, has to end in `lib/string.tk` (a suffix, so an
+include from any root still names it, `tk_div_ends` again), and the row has to measure
+`TK_STR_WORDS` × 8 = six words with all four of `nbytes`/`nchars`/`data`/`owned` present.
+A row failing either half is an ordinary user class, on which nothing of this module fires
+and every conversion refuses exactly as on the base. That gate is also the BOUND: `nel` is
+`TK_STR_WORDS` by construction, so the buffer is sized from the measured layout
+(`i64 words[TK_STR_WORDS]`) and no write can pass it. A field added to `lib/string.tk`
+raises the constant; until it does the gate answers "not the library's class" and every
+`string` fixture refuses out loud rather than corrupting memory in silence. Refuse
+fixtures: `tests/refuse/string_user_class.tk` and
+`tests/refuse/string_user_class_wide.tk`, both the base's own message at the literal's
+line.
+
+**Two threads closed as measured false positives.** `string g = "hi";` at FILE scope is
+`global initializer must be constant`, the CORE's own message, on the base and on the head
+alike — the interned literal is itself a global and `&global` is no constant initializer
+(§ 4's own measurement). Nothing in `teko_rc.tk` or `teko_typeof.tk` reaches it; the row is
+recorded in `docs/reference/not-yet.md` § string (a `string` global takes no initializer,
+assign it in `main`).
+
+**Gate after the amendment** (`mc` 1.0.1, macos/aarch64, base `origin/main` `433b18d3`):
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` → **129 passed, 143 refused as expected, 0 failed** (125/141 on the base:
+four fixtures and two refusals added); `sh scripts/bootstrap.sh --os macos --arch aarch64`
+→ `FIXPOINT OK` (127.1s); `sh scripts/check-docs.sh` → `docs ok: 703 links, 78 fragments,
+412 diagnostics, 143 refusals, 154 samples, manifest listed`; `mc build . --config
+mc.macos.toml --limits` after `rm -rf build` — `build/teko.mc` verdict `ok`, and the
+`tests/hello.tk` leg `passes`(15)/`syntax`(20)/`alias`(25)/`types`(18)/`intrin`(8)/
+`on_stmt`(4), every row equal to the base's own measurement of the same leg;
+`--dump-ast --include=lib --include=tests`, base vs head, over all **125** pre-existing
+`tests/*.tk` fixtures — byte-identical, all 125.
