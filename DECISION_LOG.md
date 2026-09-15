@@ -8165,3 +8165,139 @@ Verdict `ok` on both legs; **no new `grew` row**. This project's own tables are 
 here from 64), `TK_MAXPRIMX` **4/8** (new), `TK_MAXPRIMM` **141/160** (unmoved by this crumb,
 which registers no member row at all; D76 recorded 142 for the same table, one more than a
 call count of `tk_prim_member*` outside `teko_prim.tk` finds today).
+
+### D78 · `f32` widens to `f64` implicitly, `f64` never narrows without a cast — the raw bit move is gone (2026-09-15)
+
+> `docs/reference/not-yet.md`, since D33, carried one row this crumb closes:
+> `f64 d = s;` with an `f32` `s` was neither converted nor refused. It compiled, and it was
+> SILENT-WRONG: the core moves the four bytes of the `f32` into the low half of the eight-byte
+> slot and leaves the top half whatever the frame held, so `f32 b = 2.5f; f64 e = b;` did not
+> read `2.5`. `b == 2.5` and `b + 1.0` were worse still — `res_binary` (mc/src/gen_resolve.mc)
+> types a mixed binary from the LEFT operand, so a comparison with `b` on the left ran as an
+> `f32` compare against the raw low half of the `f64` literal's bits, never promoting either
+> side. Three call sites, one door each, close it: `tk_num_widens` (`teko_typeof.tk`), which
+> every widen in the language already answers through; `tk_ops_promote`
+> (`teko_ops.tk`), the mixed-operand rewrite a binary runs before it is typed; and
+> `tk_rc_glb_widen` (`teko_rc.tk`), the literal-rewrite a GLOBAL initializer takes because mc's
+> core refuses a cast there.
+
+**Ruling 1 — `f32` widens to `f64` implicitly (C# §10.2.3), in the same nine slots an
+integer already widens in.** `tk_num_widens` (`teko_typeof.tk`) answers 1 for a pair of
+`TK_FLOAT` types when the source is the narrower one (`type_width(ety) < type_width(tty)`);
+`tk_num_widen`, the one function every one of D33's nine slots already calls through, falls
+into its existing `tk_cast(tty, e)` line unchanged — an ordinary `N_CAST` the machine's own
+`fa_cast`/`fx_cast` (`<float>`, `lib/machine_arm64_float.mc`/`lib/machine_x86_64_float.mc`)
+already lowers both ways, ordinary code this crumb writes none of.
+
+**Ruling 2 — `f64` narrows to `f32` in NO slot without a cast (C# CS0664: `float f = 2.5;`
+is an error, "use an F suffix").** One clause beside the existing float-into-non-float
+rejection in `tk_check_scalar_compat` (`teko_typeof.tk`): both operands `TK_FLOAT` and the
+TARGET the narrower one refuses with the wording every mismatched value already gets, `teko:
+a value of type f64 does not convert to f32`. A float LITERAL without an `f` suffix is an
+ordinary `f64` node (`fl_lit`, `lib/float.mc`) and is refused into an `f32` slot the same way
+a variable is — `2.5f` or `(f32) 2.5` is what says the narrowing is meant.
+
+**Ruling 3 — a global's own initializer is a LITERAL REWRITE, and D33's existing one had a
+trap for a float source.** `tk_rc_glb_widen` reads `nd_val(e)` as a DECIMAL value when the
+source is an integer (`fl_dec2bits`'s own contract), but a float literal's `nd_val` is
+already a BIT PATTERN `fl_lit` wrote — feeding `1.0f`'s `0x3f800000` to `fl_dec2bits` as the
+integer `1065353216` would have rewritten `f64 G = 1.0f;` into garbage. The guard is
+`type_kind(nd_type(e)) == TK_FLOAT`, asked before the integer path, and the rewrite for that
+arm is BIT SURGERY over the two IEEE-754 layouts rather than a re-encode: sign carried
+unchanged, the biased exponent rebiased `127 → 1023`, the 23-bit mantissa left-shifted into
+the 52-bit one, a SUBNORMAL `f32` renormalized first (the same shift-until-the-implicit-bit
+a `clz` would give — every subnormal `f32` fits as a NORMAL `f64`, so this is the one branch
+with no direct rebias), and `inf`/`NaN` and the signed zero each keeping their own exponent
+shape. `tk_f32_bits_to_f64` (`teko_rc.tk`) is nineteen lines of `u64` shifts and masks, no
+call into `<float>` at all — the taught compiler's OWN sources build with the stock core
+(`core_teko.mc`'s four `#include <mc/core_*>`, no `<float>`), so nothing in this file may use
+an actual `f64` local; every existing bit-pattern rewrite in this same function is the same
+constraint, unstated until now.
+
+**The bit table this crumb's own fixture reads back through `&x`/`ld8`
+(`tests/primitives_f32.tk`), least-significant byte first:**
+
+| value | width | bytes |
+|---|---|---|
+| `2.5f` | `f32` | `00 00 20 40` |
+| `2.5` widened from the `f32` above | `f64` | `00 00 00 00 00 00 04 40` |
+| `1.0f` widened at a global initializer (`f64 G = 1.0f;`) | `f64` | `00 00 00 00 00 00 f0 3f` |
+| `1` into an `f32` slot (D33's own rule, unmoved) | `f32` | `00 00 80 3f` |
+| `(f32) 2.5`, the explicit road, unmoved | `f32` | `00 00 20 40` |
+
+Before this crumb, the second row was **four of those eight bytes followed by whatever the
+frame held** — not a fixed wrong value, which is why no fixture recorded one: the bug was
+"reads garbage", not "reads a specific wrong number".
+
+**`tests/primitives_decimal_order.tk` carried the double error this crumb's own scouting
+found.** Line 32 read `f32 f = 0.25;` — an `f64` literal narrowed into an `f32` slot, which
+this crumb now refuses — and line 34 compared `f != 0.25`, which the SAME silent-wrong this
+crumb closes made pass: `f` held the low four bytes of `0.25`'s eight (zero, since `0.25`'s
+low word is `0x00000000`), and `f != 0.25` read the left side raw (`res_binary`'s own LEFT
+rule) as an `f32` `0.0`'s bits against nothing narrowed at all on the right — two wrongs
+that happened to agree. The fixture now writes `0.25f`, an `f32` literal the target's own
+width, and passes by the RIGHT arithmetic: `tk_ops_promote`'s new symmetric pair
+(below) inserts an `f64` cast over `f` for the comparison, the one `--dump-ast` line this
+crumb's whole diff allows outside the file's own edited literal (measured against the base
+compiler on `f335f9d0`, below).
+
+**`tk_ops_promote` itself had to stop being asymmetric, or ruling 1 opened the same bug at
+the BINARY sites `tk_num_widens` did not reach before.** Its old shape only ever converted
+`nd_b` to `nd_a`'s type when `nd_a` was the float, which is correct for an int-beside-a-float
+(the int is always the one that moves) but wrong the moment BOTH operands can be a float of
+a different width: `b == 2.5` with `b` an `f32` on the LEFT asked `tk_num_widen(f32, f64,
+nd_b)`, which converts NOTHING (`f64` does not widen to `f32`), leaving the comparison typed
+`f32` against a `f64` literal's raw bits — the exact bug this crumb exists to close, now
+reachable through the fix itself. The rewrite is the same symmetric pair
+`tk_ops_promote_wide` already uses one function up: `tk_num_widens(ta, tb)` then
+`tk_num_widens(tb, ta)`, whichever ONE answers converts the OTHER side, so the narrower float
+moves regardless of which side of the operator it sits on, and the site is typed from the
+survivor — the wider type — however `res_binary` reads the left operand once it is
+resolved.
+
+#### What is built
+
+`teko_typeof.tk` — the float clause in `tk_num_widens` (widens) and one clause in
+`tk_check_scalar_compat` (refuses the other way).
+`teko_ops.tk` — `tk_ops_promote`'s float arm rewritten as the same symmetric pair
+`tk_ops_promote_wide` already carries, so a mixed `f32`/`f64` binary converts whichever side
+is narrower rather than only ever the right one.
+`teko_rc.tk` — the `TK_FLOAT` guard in `tk_rc_glb_widen` and `tk_f32_bits_to_f64`, the bit
+surgery beside it.
+`tests/primitives_f32.tk` (new, `// expect-exit: 42`) — the bit table above, an argument
+into an `f64` parameter, a value returned `f32` and widened at the caller, a field store, an
+element store, a global assignment, and the explicit cast, unmoved.
+`tests/refuse/f32_from_f64.tk`, `f32_from_f64_arg.tk`, `f32_from_f64_global.tk` (new) —
+an initializer, an argument and a global initializer, each refused with `teko: a value of
+type f64 does not convert to f32` at its own line.
+`tests/primitives_decimal_order.tk` — one literal, `0.25` to `0.25f`, the double error
+above.
+`docs/reference/not-yet.md`, `docs/reference/types.md`, `docs/reference/diagnostics.md` —
+the gap's own row deleted, the implicit/explicit rule written out beside the integer one it
+mirrors, and the file-scope refusal table's new row.
+Nothing else: no new intrinsic, no new node kind, no new type registered, `core_teko.mc`/
+`user.mc`/`mc.toml` untouched.
+
+#### The gate, as run
+
+`mc build . --config mc.macos.toml` clean on mc 0.17.0; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` → **94 passed, 117 refused as expected, 0 failed** (93 + 1 and 114 + 3);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → **FIXPOINT OK**; `sh
+scripts/check-docs.sh` → `docs ok: 672 links, 64 fragments, 406 diagnostics, 117 refusals,
+150 samples, manifest listed`.
+
+`--dump-ast` of every fixture that exists on `f335f9d0` (the base this branch forked from),
+each compiler in its own project directory: **92 of 93 positive fixtures byte-identical, one
+differing** (`primitives_decimal_order.tk`, both allowed changes — the edited literal and
+the one `fcvt` the corrected arithmetic now inserts, both justified above) — **and all 114
+`tests/refuse/` fixtures' stderr byte-identical**, so no refusal moved a word or a line that
+this crumb did not mean to touch.
+
+`mc build . --config mc.macos.toml --compiler-only --limits`, stock mc 0.17.0, base
+`f335f9d0` → this crumb: `intrin` **8 → 8 (unmoved)**, `types` **16 → 16 (unmoved)**,
+`syntax` **17 → 17 (unmoved — this crumb adds no name to the language)**, `alias` **23 →
+23 (unmoved)**, `passes` **15 → 15 (unmoved)**. Verdict `ok` on both legs; no new `grew`
+row. The compiler build itself grows where code was added and nowhere else: `nodes` 170191
+→ 170359, `funcs` 3378 → 3379, `ins` 234647 → 234873, `symbols` 6657 → 6658; `globals`
+983 → 983 and `defines` 1287 → 1287 are unmoved (`tk_f32_bits_to_f64` is a function, not a
+new global).

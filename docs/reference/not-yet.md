@@ -32,12 +32,12 @@ of its own ([memory.md](memory.md)).
 
 ## Numeric conversions
 
-An integer converts to a float in every slot that has one, and nothing narrows back
-([types.md](types.md#f32-and-f64)). What is still missing around it:
+An integer converts to a float in every slot that has one, `f32` converts to `f64` the
+same way, and nothing narrows back — an `f64` into an `f32` slot is refused rather than run
+raw (D78, [types.md](types.md#f32-and-f64)). What is still missing around it:
 
 | written | what happens |
 |---|---|
-| `f64 d = s;` with an `f32` `s` | neither converted nor refused: the four bytes are read as eight, so the value is wrong. The two float widths convert to each other in neither direction |
 | `7 % 2.5` | the remainder is not promoted — the integer operand stays one, and the float's bit pattern is read as an integer. `2.5 % 7` is `mc: no float remainder`, the backend having no float remainder instruction at all |
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
 | `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |

@@ -45,25 +45,27 @@ with that line in its stderr (D52).
   this version does not implement.
 - `"teko: a value of type "` — completed by *`X` does not convert to `Y`*: the only implicit
   reference conversions are derived-to-base and class-to-interface, the only implicit
-  numeric one is an integer into a float ([types.md](types.md#f32-and-f64)), and nothing
-  narrows back. A value of float type (`f64`, `f32`) never lands in a slot of another
-  kind, `null` — whose type is `uptr` — never lands in a numeric one, and neither does a
-  NON-null reference: a struct, a class, an interface, a delegate or a `T[]` of heap
-  written where an `i64`/`f64` is declared (D34). All three hold in every slot: an
+  numeric ones are an integer into a float and `f32` into `f64`
+  ([types.md](types.md#f32-and-f64), D78), and nothing narrows back. A value of float type
+  (`f64`, `f32`) never lands in a slot of another kind, an `f64` never lands in an `f32`
+  slot (D78), `null` — whose type is `uptr` — never lands in a numeric one, and neither
+  does a NON-null reference: a struct, a class, an interface, a delegate or a `T[]` of heap
+  written where an `i64`/`f64` is declared (D34). All four hold in every slot: an
   argument (of a free function, a method, a virtual call, an interface call), an
   overload's parameter, an element of a `params` list, an assignment, an initializer, a
   field store, a GLOBAL slot's own initializer and assignment, and a `return`
   ([parameters.md](parameters.md#what-a-literal-converts-to)). `i64 n = 2.5;`,
-  `solo(null)` against a single `i64 solo(i64)` and `i64 n = f;` with `f` a class value
-  are the three shortest forms of it, all written out in
+  `solo(null)`, `i64 n = f;` with `f` a class value, and `f32 c = 2.5;` are the four
+  shortest forms of it, all written out in
   [types.md](types.md#f32-and-f64).
-- **The same six, at file scope** (D53): a global slot is judged exactly as a local is, so
+- **The same rules, at file scope** (D53): a global slot is judged exactly as a local is, so
   each one has a fixture of its own under `tests/refuse/`.
 
   | written at file scope, or into a global from a body | message |
   |---|---|
   | `i64 gn = 1.5;` | `teko: a value of type f64 does not convert to i64` (`global_narrow_init.tk`) |
   | `i64 gn; ... gn = 1.5;` | `teko: a value of type f64 does not convert to i64` (`global_narrow_assign.tk`) |
+  | `f32 c = 2.5;` | `teko: a value of type f64 does not convert to f32` (D78, `f32_from_f64_global.tk`) |
   | `Cell gc; ... gc = null;` | `teko: null needs a slot declared Cell?` (`global_null_nonnullable.tk`) |
   | `i64 gn; ... gn = c;` on a `Cell c` | `teko: a value of type Cell does not convert to i64` (`global_ref_into_numeric.tk`) |
   | `Color gk = 1;` | `teko: a value of type i64 does not convert to Color` (`global_enum_from_int.tk`) |

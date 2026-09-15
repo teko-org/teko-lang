@@ -124,9 +124,8 @@ i64 main() {
 ```
 
 `i8`/`i16` convert to a wider integer or to `f64`/`f32` the same way `i64` already does
-(the section above; what does NOT convert is an `f32` into an `f64` slot or an `f64` into
-an `f32` one — the width gap [not-yet.md](not-yet.md#numeric-conversions) lists, where the
-bytes are reinterpreted and the value is wrong — so keep an `f32` in `f32` slots); nothing converts back without a cast, and a float, `null`, or a
+(the section above; `f32` widens to `f64` the same way, C#'s own direction
+[below](#f32-and-f64)); nothing converts back without a cast, and a float, `null`, or a
 class/struct/interface/delegate/`T[]` value does not convert INTO an `i8`/`i16` slot
 either, with the same wording every other mismatched value already gets.
 
@@ -194,6 +193,26 @@ three point five. The conversion is a cast the compiler writes for you, and it r
 way C#'s `long` to `double` does: an `f64` carries 53 bits of precision, so every integer up
 to 2^53 in magnitude arrives exact and a larger one lands on the nearest representable
 double.
+
+**`f32` converts to `f64` the same way, and `f64` does not convert back either** (D78, C#
+§10.2.3 and CS0664) — the SAME nine slots, and a mixed `f32`/`f64` binary promotes the
+`f32` side whichever it stands on, exactly as an integer does above. `f32 b = 2.5f; f64 e
+= b;` widens the four bytes of `2.5f` into the eight bytes of `2.5`, an ordinary `fcvt`,
+never a raw copy of the narrower value's bits into the wider slot's low half. The other
+direction is the same refusal an integer's narrowing gets: `f32 c = 2.5;` is `teko: a
+value of type f64 does not convert to f32` — write `2.5f` (the literal's own width) or
+`(f32) 2.5` (an explicit, truncating cast) to mean it.
+
+```teko
+// expect-exit: 42
+i64 main() {
+    f32 b = 2.5f;
+    f64 e = b;                                   // widens: an ordinary cast, not raw bits
+    if (e != 2.5) return 1;
+    if (b + 1.0 != 3.5) return 2;                // the narrower side promotes
+    return 42;
+}
+```
 
 ```teko
 // expect-exit: 42
@@ -342,8 +361,10 @@ the same rule and at its own line; a value that has no type even then is refused
 than written raw
 ([diagnostics.md](diagnostics.md#a-field-store-whose-value-only-the-pass-can-type)).
 
-Two floats of different widths do not convert to each other yet: an `f32` in an `f64`
-slot is neither converted nor refused ([not-yet.md](not-yet.md)).
+The two float widths convert one way: `f32` widens to `f64` implicitly, `f64` narrows to
+`f32` only through a cast (D78, [above](#f32-and-f64)) — the same field store this
+paragraph is about takes an `f32` value into an `f64` field, and refuses the width the
+other way round, exactly as an `i64` field does an out-of-range integer.
 
 ### `ptr`, `uptr` and `str`
 
