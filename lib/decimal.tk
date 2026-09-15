@@ -500,6 +500,56 @@ decimal tk_dec_from_f64(f64 x) {
     return tk_dec_pack(va, s, sign);
 }
 
+// ---- N6b-2: the `i128`/`u128` conversions (docs/specs/small-ints.md § 8;
+// D84) ----
+// `decimal.tk` does NOT include `wide.tk` (D81's own ruling: neither wide
+// file includes the other), so each function below reads its `i128`/`u128`
+// argument's sixteen bytes raw -- `ld64(&v)` for the low half, `ld64(&v + 8)`
+// for the high, D81's own layout, sign at bit 127 -- the same technique
+// `tk_dec_lo`/`tk_dec_hi` already use on a `decimal` from the other side.
+//
+// `decimal.MaxValue` is `2^96 - 1`; a 128-bit magnitude at or past `2^96`
+// therefore never fits, whichever of the two wide types it came from, and
+// panics `teko: decimal overflow` -- C#'s own `OverflowException` (D84 ruling
+// 3). The reverse direction (`tk_i128_from_dec`/`tk_u128_from_dec`,
+// `lib/wide.tk`) can never overflow the 127/128 bits it converts INTO, since
+// a decimal's own mantissa is at most 96 bits.
+decimal tk_dec_from_i128(i128 v) {
+    ptr p = &v;
+    u64 lo = ld64(p);
+    u64 hi = ld64(p + 8);
+    i64 sign = (hi >> 63) & 1;
+    if (sign) {                             // magnitude: two's complement, raw
+        u64 nlo = 0 - lo;
+        u64 borrow = 0;
+        if (lo != 0) borrow = 1;
+        hi = (0 - hi) - borrow;
+        lo = nlo;
+    }
+    u64 va[TK_DEC_NL];
+    tk_dv_zero(va);
+    tk_dv_put(va, 0, lo & 0xffffffff);
+    tk_dv_put(va, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(va, 2, hi & 0xffffffff);
+    tk_dv_put(va, 3, (hi >> 32) & 0xffffffff);
+    if (tk_dv_over96(va)) panic("decimal overflow");
+    return tk_dec_build(va, 0, sign);
+}
+
+decimal tk_dec_from_u128(u128 v) {
+    ptr p = &v;
+    u64 lo = ld64(p);
+    u64 hi = ld64(p + 8);
+    u64 va[TK_DEC_NL];
+    tk_dv_zero(va);
+    tk_dv_put(va, 0, lo & 0xffffffff);
+    tk_dv_put(va, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(va, 2, hi & 0xffffffff);
+    tk_dv_put(va, 3, (hi >> 32) & 0xffffffff);
+    if (tk_dv_over96(va)) panic("decimal overflow");
+    return tk_dec_build(va, 0, 0);
+}
+
 // ============================================================================
 // C5 -- ROUND AND TEXT (docs/specs/decimal.md § 7, § 8, § 11, § 12; D79)
 // ============================================================================

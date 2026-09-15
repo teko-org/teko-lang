@@ -18,9 +18,10 @@
 // the core below is written once over a vector and each type gets a four-line
 // wrapper.
 //
-// N6b's `%`, `<<`, `>>`, `&`, `|`, `^`, `~` are here too (D83). What is still
-// NOT here is the rest of N6b: `ToString`, `Parse`, `TryParse`, the members
-// and the `decimal`/`f64` conversions (docs/reference/not-yet.md).
+// N6b's `%`, `<<`, `>>`, `&`, `|`, `^`, `~` are here too (D83), and so are its
+// `f64` and `decimal` conversions, both directions, both types (D84). What is
+// still NOT here is `ToString`, `Parse`, `TryParse` and the members
+// (docs/reference/not-yet.md).
 #include "limbs.tk"
 
 // ---- the three declarations a wide type owes the PROGRAM ----
@@ -622,3 +623,259 @@ i64 tk_u128_to_i64(u128 v) { return tk_u128_lo(v); }
 // the two that move no bit at all
 i128 tk_i128_from_u128(u128 v) { return tk_i128_of(tk_u128_lo(v), tk_u128_hi(v)); }
 u128 tk_u128_from_i128(i128 v) { return tk_u128_of(tk_i128_lo(v), tk_i128_hi(v)); }
+
+// ---- N6b-2: the `f64` and `decimal` conversions (docs/specs/small-ints.md
+// § 8; D84) ----
+//
+// `(f64) x` rounds ONCE, to nearest even, over the WHOLE 128-bit magnitude --
+// never per 32-bit limb the way `tk_dec_to_f64` accumulates (three limbs fit
+// a `double`'s 53-bit significand with room to spare; four do not, and a
+// naive `r = r * 2^32 + limb` rounds at every step). `(f64) x` -> `i128`/
+// `u128` truncates toward zero and SATURATES rather than wraps -- .NET's own
+// `Int128`/`UInt128` explicit conversion from `double` does exactly this,
+// and teko has no `checked` word to tell a saturating cast from a wrapping
+// one the way C# tells an unchecked block from a checked one, so this is
+// teko's OWN rule and not the primitive widths' unchecked default (D84).
+//
+// Every routine below reads and writes the two 64-bit halves directly and
+// never compares one as an ORDERING against another `u64` that might have
+// bit 63 set (D81's own header: `mc` compares every integer SIGNED, `u64`
+// included) -- a shift, a mask and an equality against zero are the only
+// operations run on a value that could be that large, exactly `lib/limbs.tk`'s
+// own rule, applied here to a `u64` pair instead of a 32-bit limb.
+
+// number of bits `x` needs, 0 for `x == 0` -- a loop and not a formula,
+// since `x` may have bit 63 set and a formula would need to compare it
+u64 tk_w_bit63() { u64 o = 1; return o << 63; }
+u64 tk_w_bit52() { u64 o = 1; return o << 52; }
+
+i64 tk_w_bitlen64(u64 x) {
+    i64 n = 0;
+    loop {
+        if (x == 0) break;
+        x = x >> 1;
+        n = n + 1;
+    }
+    return n;
+}
+
+i64 tk_w_bitlen128(u64 lo, u64 hi) {
+    if (hi != 0) return 64 + tk_w_bitlen64(hi);
+    return tk_w_bitlen64(lo);
+}
+
+// bit `k` of the pair, 0 <= k <= 127
+i64 tk_w_bit_at(u64 lo, u64 hi, i64 k) {
+    if (k >= 64) return (hi >> (k - 64)) & 1;
+    return (lo >> k) & 1;
+}
+
+// 1 when the pair has a set bit strictly below position `k` (0 for k <= 0)
+i64 tk_w_sticky_below(u64 lo, u64 hi, i64 k) {
+    i64 i = 0;
+    loop {
+        if (i >= k) break;
+        if (tk_w_bit_at(lo, hi, i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 2^n, exact for every `n` this file calls it with (n <= 128): each step
+// doubles, which only ever moves a `double`'s exponent, never its mantissa
+f64 tk_w_two_pow(i64 n) {
+    f64 r = 1.0;
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        r = r * 2.0;
+        i = i + 1;
+    }
+    return r;
+}
+
+// the double closest to the UNSIGNED magnitude `(lo, hi)`, `sign` applied
+// last. `e` is the highest set bit (0 for the value 1, so the value itself is
+// `2^e` at the low end); the top 53 bits from `e` down are the candidate
+// mantissa (its own top bit is the implicit one every normal double has),
+// the next bit down is the round bit, and everything below that is folded
+// into one sticky bit -- round to nearest, ties to even, the one rounding a
+// double's own arithmetic already uses and the only one a "prove it
+// equivalent" ruling can be measured against.
+f64 tk_w_mag_to_f64(u64 lo, u64 hi, i64 sign) {
+    if (lo == 0 && hi == 0) return 0.0;
+    i64 bl = tk_w_bitlen128(lo, hi);
+    i64 e = bl - 1;
+    u64 mant = 0;
+    i64 i = 0;
+    loop {
+        if (i >= 53) break;
+        i64 bitpos = e - i;
+        i64 b = 0;
+        if (bitpos >= 0) b = tk_w_bit_at(lo, hi, bitpos);
+        mant = (mant << 1) | ((u64) b);
+        i = i + 1;
+    }
+    i64 rb = 0;
+    if (e - 53 >= 0) rb = tk_w_bit_at(lo, hi, e - 53);
+    i64 sticky = tk_w_sticky_below(lo, hi, e - 53);
+    if (rb && (sticky || (mant & 1))) {
+        mant = mant + 1;
+        if ((mant >> 53) & 1) {            // the round carried past 53 bits
+            mant = mant >> 1;
+            e = e + 1;
+        }
+    }
+    u64 mbits = mant & 0xfffffffffffff;    // the implicit top bit, dropped
+    u64 exp = (u64) (e + 1023);
+    u64 sbit = (u64) sign;
+    return tk_f64_from_bits((sbit << 63) | (exp << 52) | mbits);
+}
+
+// v = -(hi:lo), two's complement, over the raw pair -- the three lines
+// `tk_w_neg` runs over the eight-limb scratch, cheaper here since a
+// magnitude extraction already has the two halves in hand
+void tk_w_neg2(uptr lo, uptr hi) {
+    u64 l = ld64(lo);
+    u64 h = ld64(hi);
+    u64 nl = 0 - l;
+    u64 borrow = 0;
+    if (l != 0) borrow = 1;
+    st64(lo, nl);
+    st64(hi, (0 - h) - borrow);
+}
+
+f64 tk_i128_to_f64(i128 v) {
+    u64 lo = tk_i128_lo(v);
+    u64 hi = tk_i128_hi(v);
+    i64 sign = (hi >> 63) & 1;
+    if (sign) tk_w_neg2(&lo, &hi);
+    return tk_w_mag_to_f64(lo, hi, sign);
+}
+
+f64 tk_u128_to_f64(u128 v) {
+    return tk_w_mag_to_f64(tk_u128_lo(v), tk_u128_hi(v), 0);
+}
+
+// the magnitude of TRUNC(x) for a finite x >= 1.0 that is known to be below
+// the caller's own bound -- read straight off the IEEE754 bits (D131/D132's
+// own `tk_f64_bits`), since any double with an unbiased exponent at or past
+// 52 is already an integer and one with less has its fraction dropped by the
+// same right shift that reads it. Never a `(u64) x` cast: this file's own
+// header is the reason -- a narrowing int-from-float instruction is the
+// core's, not this crumb's, to trust at the one bit a wrap and a magnitude
+// disagree on.
+void tk_w_trunc_mag(f64 x, uptr lo_out, uptr hi_out) {
+    if (x < 1.0) { st64(lo_out, 0); st64(hi_out, 0); return; }
+    u64 bits = tk_f64_bits(x);
+    i64 texp = (i64) ((bits >> 52) & 0x7ff) - 1023;
+    u64 sig = (bits & 0xfffffffffffff) | tk_w_bit52();
+    u64 lo = 0;
+    u64 hi = 0;
+    if (texp >= 52) {
+        i64 sh = texp - 52;
+        if (sh >= 64) {
+            hi = sig << (sh - 64);
+        } else {
+            lo = sig << sh;
+            if (sh != 0) hi = sig >> (64 - sh);
+        }
+    } else {
+        i64 sh = 52 - texp;
+        lo = sig >> sh;
+    }
+    st64(lo_out, lo);
+    st64(hi_out, hi);
+}
+
+// (f64) -> i128, truncating toward zero, SATURATING (D84 ruling 1): NaN and
+// every magnitude at or past `2^127` collapse to the nearer bound, .NET's
+// own `(Int128) someDouble` rule and not a wrap -- there is no `checked`
+// word here to have chosen the other one with.
+i128 tk_i128_from_f64(f64 x) {
+    if (x != x) return tk_i128_of(0, 0);                   // NaN
+    f64 p127 = tk_w_two_pow(127);
+    if (x >= p127) return tk_i128_of(tk_w_ones(), tk_w_bit63() - 1);      // MaxValue
+    if (x <= 0.0 - p127) return tk_i128_of(0, tk_w_bit63());              // MinValue
+    i64 sign = 0;
+    f64 m = x;
+    if (m < 0.0) { sign = 1; m = 0.0 - m; }
+    u64 lo;
+    u64 hi;
+    tk_w_trunc_mag(m, &lo, &hi);
+    if (sign) tk_w_neg2(&lo, &hi);
+    return tk_i128_of(lo, hi);
+}
+
+// (f64) -> u128: a negative `x` saturates to 0 rather than reading its two's
+// complement, which is .NET's own `(UInt128) someDouble` rule
+u128 tk_u128_from_f64(f64 x) {
+    if (x != x) return tk_u128_of(0, 0);                   // NaN
+    if (x < 0.0) return tk_u128_of(0, 0);
+    f64 p128 = tk_w_two_pow(128);
+    if (x >= p128) return tk_u128_of(tk_w_ones(), tk_w_ones());           // MaxValue
+    u64 lo;
+    u64 hi;
+    tk_w_trunc_mag(x, &lo, &hi);
+    return tk_u128_of(lo, hi);
+}
+
+// ---- `decimal` -> `i128`/`u128`, truncating toward zero (D84 ruling 4) ----
+// Neither can ever overflow the width it converts INTO: `decimal.MaxValue`
+// is `2^96 - 1`, and `i128`/`u128` hold up to `2^127 - 1`/`2^128 - 1`, so the
+// only failure this direction has is `u128` reading a negative `decimal`
+// whose truncated MAGNITUDE is still nonzero (`-0.5m` truncates to 0 and is
+// fine; `-1m` does not) -- C# throws `OverflowException` for every decimal
+// read into an unsigned integer type out of range, and `-1m` is one.
+//
+// `decimal.tk` is NOT included here (D81's own ruling: neither wide file
+// includes the other), so the sixteen bytes are read raw -- `ld64(&d)` for
+// the mantissa's low 64 bits, `ld64(&d + 8)` for the high 32 (the scale and
+// the sign share that word, `docs/specs/decimal.md` § 1's own layout) --
+// exactly the technique `tk_dec_lo`/`tk_dec_hi` use from the other side.
+i128 tk_i128_from_dec(decimal d) {
+    ptr p = &d;
+    u64 lo = ld64(p);
+    u64 hi = ld64(p + 8);
+    i64 scale = (i64) ((hi >> 32) & 0xff);
+    i64 sign = (hi >> 63) & 1;
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, lo & 0xffffffff);
+    tk_dv_put(v, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(v, 2, hi & 0xffffffff);
+    loop {
+        if (scale <= 0) break;
+        tk_dv_divs(v, 10);                  // floor of the nonnegative magnitude: truncation
+        scale = scale - 1;
+    }
+    u64 rlo = tk_dv_at(v, 0) | (tk_dv_at(v, 1) << 32);
+    u64 rhi = tk_dv_at(v, 2);
+    if (sign) tk_w_neg2(&rlo, &rhi);
+    return tk_i128_of(rlo, rhi);
+}
+
+u128 tk_u128_from_dec(decimal d) {
+    ptr p = &d;
+    u64 lo = ld64(p);
+    u64 hi = ld64(p + 8);
+    i64 scale = (i64) ((hi >> 32) & 0xff);
+    i64 sign = (hi >> 63) & 1;
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, lo & 0xffffffff);
+    tk_dv_put(v, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(v, 2, hi & 0xffffffff);
+    loop {
+        if (scale <= 0) break;
+        tk_dv_divs(v, 10);
+        scale = scale - 1;
+    }
+    u64 rlo = tk_dv_at(v, 0) | (tk_dv_at(v, 1) << 32);
+    u64 rhi = tk_dv_at(v, 2);
+    if (sign) {
+        if (rlo != 0 || rhi != 0) panic("decimal overflow");
+        return tk_u128_of(0, 0);
+    }
+    return tk_u128_of(rlo, rhi);
+}
