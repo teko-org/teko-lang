@@ -9230,3 +9230,151 @@ crumb and a lowered call after it, and nothing that used to refuse now silently 
 
 What is left open: the rest of N6b (`ToString`/`Parse`/`TryParse`, the members and statics,
 the `decimal`/`f64` conversions) is the next crumb, unblocked and unchanged by this one.
+
+### D84 · the `f64` and `decimal` conversions of `i128`/`u128`, both directions -- `(f64) x`
+rounds ONCE over the whole magnitude, and a `double` source SATURATES (N6b-2, 2026-09-15)
+
+> Eight new rows of the cast-to-call table (`teko_i128.tk`), `TK_MAXPRIMX` 16 -> 32: `(f64)
+> v`/`(i128) x`/`(u128) x` (`lib/wide.tk`) and `(decimal) v`/`(i128) d`/`(u128) d`
+> (`lib/decimal.tk`'s two, `lib/wide.tk`'s two) -- neither wide file includes the other
+> (D81's own ruling), each reads the other type's sixteen bytes raw. Zero mc changes, zero
+> new intrinsics: `mc limits`' `intrin` row is 8 before and 8 after.
+
+N6b-2 is `docs/specs/small-ints.md` § 8's remaining two rows. It depends on N6a (D81) for
+the eight-limb scratch and on C5 (D79) for `decimal`'s own text/round crumb having landed
+first (the `decimal` side reuses `tk_dv_over96`/`tk_dec_build`, both C4's). It leaves
+`ToString`/`Parse`/`TryParse` and § 7's members and statics as N6b-3, the crumb after this
+one.
+
+#### The rulings this crumb was dispatched with, and what each became
+
+1. **`(i128)/(u128) x` on a `double` truncates toward zero and SATURATES, never wraps.**
+   NaN -> 0; `d >= 2^127` -> `i128.MaxValue`; `d <= -2^127` -> `i128.MinValue`; for `u128`:
+   `d < 0` -> 0, `d >= 2^128` -> `u128.MaxValue`. .NET's own `Int128`/`UInt128` explicit
+   conversion from `double` takes exactly this shape, and it is teko's OWN rule and not the
+   primitive widths' unchecked default -- there is no `checked` word here to have chosen a
+   wrap with, the way there is none to have chosen a saturating cast with either; the market
+   (C#, since C# has the type teko is borrowing the name from) settles the fork.
+   `tk_i128_from_f64`/`tk_u128_from_f64` (`lib/wide.tk`) read the double's own IEEE754 BITS
+   through `tk_f64_bits`/`tk_w_trunc_mag`, never a `(u64) x` cast near 2^64 -- `lib/limbs.tk`'s
+   own header is the reason (`mc` compares every integer SIGNED, `u64` included) and this
+   crumb extends the same caution to a narrowing float-to-int instruction it did not measure
+   as safe at that boundary.
+2. **`(f64) x` rounds ONCE, to nearest even, over the WHOLE 128-bit magnitude.**
+   `tk_dec_to_f64`'s own three-limb accumulation (`r = r * 2^32 + limb`, twice) can already
+   round between limbs -- 96 bits exceed a `double`'s 53-bit significand -- and four limbs
+   would round at every step, which is not one rounding. `tk_w_mag_to_f64`
+   instead finds the highest set bit, keeps the top 53 as the candidate mantissa, folds the
+   next bit and everything below it into a round bit and one sticky bit, and assembles the
+   IEEE754 bits directly (`tk_f64_from_bits`) -- the textbook software float-from-bignum
+   routine, and the one that answers Python's `float(int)` bit for bit: measured against
+   3200-odd random probes across every bit length from 0 to 127, signed and unsigned, both
+   directions, before this crumb's own fixture was cut down to the handful it keeps.
+   `-2^127` is exactly representable (a power of two needs no rounding at all), which is
+   `primitives_i128_convert.tk`'s own assertion for it.
+3. **`(decimal) x` panics `teko: decimal overflow` at or past `2^96`, and is otherwise
+   exact, scale 0.** `decimal.MaxValue` is `2^96 - 1`; `tk_dv_over96` (already `lib/limbs.tk`'s
+   own, C4's) is the one check both new `lib/decimal.tk` functions read after loading the
+   magnitude raw. C#'s own `OverflowException` on the same cast is the family this joins,
+   the same word `decimal`'s own arithmetic already panics with (D77) and not a new one.
+4. **`(i128) d` truncates toward zero and never overflows; `(u128) d` panics on a negative
+   `d` whose TRUNCATED magnitude is still nonzero.** A `decimal`'s own mantissa never holds
+   more than 96 bits, so the signed direction (`tk_i128_from_dec`) has no bound to cross --
+   `decimal.MaxValue < 2^127 - 1` by a wide margin. The unsigned one reads the sign bit and
+   the truncated magnitude separately: `-0.5m` truncates to a magnitude of 0 and answers `0u`
+   (C#'s own answer, and consistent with every other truncating cast in this project), `-1m`
+   truncates to a nonzero magnitude and panics -- C# throws `OverflowException` reading ANY
+   out-of-range decimal into an unsigned integer type, and a negative one always is.
+5. **No implicit conversion in either direction, measured and pinned.** `f64 x = v;` and
+   `decimal d = v;` on an `i128`/`u128` `v` both stay refused,
+   `teko: a value of type i128 does not convert to f64`/`decimal` -- `tk_num_wide_widens`
+   (teko_typeof.tk) still answers 0 for a wide source (D38), which no new cast-table row
+   touches, and `tk_prim_cast_lower` is reached only from an explicit `N_CAST` a plain
+   assignment never builds. `tests/refuse/i128_implicit_f64.tk` and `_implicit_decimal.tk`
+   are the two fixtures this ruling asked for.
+6. **The ceiling.** `1i128 << 100i128` round-trips through `(f64)` and back exactly (a power
+   of two, `primitives_i128_convert.tk`'s own assertion); `2^53 + 1` does not -- the same
+   fixture converts it, gets back `2^53` (round to even) and asserts the two values differ,
+   which is the "the round trip is lossy above `2^53`" row the ruling asked for.
+
+#### What changed, file by file
+
+`teko_prim.tk`: `TK_MAXPRIMX` 16 -> 32 (comment updated in the running style the other two
+caps already carry). `teko_i128.tk`: eight new `tk_prim_cast_op` rows appended after N6a's
+eight (D77's integer-before-float ordering does not actually bind here -- every new column
+names an EXACT primitive, `ty_f64` and `tk_ty_decimal` are as `tk_prim_is` as `i128`/`u128`
+are, so `tk_prim_slot_fits`'s `pt == t` line is the only one that ever matches and
+registration order carries no meaning; it is kept in one shape anyway, for a reader).
+`lib/wide.tk`: `tk_i128_to_f64`/`tk_u128_to_f64`, `tk_i128_from_f64`/`tk_u128_from_f64`,
+`tk_i128_from_dec`/`tk_u128_from_dec`, and the shared helpers underneath them
+(`tk_w_mag_to_f64`, `tk_w_trunc_mag`, `tk_w_bitlen64`/`128`, `tk_w_bit_at`,
+`tk_w_sticky_below`, `tk_w_two_pow`, `tk_w_neg2`, `tk_w_bit63`/`tk_w_bit52`) -- about 220
+lines, none of them a machine handler. `lib/decimal.tk`: `tk_dec_from_i128`/
+`tk_dec_from_u128`, each reading its argument's sixteen bytes raw and reusing `tk_dv_over96`/
+`tk_dec_build` (both C4's, already in file via `limbs.tk`).
+
+**Two refuse fixtures deleted, both compile now:** `tests/refuse/i128_cast_float.tk` and
+`i128_cast_decimal.tk` -- the exact two programs D81's own header named as the doors this
+crumb would open. **Six fixtures added:** `tests/primitives_i128_convert.tk` (42, the run
+fixture every ruling above cites), `tests/primitives_i128_decovf.tk` and
+`_udec_neg.tk` (70 each, the two panics), and three under `tests/refuse/`
+(`i128_cast_str.tk`, the shorter wording D74 wrote, now naming only `(str) x`;
+`i128_implicit_f64.tk`, `i128_implicit_decimal.tk`, ruling 5's own two).
+
+#### An adjacent finding this crumb's own `--dump-ast` pass surfaced, reported and not fixed
+
+**D83's own gate claimed `--dump-ast` "byte-identical" over every pre-existing fixture, and
+that claim does not hold under re-measurement.** `--dump-ast --include=lib --include=tests`
+dumps every `FUNC` a source's own include chain parses, whether or not the program at hand
+calls it -- there is no dead-code trim at the dump. D83 added its fourteen new operators'
+worth of functions to `lib/wide.tk`, which `tests/primitives_i128.tk` (an N6a fixture,
+already landed and already a "base" fixture at D83's own gate) already included; diffing
+`12bc95f9` against `2656b0fe` with the SAME `--dump-ast --include=lib --include=tests`
+invocation this entry's own gate uses shows 636 lines of pure ADDITION (new `FUNC`s
+appended at the point `tk_i128_rows_bits`'s own new symbols were written, zero deletions)
+in that exact file -- not the byte-identical dump D83's own PR body reported. This crumb's
+own gate below measures the same thing honestly: a fixture that does not transitively
+include `wide.tk`/`decimal.tk` is untouched, and one that does shows the identical
+ADDITIVE-ONLY shape (new library `FUNC`s appended, zero deletions, zero reordering) --
+which is the actual, provable claim a crumb that ADDS surface code to an already-included
+library can make, and the one this entry makes instead of repeating D83's overclaim.
+
+#### A second adjacent finding, newly reachable and not this crumb's to fix
+
+**`a & b == c` on three `i128`s parses as `a & (b == c)`, C's own table and not C#'s.**
+`mc`'s core grammar gives `&`/`|`/`^` LOWER precedence than `==` (D3's own "reuse the core
+grammar" ruling), which was already true for every other integer type and became reachable
+for `i128`/`u128` the moment D83 landed `&`. Measured with `--dump-ast`: `a & b == c`
+(unparenthesized) and `a & (b == c)` produce byte-identical trees, and `(a & b) == c` a
+different one; `b == c` answers `i64` 0/1, which `tk_ops_promote` widens to the wide type
+before `&` is looked up, so the expression TYPE CHECKS rather than refuses -- the program
+that meant `(a & b) == c` gets a silently different answer instead of a parse error.
+Recorded as a `docs/reference/not-yet.md` row (this crumb's own deliverable named it); the
+grammar itself is `mc`'s core and D2 forbids working around it here.
+
+**Proof of this crumb** (mc 1.0.0, macos/aarch64, PR #742's head, merged with `origin/main`
+at `2656b0fe`): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **118 passed, 134 refused as expected, 0 failed** (115 + 3 new; 133 - 2 + 3
+= 134, the two N6a refuse fixtures this crumb deletes and the three it adds); `sh scripts/
+bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK`; `sh scripts/check-docs.sh` -> `docs
+ok: 696 links, 74 fragments, 411 diagnostics, 134 refusals, 152 samples, manifest listed`
+(411 diagnostics unmoved: every new refusal this crumb's fixtures measure is an existing
+generic wording, `"...does not convert to..."`/`"decimal overflow"`, not a new literal
+string). `mc limits` (`rm -rf build` first, both legs): on the `tests/hello.tk` leg,
+`intrin` **8**, `passes` **15**, `syntax` **20**, `alias` **25**, `types` **18**, `on_stmt`
+**4**, every one identical to `2656b0fe`'s own (rows compared, not verdicts -- the `hello.tk`
+leg reads `grew` on both, unrelated to this crumb, D72's own tolerance knob). `TK_MAXPRIMX`
+**21**/32 (13/16 before), every other primitive cap unmoved.
+
+`--dump-ast --include=lib --include=tests` (single-file mode, base `2656b0fe` in a fresh
+clone under the scratchpad, this branch its own worktree), over the 246 fixtures that exist
+on both sides (two removed, accounted for separately): **224 of 246 byte-identical**, the
+other **22** -- every fixture that transitively includes `lib/wide.tk` and/or
+`lib/decimal.tk` -- show a PURELY ADDITIVE diff (new library `FUNC`s appended where this
+crumb's own new functions land in the source file, zero deletions, zero lines moved,
+confirmed by grepping every diff for a `<` line and finding none). No pre-existing program's
+own AST changed a single node.
+
+What is left open: N6b-3 (`ToString`/`Parse`/`TryParse`, § 7's members and statics) is the
+next and last crumb of N6b, unblocked and unchanged by this one. The two adjacent findings
+above are reported, not fixed, in keeping with the crumb's own boundary.

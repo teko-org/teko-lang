@@ -404,9 +404,12 @@ four intrinsics, and its machine handlers break 34 of this repository's fixtures
 | `tk_i128_to_i64` / `tk_u128_to_i64` | back to 64 bits, truncating — C#'s own unchecked narrowing. `(u64) x` and `(i32) x` ride these too: the call answers an `i64` and the cast the source wrote narrows it |
 | `tk_i128_from_u128` / `tk_u128_from_i128` | the two directions that move no bit at all |
 | `tk_i128_lo`/`_hi`, `tk_u128_lo`/`_hi`, `tk_i128_of`, `tk_u128_of` | the two halves of the layout § 6 fixes, read off `&v` and written back |
+| `tk_i128_to_f64` / `tk_u128_to_f64` | `(f64) v` — **N6b-2, D84.** Rounds ONCE, to nearest even, over the WHOLE 128-bit magnitude: the top 53 bits from the highest set bit down are the candidate mantissa, the next bit is the round bit, everything below is folded into one sticky bit, and the result is assembled straight into IEEE754 bits (`tk_w_mag_to_f64`) rather than cast from a limb — never per 32-bit limb the way `tk_dec_to_f64` accumulates, which can already round between limbs (96 bits exceed a `double`'s 53) |
+| `tk_i128_from_f64` / `tk_u128_from_f64` | `(i128) x` / `(u128) x` — **N6b-2, D84.** Truncates toward zero and SATURATES: NaN → 0, a magnitude at or past the type's own bound → that bound (.NET's `Int128`/`UInt128` explicit-conversion rule, and teko's own since there is no `checked` word). `tk_w_trunc_mag` reads the double's own IEEE754 bits directly rather than trusting a `(u64) x` cast near 2^64, for the same reason `lib/limbs.tk`'s header gives: `mc` compares every integer SIGNED |
+| `tk_i128_from_dec` / `tk_u128_from_dec` | `(i128) d` / `(u128) d` — **N6b-2, D84.** Truncating toward zero, reading `decimal`'s sixteen bytes RAW (`lib/decimal.tk` is not included from here, D81's own ruling: neither wide file includes the other); never overflows the width it lands in — a `decimal`'s own mantissa is at most 96 bits. `(u128) d` panics `teko: decimal overflow` on a negative `d` whose truncated MAGNITUDE is still nonzero |
 
-`ToString`, `Parse`, `TryParse`, the members and the `decimal`/`f64` conversions are still
-**N6b's own remainder** and are not here ([not-yet.md](not-yet.md)).
+`ToString`, `Parse`, `TryParse` and the members are still **N6b-3's own remainder** and are
+not here ([not-yet.md](not-yet.md)).
 
 ### The decimal library
 
@@ -436,6 +439,7 @@ arrays, so a nested call cannot find another call's scratch.
 | `i64 tk_dec_to_i64(decimal a)` | `(i64) d`, truncating toward zero; panics `teko: decimal overflow` outside `i64` |
 | `f64 tk_dec_to_f64(decimal a)` | `(f64) d`; one rounding, not twenty-eight — the mantissa is divided once by the scale's own power of ten |
 | `decimal tk_dec_from_f64(f64 x)` | `(decimal) x`, the double's own value rounded to fifteen significant digits with the trailing zeros dropped, which is why `(decimal) 0.1` is `0.1m` |
+| `decimal tk_dec_from_i128(i128 v)` / `tk_dec_from_u128(u128 v)` | `(decimal) v` — **N6b-2, D84.** Reads `i128`/`u128`'s sixteen bytes RAW (`lib/wide.tk` is not included from here, D81's own ruling); panics `teko: decimal overflow` on a magnitude at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`) |
 
 Everything a result goes through is `tk_dec_pack(uptr r, i64 scale, i64 sign)`: it reduces
 the scale by dividing by ten until the value fits both 28 places and 96 bits, rounding

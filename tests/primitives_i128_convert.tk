@@ -1,0 +1,90 @@
+// primitives_i128_convert.tk -- N6b-2 of docs/specs/small-ints.md (§ 8; D84):
+// the `f64` and `decimal` conversions of `i128`/`u128`, both directions.
+//
+//   (f64) x        rounds ONCE, to nearest even, over the whole 128-bit
+//                  magnitude -- never per 32-bit limb the way `decimal`'s own
+//                  three-limb `tk_dec_to_f64` accumulates, which can already
+//                  round between limbs (96 bits exceed 53) and would round
+//                  at every step for 128
+//   (i128)/(u128) x SATURATING on a `double` source: NaN -> 0, a magnitude at
+//                  or past the type's own bound -> that bound (.NET's
+//                  `Int128`/`UInt128` explicit conversion, and teko's own
+//                  rule -- there is no `checked` word to have chosen a wrap
+//                  with)
+//   (decimal) x    exact when it fits (`decimal.MaxValue` is `2^96 - 1`,
+//                  under `i128`/`u128`'s own ceiling every time it does)
+//   (i128)/(u128) d truncating toward zero, and never an overflow: a
+//                  `decimal`'s 96 bits always fit
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "wide.tk"
+#include "decimal.tk"
+
+i128 i128_max() { return 170141183460469231731687303715884105727i; }
+i128 i128_min() { return (0i - 170141183460469231731687303715884105727i) - 1i; }
+u128 u128_max() { return 340282366920938463463374607431768211455u; }
+
+f64 nan_of() { f64 z = 0.0; return z / z; }
+
+i64 main() {
+    // ---- (i128)/(u128) x -- truncating toward zero
+    if ((i128) 1.5 != 1i) return 1;
+    if ((i128) (0.0 - 1.5) != 0i - 1i) return 2;
+    if ((u128) 3.9 != 3u) return 3;
+
+    // ---- NaN -> 0, both types
+    f64 n = nan_of();
+    if ((i128) n != 0i) return 4;
+    if ((u128) n != 0u) return 5;
+
+    // ---- saturation at both ends, `i128`
+    i128 mx = i128_max();
+    i128 mn = i128_min();
+    if ((i128) 1.0e40 != mx) return 6;
+    if ((i128) (0.0 - 1.0e40) != mn) return 7;
+
+    // ---- saturation, `u128`: a negative source saturates to 0, never wraps
+    if ((u128) (0.0 - 1.0) != 0u) return 8;
+    u128 umx = u128_max();
+    if ((u128) 1.0e40 != umx) return 9;
+
+    // ---- (f64) x round-trips a value at MinValue exactly (2^127, a power
+    // of two, needs no rounding at all) and at MaxValue through a saturating
+    // round trip (2^127 - 1 itself is NOT exactly representable in a
+    // `double`, so the trip through `(i128)` lands back on the SATURATED
+    // bound, which is `mx` again since `(f64) mx` rounds UP to 2^127)
+    f64 fmn = (f64) mn;
+    if ((i128) fmn != mn) return 10;
+    f64 fmx = (f64) mx;
+    if ((i128) fmx != mx) return 11;
+
+    // ---- a value above 2^53 whose `f64` round trip CHANGES it -- the double
+    // cannot hold 54 significant bits, and round-to-even lands on the even
+    // neighbour
+    i128 above = 9007199254740993i;             // 2^53 + 1
+    f64 fabove = (f64) above;
+    if ((i128) fabove == above) return 12;       // must be LOSSY
+    if ((i128) fabove != 9007199254740992i) return 13;   // rounds to 2^53
+
+    // ---- an exact power of two round-trips exactly, at a magnitude past
+    // 2^53 where a naive per-limb accumulation would already have rounded
+    i128 p100 = 1i << 100i;
+    f64 fp100 = (f64) p100;
+    if ((i128) fp100 != p100) return 14;
+
+    // ---- `decimal`, both directions
+    if ((decimal) 5i != 5m) return 15;
+    if ((i128) 5m != 5i) return 16;
+    if ((decimal) (0i - 7i) != 0m - 7m) return 17;
+    if ((i128) (0m - 7.9m) != 0i - 7i) return 18;    // truncating toward zero
+    if ((u128) 3m != 3u) return 19;
+    // a `u128` within `decimal`'s own range (`decimal.MaxValue` is
+    // `2^96 - 1`; `u128_max()` is `2^128 - 1` and does not fit -- that
+    // failure is `primitives_i128_decovf.tk`'s own)
+    u128 within = 79228162514264337593543950335u;   // decimal.MaxValue itself
+    if ((decimal) within != 79228162514264337593543950335m) return 20;
+
+    return 42;
+}

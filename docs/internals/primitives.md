@@ -223,7 +223,7 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 | `TK_MAXPRIMT` | 16 | primitive types with a member table |
 | `TK_MAXPRIMM` | 192 | member rows, over every primitive |
 | `TK_MAXPRIMO` | 128 | operator rows, over every primitive |
-| `TK_MAXPRIMX` | 16 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
+| `TK_MAXPRIMX` | 32 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 | `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
 | `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
@@ -242,7 +242,11 @@ table's own to 13 of 16 (`teko_prim.tk`'s own `#define` comments carry the runni
 which this page had fallen behind); N6a's twenty-two operator rows took `TK_MAXPRIMO`'s own
 fill from 62 to 84, past the 80 cap, which D81 raised to **128**. N6b-1 (D83), the operators
 `%`, `<<`, `>>`, `&`, `|`, `^`, `~` on both wide types, added fourteen more operator rows,
-taking the fill to **98 of 128** — no cap move needed. The MEMBER cap was raised once, by
+taking the fill to **98 of 128** — no cap move needed. N6b-2 (D84), the `f64` and `decimal`
+conversions of `i128`/`u128`, both directions, added eight more CONVERSION rows — the
+`TK_MAXPRIMX` fill D81 left at 13 of 16 is **21 of 32** now, `TK_MAXPRIMX` raised again for
+the same reason D81 raised it the first time: eight more rows than the sixteen it had room
+for. The MEMBER cap was raised once, by
 D79: C5's nineteen `decimal` rows take the total to **160 of 160**, the old cap exactly
 full, so it is **192** now and 101 of the 128 parameter positions are spent. Measured with a
 counter printed at the end of `teko_init()`, not by counting registration lines.
