@@ -535,6 +535,48 @@ object is released when the last reference to it dies ([memory.md](memory.md)); 
 a class can carry — inheritance, `virtual`, interfaces, traits, properties, operators,
 constructors and destructors — is [classes.md](classes.md).
 
+**`this` as a value (D87b).** Inside an instance method or a constructor, `this` is an
+expression of the enclosing class — C#'s own rule — not the raw pointer it is declared as
+at the C level. It is assignable to a `C` slot, passable as a `C` argument, returnable as
+`C`, the receiver of `.member` (as it always was) and comparable with `==`/`!=` to another
+`C` through whatever `operator==` the class declares (D8: no class carries a built-in one,
+so identity, when that is what the program wants, is written explicitly — a cast to `uptr`
+on each side). A `return this;` (or a fresh local declared straight from it) increments the
+reference exactly as returning any other local of class type does. `this` names nothing
+inside a `static` member, which takes no receiver at all: `teko: \`this\` is not there in a
+static member`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+class C {
+    public i64 v;
+
+    public C(i64 x) { v = x; }
+
+    public C self() { return this; }             // `this` returned as a value
+
+    public static i64 take(C c) { return c.v; }
+
+    public i64 viaTake() { return take(this); }   // `this` passed as an argument
+}
+
+i64 main() {
+    C a = new C(7);
+    if (a.self().v != 7) return 1;
+    return 35 + a.viaTake();
+}
+```
+
+**The allocator's own local.** `new Name(...)` lowers to a generated `Name_new` function
+that allocates the object, installs its vtable and reference count, and calls the
+constructor with the allocated address as its first argument. That address is held in a
+local of the allocator's own — gensym'd (`gensym_new()`, the `$`-prefixed convention every
+compiler-synthesized name in this project uses), never a fixed spelling such as `p`, so a
+constructor parameter written with that same ordinary identifier reads its own argument
+and never the allocator's local.
+
 ---
 
 ## `enum`
