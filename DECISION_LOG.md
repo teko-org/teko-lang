@@ -9034,6 +9034,16 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
     its own that happened to keep sources in a directory literally named `lib/mc/v…` would
     be excluded from the guard along with mc's, and a locked `[deps]` package resolved to
     some third root is not covered either (this repository has no `[deps]` yet).
+    *Amended after N6b-3's dispatch (2026-09-15):* the substring is `/mc/v` now, not
+    `lib/mc/v`. mc resolves its own tree from two roots — beside the compiler
+    (`build/lib/mc/v<ver>/lib/…`) and from the package cache
+    (`$HOME/.mc/libs/mc/v<ver>/lib/…`, `libs` plural) — and the narrower substring matched
+    only the first: with `~/.mc/libs/mc/v1.0.0` populated (any `mc pkg sync` on this
+    machine does that), the bootstrap resolved `<mc/core_min>` through the cache and the
+    guard read `machine_arm64_float.mc:616`'s plain division as the project's own —
+    measured, `teko: an integer division needs #include rt.tk`, on a clean `65d54f40`.
+    CI never sees it (no cache on a runner). The ceiling is the same shape as before, one
+    directory wider: a project of its own under a path containing `/mc/v…`.
     The runtime's own `panic` (ruling 5) is recognised the same way, by the suffix
     `lib/rt.tk` of the file its declaration was read from, over EVERY declaration of the
     name in the unit (`tk_div_rt_panic`, not `decl_find`'s first hit: an unrelated overload
