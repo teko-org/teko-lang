@@ -257,29 +257,20 @@ unchanged at the same exit code.
 `ref decimal` and `out decimal` left this table with N3 (D75): the wide pointee road is open
 for every `TK_WIDE` type at once, and `tests/primitives_decimal_out.tk` is its oracle.
 
-## `i128` and `u128`: what N6b still owes
+## `i128` and `u128`
 
-N6a landed the two types, their literal, `+ - * /`, unary `-`, the six comparisons and the
-explicit casts to and from a 64-bit integer and between the two (D81, [the type
-reference](types.md#i128-and-u128)). N6b's first crumb (N6b-1, D83) landed `%`, `<<`, `>>`,
-`&`, `|`, `^` and `~` too — `%` truncating with the sign of the DIVIDEND alone, `>>`
-arithmetic for `i128` and logical for `u128`, and a shift count masked to its own low 7
-bits (`count & 127`, .NET's own `Int128`/`UInt128` mask), since the count converts to the
-SAME wide type before the operator row is looked up and never to `i64`. N6b's second crumb
-(N6b-2, D84) landed the `f64` and `decimal` conversions, both directions, both types: `(f64)
-x` rounds once, to nearest even, over the whole 128-bit magnitude; `(i128)/(u128) x` on a
-`double` truncates toward zero and SATURATES rather than wraps (NaN → 0, a magnitude past the
-bound → that bound, .NET's own `Int128`/`UInt128` rule); `(decimal) x` panics `teko: decimal
-overflow` at or past `2^96` (above `decimal.MaxValue`, `2^96 - 1`); `(i128)/(u128) d` truncates and can only overflow on the unsigned
-side, reading a negative `decimal`. None of the eight is implicit either way — `tk_num_wide_
-widens` still answers 0 for a wide source (D38). What is still N6b's — its third crumb,
-N6b-3 — and every row below is refused by name until it lands:
+N6a (D81), N6b-1 (D83), N6b-2 (D84) and N6b-3 (D85) together landed the whole of N6b
+([the specification](../specs/small-ints.md) § 6, § 7, § 8, [the type
+reference](types.md#i128-and-u128)): the two types, their literal, `+ - * / % << >> & | ^ ~`,
+unary `-`, the six comparisons, the explicit casts to and from a 64-bit integer, between the
+two types, and to and from `f64`/`decimal`, and the members and statics — `ToString`,
+`Parse`, `TryParse`, `CompareTo`, `Equals`, `MinValue`, `MaxValue`, `Zero`, `One`. N6b owes
+nothing more. Every row below is a RULE, not a gap a future crumb closes.
 
 | written | what happens |
 |---|---|
-| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128: ToString` (the member's own name after the colon) |
-| `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128: <name>` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
-| `(str) x` | `teko: an i128 does not cast yet` — text is `.ToString()`/`i128.Parse(s)`, and both are N6b-3's, so the type registers no reader and no builder clause yet |
+| `(str) x` | ``teko: an i128 does not cast; `.ToString()` writes it and `i128.Parse(s)` reads it`` — text is `.ToString()`/`i128.Parse(s)`, a MEMBER call each, so a cast never opens even though the type registers a reader and a builder clause (D85), `decimal`'s own shape (D79) |
+| `x.TryParse(...)` on an instance | ``teko: i128.TryParse is static; reach it through its type`` — `TryParse` is a static, `decimal`'s own shape (D79) |
 | `new i128()` | `teko: new i128() is not taught; write 0i` — D76's shared guard for every wide type's zero-argument constructor |
 | `const i128 K = 1i;`, `case 1i:`, an array size | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic, exactly as for `decimal` |
 | `i128 g = 1i;` at file scope | `global initializer must be constant`, from the core; `i128 g = 5;` gets past that rule and is refused by name, `teko: a global i128 takes no initializer`. A wide global is a slot and an assignment |

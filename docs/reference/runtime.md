@@ -407,9 +407,16 @@ four intrinsics, and its machine handlers break 34 of this repository's fixtures
 | `tk_i128_to_f64` / `tk_u128_to_f64` | `(f64) v` — **N6b-2, D84.** Rounds ONCE, to nearest even, over the WHOLE 128-bit magnitude: the top 53 bits from the highest set bit down are the candidate mantissa, the next bit is the round bit, everything below is folded into one sticky bit, and the result is assembled straight into IEEE754 bits (`tk_w_mag_to_f64`) rather than cast from a limb — never per 32-bit limb the way `tk_dec_to_f64` accumulates, which can already round between limbs (96 bits exceed a `double`'s 53) |
 | `tk_i128_from_f64` / `tk_u128_from_f64` | `(i128) x` / `(u128) x` — **N6b-2, D84.** Truncates toward zero and SATURATES: NaN → 0, a magnitude at or past the type's own bound → that bound (.NET's `Int128`/`UInt128` explicit-conversion rule, and teko's own since there is no `checked` word). `tk_w_trunc_mag` reads the double's own IEEE754 bits directly rather than trusting a `(u64) x` cast near 2^64, for the same reason `lib/limbs.tk`'s header gives: `mc` compares every integer SIGNED |
 | `tk_i128_from_dec` / `tk_u128_from_dec` | `(i128) d` / `(u128) d` — **N6b-2, D84.** Truncating toward zero, reading `decimal`'s sixteen bytes RAW (`lib/decimal.tk` is not included from here, D81's own ruling: neither wide file includes the other); never overflows the width it lands in — a `decimal`'s own mantissa is at most 96 bits. `(u128) d` panics `teko: decimal overflow` on a negative `d` whose truncated MAGNITUDE is still nonzero |
+| `i64 tk_i128_fmt(ptr buf, i128 v)` / `tk_u128_fmt` | the text into `buf` (48 bytes), NUL-terminated, returning the length — **N6b-3, D85,** `tk_dec_fmt`'s own split (`lib/decimal.tk`), least-significant digit first over the same eight-limb scratch, the receiver's own sign negated into the magnitude first for `i128` (`MinValue`'s magnitude, `2^127`, is exact) |
+| `str tk_i128_tostring(i128 v)` / `tk_u128_tostring` | `.ToString()`, the buffer `rt_alloc`-owned — **N6b-3, D85** |
+| `i64 tk_i128_scan(ptr p, str s)` / `tk_u128_scan` | the grammar, three-valued like `tk_dec_scan`'s own: `1` and the value, `0`/`-1` for text that is not one — **N6b-3, D85.** `[+|-] digits` only, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); `u128`'s own scan accepts a leading `-` only when the magnitude is zero |
+| `i128 tk_i128_parse(str s)` / `u128 tk_u128_parse` | `.Parse(s)`: panics `teko: the string is not an i128`/`"...u128"`, exit 70, one message for both causes the scan can find — **N6b-3, D85** |
+| `i64 tk_i128_tryparse(str s, out i128 o)` / `tk_u128_tryparse` | `.TryParse(s, out v)`: `0`/`1`, `Zero` on failure, never a panic — **N6b-3, D85** |
+| `i128 tk_i128_min()` / `_max()` / `_zero()` / `_one()`, and the `u128` twins | `MinValue`, `MaxValue`, `Zero`, `One` — **N6b-3, D85.** Each a CALL, never a folded constant, exactly `tk_dec_zero`'s own shape |
 
-`ToString`, `Parse`, `TryParse` and the members are still **N6b-3's own remainder** and are
-not here ([not-yet.md](not-yet.md)).
+`CompareTo` and `Equals` are `tk_i128_cmp`/`tk_i128_eq` (above), the same two functions the six
+comparison operators already lower to, reached a second way and needing no function of their
+own (N6b-3, D85).
 
 ### The decimal library
 

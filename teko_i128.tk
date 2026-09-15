@@ -24,12 +24,15 @@
 // `% << >> & | ^ ~` landed too (D83, `tk_i128_rows_bits` below), and so did
 // the `f64` and `decimal` conversions, both directions, both types (D84,
 // `lib/wide.tk`'s `tk_i128_from_f64`/`tk_i128_to_f64`/`tk_i128_from_dec` and
-// `lib/decimal.tk`'s `tk_dec_from_i128`, and their `u128` twins).
-// What stays out is the rest of N6b's, and is refused by name until it lands:
+// `lib/decimal.tk`'s `tk_dec_from_i128`, and their `u128` twins). N6b-3
+// (D85) closes the rest: `ToString`, `Parse`, `TryParse`, `CompareTo`,
+// `Equals`, `MinValue`, `MaxValue`, `Zero`, `One`, below, and the `read`/
+// `build` clauses of `tk_prim_type` (`tk_i128_init`), which flips `(str) x`
+// from "does not cast yet" to the long two-clause wording `decimal`'s own
+// cast refusal already carries. After this crumb N6b owes nothing more.
+// What stays refused, unmoved by this crumb:
 //
-//   x.ToString()                teko_expr.tk   unknown member of i128
-//   i128.Parse, i128.MaxValue   teko_prim.tk   unknown static member of i128: <name>
-//   (str) x                     teko_prim.tk   an i128 does not cast yet
+//   (str) x                     teko_prim.tk   an i128 does not cast; `.ToString()` writes it and `i128.Parse(s)` reads it
 //   const i128 K = 1i;          teko_const.tk  const requires a constant expression
 //   case 1i:                    teko_switch.tk a case label must be a constant expression
 //   i128 g = 5;                 teko_rc.tk     a global i128 takes no initializer
@@ -195,6 +198,126 @@ i64 tk_w128_lit() {
     return id;
 }
 
+// ---- the members and statics (docs/specs/small-ints.md § 7; D85, N6b-3) ----
+// The same mechanism `decimal`'s own `tk_dec_statics`/`tk_dec_members`
+// registers over (`teko_decimal.tk`), reused without a line changed in
+// `teko_prim.tk`: every row names an ordinary function of `lib/wide.tk`.
+//
+// `CompareTo` and `Equals` name `tk_i128_cmp`/`tk_i128_eq`, already in file
+// since N6a -- the two comparisons the eleven-row operator table (below)
+// already lowers `==`/`<`/... to, reached here a second way and needing no
+// second function (D85, ruling 6: `Equals` takes an `i128`, never an
+// `object` -- teko has no boxed root type for a member table to reach one
+// through).
+void tk_i128_statics() {
+    i64 t = tk_ty_i128;
+    tk_prim_member(t, "MinValue", TK_PMSVAL, 0 - 1, "tk_i128_min",  t);
+    tk_prim_member(t, "MaxValue", TK_PMSVAL, 0 - 1, "tk_i128_max",  t);
+    tk_prim_member(t, "Zero",     TK_PMSVAL, 0 - 1, "tk_i128_zero", t);
+    tk_prim_member(t, "One",      TK_PMSVAL, 0 - 1, "tk_i128_one",  t);
+    tk_prim_member(t, "Parse",    TK_PMSFUN, TY_UPTR, "tk_i128_parse", t);
+    // The row below never emits (`out <name>` is no column this table has,
+    // exactly `decimal`'s own note): it is registered so `x.TryParse(...)` on
+    // an INSTANCE answers `` teko: i128.TryParse is static; reach it through
+    // its type `` instead of reading as a member nobody ever heard of.
+    tk_prim_membern(t, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_i128_tryparse", TY_I64);
+}
+
+void tk_i128_members() {
+    i64 t = tk_ty_i128;
+    tk_prim_member(t, "ToString",  TK_PMFUN, 0 - 1, "tk_i128_tostring", TY_UPTR);
+    tk_prim_member(t, "CompareTo", TK_PMFUN, t, "tk_i128_cmp", TY_I64);
+    tk_prim_member(t, "Equals",    TK_PMFUN, t, "tk_i128_eq",  TY_I64);
+}
+
+void tk_u128_statics() {
+    i64 t = tk_ty_u128;
+    tk_prim_member(t, "MinValue", TK_PMSVAL, 0 - 1, "tk_u128_min",  t);
+    tk_prim_member(t, "MaxValue", TK_PMSVAL, 0 - 1, "tk_u128_max",  t);
+    tk_prim_member(t, "Zero",     TK_PMSVAL, 0 - 1, "tk_u128_zero", t);
+    tk_prim_member(t, "One",      TK_PMSVAL, 0 - 1, "tk_u128_one",  t);
+    tk_prim_member(t, "Parse",    TK_PMSFUN, TY_UPTR, "tk_u128_parse", t);
+    tk_prim_membern(t, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_u128_tryparse", TY_I64);
+}
+
+void tk_u128_members() {
+    i64 t = tk_ty_u128;
+    tk_prim_member(t, "ToString",  TK_PMFUN, 0 - 1, "tk_u128_tostring", TY_UPTR);
+    tk_prim_member(t, "CompareTo", TK_PMFUN, t, "tk_u128_cmp", TY_I64);
+    tk_prim_member(t, "Equals",    TK_PMFUN, t, "tk_u128_eq",  TY_I64);
+}
+
+// ---- `i128.TryParse(s, out v)` / `u128.TryParse(s, out v)`, parsed by hand
+// ---- `tk_dec_tryparse_expr`'s own shape (`teko_decimal.tk`), for the same
+// reason: `out v` is read through `tk_ref_addr` (teko_ref.tk) rather than
+// through `parse_expr`'s registered `out` handler, and the argument is
+// TAGGED after the fact so teko_ref.tk's own pass judges what parse time
+// could not.
+i64 tk_i128_tryparse_expr(i64 line, uptr fl) {
+    tk_prim_need_include(tk_ty_i128, "tk_i128_tryparse", line, fl);
+    p_expect(K_LPAR, "expected ( after TryParse");
+    i64 se = parse_expr(0);
+    p_expect(K_COMMA, "expected , after the string");
+    if (type_of_token(p_id()) != tk_ty_out)
+        err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+    p_next();
+    i64 pty = 0 - 1;
+    i64 oe = tk_ref_addr(line, fl, &pty);
+    p_expect(K_RPAR, "expected ) after TryParse");
+    if (pty >= 0 && pty != tk_ty_i128)
+        tk_reject_compat(tk_pointee_name(pty), "i128", line, fl);
+    tk_rfarg_tag(oe, TK_RP_OUT, pty);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call2("tk_i128_tryparse", se, oe);
+}
+
+i64 tk_u128_tryparse_expr(i64 line, uptr fl) {
+    tk_prim_need_include(tk_ty_u128, "tk_u128_tryparse", line, fl);
+    p_expect(K_LPAR, "expected ( after TryParse");
+    i64 se = parse_expr(0);
+    p_expect(K_COMMA, "expected , after the string");
+    if (type_of_token(p_id()) != tk_ty_out)
+        err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+    p_next();
+    i64 pty = 0 - 1;
+    i64 oe = tk_ref_addr(line, fl, &pty);
+    p_expect(K_RPAR, "expected ) after TryParse");
+    if (pty >= 0 && pty != tk_ty_u128)
+        tk_reject_compat(tk_pointee_name(pty), "u128", line, fl);
+    tk_rfarg_tag(oe, TK_RP_OUT, pty);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call2("tk_u128_tryparse", se, oe);
+}
+
+// the type word in EXPRESSION position: this file's own handler rather than
+// teko_prim.tk's `tk_prim_expr`, for the one static each intercepts --
+// `tk_dec_expr`'s own shape (`teko_decimal.tk`). Every other member goes
+// straight to the table, with the member name already read
+// (`tk_prim_static_m`), so nothing is duplicated here.
+i64 tk_i128_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "i128");
+    uptr m = tk_member_name();                    // D68
+    if (str_eq(m, "TryParse")) return tk_i128_tryparse_expr(line, fl);
+    return tk_prim_static_m(tk_ty_i128, m, line, fl);
+}
+
+i64 tk_u128_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "u128");
+    uptr m = tk_member_name();                    // D68
+    if (str_eq(m, "TryParse")) return tk_u128_tryparse_expr(line, fl);
+    return tk_prim_static_m(tk_ty_u128, m, line, fl);
+}
+
 // ---- registration ----
 // Called from `teko_init()` BEFORE `tk_float_init()`, for the literal's sake,
 // beside `tk_dec_init()`; the MACHINE is registered separately and after both
@@ -207,27 +330,34 @@ i64 tk_w128_lit() {
 // and never mentions `i128` still has exactly the buffer it needs -- both live
 // in `lib/wide.tk`, which is one include for the pair.
 //
-// The reader and builder clauses are EMPTY: `.ToString()` and `i128.Parse` are
-// N6b, and a refusal naming a member the type does not have yet would be
-// wrong (D74's own rule). `(str) x` therefore earns the shorter
-// `teko: an i128 does not cast yet` until that crumb lands.
+// The reader and builder clauses are FILLED now (D85, `decimal`'s own filled
+// form, `teko_decimal.tk`): `(str) x` therefore reads the long two-clause
+// wording, `` teko: an i128 does not cast; `.ToString()` writes it and
+// `i128.Parse(s)` reads it `` -- `(str) x` still does not COMPILE (no cast
+// row names `str`, § 9's own two-door rule: a member for the text, a cast for
+// nothing), only the refusal's own wording moves, exactly as `decimal`'s did
+// between C3 and C5.
 void tk_i128_init() {
     tk_ty_i128 = type_new("i128", 16, 16, TK_WIDE);
     tk_ty_u128 = type_new("u128", 16, 16, TK_WIDE);
     tk_wide_add(tk_ty_i128, "tk_i128_ld", "tk_i128_st", "tk_i128_retbuf");
     tk_wide_add(tk_ty_u128, "tk_u128_ld", "tk_u128_st", "tk_u128_retbuf");
-    tk_prim_type(tk_ty_i128, "i128", "wide.tk", 0, 0, "0i");
-    tk_prim_type(tk_ty_u128, "u128", "wide.tk", 0, 0, "0u");
+    tk_prim_type(tk_ty_i128, "i128", "wide.tk",
+                 "`.ToString()` writes it", "`i128.Parse(s)` reads it", "0i");
+    tk_prim_type(tk_ty_u128, "u128", "wide.tk",
+                 "`.ToString()` writes it", "`u128.Parse(s)` reads it", "0u");
     syntax_lit(&tk_w128_lit);
-    // the type word in EXPRESSION and STATEMENT position. Neither N6a nor
-    // this crumb registers a MEMBER, so `i128.MaxValue` answers
-    // `teko: unknown static member of i128: MaxValue` (`tk_prim_no_static`,
-    // teko_prim.tk) -- which is what a reader needs to hear until N6b's own
-    // rest registers it -- rather than a parse error about a stray type name.
-    syntax_expr("i128", &tk_prim_expr);
+    // the type word in EXPRESSION and STATEMENT position -- this file's own
+    // `tk_i128_expr`/`tk_u128_expr` now, for the `TryParse` interception
+    // above; every other static goes through the table.
+    syntax_expr("i128", &tk_i128_expr);
     syntax_stmt("i128", &tk_prim_stmt);
-    syntax_expr("u128", &tk_prim_expr);
+    syntax_expr("u128", &tk_u128_expr);
     syntax_stmt("u128", &tk_prim_stmt);
+    tk_i128_statics();
+    tk_i128_members();
+    tk_u128_statics();
+    tk_u128_members();
 }
 
 // ---- the operators and the conversions (§ 6, § 8) ----

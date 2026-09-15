@@ -19,9 +19,10 @@
 // wrapper.
 //
 // N6b's `%`, `<<`, `>>`, `&`, `|`, `^`, `~` are here too (D83), and so are its
-// `f64` and `decimal` conversions, both directions, both types (D84). What is
-// still NOT here is `ToString`, `Parse`, `TryParse` and the members
-// (docs/reference/not-yet.md).
+// `f64` and `decimal` conversions, both directions, both types (D84), and its
+// text and its members -- `ToString`, `Parse`, `TryParse`, `CompareTo`,
+// `Equals`, `MinValue`, `MaxValue`, `Zero`, `One` (N6b-3, D85). After this
+// crumb N6b owes nothing more.
 #include "limbs.tk"
 
 // ---- the three declarations a wide type owes the PROGRAM ----
@@ -879,3 +880,263 @@ u128 tk_u128_from_dec(decimal d) {
     }
     return tk_u128_of(rlo, rhi);
 }
+
+// ---- N6b-3: the text, and the four statics (docs/specs/small-ints.md § 7;
+// D85) ----
+//
+// `ToString`, `Parse`, `TryParse` are `tk_dec_fmt`/`tk_dec_scan`'s own SHAPE
+// (`lib/decimal.tk`), copied and not shared: a digit loop over `tk_dv_divs`
+// least-significant-first for the text, a digit loop over `tk_dv_muladds` for
+// the read, both over the same eight-limb scratch this file already keeps for
+// the arithmetic. Neither wide file includes the other (D81's own ruling), so
+// the two copies never converge into one function with a branch.
+//
+// The GRAMMAR is narrower than `decimal`'s own and narrower than C#'s
+// `NumberStyles.Integer`: `[+|-] digits`, no surrounding white space, no
+// separator, no exponent, no suffix -- D79's ruling 5 (`decimal.Parse`) is the
+// newest in-repo ruling on a primitive's parse grammar and it wins over what
+// C# would additionally accept, because one repository keeps one rule for the
+// shape "the text `ToString` writes, and nothing else it does not" (D85,
+// ruling 1).
+//
+// The FAILURE is one message, `"the string is not an i128"` /
+// `"...u128"`, for both causes a scan can find -- text that is no number at
+// all, and a number that does not fit -- exactly `decimal`'s own shape one
+// level up: `TryParse` cannot tell the two apart either (it reads both as
+// `false`), so `Parse` does not pretend to (D85, ruling 2). The scan below
+// still ANSWERS three values, the same split `tk_dec_scan` makes, because the
+// split costs nothing extra to keep and a future caller might want it; today
+// nothing reads -1 differently from 0.
+//
+// The longest text is `i128.MinValue`, 40 characters plus the terminator
+// (`-170141183460469231731687303715884105728`); 48 bytes leaves headroom
+// without pretending to a tighter bound `u128.MaxValue`'s 39 digits would
+// already make wrong reasoning to trim further.
+#define TK_W_STRMAX 48
+
+i64 tk_w_isdig(i64 c) { return c >= '0' && c <= '9'; }
+
+// 1 when the vector holds a value at or past 2^128 -- the four headroom limbs
+// `tk_w_mask` already drops, read here BEFORE the drop so a literal past the
+// width is refused rather than silently wrapped.
+i64 tk_w_over128(uptr v) {
+    i64 i = TK_W_NL;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        if (tk_dv_at(v, i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// the magnitude in `v` (already non-negative, `TK_DEC_NL` limbs, mutated by
+// this call) into `buf`, NUL-terminated, `sign` written first when it is set
+// -- `tk_dec_fmt`'s own split (`lib/decimal.tk`), without a scale to place a
+// point at.
+i64 tk_w_fmt_mag(ptr buf, uptr v, i64 sign) {
+    u8 dig[TK_W_STRMAX];
+    i64 nd = 0;
+    loop {
+        u64 r = tk_dv_divs(v, 10);
+        st8(dig + nd, '0' + r);
+        nd = nd + 1;
+        if (tk_dv_is_zero(v)) break;
+    }
+    i64 k = 0;
+    if (sign) { st8(buf + k, '-'); k = k + 1; }
+    i64 i = 0;
+    loop {
+        if (i >= nd) break;
+        st8(buf + k, ld8(dig + nd - 1 - i));
+        k = k + 1;
+        i = i + 1;
+    }
+    st8(buf + k, 0);
+    return k;
+}
+
+// `v` into `buf`, NUL-terminated, returning the length -- the allocation-free
+// half, `tk_dec_fmt`'s own split. `MinValue`'s magnitude is `2^127`, which
+// `tk_w_neg` (over the 256-bit scratch, masked back to 128) answers exactly,
+// the same identity `tests/primitives_i128_math.tk` already asserts for the
+// unary `-` operator.
+i64 tk_i128_fmt(ptr buf, i128 v) {
+    u64 x[TK_DEC_NL];
+    tk_iv(v, x);
+    i64 sign = tk_w_isneg(x);
+    if (sign) tk_w_neg(x);
+    return tk_w_fmt_mag(buf, x, sign);
+}
+
+i64 tk_u128_fmt(ptr buf, u128 v) {
+    u64 x[TK_DEC_NL];
+    tk_uv(v, x);
+    return tk_w_fmt_mag(buf, x, 0);
+}
+
+// `.ToString()`. The buffer is heap-owned and the caller keeps it past this
+// call's own return, `tk_dec_tostring`'s own shape (`lib/decimal.tk`).
+str tk_i128_tostring(i128 v) {
+    uptr buf = rt_alloc(TK_W_STRMAX);
+    tk_i128_fmt(buf, v);
+    return buf;
+}
+
+str tk_u128_tostring(u128 v) {
+    uptr buf = rt_alloc(TK_W_STRMAX);
+    tk_u128_fmt(buf, v);
+    return buf;
+}
+
+// ---- Parse and TryParse ----
+// Three-valued, `tk_dec_scan`'s own split: 0 for text that is no number at
+// all, -1 for one that IS a number and does not fit, 1 for parsed -- read
+// identically by `Parse`/`TryParse` below (D85, ruling 2).
+//
+// `i128`'s own range is `[-2^127, 2^127-1]`, asymmetric around zero the way
+// `u128`'s `[0, 2^128-1]` is not: once the magnitude is known to fit in 128
+// bits (`tk_w_over128` above), a positive one has to leave bit 127 clear, and
+// a negative one may set it only for the single value `-2^127` -- the same
+// bit `tk_w_isneg` already reads elsewhere in this file, checked here on the
+// raw digit vector before any sign is applied.
+i64 tk_i128_scan(ptr p, str s) {
+    i64 i = 0;
+    i64 sign = 0;
+    i64 c = ld8(s);
+    if (c == '+' || c == '-') {
+        if (c == '-') sign = 1;
+        i = 1;
+    }
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    i64 nd = 0;
+    i64 over = 0;
+    loop {
+        c = ld8(s + i);
+        if (!tk_w_isdig(c)) break;
+        if (tk_dv_muladds(v, 10, c - '0')) over = 1;
+        nd = nd + 1;
+        i = i + 1;
+    }
+    if (nd == 0) return 0;                     // "", "+", "-", "x"
+    if (ld8(s + i) != 0) return 0;              // trailing text of any kind
+    if (over || tk_w_over128(v)) return 0 - 1;
+    i64 top = (tk_dv_at(v, 3) >> 31) & 1;
+    if (sign) {
+        if (top && (tk_dv_at(v, 3) != 0x80000000 || tk_dv_at(v, 2) != 0
+                    || tk_dv_at(v, 1) != 0 || tk_dv_at(v, 0) != 0))
+            return 0 - 1;                       // more negative than MinValue
+    } else if (top) {
+        return 0 - 1;                           // MaxValue + 1 or past it
+    }
+    if (sign) tk_w_neg(v);
+    tk_i128_st(p, tk_i128_of(tk_w_lo(v), tk_w_hi(v)));
+    return 1;
+}
+
+// `u128`'s own range check: a leading `-` is a format failure only when the
+// MAGNITUDE is nonzero (D85, ruling 1 -- C#'s own documented `UInt128.Parse`:
+// `"-0"` succeeds and answers 0, `"-1"` overflows). No signed magnitude check
+// is needed once the width fits: every non-negative value below `2^128` is a
+// `u128`.
+i64 tk_u128_scan(ptr p, str s) {
+    i64 i = 0;
+    i64 neg = 0;
+    i64 c = ld8(s);
+    if (c == '+' || c == '-') {
+        if (c == '-') neg = 1;
+        i = 1;
+    }
+    u64 v[TK_DEC_NL];
+    tk_dv_zero(v);
+    i64 nd = 0;
+    i64 over = 0;
+    loop {
+        c = ld8(s + i);
+        if (!tk_w_isdig(c)) break;
+        if (tk_dv_muladds(v, 10, c - '0')) over = 1;
+        nd = nd + 1;
+        i = i + 1;
+    }
+    if (nd == 0) return 0;
+    if (ld8(s + i) != 0) return 0;
+    if (over || tk_w_over128(v)) return 0 - 1;
+    if (neg && !tk_dv_is_zero(v)) return 0 - 1;
+    tk_u128_st(p, tk_u128_of(tk_dv_at(v, 0) | (tk_dv_at(v, 1) << 32),
+                              tk_dv_at(v, 2) | (tk_dv_at(v, 3) << 32)));
+    return 1;
+}
+
+// `i128.Parse(s)` / `u128.Parse(s)`: the value, or a panic (exit 70). One
+// message for both causes the scan can find (D85, ruling 2) -- `decimal`'s
+// own `Parse` tells them apart because ITS two causes have two different
+// remedies (a scale to trim, a magnitude that never fits); a wide integer's
+// two causes have the same one remedy, "write a number in range", so a second
+// sentence would say nothing a reader could act on differently.
+i128 tk_i128_parse(str s) {
+    i128 v;
+    ptr q = &v;
+    st64(q, 0);
+    st64(q + 8, 0);
+    if (tk_i128_scan(q, s) != 1) panic("the string is not an i128");
+    return v;
+}
+
+u128 tk_u128_parse(str s) {
+    u128 v;
+    ptr q = &v;
+    st64(q, 0);
+    st64(q + 8, 0);
+    if (tk_u128_scan(q, s) != 1) panic("the string is not a u128");
+    return v;
+}
+
+// `i128.TryParse(s, out v)` / `u128.TryParse(s, out v)`: 1 and the value, or 0
+// and `Zero` -- the one road into either type that never panics, `o` an
+// `out i128`/`out u128` judged at the call site by teko_ref.tk's own pass
+// (`tk_dec_tryparse`'s own shape, `lib/decimal.tk`).
+i64 tk_i128_tryparse(str s, out i128 o) {
+    i128 v;
+    ptr q = &v;
+    st64(q, 0);
+    st64(q + 8, 0);
+    if (tk_i128_scan(q, s) != 1) {
+        st64(q, 0);
+        st64(q + 8, 0);
+        o = v;
+        return 0;
+    }
+    o = v;
+    return 1;
+}
+
+i64 tk_u128_tryparse(str s, out u128 o) {
+    u128 v;
+    ptr q = &v;
+    st64(q, 0);
+    st64(q + 8, 0);
+    if (tk_u128_scan(q, s) != 1) {
+        st64(q, 0);
+        st64(q + 8, 0);
+        o = v;
+        return 0;
+    }
+    o = v;
+    return 1;
+}
+
+// ---- the four statics ----
+// Each a CALL, never a constant fold: `const i128 K = i128.One;` stays
+// refused exactly as it was before this crumb (`tests/refuse/i128_const.tk`),
+// because these are ordinary function calls and the `const` pass never folds
+// one (D85, ruling 5). `MinValue`/`MaxValue` read the same two limb pairs
+// `tk_i128_from_f64`'s own saturating bounds already use, above.
+i128 tk_i128_min()  { return tk_i128_of(0, tk_w_bit63()); }
+i128 tk_i128_max()  { return tk_i128_of(tk_w_ones(), tk_w_bit63() - 1); }
+i128 tk_i128_zero() { return tk_i128_of(0, 0); }
+i128 tk_i128_one()  { return tk_i128_of(1, 0); }
+
+u128 tk_u128_min()  { return tk_u128_of(0, 0); }
+u128 tk_u128_max()  { return tk_u128_of(tk_w_ones(), tk_w_ones()); }
+u128 tk_u128_zero() { return tk_u128_of(0, 0); }
+u128 tk_u128_one()  { return tk_u128_of(1, 0); }
