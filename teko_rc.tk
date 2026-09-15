@@ -167,6 +167,8 @@ void tk_rc_var(i64 n) {
         i64 ety = tk_ty_of(e);
         tk_check_compat(nd_type(n), ety, e, nd_line(n), nd_file(n));
         e = tk_num_widen(nd_type(n), ety, e);     // `f64 y = 1;` is one point zero
+        e = tk_str_intern(nd_type(n), ety, e);    // `string s = "hi";` interns (N7b)
+        e = tk_str_borrow(nd_type(n), ety, e);    // `str p = s;` reads `.data` (N7b)
         e = tk_nl_wrap(nd_type(n), ety, e);       // `i64? n = 5;` builds the box (Q1b)
         set_nd_a(n, e);
     }
@@ -215,6 +217,8 @@ void tk_rc_assign(i64 n) {
         i64 aty = tk_ty_of(nd_a(n));
         tk_check_compat(tty, aty, nd_a(n), nd_line(n), nd_file(n));
         set_nd_a(n, tk_num_widen(tty, aty, nd_a(n)));        // `y = 5;` on an `f64 y`
+        set_nd_a(n, tk_str_intern(tty, aty, nd_a(n)));       // `s = "hi";` on a `string s` (N7b)
+        set_nd_a(n, tk_str_borrow(tty, aty, nd_a(n)));       // `p = s;` on a `str p` (N7b)
         set_nd_a(n, tk_nl_wrap(tty, aty, nd_a(n)));          // `n = 7;` on an `i64? n`
     }
     if (tty < 0) return;
@@ -247,6 +251,8 @@ void tk_rc_return(i64 n, i64 p0) {
         i64 ety = tk_ty_of(e);
         tk_check_compat(tk_rc_ret, ety, e, nd_line(n), nd_file(n));
         e = tk_num_widen(tk_rc_ret, ety, e);      // `return 7;` from an `f64` function
+        e = tk_str_intern(tk_rc_ret, ety, e);     // `return "hi";` from a `string` one (N7b)
+        e = tk_str_borrow(tk_rc_ret, ety, e);     // `return s;` from a `str` one (N7b)
         e = tk_nl_wrap(tk_rc_ret, ety, e);        // ...and from an `i64?` one (Q1b)
         set_nd_a(n, e);
     }
@@ -399,6 +405,24 @@ void tk_rc_call_args(i64 n) {
     if (tk_deleg_is_thunk(tk_rc_cur_fn)) return;
     i64 d = decl_find(nd_name(n));
     if (d < 0) return;
+    // N7b: this walk runs over EVERY `N_CALL`, the reclaim's own generated
+    // calls included (`rt_store`/`rt_own`/`rc_dec`... -- `tk_rc_store`
+    // above renames an `st64`-shaped call into `rt_store`/`rt_store_own` IN
+    // PLACE, on the very node this function reads right after, and a
+    // generated function such as `tkarr_put_string` -- an array-of-`string`
+    // put, teko_heaparr.tk -- is walked exactly like a program's own body).
+    // Every one of `lib/rt.tk`'s reference-management primitives takes its
+    // argument as a `uptr` GENERICALLY -- the slot, the value, any counted
+    // reference at all, never text -- so a `string` argument reaching one
+    // of them is never the `str`/`ptr`/`uptr` conversion's business:
+    // `rt_own(v)`/`rt_store(dst, v)` on a `string v` matched
+    // `tk_str_borrows` (`uptr` beside `string`) and read `.data` off the
+    // VALUE instead of keeping the object reference, corrupting a field
+    // store and every array of `string` alike (measured directly --
+    // `tests/surface_string_rc.tk` crashed on the field, and
+    // `tests/surface_string_value.tk`'s own `params string[]` row on the
+    // array -- neither without this guard).
+    i64 rt_plumbing = tk_str_is_rt_plumbing(nd_name(n));
     i64 prev = 0;
     i64 a = nd_a(n);
     i64 i = 0;
@@ -436,7 +460,22 @@ void tk_rc_call_args(i64 n) {
             continue;
         }
         tk_check_compat(pt, at, a, nd_line(n), nd_file(n));
-        i64 fixed = tk_nl_wrap(pt, at, tk_num_widen(pt, at, a));
+        // N7b: this walk reads a METHOD call's own RECEIVER as parameter 0,
+        // by index, exactly like any other argument (this function's own
+        // header: "a CALL's own arguments against the callee's declared
+        // parameter types, by INDEX") -- and the receiver's declared type is
+        // `uptr` (`this`, teko_class.tk's `tk_this_name`), the same `uptr`
+        // `str`/`ptr` are. `a.Length` on a `string a` therefore matched
+        // `tk_str_borrows`, and reading `.data` off the receiver instead of
+        // the OBJECT itself corrupted every method call on a `string` --
+        // measured directly (`tests/surface_string_interop.tk` regressed to
+        // exit 1 without this guard). A parameter named `this` is never the
+        // `str`/`ptr`/`uptr` conversion's business.
+        i64 pn = tk_decl_param_node(d, i);
+        i64 widened = tk_num_widen(pt, at, a);
+        if (!rt_plumbing && (pn == 0 || !str_eq(nd_name(pn), "this")))
+            widened = tk_str_borrow(pt, at, tk_str_intern(pt, at, widened));
+        i64 fixed = tk_nl_wrap(pt, at, widened);
         if (fixed != a) {
             set_nd_next(fixed, nxt);
             if (prev == 0) set_nd_a(n, fixed);
