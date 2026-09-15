@@ -1,0 +1,70 @@
+// surface_ctor_param_p.tk -- D87a: `Name_new`'s own allocator local no
+// longer shadows a constructor parameter spelled the same way.
+//
+// `tk_new_fn` (teko_class.tk) used to declare its allocator's local literally
+// `p`: `uptr p = rt_alloc(SIZE); ...; Name_ctor(p, params...); return p;` --
+// the SAME function that builds the argument list the constructor is called
+// with, from the constructor's own (cloned) parameter names. A constructor
+// parameter spelled `p` is an ordinary identifier, not a reserved word the
+// way `this` is (teko_this.tk), so `Cell(i64 p) { v = p; }` read `v = p;`
+// against the allocator's OWN `p` -- the address just allocated, not the
+// caller's argument -- inside `Cell_new`'s own body, where the identifier
+// `Cell_ctor(p, p)` is what got built: the allocator's `p` twice, the
+// argument never reaching the constructor at all. `Cell(42).v` answered
+// whatever bit pattern the allocation happened to leave rather than 42,
+// exit 2 on the base this crumb measured (`5c913517`). The fix gensyms the
+// allocator's local (`gensym_new()`, the same convention
+// `tk_div_lazy_lower`, teko_ternary.tk, already uses): a name no program can
+// ever write, so no parameter spelled any which way collides with it.
+//
+// What each check proves:
+//
+//   1. `Cell`/`Cell2`    -- the reproducer itself: a constructor parameter
+//                           spelled `p` reads its OWN argument, exactly as
+//                           one spelled `x` already did.
+//   2. `Bumper.Bump`     -- the allocator's OWN local was never a METHOD's
+//                           business: a parameter spelled `p` in a METHOD
+//                           (not a constructor) was never on this road --
+//                           `tk_new_fn` builds only the ALLOCATOR, one
+//                           function, and a method is compiled on its own --
+//                           so `Bump(i64 p)` reading its own `p` is measured
+//                           here rather than assumed.
+//   3. `Bumper.p`        -- a FIELD spelled `p` is likewise untouched: the
+//                           constructor writes it through `this.p` (the
+//                           implicit-receiver store, teko_this.tk), a
+//                           different function again from the allocator
+//                           whose local this crumb renamed.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Cell {
+    public i64 v;
+    public Cell(i64 p) { v = p; }
+}
+
+class Cell2 {
+    public i64 v;
+    public Cell2(i64 x) { v = x; }
+}
+
+class Bumper {
+    public i64 p;
+    public Bumper(i64 v) { p = v; }
+    public i64 Bump(i64 p) { return p + 1; }
+}
+
+i64 main() {
+    Cell a = new Cell(42);
+    if (a.v != 42) return 1;
+
+    Cell2 b = new Cell2(42);
+    if (b.v != 42) return 2;
+
+    Bumper m = new Bumper(9);
+    if (m.p != 9) return 3;
+    if (m.Bump(10) != 11) return 4;
+
+    return 42;
+}
