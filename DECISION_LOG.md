@@ -8810,7 +8810,7 @@ surface follows C#, which throws `DivideByZeroException` for the first and, on *
 own ISAs, `OverflowException` for the second (`int.MinValue / -1` throws under the CLR on
 x86 and ARM alike, the runtime itself absorbing the ISA's own difference where teko had not
 yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) already panicked
-`division by zero`; only the five core widths were still the machine's own word.
+`division by zero`; only the eight core widths were still the machine's own word.
 
 1. **`mc` is target-defined here, and says nothing for the channel — so this is taught, not
    reported.** `docs/core-language.md:86-108`, `docs/reference/language.md:273-279` and
