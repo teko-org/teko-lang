@@ -8055,14 +8055,28 @@ row stands and now shows the spelling it is true of. `use (d) () => d`, the orde
 guesses, is a different refusal (`call by name only`) that says nothing about the wide value,
 and the row says that too.
 
-**What this moved in the files listed below.** `lib/decimal.tk` is no longer append-only
-against `85901f5b`: `tk_dec_div`'s body is rewritten, `tk_dv_shl96` is deleted with its last
-caller, and `tk_dec_from_u64` is new. `teko_typeof.tk` gains the include check and one
-forward declaration; `teko_decimal.tk` one conversion row. The gate after the review:
+**What this moved in the files listed below.** `lib/decimal.tk` is still **append-only
+against `85901f5b`** — `tk_dec_div`'s body is rewritten and `tk_dv_shl96` deleted with its
+last caller, but both live inside C4's own new block, which is why the dumps below still show
+zero lines removed. `teko_typeof.tk` gains the include check and one forward declaration;
+`teko_decimal.tk` one conversion row; `tests/primitives_decimal_value.tk` one exit code, the
+only base fixture whose SOURCE this pass touched.
+
+The gate after the review, mc 0.17.0, macos/aarch64:
 `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **93 passed, 114 refused as expected,
-0 failed**; `sh scripts/check-docs.sh` → `docs ok: 674 links, 63 fragments, 406 diagnostics,
-114 refusals, 149 samples, manifest listed`. It supersedes the counts the section below
-recorded for the first pass.
+0 failed**; `sh scripts/bootstrap.sh --os macos --arch aarch64` → **FIXPOINT OK**;
+`sh scripts/check-docs.sh` → `docs ok: 674 links, 63 fragments, 406 diagnostics, 114
+refusals, 149 samples, manifest listed`; `mc limits` verdict `ok` on both legs with `intrin`
+**8**, `passes` **15**, `syntax` **17**, `types` **16**, `alias` **23** and every other
+capped table exactly where the first pass left them, `TK_MAXPRIMO` 62/80 and `TK_MAXPRIMX`
+**5**/8. `--dump-ast` over **all 201** `.tk` files under `tests/` on `85901f5b`, each
+compiler in its own project directory with `--include=lib` (without it every fixture with an
+`#include` dumps the same one-line open failure and the comparison proves nothing — the trap
+this pass fell into once): **195 byte-identical, 6 differing**, the same six the first pass
+had, none added by the review. Four are `decimal.tk`'s includers with **zero lines removed**
+(`_indirect` +1700, `_out` +1700, `_order` +2829, `_value` +1701 and the one line its own
+exit code moved), and two are the refuse fixtures C4 turned into run cases. It supersedes
+the counts the section below recorded for the first pass.
 
 #### What the library turned out to be
 
