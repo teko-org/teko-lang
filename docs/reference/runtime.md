@@ -1,9 +1,10 @@
 # The runtime
 
-Two library files, both **program** code compiled under the same taught vocabulary as the
-program that includes them: `lib/rt.tk`, the runtime every program links against, and
+Four library files, all of them **program** code compiled under the same taught vocabulary
+as the program that includes them: `lib/rt.tk`, the runtime every program links against,
 [`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` and `DateTime` member
-and operator lowers to.
+and operator lowers to, and the two files of the sixteen-byte types —
+[`lib/decimal.tk` and `lib/guid.tk`](#the-wide-libraries).
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
 the compiler injects, the guards behind an index and an interface call, and a handful of
@@ -300,6 +301,38 @@ Fifteen panics live here, all exit **70**:
 | `teko: a month count is out of range` | `AddMonths` outside ±120000, C#'s own bound |
 | `teko: a year count is out of range` | `AddYears` outside ±10000 |
 | `teko: a time of day is out of range` | a tick count outside `0 .. 863999999999`: `new TimeOnly(ticks)` or `TimeOnly.FromTimeSpan(ts)` |
+
+---
+
+## The wide libraries
+
+`lib/decimal.tk` and `lib/guid.tk` are what a `TK_WIDE` type owes the **program**: a machine
+emits code for the program being compiled, and the three things a sixteen-byte value needs
+are declarations of the program's own ([`teko_wide.tk`](../../teko_wide.tk), D74/D75).
+Each file declares the same three, under its own names.
+
+| | |
+|---|---|
+| `decimal tk_dec_retbuf;` / `Guid tk_guid_retbuf;` | the buffer a sixteen-byte RETURN travels through. The callee copies its value here and returns the ADDRESS; the call site copies it out into the call depth's own slot immediately after the branch, which is what makes ONE buffer safe under recursion and under nesting. It is **per type**, so a program that returns a `Guid` and never mentions `decimal` includes `guid.tk` alone. A program that forgot it is refused by name: `teko: include "guid.tk" before returning a sixteen-byte value` |
+| `decimal tk_dec_ld(ptr p)` / `Guid tk_guid_ld(ptr p)` | the INDIRECT load: two `ld64`s over the address of the sixteen bytes. `tk_ldn` ([`teko_struct.tk`](../../teko_struct.tk)) lowers every field, array element, `ref`/`out` pointee and closure capture of a wide type to it, because no raw `ldW` moves sixteen bytes and the width table would answer `ld64` and move half the value in silence |
+| `void tk_dec_st(ptr p, decimal d)` / `void tk_guid_st(ptr p, Guid g)` | the store, the same two words the other way |
+
+`&d` on a local or on a parameter of wide type is the address of its own sixteen-byte frame
+slot — the core's own `MTASK_LOCAL_ADDR`, untouched by the wide machine — so surface code
+reaches the halves with no accessor and no intrinsic.
+
+`lib/guid.tk` carries `Guid`'s own surface code on top of those three, and needs `rt.tk` for
+`rt_alloc` and `rt_panic`. Every member and every operator of [`Guid`](types.md#guid) lowers
+to one of them.
+
+| | |
+|---|---|
+| `Guid tk_guid_empty()`, `i64 tk_guid_isempty(Guid g)` | the all-zero value, and the one comparison against it |
+| `Guid tk_guid_parse(str s)` | the `"D"` and `"N"` forms, either case; panics `teko: the string is not a Guid` |
+| `i64 tk_guid_tryparse(str s, uptr o)` | `1` and the value, or `0` and `Guid.Empty` written through `o` |
+| `str tk_guid_tostring(Guid g)`, `str tk_guid_tostring_fmt(Guid g, str f)` | 36 characters of the `"D"` form, or `"N"`'s 32; the buffer is `rt_alloc`'d and the caller keeps it, exactly as `tk_enum_digits` hands one back |
+| `i64 tk_guid_fmt(ptr buf, Guid g, i64 dash)` | the allocation-free half, returning the length. `buf` needs 37 bytes with `dash`, 33 without |
+| `i64 tk_guid_cmp(Guid a, Guid b)` and `tk_guid_eq`…`tk_guid_ge` | the sixteen bytes, UNSIGNED, left to right, stopping at the first difference |
 
 ---
 

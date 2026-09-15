@@ -47,7 +47,7 @@ fixes the order.
 | 9a | ~~**N4a** `DateOnly`~~ **landed**, D54 | datetime-extras.md | M | C2 |
 | 9b | ~~**N4b** `TimeOnly`~~ **landed**, D58 | datetime-extras.md | M | C2 |
 | 10 | ~~**C3** the sixteen-byte value and `teko_wide.tk`~~ **landed**, D74 | `docs/specs/decimal.md` | M | C1 |
-| 11 | **N3** `Guid` | guid.md | M | C3, C1 |
+| 11 | ~~**N3** `Guid`~~ **landed**, D75 | guid.md | M | C3, C1 |
 | 12 | **N5** `DateTimeOffset` | datetime-extras.md | M | C2, C3 |
 | 13 | **C4** the `decimal` arithmetic | `docs/specs/decimal.md` | L | C3 |
 | 14 | **C5** `decimal` round and text | `docs/specs/decimal.md` | M | C4 |

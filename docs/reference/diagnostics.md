@@ -396,13 +396,16 @@ messages reuse the wordings a declared type already gets; only a handful are its
   A cast is the one syntax that would convert what converts to nothing but itself, and over
   a `DateTime` it would answer a wrong number rather than refuse — the `Kind` sits in the
   two bits above the ticks. The compiler writes both casts itself, in the lowering, and
-  knows its own. **The member the message names is the type's own reader**, a column of the
-  primitive's registration since D54 and not one word for every primitive: a `DateOnly` has
-  no `.Ticks` at all, so it reads
+  knows its own. **The two clauses after the semicolon are columns of the primitive's own
+  registration**, since D54 the reader and since D75 the builder, and neither is one word
+  for every primitive: a `DateOnly` has no `.Ticks` at all, so it reads
   ``teko: a DateOnly does not cast; `.DayNumber` reads it and `new DateOnly(...)` builds it``.
   A `TimeOnly` DOES have `.Ticks` — the same identity `TimeSpan` and `DateTime` read by — so
   its own reads
   ``teko: a TimeOnly does not cast; `.Ticks` reads it and `new TimeOnly(...)` builds it``.
+  Each clause carries its VERB as well as its spelling, because the pair is not the same
+  sentence for every type: a `Guid` is not constructed at all, so its own reads
+  ``teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it``.
 - `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
   `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
   to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
@@ -683,7 +686,10 @@ registered as a primitive with an **empty** member table
 - `"teko: include \""` — completed by *decimal.tk" before returning a sixteen-byte value*: a
   wide return travels through `tk_dec_retbuf`, a global the **program** declares, and
   `lib/decimal.tk` is where it is declared. It is the rule `lib/rt.tk` already has for an
-  `enum`'s own lowering symbols.
+  `enum`'s own lowering symbols. The buffer and the file named are **per type** since D75,
+  so a function that returns a `Guid` reads
+  *teko: include "guid.tk" before returning a sixteen-byte value* and is never pointed at a
+  file it does not use.
 
 Five more are **guards on the machine**, in the same file. Every one of them is unreachable
 from the surface — teko refuses each construct earlier, with a line and a name — and they
@@ -704,6 +710,41 @@ sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
 - `"teko: a sixteen-byte value in an allocatable register"` — `MTASK_PARAM_REG` under
   `--opt=1`. The walker allocates no sixteen-byte local today; the guard is what says so if
   it ever does.
+
+## `Guid`
+
+`Guid` is the second `TK_WIDE` type and the first that is not `decimal`
+([the specification](../specs/guid.md), D75), so every refusal of the section above that is
+about the sixteen bytes rather than about `decimal` reaches it too — the `extern` one by
+name, the five machine guards as guards. What is its own is short.
+
+- `"teko: "` — completed by *Guid.NewGuid is not taught yet*: a version-4 `Guid` is sixteen
+  bytes of **cryptographic** randomness, which is one `extern` per operating system and
+  teko's own to write (N9, [the specification](../specs/guid.md) § 5,
+  [not-yet.md](not-yet.md)). A `Guid` built from a counter, a clock or an address would
+  compile and two processes would collide, so there is no fallback — there is a `TK_PMSOON`
+  row, and the site says so by name.
+- ``"teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it"`` —
+  `(i64) g` and `(Guid) n` written by hand. Sixteen bytes are no number, and unlike
+  `decimal` this type teaches both directions already, so the refusal names them.
+- ``"teko: TryParse's second argument is `out <name>`"`` — `Guid.TryParse(s, g)` without the
+  `out`, or with anything but a variable after it. `Guid.TryParse` is parsed by hand
+  ([`teko_guid.tk`](../../teko_guid.tk)), exactly as `Color.TryParse` is, because `out` is
+  no column the primitive-member table has.
+- `"teko: a value of type "` — completed by *X does not convert to Guid*: the second
+  argument of `TryParse` is an `out` of a `Guid` slot and of nothing else, checked against
+  the pointee `tk_ref_addr` hands back.
+
+Two more are **run-time panics** of `lib/guid.tk`, both exit 70 and both on stderr with no
+`file:line` — the same abort every other guard in this port takes
+([runtime.md](runtime.md)):
+
+- `"teko: the string is not a Guid"` — `Guid.Parse(s)` on anything that is neither the
+  36-character hyphenated form nor the 32-character bare one. C#'s own `Parse` throws here;
+  `Guid.TryParse(s, out g)` is the pair that answers `0` and writes `Guid.Empty` instead.
+- `"teko: the Guid format is not taught"` — `g.ToString(fmt)` on a format outside `"D"` and
+  `"N"`. `"B"`, `"P"` and `"X"` are three more spellings of the same sixteen bytes and are
+  not taught ([the specification](../specs/guid.md) § 6).
 
 ## Properties
 

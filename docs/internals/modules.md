@@ -1,6 +1,6 @@
 # The module map
 
-Thirty-seven files: [`teko.tk`](../../teko.tk) and the thirty-six `teko_*.tk` modules it
+Thirty-eight files: [`teko.tk`](../../teko.tk) and the thirty-seven `teko_*.tk` modules it
 `#include`s. The order of those includes is not cosmetic — a module may forward-declare a
 **function** a later module defines, but a **global** has to already exist where it is
 read, so a file that touches another's tables is included after it. `teko_type.tk` opens
@@ -18,6 +18,7 @@ handlers and the tables. What each one registers is listed below in the include 
 | `teko_float.tk` | `f32`/`f64` | calls `float_init()` and the two float machines of mc's `<float>` | — |
 | `teko_wide.tk` | how a sixteen-byte `TK_WIDE` value MOVES: three machines derived over `arm64`, `x86_64` and `x86_64-win`, everything by ADDRESS (D74) | `machine()` three times, from `tk_wide_init()` AFTER `tk_float_init()` so the copy is `<float>`'s table and not the one under it | the wide id set, and one sixteen-byte frame slot per wide depth |
 | `teko_decimal.tk` | `decimal` and its literal `1.5m` | `type_new("decimal", 16, 16, TK_WIDE)`, `tk_wide_add`, `tk_prim_type` with an EMPTY member table, and one `syntax_lit` registered BEFORE `tk_float_init()` | the literal's four 32-bit limbs, and the globals it numbers |
+| `teko_guid.tk` | `Guid` — the type word, `Empty`/`Parse`/`TryParse`/`ToString`/`CompareTo`/`Equals`/`IsEmpty`, the six comparisons, and `NewGuid` refused by name (D75) | `type_new("Guid", 16, 16, TK_WIDE)`, `tk_wide_add`, `tk_prim_type`, one `syntax_expr`/`syntax_stmt` pair, then the rows of `teko_prim.tk`'s two tables | the type id |
 | `teko_struct.tk` | the type table itself, and `struct` | `syntax("struct")`, `on_stmt` for a local of struct type, one `type_new` per declared type | types, fields, locals in scope, the node table, array-field addresses, counted stores |
 | `teko_array.tk` | `T a[N]` local and global, `a[i]`, `a.Length` | `on_stmt` for the `N_VAR`/`N_GLOBAL` the core builds | local arrays per scope, global arrays, deferred writes |
 | `teko_const.tk` | `const i64 N = 10` at top level and as a member | `syntax("const")` | folded constants, global and per type |

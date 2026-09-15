@@ -1,8 +1,12 @@
 # `Guid`
 
-**Designed, not built.** Nothing on this page compiles today; every sample carries
-`// no-run` for that reason. What runs is [the type reference](../reference/types.md), and
-this page is kept apart from it on purpose ([the specs index](README.md)).
+**N3 landed** (D75): everything on this page compiles today except `Guid.NewGuid`, which is
+N9 (§ 5) and refused by name. The samples keep their `// no-run` marker because they are
+fragments rather than whole programs; the runnable form is
+[the type reference](../reference/types.md#guid), and
+`tests/primitives_guid.tk`, `tests/primitives_guid_bytes.tk`,
+`tests/primitives_guid_tryparse.tk` and `tests/primitives_guid_parse_bad.tk` are the
+oracles. What each section owes the build is marked below.
 
 `Guid` is C#'s `System.Guid`: a 128-bit identifier, written as
 `f81d4fae-7dec-11d0-a765-00a0c91e6bf6`, compared and ordered by value, with an all-zero
@@ -103,10 +107,10 @@ i64 main() {
 | anything in a `Guid` slot | `teko: a value of type i64 does not convert to Guid` |
 | `+ - * / % & \| ^ ~ << >>` | ``teko: no operator `+` takes these operands`` |
 | `(i64) g`, `(Guid) n` written by hand | ``teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it`` |
-| an unknown member | `teko: unknown member of Guid`, `teko: unknown static member of Guid` |
+| an unknown member | `teko: unknown member of Guid`, `teko: unknown static member of Guid`, each completed by the name written |
 | `Guid.NewGuid()` | `teko: Guid.NewGuid is not taught yet` (§ 5) |
 | a `Guid` on an `extern` | ``teko: an `extern` takes no Guid`` — the sixteen-byte convention is teko's own and crosses no C boundary |
-| a `Guid` as a `const` or a `switch` label | `teko: a const is an integer` — the folder has no 128-bit arithmetic, exactly as for `decimal` |
+| a `Guid` as a `const` or a `switch` label | `teko: const requires a constant expression` and `teko: a case label must be a constant expression` — **as built**: the folder has no 128-bit arithmetic and those are the wordings it already had, exactly as for `decimal` |
 
 ## 3. Operators
 
@@ -184,9 +188,10 @@ there is a refusal until the `extern` lands.
 
 | module | what it grows |
 |---|---|
-| `teko_wide.tk` | **nothing** — it already moves any `TK_WIDE` id; `Guid` is the second one it carries and proves the module is general rather than `decimal`-shaped |
-| **`teko_guid.tk`** (new) | one `type_new`, one `syntax_expr` for the type word, and the rows of § 3 and § 4 in the primitive-member and primitive-operator tables |
-| `teko_prim.tk` | nothing: the tables are `docs/specs/datetime.md` § 9's, and this page adds rows to them |
+| `teko_wide.tk` | **one column**: the machine is general, as this page predicted, but the RETURN BUFFER was one name for the whole program (`tk_dec_retbuf`), so returning a `Guid` asked for `decimal.tk`. It is per type now — a fourth column of the wide set — and every handler that moves the bytes is untouched (D75) |
+| `teko_ref.tk` | **one tag**, and C3's own hole closed with it: a `ref`/`out` parameter's name INSIDE the load or the store the deref pass writes is the ADDRESS, and nothing said so, so `ref decimal`/`out decimal` was refused `teko: a value of type decimal does not convert to uptr` on a line no source wrote. `Guid.TryParse(s, out g)` needs that road, and `tests/primitives_decimal_out.tk` proves it for `decimal` too |
+| **`teko_guid.tk`** (new) | one `type_new`, one `tk_wide_add`, one `syntax_expr`/`syntax_stmt` pair for the type word, the rows of § 3 and § 4 in the primitive-member and primitive-operator tables, and `Guid.TryParse(s, out g)` parsed by hand — `out <name>` is no column those tables have, the same reason `Color.TryParse` is hand-parsed (`teko_enum.tk`) |
+| `teko_prim.tk` | **as built, four things** — this page's estimate of "nothing" was wrong (D75). C1's lowering crossed a receiver as `(i64) recv`, wrapped a returning call in a cast and cast an argument, all three of which are `tw_cast` on a sixteen-byte value; a WIDE receiver, argument and result now cross UNCAST. The cast refusal gained a BUILDER clause beside the reader, so a type that is written and read rather than constructed says so (§ 2). And `tk_prim_static_m` splits the member name out of `tk_prim_static`, for the one static this page parses by hand |
 | `teko_typeof.tk` | nothing: the § 5 clause of that page already refuses every conversion |
 | `teko.tk` | `#include` and one `_init()` call |
 | `lib/guid.tk` (new) | the parser, the formatter, the comparison and `Empty`: about 200 lines of ordinary teko over `ld8`/`st8` through `&g` |
@@ -196,9 +201,10 @@ there is a refusal until the `extern` lands.
 
 | row | before | after | why |
 |---|---|---|---|
-| `types` | — | **+1** | one `type_new` |
-| `syntax` | — | **+1** | `Guid.Empty` and `Guid.Parse` need the type word to open an expression |
-| `passes`, `intrin`, `alias` | — | unmoved | by design, as every page in this plan |
+| `types` | 14 | **15** | one `type_new` |
+| `syntax` | 15 | **16** | `Guid.Empty` and `Guid.Parse` need the type word to open an expression. The table is keyed by NAME, so `syntax_expr("Guid")` and `syntax_stmt("Guid")` are one row between them |
+| `alias` | 21 | **22** | **measured, and this page's "unmoved" was wrong**: `type_new` reserves the word in the very table `type_alias` uses (`alias_add`, mc's own hooks module), so `types` and `alias` move together and always have. It is mechanical, not a choice |
+| `passes`, `intrin` | 15, 8 | unmoved | by design, as every page in this plan |
 
 The machine module adds no row: `teko_wide.tk` is already derived, and a derived table
 shadows the name it registers rather than consuming a `machines` slot.
@@ -217,7 +223,7 @@ a small distinct number per failed assertion.
 
 ## 10. The crumb
 
-### N3 — `Guid` (M)
+### N3 — `Guid` (M) — **landed, D75**
 
 The registration, the tables, `lib/guid.tk`, and the `NewGuid` refusal.
 **Depends on `docs/specs/decimal.md`'s C3** for `teko_wide.tk` and the sixteen-byte value,
@@ -225,7 +231,13 @@ and on `docs/specs/datetime.md`'s C1 for the primitive-member and primitive-oper
 It depends on nothing else — in particular not on `decimal`'s arithmetic, so it can land
 between C3 and C4.
 
-**Gate:** the four fixtures at their exit codes **on all five legs** — a sixteen-byte value
+**Gate, as run:** 84 fixtures passed and 102 refused as expected, 0 failed; `--dump-ast` of
+all 170 pre-existing fixtures byte-identical; `FIXPOINT OK`; `mc limits` verdict `ok` with
+`passes` and `intrin` unmoved. Eleven refuse fixtures landed beside the four that run, and
+`tests/primitives_decimal_out.tk` is the fifth runnable one — the `ref`/`out` road this
+crumb opened is proved for `decimal` as well as for `Guid`.
+
+**Gate, as designed:** the four fixtures at their exit codes **on all five legs** — a sixteen-byte value
 in a parameter and a return is what a single leg cannot prove — every other fixture
 unchanged with `--dump-ast` byte-identical, `FIXPOINT OK`, `mc limits` verdict `ok` with
 `passes` and `intrin` **not moved**, `sh scripts/check-docs.sh` green. **Owes:** a `Guid`

@@ -59,7 +59,7 @@ legs:
 |---|---|
 | a local, a global, a parameter | sixteen bytes of frame or of `__data`, sized by the registry from `type_width`; the machine copies them two words at a time |
 | an argument | the caller materialises the address of the value's slot into the argument's depth and lets the **underlying machine's own ABI** place that pointer, exactly as it places any `uptr` |
-| a return | the callee copies its sixteen bytes into one global and returns **its address**; the call site copies them out into the call depth's slot before anything else runs. **As built** that global is `tk_dec_retbuf` in `lib/decimal.tk` and belongs to the PROGRAM, not to the module: a machine emits code for the program, and a frame slot of the returning function is gone the moment its epilogue runs |
+| a return | the callee copies its sixteen bytes into one global and returns **its address**; the call site copies them out into the call depth's slot before anything else runs. **As built** that global is `tk_dec_retbuf` in `lib/decimal.tk` and belongs to the PROGRAM, not to the module: a machine emits code for the program, and a frame slot of the returning function is gone the moment its epilogue runs. **Amended by N3 (D75):** it is one buffer per wide TYPE, a fourth column of the wide set beside the load and the store symbols (`tk_wide_add(ty, ldsym, stsym, retbuf)`), and the include named in the refusal comes from the primitive table — so `Guid` answers `tk_guid_retbuf` in `lib/guid.tk`, and a program that returns a `Guid` and never mentions `decimal` is never pointed at `decimal.tk` |
 | a field, an array element | two `ld64`/`st64` pairs, written in ordinary teko: `tk_dec_ld(ptr)` and `tk_dec_st(ptr, decimal)` in `lib/decimal.tk`. **As built** they are also what `tk_ldn`/`tk_stn` (`teko_struct.tk`) lower every INDIRECT access of a wide type to, so `a[i] = d`, `p.f = d` and their reads move all sixteen bytes with nothing written at the surface — teko picks a raw `ldW`/`stW` by width everywhere else, and sixteen is a width no machine has |
 
 The consequences are worth naming, because they are why this shape was chosen over the
@@ -73,10 +73,11 @@ register pair `<i128>` uses:
 - **A `decimal` and an `f64` mix in one call.** The float machine's own `MTASK_CALL` sees a
   pointer where the wide value was, puts it in an integer register, and keeps its float
   register accounting untouched. `decimal.ToDouble(d)` and `(decimal) x` both need that.
-- **The return buffer is safe under recursion.** One global, sixteen bytes: the call site
-  copies out immediately after the branch and before any other call is emitted, so a nested
-  or recursive call can never find the buffer stale. It is a **rule of the handler**, not a
-  hope, and the fixture that proves it is a recursive `decimal` function.
+- **The return buffer is safe under recursion.** One global per wide type, sixteen bytes:
+  the call site copies out immediately after the branch and before any other call is
+  emitted, so a nested or recursive call can never find the buffer stale. It is a **rule of
+  the handler**, not a hope, and the fixture that proves it is a recursive `decimal`
+  function — and, since N3, a recursive `Guid` one on the same road.
 - **No `MTASK_DEPTH_SPAN`.** The value lives in ONE depth backed by a sixteen-byte slot,
   which is the constraint `mc`'s own `<i128>` records and the reason it is memory-resident.
 

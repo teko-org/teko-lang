@@ -856,7 +856,95 @@ block to reclaim. C# gives it value semantics and no heap.
 | `const decimal R = 1m;` | `teko: const requires a constant expression` |
 | `case 1m:` | `teko: a case label must be a constant expression` |
 | `extern i64 f(decimal d);` | ``teko: an `extern` takes no decimal`` |
-| `ref decimal` / `out decimal` | `teko: a value of type decimal does not convert to uptr` |
+
+`ref decimal` and `out decimal` are NOT in that list any more: N3 opened the wide pointee
+road for every `TK_WIDE` type at once (D75, [`Guid`](#guid) below), so a `decimal` reached
+through a `ref`/`out` parameter moves all sixteen bytes.
+
+---
+
+## `Guid`
+
+Sixteen bytes, sixteen-byte aligned, behind `#include "guid.tk"`. It is C#'s `System.Guid`:
+a 128-bit identifier written `f81d4fae-7dec-11d0-a765-00a0c91e6bf6`, compared and ordered by
+value, with an all-zero `Guid.Empty`. It is the SECOND `TK_WIDE` type and the first that is
+not `decimal`, so it moves on exactly the machine that one brought
+([`teko_wide.tk`](../../teko_wide.tk), D74/D75) — read "It moves by address" above, word for
+word.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "guid.tk"
+
+i64 main() {
+    Guid a = Guid.Parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6");
+    Guid b = Guid.Parse("F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6");   // case-insensitive
+    if (a != b) return 1;
+    if (a == Guid.Empty) return 2;
+
+    str s = a.ToString();                            // the "D" form, lowercase
+    if (Guid.Parse(s) != a) return 3;
+    if (!tk_str_eq(a.ToString("N"), "f81d4fae7dec11d0a76500a0c91e6bf6")) return 4;
+
+    Guid z = Guid.Empty;
+    if (!z.IsEmpty) return 5;
+    if (z >= a) return 6;                            // the bytes, left to right
+
+    Guid v = a;
+    if (Guid.TryParse("nope", out v) != 0) return 7;
+    if (!v.IsEmpty) return 8;                        // Empty written on failure
+    return 42;
+}
+```
+
+**The layout** is RFC 4122's own, **in text order**, big-endian, byte 0 first — which makes
+`ToString` a straight walk from byte 0 to byte 15 and `Parse` its inverse.
+
+| offset | holds | prints as |
+|---|---|---|
+| `+0 .. +3` | `time_low` | the first group, 8 hex digits |
+| `+4 .. +5` | `time_mid` | the second group, 4 |
+| `+6 .. +7` | `time_hi_and_version` | the third group, 4 |
+| `+8 .. +9` | `clock_seq` | the fourth group, 4 |
+| `+10 .. +15` | `node` | the fifth group, 12 |
+
+**The ordering diverges from C#, deliberately.** `<`, `<=`, `>`, `>=` and `CompareTo` walk
+the sixteen bytes **unsigned, left to right**, which is the order the text sorts in. C#
+compares its first field as a signed `int` and the next two as signed `short`s — an order
+almost nobody intends and SQL Server famously disagrees with. Matching it would mean
+matching C#'s in-memory byte swap too, and then `ToString` would stop being a straight walk
+([the specification](../specs/guid.md) § 1, § 6).
+
+**The API.**
+
+| static | instance |
+|---|---|
+| `Guid.Empty` | `.ToString()` — the `"D"` form, lowercase, 36 characters |
+| `Guid.Parse(str)` — `"D"` or `"N"`, either case | `.ToString(str fmt)` — `"D"` or `"N"` |
+| `Guid.TryParse(str, out Guid)` — `1`/`0`, `Empty` on failure | `.CompareTo(Guid)`, `.Equals(Guid)` |
+| | `.IsEmpty` — an `i64` `0`/`1` |
+
+`.IsEmpty` is not a C# member — C# writes `g == Guid.Empty`, which works here too. It is the
+one addition this type makes, and it is additive.
+
+`Guid.Parse` panics (exit 70, `teko: the string is not a Guid`) on anything that is neither
+the 36-character hyphenated form nor the 32-character bare one. `ToString` takes `"D"` and
+`"N"` and panics on any other format (`teko: the Guid format is not taught`); `"B"`, `"P"`
+and `"X"` are three more spellings of the same sixteen bytes and are not taught.
+
+**What N3 refuses**, every one of them by name and at the line it was written:
+
+| written | message |
+|---|---|
+| `Guid.NewGuid()` | `teko: Guid.NewGuid is not taught yet` — it needs the host's entropy, one `extern` per operating system (N9, [not-yet.md](not-yet.md)) |
+| `a + b`, `~a`, every operator but the six | ``teko: no operator `+` takes these operands`` |
+| `i64 n = g;` | `teko: a value of type Guid does not convert to i64` |
+| `Guid g = 0;` | `teko: a value of type i64 does not convert to Guid` |
+| `(i64) g`, `(Guid) n` | ``teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it`` |
+| `g.Anything`, `Guid.Anything` | `teko: unknown member of Guid` and its static twin |
+| `const Guid ID = ...;`, `case Guid.Empty:` | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` |
+| `extern i64 f(Guid g);` | ``teko: an `extern` takes no Guid`` |
 
 ---
 

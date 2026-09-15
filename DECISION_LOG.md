@@ -7597,3 +7597,132 @@ over 234592 lines); `sh scripts/check-docs.sh` → `docs ok`;
 `mc limits` per ruling 3. `--dump-ast` of all **169** fixtures against a compiler built from
 `origin/main` (`9ded80ec`): **160 byte-identical, 9 differing, and the 9 are this crumb's own
 new fixtures** — which the base compiler cannot compile at all, since it has no `decimal`.
+
+### D75 · `Guid`, the second wide type: what C1 and C3 owed a sixteen-byte value (N3, 2026-09-14)
+> A `TK_WIDE` type is carried **by the wide set and by nothing named after `decimal`**. N3 is the
+> proof: `Guid` registers one id, one load symbol, one store symbol and one return buffer, and the
+> three derived machine tables of `teko_wide.tk` move its sixteen bytes with **no machine work at
+> all**. Where that turned out not to be true — C1's member lowering, the return buffer's name and
+> the `ref`/`out` pointee road — the fix is in the SHARED code and serves every wide type at once,
+> never in a branch that reads the type's name.
+
+`Guid` is `docs/specs/guid.md` whole but § 5, which is N9. It is the second `TK_WIDE` type and the
+first that is not `decimal`, which is exactly why the order puts it here: the machine module is
+proved general while it is still small (D74, `22e8d5d1`).
+
+#### The seven rulings this crumb was dispatched with, and what each became
+
+1. **Representation: RFC 4122 text order, big-endian, byte 0 = `time_low`.** `type_new("Guid", 16,
+   16, TK_WIDE)`, § 1's table exactly, so `ToString` is a straight walk from byte 0 to byte 15 and
+   `Parse` its inverse. It is **not** C#'s in-memory order, whose first eight bytes are
+   byte-swapped on a little-endian host. The difference is invisible to `ToString`, `Parse`, `==`
+   and `!=`, and visible in the **ordering**: teko compares the sixteen bytes **unsigned, left to
+   right**, C# compares its first field as a signed `int` and the next two as signed `short`s.
+   That is a **recorded divergence** (§ 1, § 6, `docs/reference/types.md`), not a gap: matching
+   C# would mean matching the byte swap too, and then `ToString` stops being a walk.
+   `tests/primitives_guid_bytes.tk` pins the layout with an oracle and not a comment, and
+   `tests/primitives_guid.tk` pins the ordering with values that only pass under it.
+
+2. **The return buffer is per TYPE — a fourth column of the wide set.** `tw_retbuf_name()`
+   answered `"tk_dec_retbuf"` for the whole program (`teko_wide.tk`, C3), so a function returning
+   a `Guid` was told to `include "decimal.tk"`. It is `tk_wide_add(ty, ldsym, stsym, retbuf)` now,
+   read by `tw_ret` through `tw_retbuf_of(ty)`, and the include named in the refusal comes from
+   the primitive table (`tk_prim_inc_of`, `teko_prim.tk`): `lib/guid.tk` declares
+   `Guid tk_guid_retbuf;` beside its own `tk_guid_ld`/`tk_guid_st`, and a program that never
+   mentions `decimal` is never pointed at `decimal.tk`. The alternative — one shared buffer — is
+   one file every wide-returning program has to include whatever it uses.
+
+3. **`ref`/`out` of a wide value is inside N3**, because `Guid.TryParse(s, out g)` needs it and
+   because it is C3's own hole. Measured on `22e8d5d1`: `void bump(ref decimal d) { d = 7m; }`
+   was refused ``teko: a value of type decimal does not convert to uptr`` at
+   `lib/rt.tk:385` — a line no source wrote.
+
+   The root cause is one node. A `ref`/`out` parameter's name means the POINTEE everywhere the
+   scope records it (`tk_ty_scope_params`), and the deref pass then writes a load and a store
+   over it in which the very same name means the **address** — and nothing said so. Harmless
+   while that load was `ld64`, which `decl_find` does not know and `tk_rc_call_args` skips;
+   not harmless for a wide pointee, whose indirect access is a declared function of the program
+   (`tk_dec_ld(ptr p)`, `tk_ldn`/`tk_stn`, D74). One tag where the node is built
+   (`tk_ref_slot_addr`, `teko_ref.tk`) fixes it for every pointee at once, and the statement's
+   own line and file are put in force there too, which is where the misattributed line was lost.
+   `tests/primitives_decimal_out.tk` proves it for `decimal` as well, at exit 42.
+
+4. **`tk_prim_cast_check` gains a BUILDER clause beside the reader.** Each is a COLUMN of
+   `tk_prim_type` and each carries its VERB, because the pair is not the same sentence for every
+   type: `TimeSpan` is read by `.Ticks` and built by `new TimeSpan(...)`, while a `Guid` is not
+   constructed at all. The refusal reads
+   `` teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it ``
+   (§ 2), and every wording that existed is **byte-identical** — `decimal` keeps its `yet` form,
+   which is what a primitive registered with neither clause gets.
+
+5. **The include flip is the owner's.** `#include "guid.tk"` stays a build-time step the surface
+   names, refused per type through the primitive table
+   (`teko: Guid needs #include guid.tk before it is used`,
+   `teko: include "guid.tk" before returning a sixteen-byte value`). Whether `guid.tk`,
+   `time.tk`, `decimal.tk` and `string.tk` fold into `lib/rt.tk` is one decision for all four
+   (§ 11), and it is not taken here.
+
+6. **`Guid.NewGuid` is N9**, a `TK_PMSOON` row: `teko: Guid.NewGuid is not taught yet`. A
+   version-4 `Guid` is sixteen bytes of **cryptographic** randomness and there is no fallback —
+   a value built from a counter, a clock or an address would compile and two processes would
+   collide. `tests/refuse/guid_newguid.tk` is its oracle.
+
+7. **The members are § 4's list**: `Guid.Empty`, `Guid.Parse(str)`, `Guid.TryParse(str, out Guid)`,
+   `.ToString()`, `.ToString(str fmt)` (`"D"`/`"N"`, either case, anything else a run-time panic),
+   `.CompareTo(Guid)`, `.Equals(Guid)`, `.IsEmpty`. `Parse` takes the 36-character hyphenated form
+   and the 32-character bare one, either case, and panics on everything else
+   (`teko: the string is not a Guid`, exit 70). `"B"`, `"P"` and `"X"` are three more spellings of
+   the same sixteen bytes and are not taught (§ 6) — so `Parse` accepts two formats and not C#'s
+   five, which is this crumb's one narrowing of C# and is written into
+   `docs/reference/not-yet.md`.
+
+#### What C1 owed a WIDE receiver, measured
+
+`docs/specs/guid.md` § 7 said `teko_prim.tk` grows "nothing". **That was wrong**, and the page is
+corrected. The lowering crossed three things through a cast that no sixteen-byte type can wear —
+each of them `tw_cast`'s own `die` — and all three are fixed in the shared code:
+
+- `tk_prim_emit` crossed the receiver as `tk_prim_raw(recv)`, i.e. `(i64) recv`. A WIDE receiver
+  crosses as **itself**: `g.ToString()` is `tk_guid_tostring(g)`, and the lowering symbol declares
+  the wide type, so the sixteen bytes travel by address exactly as `tw_args` sends any argument.
+- `tk_prim_ret` wrapped a wide-returning call in `tk_cast`. A wide result crosses **uncast**: the
+  call's own declared return type is already what every oracle reads.
+- `tk_prim_conv` cast a wide argument. Same rule, same reason.
+
+A fourth change is a split and not a behaviour: `tk_prim_static_m` takes the member name already
+read, so a module that owns a primitive may hand-parse ONE static and leave every other one to the
+table. `Guid.TryParse(s, out g)` is that static — `out <name>` is no column the `pmr_*` rows have —
+and it is parsed exactly as `Color.TryParse` is (`teko_enum.tk`), reading the operand through
+`tk_ref_addr` rather than through the tagging `out` handler.
+
+#### What is built
+
+`teko_guid.tk` (new, 37th module): one `type_new`, one `tk_wide_add`, one `tk_prim_type`, one
+`syntax_expr`/`syntax_stmt` pair, nine member rows, six operator rows, the `NewGuid` `TK_PMSOON`
+row and the hand-parsed `TryParse`. `lib/guid.tk` (new): the copy helpers, the return buffer,
+`Empty`/`IsEmpty`, the hex scanner and formatter, `Parse`/`TryParse`/`ToString`, and
+`tk_guid_cmp` with its six spellings. Nothing else: `teko_wide.tk` grew one column, `teko_ref.tk`
+one tag, `teko_prim.tk` the four above, `teko.tk` an `#include` and one `_init()` call,
+`lib/rt.tk`, `core_teko.mc` and `user.mc` nothing at all.
+
+#### The gate, as run
+
+`mc build . --config mc.macos.toml` clean on mc 0.17.0;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **84 passed, 102 refused as expected,
+0 failed** (79 + 5 and 91 + 11);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` → **FIXPOINT OK**;
+`sh scripts/check-docs.sh` → `docs ok: 654 links, 53 fragments, 403 diagnostics, 102 refusals,
+148 samples`. `--dump-ast` of all **170** fixtures that exist on `22e8d5d1`, against a compiler
+built from that commit: **170 byte-identical, 0 differing** — the four `teko_prim.tk` hunks move
+nothing, because no program that compiled before has a wide primitive member. The five `Guid`
+fixtures and `primitives_decimal_out.tk` also compile on all four non-host targets
+(`linux/x86_64`, `linux/aarch64`, `windows/x86_64`, `windows/aarch64`), which is the SysV, Win64
+and AAPCS64 tables reached; the five-leg matrix is the oracle that runs them.
+
+`mc limits . --config mc.macos.toml`, tolerance 1.0, base `22e8d5d1` → this crumb: `intrin`
+**8 → 8 (unmoved, the law's own row)**, `passes` **15 → 15 (unmoved)**, `syntax` **15 → 16 (+1**,
+the table is keyed by NAME, so `syntax_expr("Guid")` and `syntax_stmt("Guid")` are one row
+between them**)**, `types` **14 → 15 (+1)**, `alias` **21 → 22 (+1**, and
+`docs/specs/guid.md` § 8's "alias unmoved" was wrong: `type_new` reserves the word in the very
+table `type_alias` uses, so the two move together and always have — the page is corrected**)**.
+Verdict `ok` on both sides; **no new `grew` row**, and the three derived tables still add none.
