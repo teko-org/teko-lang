@@ -79,13 +79,23 @@ uptr tk_op_side_msg(uptr side, uptr sp);
 i64  pt_ty[TK_MAXPRIMT];
 uptr pt_name[TK_MAXPRIMT];
 uptr pt_inc[TK_MAXPRIMT];             // the include its lowering symbols live in
-uptr pt_read[TK_MAXPRIMT];            // the member that reads it, named in the cast refusal
+// The two CLAUSES the cast refusal is spelled with, one pair per primitive:
+// what reads the value out, and what builds one. Each carries its VERB as well
+// as its spelling, because the pair is not the same sentence for every type --
+// a `TimeSpan` is read by `.Ticks` and built by `new TimeSpan(...)`, while a
+// `Guid` is WRITTEN by `.ToString()` and READ back by `Guid.Parse(s)`
+// (docs/specs/guid.md § 2, D75). Neither is one word for every primitive,
+// because a message naming a member the type does not have would be wrong --
+// a `DateOnly` is read by `.DayNumber` and has no `.Ticks` at all (N4a).
+uptr pt_read[TK_MAXPRIMT];            // "`.Ticks` reads it"
+uptr pt_build[TK_MAXPRIMT];           // "`new TimeSpan(...)` builds it"
 i64  tk_nprimt = 0;
 
 i64  pt_ty_at(i64 i)   { return ld64(pt_ty + i * 8); }
 uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
 uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
 uptr pt_read_at(i64 i) { return ld64(pt_read + i * 8); }
+uptr pt_build_at(i64 i) { return ld64(pt_build + i * 8); }
 
 // ---- a column that names a type the row cannot see yet ----
 // Every column below carries a type ID, written at `teko_init()` time -- and
@@ -197,16 +207,16 @@ i64  po_swap_at(i64 i) { return ld64(po_swap + i * 8); }
 // `inc` is the include the lowering symbols are written in, named in the
 // refusal a program that forgot it gets (§ 9: the include is part of the
 // surface).
-// `read` is the member that reads the value out, spelled as the refusal shows
-// it (`` `.Ticks` ``): it is a COLUMN and not one word for every primitive
-// because a message naming a member the type does not have would be wrong --
-// a `DateOnly` is read by `.DayNumber` and has no `.Ticks` at all (N4a).
-void tk_prim_type(i64 ty, uptr name, uptr inc, uptr read) {
+// `read`/`build` are the two clauses of the cast refusal, spelled exactly as
+// it shows them (above). A primitive that teaches neither yet -- `decimal` in
+// C3 -- passes 0 for both and gets the shorter wording.
+void tk_prim_type(i64 ty, uptr name, uptr inc, uptr read, uptr build) {
     if (tk_nprimt == TK_MAXPRIMT) err_at(tk_file, tk_line, "teko: too many primitive types");
     st64(pt_ty + tk_nprimt * 8, ty);
     st64(pt_name + tk_nprimt * 8, name);
     st64(pt_inc + tk_nprimt * 8, inc);
     st64(pt_read + tk_nprimt * 8, read);
+    st64(pt_build + tk_nprimt * 8, build);
     tk_nprimt = tk_nprimt + 1;
 }
 
@@ -442,6 +452,12 @@ i64 tk_prim_raw(i64 e) {
 // already writes for an enum (`tk_nl_payload`), and it is not an instruction:
 // the value is the underlying integer at run time, no box and no tag.
 i64 tk_prim_ret(i64 ret, i64 call) {
+    // D75: no cast can name a sixteen-byte type. The lowering symbol of a wide
+    // row DECLARES the wide type itself (`Guid tk_guid_parse(str s)`,
+    // lib/guid.tk), so the call's own declared return type is already the
+    // answer every oracle reads -- and a cast here would reach `tw_cast`'s own
+    // guard (teko_wide.tk) instead of moving sixteen bytes.
+    if (tk_wide_is(ret)) return call;
     if (tk_prim_is(ret)) return tk_cast(ret, call);
     if (tk_is_enum(tk_struct_by_ty(ret))) return tk_cast(ret, call);
     return call;
@@ -494,6 +510,16 @@ void tk_prim_need_include_of(uptr word, uptr inc, uptr sym, i64 line, uptr fl) {
                               inc, " before it is used"));
 }
 
+// the include a primitive's lowering symbols live in, by type -- read by
+// `tw_ret` (teko_wide.tk) for the return buffer a sixteen-byte value travels
+// through, which is declared in that very file (D75). "" for a type no row of
+// this table owns, which no caller has: every wide type registers here.
+uptr tk_prim_inc_of(i64 ty) {
+    i64 i = tk_prim_slot(ty);
+    if (i < 0) return "";
+    return pt_inc_at(i);
+}
+
 void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl) {
     i64 pi = tk_prim_slot(ty);
     tk_prim_need_include_of(tk_prim_name(ty), pt_inc_at(pi), sym, line, fl);
@@ -524,6 +550,12 @@ i64 tk_prim_ty_of(i64 n, i64 atpass) {
 // (`tk_check_scalar_compat`, docs/specs/enum.md § 5) that already refused
 // everything but the enum itself in this position.
 i64 tk_prim_conv(i64 pty, i64 e, i64 ety) {
+    // D75, the argument half of `tk_prim_ret` above: a wide column takes the
+    // VALUE, under its own type, because the lowering symbol declares that type
+    // (`i64 tk_guid_cmp(Guid a, Guid b)`) and the sixteen bytes travel by
+    // address on every one of the three ABIs (teko_wide.tk's own `tw_args`).
+    // `(i64) g` would be `tw_cast` on a sixteen-byte value.
+    if (tk_wide_is(pty)) return e;
     if (tk_prim_is(pty)) return tk_prim_raw(e);
     if (tk_is_enum(tk_struct_by_ty(pty))) return tk_cast(TY_I64, e);
     return tk_num_widen(pty, ety, e);
@@ -812,7 +844,13 @@ i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 atpass, i64 line, uptr fl) {
     }
     tk_prim_need_include(ty, sym, line, fl);
     i64 list = 0;
-    if (recv != 0) list = tk_prim_raw(recv);
+    // the receiver, by the same rule `tk_prim_conv` states one function up: a
+    // WIDE receiver crosses as itself (`g.ToString()` is `tk_guid_tostring(g)`)
+    // and an eight-byte one as its raw bytes (`t.Days` is `tk_ts_days((i64) t)`).
+    if (recv != 0) {
+        if (tk_wide_is(ty)) list = recv;
+        else                list = tk_prim_raw(recv);
+    }
     // `a` is already a LIST of converted arguments: appending its head links
     // the whole chain behind the receiver, in the order the source wrote it.
     if (a != 0) {
@@ -828,10 +866,11 @@ i64 tk_prim_emit(i64 ri, i64 recv, i64 args, i64 atpass, i64 line, uptr fl) {
 // The word is registered with `syntax_expr` by the owner module, which is what
 // puts this handler ahead of the core's own "a type word is no expression"
 // (parse_primary, mc/src/parse.mc) -- measured by the P0 probe.
-i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
-    uptr nm = tk_prim_name(ty);
-    if (!p_accept(tk_dot_tok)) err_at2(fl, line, "teko: a type name reaches its static members", nm);
-    uptr m = tk_member_name();                   // D68
+// `m` is the member name, ALREADY READ: the split is what lets a module that
+// owns a primitive hand-parse one of its statics and leave every other one to
+// the table -- `Guid.TryParse(s, out g)` takes an `out <name>` no `pmr_*` row
+// can spell (teko_guid.tk, after teko_enum.tk's own `TryParse`, D75).
+i64 tk_prim_static_m(i64 ty, uptr m, i64 line, uptr fl) {
     i64 ri = tk_prim_find(ty, m);
     if (ri < 0) tk_prim_no_static(ty, m, line, fl);
     i64 kind = pmr_kind_at(ri);
@@ -848,6 +887,12 @@ i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
     else if (p_id() == K_LPAR)
         err_at2(fl, line, "teko: the member is a property; it is not called", m);
     return tk_prim_emit(tk_prim_pick(ty, m, na, line, fl), 0, args, 0, line, fl);
+}
+
+i64 tk_prim_static(i64 ty, i64 line, uptr fl) {
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", tk_prim_name(ty));
+    return tk_prim_static_m(ty, tk_member_name(), line, fl);   // D68
 }
 
 i64 tk_prim_expr() {
@@ -974,7 +1019,8 @@ void tk_prim_cast_check(i64 n) {
     i64 pty = tty;
     if (!tk_prim_is(pty)) pty = ety;
     uptr nm = tk_prim_name(pty);
-    uptr rd = pt_read_at(tk_prim_slot(pty));
+    i64 pi = tk_prim_slot(pty);
+    uptr rd = pt_read_at(pi);
     // D74: a primitive registered with NO reader and NO constructor -- which is
     // `decimal` in C3 (teko_decimal.tk) -- names neither in its refusal,
     // because a message pointing at a member the type does not have YET would
@@ -985,8 +1031,8 @@ void tk_prim_cast_check(i64 n) {
         return;
     }
     err_at(nd_file(n), nd_line(n),
-           tk_join3(tk_join3(tk_join3("teko: a ", nm, " does not cast; "), rd, " reads it and `new "),
-                    nm, "(...)` builds it"));
+           tk_join(tk_join3("teko: a ", nm, " does not cast; "),
+                   tk_join3(rd, " and ", pt_build_at(pi))));
 }
 
 // ...and the same check over what a BODY walk never reaches. `tk_ty_pass_walk`

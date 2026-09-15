@@ -1,0 +1,73 @@
+// primitives_guid_bytes.tk -- docs/specs/guid.md § 1: the sixteen bytes are in
+// TEXT order, big-endian, byte 0 = `time_low`'s first digit pair. The layout
+// has an ORACLE and not a comment: the bytes are read back through `&g` with
+// `ld8`, which is the technique docs/specs/decimal.md § 13 uses for its own.
+//
+// `&g` on a local or on a parameter of `Guid` type is the address of its own
+// sixteen-byte frame slot -- the core's own `MTASK_LOCAL_ADDR`, untouched by
+// the wide machine -- so no intrinsic and no accessor is needed to reach them.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "guid.tk"
+
+i64 byte_of(Guid g, i64 i) { ptr p = &g; return ld8(p + i); }
+
+i64 main() {
+    //                    time_low time_mid  hi_ver  seq   node
+    Guid g = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+
+    // +0 .. +3   time_low, the first group
+    if (byte_of(g, 0) != 0x00) return 1;
+    if (byte_of(g, 1) != 0x11) return 2;
+    if (byte_of(g, 2) != 0x22) return 3;
+    if (byte_of(g, 3) != 0x33) return 4;
+    // +4 .. +5   time_mid, the second
+    if (byte_of(g, 4) != 0x44) return 5;
+    if (byte_of(g, 5) != 0x55) return 6;
+    // +6 .. +7   time_hi_and_version, the third
+    if (byte_of(g, 6) != 0x66) return 7;
+    if (byte_of(g, 7) != 0x77) return 8;
+    // +8 .. +9   clock_seq, the fourth
+    if (byte_of(g, 8) != 0x88) return 9;
+    if (byte_of(g, 9) != 0x99) return 10;
+    // +10 .. +15 node, the fifth
+    if (byte_of(g, 10) != 0xaa) return 11;
+    if (byte_of(g, 11) != 0xbb) return 12;
+    if (byte_of(g, 12) != 0xcc) return 13;
+    if (byte_of(g, 13) != 0xdd) return 14;
+    if (byte_of(g, 14) != 0xee) return 15;
+    if (byte_of(g, 15) != 0xff) return 16;
+
+    // the two eight-byte halves, read whole: big-endian text order means the
+    // FIRST byte of the text is the LOW address, so the low half read as a
+    // little-endian word has the bytes reversed
+    ptr p = &g;
+    if (ld64(p) != 0x7766554433221100) return 17;
+    if (ld64(p + 8) != 0 - 0x0011223344556678) return 18;   // 0xffeeddccbbaa9988
+
+    // the "N" form reads the same sixteen bytes, and writes them back
+    Guid n = Guid.Parse("00112233445566778899aabbccddeeff");
+    if (n != g) return 19;
+    if (!tk_str_eq(g.ToString(), "00112233-4455-6677-8899-aabbccddeeff")) return 20;
+    if (!tk_str_eq(g.ToString("N"), "00112233445566778899aabbccddeeff")) return 21;
+
+    // a byte written BY HAND through the address is what the text then prints:
+    // the layout is the same one in both directions
+    st8(p, 0xf0);
+    if (!tk_str_eq(g.ToString(), "f0112233-4455-6677-8899-aabbccddeeff")) return 22;
+    st8(p + 15, 0x01);
+    if (!tk_str_eq(g.ToString(), "f0112233-4455-6677-8899-aabbccddee01")) return 23;
+
+    // every zero byte prints as `00`, and `Guid.Empty` is the all-zero value
+    Guid z = Guid.Empty;
+    i64 i = 0;
+    loop {
+        if (i >= 16) break;
+        if (byte_of(z, i) != 0) return 24;
+        i = i + 1;
+    }
+
+    return 42;
+}

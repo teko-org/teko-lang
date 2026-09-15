@@ -1,0 +1,119 @@
+// primitives_guid.tk -- N3 of docs/specs/guid.md (§ 2, § 3, § 4; D75): the
+// round trip through text, the six comparisons, and a `Guid` on every one of
+// the five roads a sixteen-byte value travels.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "guid.tk"
+
+// a global, and a fixed global array
+Guid gg;
+Guid garr[3];
+
+class Box {
+    public Guid id;
+    public i64 tag;
+}
+
+// a parameter and a return
+Guid echo(Guid g) { return g; }
+
+// the return buffer under recursion: the call site copies the sixteen bytes
+// out IMMEDIATELY after the branch, so a nested call cannot find them stale
+Guid countdown(i64 n, Guid g) {
+    if (n == 0) return g;
+    return countdown(n - 1, g);
+}
+
+i64 main() {
+    Guid a = Guid.Parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6");
+    Guid b = Guid.Parse("F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6");   // case-insensitive
+    if (a != b) return 1;
+    if (a == Guid.Empty) return 2;
+
+    // the "N" form parses to the very same value
+    Guid n = Guid.Parse("f81d4fae7dec11d0a76500a0c91e6bf6");
+    if (n != a) return 3;
+
+    // ---- text
+    str s = a.ToString();                        // the "D" form, lowercase
+    if (!tk_str_eq(s, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6")) return 4;
+    if (Guid.Parse(s) != a) return 5;
+    if (!tk_str_eq(a.ToString("N"), "f81d4fae7dec11d0a76500a0c91e6bf6")) return 6;
+    if (!tk_str_eq(a.ToString("D"), "f81d4fae-7dec-11d0-a765-00a0c91e6bf6")) return 7;
+    if (!tk_str_eq(a.ToString("n"), "f81d4fae7dec11d0a76500a0c91e6bf6")) return 8;
+
+    Guid z = Guid.Empty;
+    if (!tk_str_eq(z.ToString(), "00000000-0000-0000-0000-000000000000")) return 9;
+    if (!z.IsEmpty) return 10;
+    if (a.IsEmpty) return 11;
+
+    // ---- the six comparisons, on the documented ordering: the bytes,
+    // unsigned, left to right (§ 1, a recorded divergence from C#)
+    if (z >= a) return 12;
+    if (!(z < a)) return 13;
+    if (!(z <= a)) return 14;
+    if (!(a > z)) return 15;
+    if (!(a >= a)) return 16;
+    if (a.CompareTo(z) != 1) return 17;
+    if (z.CompareTo(a) != 0 - 1) return 18;
+    if (a.CompareTo(b) != 0) return 19;
+    if (!a.Equals(b)) return 20;
+    if (a.Equals(z)) return 21;
+
+    // the FIRST byte that differs decides, and a high byte is UNSIGNED: `ff`
+    // sorts above `00` where a signed read would put it below
+    Guid hi = Guid.Parse("ff000000-0000-0000-0000-000000000000");
+    Guid lo = Guid.Parse("00000000-0000-0000-0000-0000000000ff");
+    if (!(lo < hi)) return 22;
+    if (hi.CompareTo(lo) != 1) return 23;
+
+    // ---- a local into a local, a parameter and a return
+    Guid c = a;
+    if (c != a) return 24;
+    if (echo(a) != a) return 25;
+
+    // ---- a global, and an element of a `Guid[]`
+    gg = a;
+    if (gg != a) return 26;
+    garr[0] = a;
+    garr[2] = z;
+    if (garr[0] != a) return 27;
+    if (!garr[1].IsEmpty) return 28;             // never written: still zero
+    if (!garr[2].IsEmpty) return 29;
+
+    Guid larr[2];
+    larr[1] = a;
+    if (larr[1] != a) return 30;
+
+    Guid[] harr = new Guid[3];                   // the heap array, the same road
+    harr[1] = a;
+    if (harr[1] != a) return 31;
+    if (harr.Length != 3) return 32;
+
+    // ---- a field of a class, and its neighbour
+    Box box = new Box();
+    box.id = a;
+    box.tag = 7;
+    if (box.id != a) return 33;
+    if (box.tag != 7) return 34;
+
+    // ---- the two copy helpers, over a raw address
+    Guid cell = Guid.Empty;
+    tk_guid_st(&cell, a);
+    if (cell != a) return 35;
+    if (tk_guid_ld(&cell) != a) return 36;
+
+    // ---- the return buffer, under recursion and under nesting
+    if (countdown(8, a) != a) return 37;
+    if (echo(countdown(2, a)) != a) return 38;
+
+    // the allocation-free formatter, the other half of `ToString`
+    u8 buf[40];
+    if (tk_guid_fmt(buf, a, 1) != 36) return 39;
+    if (!tk_str_eq(buf, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6")) return 40;
+    if (tk_guid_fmt(buf, a, 0) != 32) return 41;
+
+    return 42;
+}

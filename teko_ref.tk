@@ -402,11 +402,39 @@ i64 tk_ref_param_named(uptr name) {
     return pn;
 }
 
+// The parameter's own name INSIDE the load or the store this pass writes over
+// it. Everywhere else `x` means the pointee -- that is what the scope records
+// it under (`tk_ty_scope_params`) and what every check reads -- but here it is
+// the ADDRESS being handed to `ldW`/`stW`, and nothing said so: `tk_ty_of`
+// answered the POINTEE for it, and `tk_rc_call_args` (teko_rc.tk) then judged
+// that answer against the intrinsic's own parameter.
+//
+// Harmless while the load and the store were `ld64`/`st64`, which `decl_find`
+// does not know and that check skips; NOT harmless for a WIDE pointee, whose
+// indirect access is a declared function of the program's own
+// (`tk_dec_ld(ptr p)`, `tk_guid_st(ptr p, Guid g)` -- teko_struct.tk's
+// `tk_ldn`/`tk_stn`, D74): `void bump(ref decimal d) { d = 7m; }` was refused
+// with `teko: a value of type decimal does not convert to uptr`, on a line no
+// source wrote, which is the hole C3 left and D75 closes. The node is tagged
+// with what it IS, once, where it is built.
+i64 tk_ref_slot_addr(uptr name) {
+    i64 a = tk_id(name);
+    tk_xt_put(a, 0 - 1, TY_UPTR, 1, TK_BORROWED);
+    return a;
+}
+
 // `x = e;` on a `ref`/`out` parameter of a SCALAR pointee: `x` already IS the
 // caller's slot address, so the store goes straight through it -- a counted
-// pointee is left as an ordinary N_ASSIGN, `teko_rc.tk`'s own exception
+// pointee is left as an ordinary N_ASSIGN, `teko_rc.tk`'s own exception.
+//
+// The statement's own line and file are put in force first: every node below is
+// built through `tk_nd` (teko_struct.tk), which stamps `tk_line`/`tk_file`, and
+// what those held here was whatever the last node the PARSER built had left --
+// `lib/rt.tk:385` on a refusal about a `ref decimal` parameter, measured (D75).
 void tk_ref_rewrite_assign(i64 n, i64 pn) {
-    i64 store = tk_arr_store(tk_param_ty(pn), tk_id(nd_name(n)), nd_a(n));
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+    i64 store = tk_arr_store(tk_param_ty(pn), tk_ref_slot_addr(nd_name(n)), nd_a(n));
     set_nd_kind(n, N_EXPRSTMT);
     set_nd_name(n, 0);
     set_nd_a(n, store);
@@ -546,7 +574,9 @@ void tk_ref_walk(i64 n) {
             i64 pn = tk_ref_param_named(nd_name(n));
             if (pn >= 0) {
                 i64 pty = tk_param_ty(pn);
-                tk_node_replace(n, tk_arr_load(pty, tk_id(nd_name(n))));
+                tk_line = nd_line(n);
+                tk_file = nd_file(n);
+                tk_node_replace(n, tk_arr_load(pty, tk_ref_slot_addr(nd_name(n))));
                 // the read IS a value of the POINTEE's type, and nothing said
                 // so: the node it becomes is a raw `ld64`, which the oracle
                 // reads as an intrinsic call it cannot type

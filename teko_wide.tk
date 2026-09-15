@@ -66,6 +66,7 @@
 i64  tw_ty[TK_MAXWIDE];
 uptr tw_ldsym[TK_MAXWIDE];            // the library function an INDIRECT load lowers to
 uptr tw_stsym[TK_MAXWIDE];            // ...and a store
+uptr tw_rbsym[TK_MAXWIDE];            // ...and the program global a RETURN travels through
 i64  tk_nwide = 0;
 
 // Called from a registering module's own `_init()`, before any program is
@@ -79,11 +80,19 @@ i64  tk_nwide = 0;
 // type would move exactly half the value, in silence. A wide type answers with
 // a library function of its own instead, and the two halves are copied there
 // (`tk_dec_ld`/`tk_dec_st`, lib/decimal.tk).
-void tk_wide_add(i64 ty, uptr ldsym, uptr stsym) {
+// `retbuf` is the PROGRAM global the type's own return travels through, one
+// per type and not one per compiler: `tk_dec_retbuf` and `tk_guid_retbuf` are
+// sixteen bytes each, declared in their own includes, and a program that
+// includes one and not the other has exactly the buffer it needs. A single
+// shared buffer would have been one name in one file, which is the file a
+// program that never mentions `decimal` would have had to include to return a
+// `Guid` (D75).
+void tk_wide_add(i64 ty, uptr ldsym, uptr stsym, uptr retbuf) {
     if (tk_nwide == TK_MAXWIDE) die("teko: too many wide types");
     st64(tw_ty + tk_nwide * 8, ty);
     st64(tw_ldsym + tk_nwide * 8, ldsym);
     st64(tw_stsym + tk_nwide * 8, stsym);
+    st64(tw_rbsym + tk_nwide * 8, retbuf);
     tk_nwide = tk_nwide + 1;
 }
 
@@ -111,6 +120,12 @@ uptr tk_wide_st(i64 t) {
     i64 i = tk_wide_slot(t);
     if (i < 0) return 0;
     return ld64(tw_stsym + i * 8);
+}
+
+uptr tw_retbuf_of(i64 t) {
+    i64 i = tk_wide_slot(t);
+    if (i < 0) return 0;
+    return ld64(tw_rbsym + i * 8);
 }
 
 // ---- the sixteen-byte slot a wide depth lives in ----
@@ -351,15 +366,20 @@ void tw_callp(i64 d, i64 na) {
 
 // The callee writes the buffer and returns its ADDRESS, which is an ordinary
 // pointer the delegated `MTASK_RET` puts wherever this ABI returns a `uptr`.
-// The buffer is a global of the PROGRAM (`lib/decimal.tk`), because a frame
-// slot of this function is gone the moment the epilogue runs -- reading it
-// after the return would be a red-zone read this compiler is not entitled to.
-uptr tw_retbuf_name() { return "tk_dec_retbuf"; }
-
+// The buffer is a global of the PROGRAM (`lib/decimal.tk`, `lib/guid.tk`),
+// because a frame slot of this function is gone the moment the epilogue runs --
+// reading it after the return would be a red-zone read this compiler is not
+// entitled to. It is per TYPE (D75): the name comes from the wide set's own
+// fourth column and the include named in the refusal from the primitive table
+// (`tk_prim_inc_of`, teko_prim.tk), so a program that returns a `Guid` is told
+// about `guid.tk` and never about a file it does not use.
 void tw_ret(i64 d) {
-    if (!tk_wide_is(walk_depth_type(d))) { callp(tw_of(MTASK_RET), d); return; }
-    i64 gi = global_find(tw_retbuf_name());
-    if (gi < 0) die("teko: include \"decimal.tk\" before returning a sixteen-byte value");
+    i64 t = walk_depth_type(d);
+    if (!tk_wide_is(t)) { callp(tw_of(MTASK_RET), d); return; }
+    i64 gi = global_find(tw_retbuf_of(t));
+    if (gi < 0)
+        die(tk_join3("teko: include \"", tk_prim_inc_of(t),
+                     "\" before returning a sixteen-byte value"));
     callp(tw_of(MTASK_SYM_ADDR), d, glb_sym(glb_at(gi)));
     i64 r = tw_val(d);
     tw_cp(r, 0, tw_frame, 0 - tw_depth(d));

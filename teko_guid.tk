@@ -1,0 +1,150 @@
+// teko_guid.tk -- `Guid` itself: the registration, the rows and the one static
+// that is parsed by hand. N3 of docs/specs/guid.md, D75.
+//
+// It is the SECOND client of `teko_wide.tk` and the first that is not
+// `decimal`, which is the whole point of the order this crumb lands in: the
+// machine module gets one line here and none there (`tk_wide_add`), and the
+// sixteen bytes move because this id is in the wide set. It is also the first
+// client of teko_prim.tk's member table whose receiver is WIDE -- `g.ToString()`
+// hands the VALUE across, where `t.Days` hands the raw eight bytes -- which is
+// the four-line widening D75 records in teko_prim.tk.
+//
+// What this file does NOT do is as short: no machine, no pass, no intrinsic.
+// Every row names an ordinary function of `lib/guid.tk` with surface code, and
+// the refusals are wordings the compiler already had:
+//
+//   g + g, ~g            teko_ops.tk        no operator `+` takes these operands
+//   i64 n = g;           teko_typeof.tk     a value of type Guid does not convert to i64
+//   Guid g = 0;          teko_typeof.tk     a value of type i64 does not convert to Guid
+//   extern f(Guid g)     teko_over.tk       an `extern` takes no Guid
+//   g.Foo, Guid.Foo      this file's rows   unknown member of Guid
+//   const Guid G = ...;  teko_const.tk      a const is an integer
+//
+// ...and exactly two are its own: `Guid.NewGuid` is named and refused (§ 5,
+// N9), and a cast says what reads the value and what builds one (§ 2).
+
+i64 tk_ty_guid = 0;
+
+// ---- the statics (§ 4) ----
+// `Guid.Empty` is a CALL and not a folded constant: sixteen zero bytes have no
+// `MTASK_CONST` (`tw_const`, teko_wide.tk) and `lib/guid.tk` writes them into
+// the return buffer like any other `Guid`-valued function.
+void tk_guid_statics() {
+    i64 g = tk_ty_guid;
+    tk_prim_member(g, "Empty", TK_PMSVAL, 0 - 1, "tk_guid_empty", g);
+    tk_prim_member(g, "Parse", TK_PMSFUN, TY_UPTR, "tk_guid_parse", g);
+    // The row `tk_guid_expr` below never emits: `Guid.TryParse(s, out g)` is
+    // hand-parsed, because `out <name>` is no column this table has
+    // (teko_prim.tk's `pmr_*` rows carry a type per position and no KIND). It
+    // is registered all the same, so `g.TryParse(...)` on an instance answers
+    // ``teko: Guid.TryParse is static; reach it through its type`` instead of
+    // reading as a member nobody ever heard of.
+    tk_prim_membern(g, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_guid_tryparse", TY_I64);
+    // § 5: a version-4 `Guid` is sixteen bytes of CRYPTOGRAPHIC randomness,
+    // which is one `extern` per host and teko's own to write (N9). A value
+    // built from a counter, a clock or an address would compile and two
+    // processes would collide, so there is no fallback -- there is a refusal
+    // by name until the `extern` lands.
+    tk_prim_member(g, "NewGuid", TK_PMSOON, 0 - 1, 0, g);
+}
+
+// ---- the instance members (§ 4) ----
+void tk_guid_members() {
+    i64 g = tk_ty_guid;
+    // the two `ToString` rows are one overload set told apart by the number of
+    // arguments written (`tk_prim_pick`), the same way `new DateTime(...)`'s
+    // five are
+    tk_prim_member(g, "ToString", TK_PMFUN, 0 - 1,   "tk_guid_tostring",     TY_UPTR);
+    tk_prim_member(g, "ToString", TK_PMFUN, TY_UPTR, "tk_guid_tostring_fmt", TY_UPTR);
+    tk_prim_member(g, "CompareTo", TK_PMFUN, g, "tk_guid_cmp", TY_I64);
+    tk_prim_member(g, "Equals",    TK_PMFUN, g, "tk_guid_eq",  TY_I64);
+    // NOT a C# member: C# writes `g == Guid.Empty`, which works here too. It
+    // is the one addition this page makes, and it is additive -- one
+    // comparison the caller would otherwise write against a static that costs
+    // a load (§ 4).
+    tk_prim_member(g, "IsEmpty", TK_PMPROP, 0 - 1, "tk_guid_isempty", TY_I64);
+}
+
+// ---- the operators (§ 3) ----
+// Every one is a CALL, because a sixteen-byte value has no `cmp`: `tw_cmp`
+// (teko_wide.tk) `die`s on one, and these six rows are what keep the site from
+// ever reaching it. A `decimal` registers NO operator row and is refused at
+// the surface instead (`no operator `==` takes these operands`), which is the
+// difference between a type whose comparison is taught and one whose is not.
+void tk_guid_operators() {
+    i64 g = tk_ty_guid;
+    tk_prim_op(K_EQ, 2, g, g, "tk_guid_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, g, g, "tk_guid_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, g, g, "tk_guid_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, g, g, "tk_guid_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, g, g, "tk_guid_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, g, g, "tk_guid_ge", TY_I64, 0);
+}
+
+// ---- `Guid.TryParse(s, out g)`, parsed by hand ----
+// The shape is teko_enum.tk's own `Color.TryParse(s, out c)` and so is the
+// reason: `out c` is read directly through `tk_ref_addr` (teko_ref.tk) and NOT
+// through `parse_expr`'s registered `out` handler, because that one TAGS the
+// node and `tk_ref_check_call` then requires the tag to match the callee's own
+// declared parameter kind -- and the callee here (`tk_guid_tryparse`,
+// lib/guid.tk) takes a plain `uptr`. An untagged address answers `TK_RP_NONE`
+// by construction, matching it, and `tk_ref_addr` hands back the address AND
+// the pointee's type in one call.
+i64 tk_guid_tryparse_expr(i64 line, uptr fl) {
+    tk_prim_need_include(tk_ty_guid, "tk_guid_tryparse", line, fl);
+    p_expect(K_LPAR, "expected ( after TryParse");
+    i64 se = parse_expr(0);
+    p_expect(K_COMMA, "expected , after the string");
+    if (type_of_token(p_id()) != tk_ty_out)
+        err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+    p_next();
+    i64 pty = 0 - 1;
+    i64 oe = tk_ref_addr(line, fl, &pty);
+    p_expect(K_RPAR, "expected ) after TryParse");
+    if (pty >= 0 && pty != tk_ty_guid)
+        tk_reject_compat(tk_pointee_name(pty), "Guid", line, fl);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call2("tk_guid_tryparse", se, oe);
+}
+
+// the type word in EXPRESSION position: this file's own handler rather than
+// teko_prim.tk's `tk_prim_expr`, for the one static above. Every other member
+// goes straight to the table, with the member name already read
+// (`tk_prim_static_m`), so nothing is duplicated here.
+i64 tk_guid_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "Guid");
+    uptr m = tk_member_name();                   // D68
+    if (str_eq(m, "TryParse")) return tk_guid_tryparse_expr(line, fl);
+    return tk_prim_static_m(tk_ty_guid, m, line, fl);
+}
+
+// ---- registration ----
+// Called from `teko_init()` AFTER `tk_wide_init()`: `tk_wide_add` fills a table
+// the machine reads, and the machine's three derived copies have to exist
+// first. No literal and no suffix -- a `Guid` is written as TEXT and read back
+// with `Guid.Parse`, which is why this file registers no `syntax_lit` at all.
+//
+// `syntax_expr`/`syntax_stmt` are what let `Guid` open an expression and a
+// statement (`Guid.Empty`, `Guid.Parse(s)`); the core's own type parser already
+// reads `Guid g = ...;` from the registry. They count as ONE row of `mc
+// limits`' `syntax`, which is keyed by NAME.
+void tk_guid_init() {
+    tk_ty_guid = type_new("Guid", 16, 16, TK_WIDE);
+    tk_wide_add(tk_ty_guid, "tk_guid_ld", "tk_guid_st", "tk_guid_retbuf");
+    syntax_expr("Guid", &tk_guid_expr);
+    syntax_stmt("Guid", &tk_prim_stmt);
+    // § 2: a `Guid` is WRITTEN out as text and READ back from it -- it is not
+    // constructed, and `new Guid(...)` is no row of this table -- so the cast
+    // refusal names that pair and not a constructor (teko_prim.tk's two clause
+    // columns, D75).
+    tk_prim_type(tk_ty_guid, "Guid", "guid.tk",
+                 "`.ToString()` writes it", "`Guid.Parse(s)` reads it");
+    tk_guid_statics();
+    tk_guid_members();
+    tk_guid_operators();
+}

@@ -1,0 +1,62 @@
+// primitives_guid_tryparse.tk -- docs/specs/guid.md § 4: `TryParse` answers
+// `1`/`0` and writes `Guid.Empty` on every failure, which is C#'s own pair and
+// the reason `out` of a WIDE value is worth having (D75, the hole C3 left).
+//
+// `out g` here is read by teko_guid.tk's own hand parser -- `out <name>` is no
+// column the primitive-member table has -- and the address it hands over is
+// the caller's own sixteen-byte slot.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "guid.tk"
+
+Guid gout;
+
+i64 main() {
+    Guid g = Guid.Parse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6");
+
+    // ---- a good "D"
+    Guid v = g;
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6", out v) != 1) return 1;
+    if (v != g) return 2;
+
+    // ---- a good "N", either case
+    if (Guid.TryParse("F81D4FAE7DEC11D0A76500A0C91E6BF6", out v) != 1) return 3;
+    if (v != g) return 4;
+
+    // ---- the wrong length
+    if (Guid.TryParse("nope", out v) != 0) return 5;
+    if (!v.IsEmpty) return 6;                    // Empty written on failure
+    if (Guid.TryParse("", out v) != 0) return 7;
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bf", out v) != 0) return 8;
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bf60", out v) != 0) return 9;
+
+    // ---- a bad character, at the right length
+    if (Guid.TryParse("g81d4fae-7dec-11d0-a765-00a0c91e6bf6", out v) != 0) return 10;
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bfz", out v) != 0) return 11;
+    if (!v.IsEmpty) return 12;
+
+    // ---- a misplaced dash: the right length, the wrong shape
+    if (Guid.TryParse("f81d4fae7-dec-11d0-a765-00a0c91e6bf6", out v) != 0) return 13;
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bf-", out v) != 0) return 14;
+    // ...and a hyphen where the "N" form allows none
+    if (Guid.TryParse("f81d4fae7dec11d0a76500a0c91e6bf-", out v) != 0) return 15;
+
+    // ---- the out slot is written even when the caller never read it before
+    Guid fresh;
+    if (Guid.TryParse("00112233-4455-6677-8899-aabbccddeeff", out fresh) != 1) return 16;
+    if (!tk_str_eq(fresh.ToString(), "00112233-4455-6677-8899-aabbccddeeff")) return 17;
+
+    // ---- a GLOBAL slot, and an element of a local array
+    if (Guid.TryParse("f81d4fae-7dec-11d0-a765-00a0c91e6bf6", out gout) != 1) return 18;
+    if (gout != g) return 19;
+    if (Guid.TryParse("nope", out gout) != 0) return 20;
+    if (!gout.IsEmpty) return 21;
+
+    Guid arr[2];
+    if (Guid.TryParse("00112233-4455-6677-8899-aabbccddeeff", out arr[1]) != 1) return 22;
+    if (arr[1].IsEmpty) return 23;
+
+    return 42;
+}
