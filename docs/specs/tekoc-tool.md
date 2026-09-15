@@ -5,7 +5,9 @@
 to know what a hook module is*. It is a **packaging** crumb sequence — it teaches no teko
 construct, adds no `teko:` refusal and touches none of the 35 modules at the root.
 
-Everything below was measured on this machine against the pinned `mc` **0.17.0** (D72),
+Everything below was measured on this machine against `mc` **0.17.0** — the pin of the day
+(D72; the pin has since moved to 0.17.5 under the same frozen surface, and `[package].mc`
+names 0.17.0 as the minimum, D72's second amendment — the measurements stand as taken),
 with a throwaway registry, a throwaway `HOME` and a throwaway bin directory; the real
 `~/.mc` was never written to. Where a sentence says *measured*, the command that produced
 it is named.

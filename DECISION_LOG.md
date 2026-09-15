@@ -7476,7 +7476,9 @@ six minutes after the publish) and mc promoted the release on that verdict. The 
 recipe is green on 0.17.5 over `8d95c1ff` (102 passed, 130 refused, 0 failed; `FIXPOINT OK`;
 docs ok), and `--dump-ast` is byte-identical between the compiler built by 0.17.2 and by
 0.17.5 on all 232 fixtures. The move is D64's again: `MC_VERSION` to 0.17.5 and the
-current-pin quotes with it (`site.yml`, `CONTRIBUTING.md`, `build.md`, `00-getting-started.md`);
+current-pin quotes with it (`site.yml`, `CONTRIBUTING.md`, `build.md`, `00-getting-started.md`;
+`docs/specs/tekoc-tool.md` keeps its measurements against 0.17.0 and says so — the pin of the
+day it was measured on, not a current-pin quote);
 `[package].mc` stays 0.17.0 (the second amendment); nothing in the modules moves. Contract v6
 compares `u64`/`uptr` unsigned from 0.17.3 on — the pages that recorded the signed compare
 (`small-ints.md`, `lib/limbs.tk`) now say which side of the fix each pin is on, and the 32-bit
