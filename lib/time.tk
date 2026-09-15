@@ -653,7 +653,13 @@ void tk_dto_st(ptr p, DateTimeOffset o) {
 }
 
 // ---- the two halves ----
+// The one door every value passes: the LOCAL clock (instant + offset) has to
+// be a `DateTime` too, or a later `.DateTime`/`.Year`/`ToString` would panic
+// on a value that was let in -- `MaxValue.ToOffset(+14:00)` for one
+// (Copilot on #729; C# refuses the same at construction).
 DateTimeOffset tk_dto_make(i64 instant, i64 offmin) {
+    i64 local = tk_dt_ticks(instant) + offmin * TICKS_PER_MINUTE;
+    if (local < 0 || local > DATETIME_MAX_TICKS) panic("the local time of that DateTimeOffset is out of range");
     DateTimeOffset o;
     ptr q = &o;
     st64(q, instant);
@@ -908,7 +914,7 @@ i64 tk_dto_try_scan(str s, ptr utcp, ptr offp) {
         if (oh < 0) return 0;
         if (ld8(s + 30) != ':') return 0;
         i64 om = tk_dto_scan_num(s, 31, 2);
-        if (om < 0) return 0;
+        if (om < 0 || om > 59) return 0;         // `+00:60` is no `HH:MM` (Copilot on #729)
         offmin = oh * 60 + om;
         if (sign == '-') offmin = 0 - offmin;
         if (offmin < 0 - DTO_MAX_OFFSET_MIN || offmin > DTO_MAX_OFFSET_MIN) return 0;

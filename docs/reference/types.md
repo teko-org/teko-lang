@@ -1018,6 +1018,7 @@ offset zero, since teko has no time-zone database to read a bare wall-clock stri
 | `new DateTimeOffset(ticks, ts)` on an `i64 ticks` | `teko: a value of type i64 does not convert to DateTime` — the one `new` row takes a `DateTime` first, and the C# ticks overload is not taught |
 | `extern i64 f(DateTimeOffset o);` | ``teko: an `extern` takes no DateTimeOffset`` |
 | an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
+| a value whose LOCAL clock (instant + offset) leaves the `DateTime` range (`MaxValue.ToOffset(+01:00)`) | `teko: the local time of that DateTimeOffset is out of range`, exit 70 — refused where the value is built (`tk_dto_make`), as C# does at construction |
 | `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `DateTime.Now` is blocked on |
 
 ---

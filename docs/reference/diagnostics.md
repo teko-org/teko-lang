@@ -796,6 +796,9 @@ Three are **run-time panics** of `lib/time.tk`, all exit 70 and all on stderr wi
 
 - `"teko: that UTC offset does not exist"` — the constructor's second argument, or
   `.ToOffset`'s, outside `-14:00 .. +14:00` or not a whole minute (`tk_dto_check_offset`).
+- `"teko: the local time of that DateTimeOffset is out of range"` — the instant plus the offset
+  would read outside `DateTime`'s range (`MaxValue.ToOffset(+01:00)`); refused where the value is
+  built (`tk_dto_make`, lib/time.tk), exit 70.
 - `"teko: the DateTimeOffset format is not taught"` — `o.ToString(fmt)` on a format outside
   the lowercase `"o"` and `"s"` § 5 of the specification names; C#'s own format characters are
   case-sensitive for these two, and none of C#'s other calendar formats is taught.

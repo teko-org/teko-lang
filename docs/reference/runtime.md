@@ -315,6 +315,7 @@ the LOCAL reading (the instant plus the offset, an ordinary Unspecified tick cou
 | `i64 tk_dto_instant(DateTimeOffset)` `i64 tk_dto_offmin(DateTimeOffset)` | the two halves back out |
 | `i64 tk_dto_local_ticks(DateTimeOffset)` | the instant plus the offset: what `.Year` … `.Millisecond` and the text both read |
 | `i64 tk_dto_check_offset(i64 ts)` | the offset validator: a whole minute, `-14:00 .. +14:00`; panics `teko: that UTC offset does not exist` otherwise |
+| `DateTimeOffset tk_dto_make(i64 instant, i64 offmin)` | the one constructor every value passes; panics `teko: the local time of that DateTimeOffset is out of range` when instant + offset leaves the `DateTime` range |
 | `DateTimeOffset tk_dto_min()` `tk_dto_max()` `tk_dto_unixepoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
 | `DateTimeOffset tk_dto_new(i64 dt, i64 ts)` | `new DateTimeOffset(DateTime, TimeSpan)`: the `DateTime` read as a LOCAL reading at `ts`'s offset, the instant that minus the offset |
 | `DateTimeOffset tk_dto_from_unix_seconds(i64)` `tk_dto_from_unix_ms(i64)` | the two `FromUnixTime*` builders, range-checked before the multiply |
