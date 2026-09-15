@@ -71,7 +71,7 @@ void tk_dec_st(ptr p, decimal d) {
 //
 //   aligning an operand of `+`  a 96-bit mantissa times 10^28   ~ 2^189
 //   the product of `*`          96 bits by 96 bits              = 192 bits
-//   the divisor's own ceiling   a 96-bit divisor shifted by 96  = 192 bits
+//   a remainder of `/` times 10 below the divisor, so  96 + 4   = 100 bits
 //
 // The vectors are LOCAL arrays, never globals: `u64 a[8]` in a frame is its
 // own address (`tests/primitives_decimal_math.tk` walks a nested call), so
@@ -216,20 +216,6 @@ void tk_dv_shl1(uptr a) {
         c = (x >> 32) & 1;
         i = i + 1;
     }
-}
-
-// v <<= 96, which is exactly three limbs up: the ceiling a quotient of 96 bits
-// puts on the dividend (`tk_dec_div`)
-void tk_dv_shl96(uptr v) {
-    i64 i = TK_DEC_NL - 1;
-    loop {
-        if (i < 3) break;
-        tk_dv_put(v, i, tk_dv_at(v, i - 3));
-        i = i - 1;
-    }
-    tk_dv_put(v, 0, 0);
-    tk_dv_put(v, 1, 0);
-    tk_dv_put(v, 2, 0);
 }
 
 // r = a * b, the school product. `r` is neither `a` nor `b`, and the carry out
@@ -420,22 +406,38 @@ decimal tk_dec_mul(decimal a, decimal b) {
 }
 
 // ---- / ----
-// The quotient's scale starts at `sa - sb` and the dividend buys the rest: it
-// is multiplied by ten for every place the result may still carry, as long as
-// the quotient stays inside 96 bits -- which is exactly `dividend < divisor *
-// 2^96`, the one comparison `tk_dv_shl96` exists for.
+// C# § 12.9.3, which is the one rule of the five operators that decides a
+// scale of its own (D77, ruling 9): **the quotient carries the smallest scale
+// that preserves the result**, at most 28 places. Nothing else strips a
+// trailing zero -- `1.0m == 1.00m` is true and `+`, `-` and `*` keep the
+// scales the operands imply -- so this is written here and nowhere else.
 //
-// `1m / 3m` therefore spends all 28 places and answers
-// 0.3333333333333333333333333333, and `1m / 3m * 3m` is
-// 0.9999999999999999999999999999 and not `1m`. That is C#'s answer and the
-// fixture asserts it (docs/specs/decimal.md § 5).
+// It is long division, one decimal place per round: the quotient starts at the
+// natural scale `sa - sb` and each round multiplies the REMAINDER by ten and
+// divides again, which is exactly one more digit. Two things stop it -- a
+// remainder of zero, because the result is then exact and every further place
+// would be a trailing zero, and the 28th place. A quotient that no longer fits
+// 96 bits stops it too: that is the same ceiling the shifted divisor used to
+// express, read here off the quotient itself.
+//
+// The trailing zeros the NATURAL scale carries are then stripped for the same
+// rule: `4.0m / 2m` is `2m` and not `2.0m`, because the smallest scale that
+// preserves two is zero.
+//
+// `5m / 2m` is therefore `2.5m` at scale 1 and not at scale 28, `1m / 8m` is
+// `0.125m` at scale 3, and `1m / 3m` -- whose remainder never reaches zero --
+// spends all 28 places, answers 0.3333333333333333333333333333 and makes
+// `1m / 3m * 3m` 0.9999999999999999999999999999 rather than `1m`. All four are
+// C#'s answers and the fixture asserts every one of them, SCALE included
+// (docs/specs/decimal.md § 5).
 decimal tk_dec_div(decimal a, decimal b) {
     if (tk_dec_is_zero(b)) panic("decimal division by zero");
     u64 va[TK_DEC_NL];
     u64 vb[TK_DEC_NL];
     u64 vq[TK_DEC_NL];
     u64 vt[TK_DEC_NL];
-    u64 vc[TK_DEC_NL];
+    u64 vr[TK_DEC_NL];
+    u64 vd[TK_DEC_NL];
     tk_dec_load(a, va);
     tk_dec_load(b, vb);
     i64 s = tk_dec_scale(a) - tk_dec_scale(b);
@@ -446,19 +448,35 @@ decimal tk_dec_div(decimal a, decimal b) {
         if (tk_dv_muls(va, 10)) panic("decimal overflow");
         s = s + 1;
     }
-    tk_dv_copy(vc, vb);
-    tk_dv_shl96(vc);                          // the ceiling: divisor * 2^96
+    tk_dv_divmod(vq, va, vb);                 // `va` becomes the remainder
+    // one decimal place per round, and only while the remainder says the
+    // result is not exact yet. The new quotient is formed WHOLE before it is
+    // committed, so the 96-bit ceiling is read off the digit that would land
+    // and not off an estimate of it.
     loop {
+        if (tk_dv_is_zero(va)) break;         // exact: the scale stops here
         if (s >= TK_DEC_MAXSCALE) break;
-        tk_dv_copy(vt, va);
+        tk_dv_copy(vt, vq);
         if (tk_dv_muls(vt, 10)) break;
-        if (tk_dv_cmp(vt, vc) >= 0) break;
-        tk_dv_copy(va, vt);
+        tk_dv_copy(vr, va);
+        tk_dv_muls(vr, 10);                   // the remainder buys the place
+        tk_dv_divmod(vd, vr, vb);             // one digit, and what is left
+        tk_dv_add(vt, vd);
+        if (tk_dv_over96(vt)) break;          // a mantissa is 96 bits
+        tk_dv_copy(vq, vt);
+        tk_dv_copy(va, vr);
         s = s + 1;
     }
-    tk_dv_divmod(vq, va, vb);                 // `va` becomes the remainder
-    tk_dv_shl1(va);                           // twice it, against the divisor:
-    if (tk_dv_cmp(va, vb) >= 0) tk_dv_inc(vq);  // half away from zero
+    tk_dv_shl1(va);                           // twice the remainder, against the
+    if (tk_dv_cmp(va, vb) >= 0) tk_dv_inc(vq);  // divisor: half away from zero
+    // ...and the smallest scale that still preserves it
+    loop {
+        if (s <= 0) break;
+        tk_dv_copy(vt, vq);
+        if (tk_dv_divs(vt, 10)) break;
+        tk_dv_copy(vq, vt);
+        s = s - 1;
+    }
     return tk_dec_pack(vq, s, tk_dec_sign(a) ^ tk_dec_sign(b));
 }
 

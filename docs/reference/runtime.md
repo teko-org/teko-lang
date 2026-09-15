@@ -377,7 +377,7 @@ arrays, so a nested call cannot find another call's scratch.
 |---|---|
 | `decimal tk_dec_add(decimal a, decimal b)` / `tk_dec_sub` | the scales align to the larger one; panics `teko: decimal overflow` |
 | `decimal tk_dec_mul(decimal a, decimal b)` | the scales SUM, the mantissas multiply |
-| `decimal tk_dec_div(decimal a, decimal b)` | up to 28 places, the quotient bounded by 96 bits; panics `teko: decimal division by zero` |
+| `decimal tk_dec_div(decimal a, decimal b)` | the SMALLEST scale that preserves the result (C# § 12.9.3), at most 28 places, the quotient bounded by 96 bits; panics `teko: decimal division by zero` |
 | `decimal tk_dec_rem(decimal a, decimal b)` | the sign of the DIVIDEND, the scale `max(sa, sb)`; the same panic on a zero divisor |
 | `decimal tk_dec_neg(decimal a)` | bit 63 of the high word, flipped |
 | `i64 tk_dec_cmp(decimal a, decimal b)` | `-1`/`0`/`1`: zero first (three patterns, one value), then the sign, then the magnitudes at a common scale |

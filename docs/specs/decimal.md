@@ -226,6 +226,13 @@ the operators. `Round` is the other rule, and it is the one the owner named:
 `decimal.Round(d)` and `decimal.Round(d, n)` round **half to even**, C#'s
 `MidpointRounding.ToEven` default.
 
+**The quotient's scale is C# § 12.9.3's**, and `/` is the only operator that decides one of
+its own: the quotient carries **the smallest scale that preserves the result**, at most 28
+places. `5m / 2m` is `2.5m` at scale 1, `1m / 8m` is `0.125m` at scale 3, `4.0m / 2m` is
+`2m` at scale 0 and `1m / 3m` — whose remainder never reaches zero — spends all 28. Nothing
+else in this type strips a trailing zero: `1.0m == 1.00m` is true with two different
+mantissas, and `+`, `-` and `*` keep the scales § 5 gives them, so `1.0m * 1.0m` is `1.00m`.
+
 `1m / 3m * 3m` is therefore `0.9999999999999999999999999999` and not `1m` — 28 digits, the
 same answer C# gives, and a fixture asserts exactly that. A design that "fixed" it would be
 a different type.
@@ -292,8 +299,11 @@ locals — the same technique `mc`'s own `<i128>` uses to convert a literal
   (a limb multiply-add), then add or subtract 96-bit magnitudes with an explicit carry;
 - multiply is the school product of three limbs by three limbs into six, scales summed,
   reduced by dividing by ten with rounding while the result is too wide;
-- divide is long division over the limbs, producing up to 29 digits and rounding the last
-  one away from zero;
+- divide is long division over the limbs, one decimal place per round: it stops at the 28th
+  place, at a remainder of zero (the result is exact there, and every further place would be
+  a trailing zero) or at a quotient that no longer fits 96 bits, rounds the last digit away
+  from zero and then strips the trailing zeros the natural scale `sa - sb` carried — which
+  is C# § 12.9.3's smallest-scale rule, § 5's last paragraph;
 - every operation that leaves the 96-bit range calls `panic("decimal overflow")`, which is
   `rt_panic` and exit 70 — the same failure an array guard already gives
   ([memory.md](../reference/memory.md)).
