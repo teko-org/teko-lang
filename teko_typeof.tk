@@ -113,6 +113,7 @@ i64 tk_prim_op_ret(i64 tok, i64 ta, i64 tb);
 // this file reads of them.
 i64  tk_prim_cast_find(i64 tty, i64 ety);
 uptr px_sym_at(i64 i);
+void tk_prim_need_include(i64 ty, uptr sym, i64 line, uptr fl);
 i64  tk_wide_is(i64 t);
 
 // docs/specs/enum.md § 6 (N2b, D47): `c.ToString()` on a receiver only the
@@ -598,8 +599,19 @@ i64 tk_num_widen(i64 tty, i64 ety, i64 e) {
     // D77: the wide arm writes the CALL the conversion table names, and the
     // `callp` clause below is not its business -- the symbol declares `i64`
     // and the core already types an indirect call's result as one.
-    if (tk_num_wide_widens(tty, ety))
-        return tk_call(px_sym_at(tk_prim_cast_find(tty, ety)), e);
+    //
+    // The include is checked HERE and not at the call sites (D77, ruling 10):
+    // this one function is the implicit road in every one of D33's nine slots
+    // and is what `tk_ops_promote` (teko_ops.tk) calls for a mixed operand, so
+    // one question covers all of them, with the same wording the EXPLICIT road
+    // already gives (`tk_prim_cast_lower`, teko_prim.tk). Without it
+    // `decimal d = 1;` with no `#include "decimal.tk"` reached the core's own
+    // `call to unknown function`, which names no file the writer forgot.
+    if (tk_num_wide_widens(tty, ety)) {
+        uptr sym = px_sym_at(tk_prim_cast_find(tty, ety));
+        tk_prim_need_include(tty, sym, nd_line(e), nd_file(e));
+        return tk_call(sym, e);
+    }
     if (tk_is_callp(e)) e = tk_cast(ety, e);
     return tk_cast(tty, e);
 }

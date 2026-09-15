@@ -704,6 +704,14 @@ them a call into `lib/decimal.tk` (D77) — and leaves the MEMBER table empty, s
   the return) and no C ABI shares it, so the two would disagree at run time rather than at
   the declaration. Refused where the type and the word `extern` are both in hand
   (`tk_ov_extern_wide`, [`teko_over.tk`](../../teko_over.tk)).
+- `"teko: "` — completed by *decimal needs #include "decimal.tk" before it is used*: every
+  one of § 6's conversions is a CALL into `lib/decimal.tk`, so a program that converts
+  without the include is told which file it forgot instead of reaching the core's own `call
+  to unknown function`. It is the same message `TimeSpan` and an `enum`'s own text already
+  give, and it now covers **both** roads: the explicit `(decimal) n`
+  (`tk_prim_cast_lower`, [`teko_prim.tk`](../../teko_prim.tk)) and the implicit
+  `decimal d = 1;` in all nine of D33's slots plus the mixed `d + 1`
+  (`tk_num_widen`, [`teko_typeof.tk`](../../teko_typeof.tk); D77, ruling 10).
 - `"teko: include "` — completed by *"decimal.tk" before returning a sixteen-byte value*: a
   wide return travels through `tk_dec_retbuf`, a global the **program** declares, and
   `lib/decimal.tk` is where it is declared. It is the rule `lib/rt.tk` already has for an
