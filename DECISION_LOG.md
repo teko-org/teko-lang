@@ -7737,3 +7737,164 @@ slot. Closed at the root: the argument is TAGGED (`tk_rfarg_tag(oe, TK_RP_OUT, p
 Measured: local, global and parameter targets write the value (exit 42);
 `out victim` with `i64 victim;` refuses `teko: a value of type i64 does not convert to Guid`
 (`tests/refuse/guid_tryparse_out_global.tk`).
+
+### D76 · `DateTimeOffset`, the third wide type: the instant and its offset in sixteen bytes (N5, 2026-09-14)
+> A UTC instant, `+0`, and its offset in signed minutes, `+8`, is the third `TK_WIDE` type
+> and the first whose own members mix TWO other primitives (`DateTime`, `TimeSpan`) rather
+> than reading raw bytes alone. It rides `teko_wide.tk` (D74) and the mechanism D75
+> generalised — the reader/builder cast clauses, the per-type return buffer, the wide
+> `ref`/`out` road — with no change to any of the three, which is the proof the machine
+> generalises past its second client and not only its first. Where the shared code still had
+> a hole — a stale include-quoting convention, a `new T()` that would crash a wide type's own
+> codegen guard — the fix is in the SHARED code, for every wide type at once, never in a
+> branch that reads this type's name.
+
+`DateTimeOffset` is `docs/specs/datetime-extras.md`'s own N5, the crumb it named "still
+open" — depended on `docs/specs/datetime.md`'s C2 (`DateTime`/`TimeSpan`, D40/D41) and
+`docs/specs/decimal.md`'s C3 (`teko_wide.tk`, D74), both live by the time this crumb ran,
+and it registers LAST in `tk_time_init()` so its own columns can name `DateTime`'s and
+`TimeSpan`'s live ids without a `tk_prim_late` indirection.
+
+#### The seven rulings this crumb was dispatched with, and what each became
+
+1. **One two-argument constructor only**, `new DateTimeOffset(DateTime, TimeSpan)`. C#'s
+   `(i64 ticks, TimeSpan)` overload is NOT taught: `tk_prim_pick` (`teko_prim.tk`) chooses a
+   `"new"` row by ARGUMENT COUNT alone, and the one row this table carries is of arity 2, so
+   a second row of the same arity was never going to be told apart from it. Measured, and
+   pinned rather than special-cased: `new DateTimeOffset(621355968000000000,
+   TimeSpan.Zero)` reaches the row's own first-position check and is refused
+   `teko: a value of type i64 does not convert to DateTime` — an ORDINARY argument mismatch,
+   not a row of its own (`tests/refuse/dto_ticks_ctor.tk`). `new DateTimeOffset(new
+   DateTime(t), ts)` is the written form, recorded in `not-yet.md`.
+
+2. **Text stays in N5.** `ToString()`/`ToString("o")`/`ToString("s")` and
+   `Parse`/`TryParse` of BOTH forms — the "o" 33-character round-trip form with its offset
+   suffix, and the "s" 19-character sortable one, which `Parse` reads as UTC, offset zero,
+   since teko has no time-zone database to read a bare wall-clock string against. Every
+   format outside those two panics by name at run time, exit 70
+   (`teko: the DateTimeOffset format is not taught`, `teko: the string is not a
+   DateTimeOffset`), the same two-panic shape `Guid`'s own text already has. The amendment is
+   recorded on `docs/specs/datetime-extras.md` itself: its own § 2/§ 4 wording —
+   `` `.DayNumber` reads it `` and "no primitive here has a `str` member yet" — describes
+   `DateOnly`, not a blanket claim over every type this page designs, and was easy to misread
+   as one; narrowed where it appears.
+
+3. **`new T()` on a WIDE type is refused by name, one guard in the shared code, for
+   `decimal`, `Guid` and `DateTimeOffset` at once.** `tk_prim_new`'s empty-argument branch
+   wrote `tk_cast(ty, tk_int(0))` unconditionally — harmless for eight bytes (`TimeSpan.Zero`
+   is exactly that cast) and a codegen `die` for sixteen: `tw_cast` (`teko_wide.tk`) has no
+   zero BIT PATTERN a wide cast could write, since a wide value moves by address and never
+   through a register. `decimal` and `Guid` never reached it before this crumb — neither
+   registers a `"new"` row of ANY arity, so `tk_prim_new`'s earlier `ri < 0` check refused
+   `new decimal()`/`new Guid()` first, with the generic "this primitive has no constructor" —
+   but `DateTimeOffset` DOES register one, of arity 2, so its own zero-argument call reached
+   the crash. The guard moved AHEAD of that check and reads `tk_wide_is(ty)` first: every
+   wide type answers with its own named zero instead — `` `new decimal()` is not taught;
+   write `0m` ``, `` `new Guid()` is not taught; write `Guid.Empty` ``, `` `new
+   DateTimeOffset()` is not taught; write `DateTimeOffset.MinValue` `` — read from a FOURTH
+   column of `tk_prim_type` (`pt_zero`), one wording template, one guard, three spellings.
+   `decimal`'s and `Guid`'s own wordings CHANGE (a strictly better answer, naming the type's
+   own zero instead of a generic "no constructor"), untested by any fixture until now since
+   neither had one; `docs/reference/diagnostics.md`'s own catalogue records the change and
+   the reason.
+
+4. **The include column is bare everywhere; one place quotes it.** `teko_time.tk` baked its
+   own quotes into `tk_time_include()` (`return "\"time.tk\"";`) while `teko_guid.tk` passed
+   the name bare (`"guid.tk"`), so `tk_prim_need_include_of` (`teko_prim.tk`) printed a
+   correctly-quoted message for one and an unquoted one for the other, and `tw_ret`
+   (`teko_wide.tk`) — which adds its OWN quotes around whatever `tk_prim_inc_of` answers —
+   would have printed `include ""time.tk""` for a wide type registered under the baked-quote
+   column, which `DateTimeOffset` is the first one of. Fixed at the root, once: the column
+   (`pt_inc`, every `tk_prim_type` call) carries the bare name everywhere now, and a new
+   `tk_prim_inc_q` is the ONE reader both `tk_prim_need_include_of` and `tw_ret` ask for the
+   quoted form. `tests/refuse/guid_no_include.tk`'s own wording moves from `teko: Guid needs
+   #include guid.tk before it is used` to `` teko: Guid needs #include "guid.tk" before it is
+   used `` — measured, and the only wording this repository ships that the fix moves at all,
+   since no fixture on `dcbd88c5` yet returned a `DateTimeOffset` without its own include.
+
+5. **`TK_MAXPRIMO` rises from 48 to 64.** Measured before this crumb: 41 operator rows in
+   use against a cap of 48 (`tk_prim_op` calls, summed over `teko_time.tk`/`teko_guid.tk`);
+   N5's own nine rows (six comparisons, `o + ts`, `o - ts`, `o - o`) would have crossed it.
+   `docs/reference/diagnostics.md`'s own capacity table had drifted to a stale `32` for this
+   row and a stale `96` for `TK_MAXPRIMM`'s (160, unmoved: measured usage after this crumb is
+   142 member rows, comfortably under) since before D74 — both corrected here, not only the
+   row this crumb needed raised.
+
+6. **The code lives in `teko_time.tk` and `lib/time.tk`; no new module.** A `DateTimeOffset`
+   section registered LAST in `tk_time_init()`, so `tk_ty_datetime`/`tk_ty_timespan` are live
+   ids where its constructor and operator columns name them; `lib/time.tk` carries
+   `tk_dto_retbuf`/`tk_dto_ld`/`tk_dto_st` beside `tk_dec_retbuf`/`tk_guid_retbuf`'s own
+   shape, and every reader, the offset validator, the Unix conversions, `ToOffset`, the
+   arithmetic (reusing `tk_dt_add`/`tk_dt_sub_ts`/`tk_dt_sub` directly, an instant IS a
+   `DateTime`), the comparisons (reusing `tk_dt_eq` … `tk_dt_cmp` directly, the same reuse
+   `DateOnly`/`TimeOnly` already made of `tk_ts_*`) and the text. `mc.toml`'s
+   `[package].files` needed no new entry — `sh scripts/check-docs.sh`'s own manifest check is
+   the proof.
+
+7. **`DateTimeOffset.Now`/`UtcNow` are C6-class externs**, a `TK_PMSOON` row apiece, refused
+   `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `DateTime.Now` is
+   already blocked on (the owner's ruling of 2026-09-08). Nothing new is asked of the `mc`
+   channel: no member on this page needs `mc` to change.
+
+#### What C1/C3/D75 owed a value that reads TWO other primitives, measured
+
+Nothing. `tk_prim_conv`/`tk_prim_ret`/`tk_prim_emit` already answer "does this column name a
+wide type, or a primitive, or neither" by the COLUMN's own type and not by the ROW's, so a
+constructor whose two positions are `DateTime` (a primitive) and `TimeSpan` (a primitive) and
+whose OWN type is wide crosses each argument correctly with no line changed: `tk_prim_member2`
+(D41, written for `new DateTime(ticks, kind)`) already took two DIFFERING column types, and
+D75's wide-receiver/wide-argument split already took a wide TYPE regardless of which column
+carried it. The two mechanisms had never been exercised TOGETHER on one row before this crumb,
+and the measurement is that they compose with no seam: `tests/primitives_dto.tk`'s own
+constructor call is the oracle.
+
+#### What is built
+
+`teko_prim.tk` — `TK_MAXPRIMO` 48 → 64; a fourth `pt_zero` column on `tk_prim_type` (six
+call sites updated: four unused-`0` for `TimeSpan`/`DateTime`/`TimeOnly`/`DateOnly`, `"0m"`
+for `decimal`, `"Guid.Empty"` for `Guid`); the wide `new T()` guard in `tk_prim_new`, moved
+ahead of the "no constructor" check; `tk_prim_inc_q`, the one quoting point
+`tk_prim_need_include_of` now reads. `teko_wide.tk` — `tw_ret`'s own refusal reads the include
+through `tk_prim_inc_q` instead of quoting it by hand. `teko_time.tk` — the `DateTimeOffset`
+section: `tk_dto_statics`/`_ctors`/`_members`/`_operators`, the hand-parsed
+`tk_dto_tryparse_expr` (`Guid.TryParse`'s own shape, D75), `tk_dto_expr`, and the
+registration at the end of `tk_time_init()`; `tk_time_include()` unbaked. `teko_decimal.tk`,
+`teko_guid.tk` — one argument each, the type's own zero spelling. `lib/time.tk` — the
+`DateTimeOffset` section: the return buffer, the two copy helpers, the two extractors, the
+offset validator, the statics, the constructor, the Unix conversions, the readers reusing
+`tk_dt_*` directly, `ToOffset`, the arithmetic and the comparisons reusing `tk_dt_*` directly,
+the `"o"`/`"s"` formatters and their inverse scanner, `Parse`/`TryParse`. Nothing else:
+`teko.tk`, `core_teko.mc`, `user.mc`, `mc.toml` unchanged; no new file.
+
+#### The gate, as run
+
+`mc build . --config mc.macos.toml` clean on mc 0.17.0;
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **86 passed, 111 refused as expected,
+0 failed** (84 + 2 and 103 + 8); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+**FIXPOINT OK**; `sh scripts/check-docs.sh` → `docs ok: 667 links, 60 fragments,
+404 diagnostics, 111 refusals, 149 samples, manifest listed`.
+
+`--dump-ast` of all **187** fixtures that exist on `dcbd88c5`, each compiler in its own
+project directory (so a fixture's `#include` reads that compiler's OWN `lib/`): **170
+byte-identical, 17 differing**. Sixteen of the seventeen are every fixture that
+`#include`s `time.tk` — `lib/time.tk` gained roughly forty functions at its OWN tail, which
+is EVERY line of every one of those sixteen diffs (`diff` shows zero lines removed on all
+sixteen, measured one by one): no existing declaration moved, the new ones are appended
+after everything a program could have referenced before this crumb landed. The seventeenth
+is `tests/refuse/guid_no_include.tk`, ruling 4's own wording change, already accounted for.
+Cross-compiled (compile only; this host's linker cannot link a foreign-arch object) on the
+three non-host machine tables `tests/primitives_dto.tk` reaches — `linux/x86_64`,
+`linux/aarch64`, `windows/x86_64` — with no error, which is the SysV, AAPCS64 and Win64
+tables `teko_wide.tk`'s own derived machines answer for a `DateTimeOffset` argument, a
+`DateTimeOffset` return and a `DateTime`/`TimeSpan` argument beside it in one call; the CI
+five-leg matrix is what RUNS all five, this being the local measurement ahead of the push.
+
+`mc limits . --config mc.macos.toml`, tolerance 1.0, base `dcbd88c5` → this crumb: `intrin`
+**8 → 8 (unmoved, the law's own row)**, `passes` **15 → 15 (unmoved)**, `syntax`
+**16 → 17 (+1**, one row, keyed by NAME — `syntax_expr("DateTimeOffset")` and
+`syntax_stmt("DateTimeOffset")` are the one row between them**)**, `types` **15 → 16 (+1**,
+the `DateTimeOffset` row**)**, `alias` **22 → 23 (+1**, `type_new` reserving the word, the
+same lockstep D75 measured for `Guid`**)**. Verdict `ok` on both sides; **no new `grew`
+row**. `TK_MAXPRIMM`/`TK_MAXPRIMO` are this project's own tables and outside `mc limits`'
+own set: measured directly, 142/160 and 50/64 after this crumb (the second ceiling raised
+by ruling 5, the first left at its existing 160 since 142 does not reach it).
