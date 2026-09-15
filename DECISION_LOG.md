@@ -8936,7 +8936,8 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    `tests/surface_divovf.tk` (70, `i64.MinValue / m` with `m` a parameter),
    `tests/surface_divguard.tk` (42: every width with a non-literal divisor, truncation
    toward zero, `MinValue / 1`, a narrow width's own `MinValue` divided by something other
-   than `-1`, a divisor with a side effect evaluated exactly once, `u64.MaxValue / 2`, a
+   than `-1`, a divisor with a side effect evaluated exactly once, both operands with side
+   effects evaluated left to right and once each on an unsigned width, `u64.MaxValue / 2`, a
    literal divisor path left untouched, and — ruling 9 — the `&&`/`||`/`while`/nested rows
    whose division is never reached, side-effecting lazy divisor included),
    `tests/surface_divlazy.tk` (70: the same lazy division reached through a TRUE left side),

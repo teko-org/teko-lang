@@ -181,13 +181,14 @@ i64 tk_prim_is(i64 ty);
 // A LITERAL nonzero divisor needs no guard at all -- `x / 2` is left exactly
 // as the core wrote it, and it is what keeps `--dump-ast` unmoved for the
 // common case and for most of the compiler's own divisions (D82's own gate
-// entry: every one of them divides by a `#define`d constant). A literal ZERO
-// divisor is not specially skipped -- it falls into the same guard as a
-// variable would, which folds to an unconditional panic once the ordinary
-// path is taken; mc's own compile-time folder (`fold_binary`, `src/parse.mc`)
-// still catches the case where BOTH sides are constant, ahead of codegen,
-// with no `teko:` prefix -- left exactly as it is (D2), and never reached by
-// this guard because `fold()` runs after every pass.
+// entry: every one of them divides by a `#define`d constant). A LITERAL
+// divisor never reaches the run-time guard at all (`tk_div_guard`'s first
+// exit): a nonzero literal is left exactly as the core wrote it, and a
+// literal ZERO is refused where it is written -- `teko: division by zero`
+// when the dividend is not constant (`a / 0`, `tests/refuse/divzero_literal.tk`),
+// and mc's own compile-time folder (`fold_binary`, `src/parse.mc`, no
+// `teko:` prefix, D2) when BOTH sides are constant, since `fold()` runs
+// after every pass and answers `12 / 0` before codegen.
 //
 // THE DIVISOR AND (for the overflow check) THE DIVIDEND are each read AT
 // MOST twice -- once by the guard, once by the division itself -- so an
@@ -283,7 +284,8 @@ i64 tk_div_has(uptr hay, uptr needle) {
         i64 hit = 1;
         loop {
             if (j >= nl) break;
-            if (ld8(hay + i + j) != ld8(needle + j)) { hit = 0; break; }
+            i64 h = ld8(hay + i + j);
+            if (h == 0 || h != ld8(needle + j)) { hit = 0; break; }
             j = j + 1;
         }
         if (hit) return 1;
@@ -382,11 +384,14 @@ void tk_div_guard(i64 n, uptr dst) {
     if (!tk_div_rt_panic())
         err_at(tk_file, tk_line, "teko: an integer division needs #include rt.tk");
     i64 sgn = type_signed(ta);
-    uptr an = 0;
-    if (sgn) {
-        if (nd_kind(a) == N_IDENT) an = nd_name(a);
-        else { an = tk_div_hoist(a, ta, dst); set_nd_a(n, tk_id(an)); }
-    }
+    // BOTH operands are hoisted, the dividend first, whatever the width's
+    // sign: the divisor's initializer lands ahead of the division, so a
+    // dividend with a side effect of its own (`left() / right()`) has to be
+    // hoisted too or it would run AFTER the divisor, against left-to-right
+    // evaluation. `an` is then read only by the signed overflow check.
+    uptr an;
+    if (nd_kind(a) == N_IDENT) an = nd_name(a);
+    else { an = tk_div_hoist(a, ta, dst); set_nd_a(n, tk_id(an)); }
     uptr bn;
     if (nd_kind(b) == N_IDENT) bn = nd_name(b);
     else { bn = tk_div_hoist(b, tb, dst); set_nd_b(n, tk_id(bn)); }
