@@ -598,15 +598,29 @@ void tk_rc_stmt(i64 n) {
 
 // the parameters of the function being walked: borrowed, every one of them, so
 // they are in scope for what reads them and below the floor the releases start
-// at
+// at.
+//
+// `tk_this_enter_fn`/`tk_this_leave_fn` (teko_this.tk) bracket the push the
+// same way `tk_ty_pass_walk`'s own walk does (teko_typeof.tk): this pass runs
+// as its OWN loop over every `N_FUNC`, not through that walk, so
+// `tk_pass_class`/`tk_pass_static` are stale -- whatever the last walk that
+// called `tk_this_leave_fn` left them at -- unless set fresh here too.
+// `tk_ty_scope_params` reads them to type the receiver as the enclosing type
+// rather than the raw `uptr` it is declared at the C level (D87b): `return
+// this;` calls `tk_ty_of` again here, under THIS pass's own scope table, and
+// a bare `this` node carries no cached type of its own (`tk_xt_ty` answers -1
+// for it) until this scope entry gives it one -- measured `ety = TY_UPTR`,
+// `teko: a value of type uptr does not convert to C`, before this bracket.
 void tk_rc_fn(i64 f) {
     tk_nscope = 0;
     tk_nlp = 0;
     tk_rc_cur_fn = f;
+    tk_this_enter_fn(nd_name(f));
     tk_ty_scope_params(nd_a(f));
     tk_rc_floor = tk_nscope;
     tk_rc_ret = nd_type(f);
     tk_rc_stmt(nd_b(f));
+    tk_this_leave_fn();
     tk_nscope = 0;
 }
 

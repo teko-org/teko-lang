@@ -1,0 +1,92 @@
+// surface_this_value.tk -- D87b: `this`, inside an instance method or
+// constructor, is an expression of the ENCLOSING CLASS -- C#'s own rule --
+// and not the raw `uptr` it is declared at the C level
+// (`param_new(TY_UPTR, tk_this_name())`, teko_class.tk, the width `callp`
+// and a field's `ld64(this + OFF)` both need). `class C { ... public C
+// Self() { return this; } }` used to refuse `return this;` itself, `teko: a
+// value of type uptr does not convert to C`, on the base this crumb
+// measured (`5c913517`): nothing had ever told the ORACLE (`tk_ty_of`,
+// teko_typeof.tk) that a bare `this` node carries the class's own type, so
+// every consumer that asks it -- a `return`, an assignment, an argument, a
+// comparison -- read `uptr` off it and refused, no matter how the receiver
+// was reached through `.` (which never asked the oracle at all, and so
+// already worked). The fix teaches `tk_ty_scope_params` the one row `this`
+// is pushed under: the enclosing type's own id, read off `tk_pass_class`
+// (`tk_this_enter_fn`, teko_this.tk) rather than the parameter's raw
+// C-level type -- reached from BOTH walks that push a function's scope
+// (`tk_ty_pass_walk`, teko_typeof.tk, and `tk_rc_fn`, teko_rc.tk, which runs
+// its own loop over every function and needed the same bracket).
+//
+// What each check proves, in order:
+//
+//   1. `Self()`     -- `return this;`, the reproducer itself: the RC pass
+//                      (teko_rc.tk) increments the reference on the way out
+//                      exactly as returning a local class reference does
+//                      (`tk_rc_return`'s own `needinc`), which `rt_live()`
+//                      staying at the baseline below proves rather than
+//                      merely typing.
+//   2. `Copy()`     -- `C d = this;`, a fresh LOCAL declared straight from
+//                      the receiver: the same `tk_rc_var` road an ordinary
+//                      assignment takes, borrowed `this` incremented into
+//                      an owning slot.
+//   3. `ViaTake()`  -- `Take(this)`, `this` passed as an ARGUMENT to a
+//                      STATIC member of the same class, reached by its bare
+//                      name (`tk_this_call`, teko_this.tk) -- the argument
+//                      check (`tk_vcall_args_check`/D57's own road) has to
+//                      see `this` as `C` to accept it against `C c`.
+//   4. `SameAs()`   -- `this == other`, resolved through `operator==`
+//                      (D8: an operator is a static member, no vtable) the
+//                      same way any other `C`-typed operand would be. No
+//                      class carries a built-in `==`, so the operator body
+//                      writes reference identity itself, the road teko
+//                      gives it today: a cast to `uptr` on each side (D34:
+//                      neither operand of a plain scalar comparison is
+//                      judged against a row at all), which is what tells
+//                      `a.SameAs(a)` (the same object) from `a.SameAs(b)`
+//                      (an equal but DIFFERENT one).
+//   5. `rt_live()`  -- back to the count it held before the block: every
+//                      road above that widened `this` into an owned
+//                      reference (`Self`, `Copy`) released it again, and no
+//                      road leaked or double-freed the object underneath.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class C {
+    public i64 v;
+
+    public C(i64 x) { v = x; }
+
+    public C Self() { return this; }
+
+    public i64 Copy() {
+        C d = this;
+        return d.v;
+    }
+
+    public static i64 Take(C c) { return c.v; }
+
+    public i64 ViaTake() { return Take(this); }
+
+    public static i64 operator==(C a, C b) { return (uptr) a == (uptr) b; }
+    public static i64 operator!=(C a, C b) { return !(a == b); }
+
+    public i64 SameAs(C other) { return this == other; }
+}
+
+i64 main() {
+    i64 floor = rt_live();
+    {
+        C a = new C(7);
+        if (a.Self().v != 7) return 1;
+        if (a.Copy() != 7) return 2;
+        if (a.ViaTake() != 7) return 3;
+        if (a.SameAs(a) != 1) return 4;
+
+        C other = new C(7);
+        if (a.SameAs(other) != 0) return 5;
+    }
+    if (rt_live() != floor) return 6;
+    return 42;
+}
