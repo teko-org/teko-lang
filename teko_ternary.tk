@@ -229,40 +229,62 @@ i64 tk_div_panic(uptr msg) {
     return tk_blk(list_append(0, tk_stmt(tk_call("panic", tk_str(msg)))));
 }
 
-// D2 draws the line at mc's own bundled core, and getting there right takes
-// BOTH oracles this project already has, not either alone -- measured on the
-// fixed point (`scripts/bootstrap.sh` compiles `mc_teko.tk`, which reaches
-// `<mc/core_min>`):
+// D2 draws the line at mc's own bundled core, and getting there right took
+// TWO measured failures of the fixed point (`scripts/bootstrap.sh` compiles
+// `mc_teko.tk`, which reaches `<mc/core_min>`), not one:
 //
 //   1. `src/arena.mc`'s own `buf_pad` divides by a PARAMETER (`buf_len(b) %
 //      align`), reached through the compiler's OWN blob, and announced by
 //      `lex_file()` under a bare canonical name (`mc/arena`, no directory,
 //      no extension -- hooks.md's own "a normalised path... the canonical
 //      bundled name... for a bundled one"). `tk_origin_of_file`
-//      (teko_access.tk) answers WRONG for exactly this shape: with a bare
-//      (no-directory) entry and config, the pair `scripts/bootstrap.sh`
-//      derives when it runs from the repository root, its own fallback
-//      ("the project is the whole [current] directory") calls `mc/arena`
-//      project code too, since it does not start with `.`. The narrower
-//      question this file actually needs already has an exact answer:
-//      `tk_fwd_is_source_name` (teko_fwd.tk) is the SAME `.tk`-suffix filter
-//      `source_claim` uses to tell a real file from a bundled canonical name
-//      -- none of the latter ends in `.tk` or `.mc` -- `.mc` joins it here
-//      for `core_teko.mc`/`user.mc`, this project's own two non-`.tk` files.
+//      (teko_access.tk, the oracle `internal` reads) answers WRONG for
+//      exactly this shape: with a bare (no-directory) entry and config, the
+//      pair `scripts/bootstrap.sh` derives when it runs from the repository
+//      root, its own fallback ("the project is the whole [current]
+//      directory") calls `mc/arena` project code too, since it does not
+//      start with `.`. The narrower question this file actually needs
+//      already has an exact answer: `tk_fwd_is_source_name` (teko_fwd.tk) is
+//      the SAME `.tk`-suffix filter `source_claim` uses to tell a real file
+//      from a bundled canonical name -- none of the latter ends in `.tk` or
+//      `.mc` -- `.mc` joins it here for `core_teko.mc`/`user.mc`, this
+//      project's own two non-`.tk` files.
 //
 //   2. mc's own LIBRARY TREE, resolved onto disk rather than carried in the
 //      blob (`lib/machine_arm64_float.mc`, reached the same way), announces
-//      a REAL path, extension included -- `.mc`, same as this project's
-//      own -- so the suffix filter alone answers 1 for it too. It is
-//      `tk_origin_of_file`'s OWN first line that gets this one right: the
-//      resolved path is absolute, and an absolute path is never this
-//      project's own (that function's own comment).
-//
-// Neither oracle alone is enough; both together are, since each one is
-// wrong only on the shape the other one reads correctly.
+//      a REAL path, extension included -- `.mc`, same as this project's own
+//      -- so the suffix filter alone answers 1 for it too. `tk_origin_of_file`
+//      was tried here (its first line answers 0 for an absolute path), and
+//      is WRONG on this leg too: a Windows CI runner's own resolved path
+//      starts with a drive letter (`D:/a/teko-lang/...`), not `/`, so that
+//      check never fires and this shape needs an oracle of its own. The
+//      layout mc's own docs fix (`docs/reference/bundle.md`, "its standard
+//      library in a tree... `lib/mc/v<version>/`") is stable across every OS
+//      this project targets, so the substring `lib/mc/v` is checked
+//      directly, portably, rather than trying a THIRD way to spell "absolute
+//      path" (this project has no `[deps]` yet -- a locked package resolved
+//      to some OTHER root would need its own line here, not needed today).
+i64 tk_div_has(uptr hay, uptr needle) {
+    i64 nl = cstrlen(needle);
+    i64 i = 0;
+    loop {
+        i64 c = ld8(hay + i);
+        if (c == 0) return 0;
+        i64 j = 0;
+        i64 hit = 1;
+        loop {
+            if (j >= nl) break;
+            if (ld8(hay + i + j) != ld8(needle + j)) { hit = 0; break; }
+            j = j + 1;
+        }
+        if (hit) return 1;
+        i = i + 1;
+    }
+}
+
 i64 tk_div_project_file(uptr f) {
     if (f == 0) return 0;
-    if (!tk_origin_of_file(f)) return 0;
+    if (tk_div_has(f, "lib/mc/v")) return 0;
     if (tk_fwd_is_source_name(f)) return 1;
     i64 n = cstrlen(f);
     return n >= 3 && ld8(f + n - 3) == '.' && ld8(f + n - 2) == 'm' && ld8(f + n - 1) == 'c';

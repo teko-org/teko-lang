@@ -8860,8 +8860,9 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    no `#include` at all, `tests/hello.tk`'s own shape, has neither).
 
 6. **mc's own bundled core needed a SEPARATE exclusion, found only by running the fixed
-   point, not by reasoning about it first.** The fixed point (`scripts/bootstrap.sh`) failed
-   twice before this ruling closed:
+   point on every OS, not by reasoning about it first.** The fixed point
+   (`scripts/bootstrap.sh`) failed three times, on three different shapes, before this
+   ruling closed:
    - `src/arena.mc`'s own `buf_pad` (`<mc/core_min>`, reached from `mc_teko.tk`) divides by a
      PARAMETER (`buf_len(b) % align`) and is announced under a bare canonical name
      (`mc/arena`, no directory, no extension — hooks.md's own "the canonical bundled name...
@@ -8869,20 +8870,31 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
      reads) answers this WRONG: with the bare (no-directory) entry and config
      `scripts/bootstrap.sh` derives from the repository root, its own fallback ("the project
      is the whole [current] directory") calls `mc/arena` project code too, since it does not
-     start with `.`.
-   - Fixed by filtering on the SAME `.tk`-suffix oracle `source_claim` already uses
-     (`tk_fwd_is_source_name`, teko_fwd.tk), `.mc` joining it for `core_teko.mc`/`user.mc` --
-     but mc's own LIBRARY TREE, resolved onto disk rather than carried in the blob
-     (`lib/machine_arm64_float.mc`, reached the same include), announces a REAL path with
-     the SAME extension this project's own files carry, so the suffix filter alone answered
-     1 for it too.
-   - `tk_origin_of_file`'s OWN first line gets THAT one right (an absolute path is never this
-     project's own), so the final oracle (`tk_div_project_file`, teko_ternary.tk) is BOTH:
-     `tk_origin_of_file(f) && (tk_fwd_is_source_name(f) || f ends ".mc")`. Neither alone is
-     enough; each is wrong on exactly the shape the other reads correctly. D2 draws the line
-     at mc's own bundled/resolved core either way — a defect there (if `buf_pad` genuinely
-     divides by zero somewhere) is minicompiler/mc's to report, never teko's to silently
-     reinterpret.
+     start with `.`. Fixed by filtering on the SAME `.tk`-suffix oracle `source_claim`
+     already uses (`tk_fwd_is_source_name`, teko_fwd.tk), `.mc` joining it for
+     `core_teko.mc`/`user.mc` — every bundled canonical name ends in neither.
+   - mc's own LIBRARY TREE, resolved onto disk rather than carried in the blob
+     (`lib/machine_arm64_float.mc`, reached the same include), announces a REAL path with the
+     SAME extension this project's own files carry, so the suffix filter alone answered 1
+     for it too — needing a second line, not a replacement for the first.
+   - That second line was first written as `tk_origin_of_file`'s own absolute-path check (an
+     absolute path is never this project's own, that function's own first line) — right on
+     macOS and Linux CI, and WRONG on the Windows leg: a Windows runner's own resolved path
+     starts with a drive letter (`D:/a/teko-lang/...`), not `/`, so the check never fires
+     there and the leg failed exactly the same way, on exactly the file the macOS leg had
+     already cleared. The fixed, portable answer does not try a third spelling of "absolute
+     path": mc's own docs name the layout directly (`docs/reference/bundle.md`, "its
+     standard library in a tree... `lib/mc/v<version>/`"), stable across every OS this
+     project targets, so `tk_div_project_file` (teko_ternary.tk) checks the substring
+     `lib/mc/v` — present in the Linux/macOS path (`/…/build/lib/mc/v0.17.2/lib/…`) and the
+     Windows one alike (`D:/a/…/build/lib/mc/v0.17.2/lib/…`), since `mc` itself normalises
+     the separator to `/` on every host (measured on all three). The final oracle is: a
+     path naming mc's own resolved library tree is excluded outright; otherwise a name
+     ending `.tk` or `.mc` is this project's own. D2 draws the line at mc's own
+     bundled/resolved core either way — a defect there (if `buf_pad` genuinely divides by
+     zero somewhere) is minicompiler/mc's to report, never teko's to silently reinterpret.
+     This project has no `[deps]` yet; a locked package resolved to some OTHER root would
+     need a line of its own, not needed today.
 
 7. **`lib/wide.tk`'s `i128` amends D81's ruling 3: `MinValue / -1i` panics too, and `%` was
    never a row to amend (D81's own eleven-op table has no `%` for either wide type — N6b's).**
@@ -8926,16 +8938,40 @@ exactly where D81 left it; no `type_new`, no `syntax`/`syntax_infix`, no new `pa
 `on_stmt()` registration anywhere in this crumb.
 
 `--dump-ast --include=lib --include=tests` over all 235 `.tk` files under `tests/` as they
-stand on `8d95c1ff`, base compiler built in its own worktree: **232 of 235 byte-identical**.
-The three that differ — `tests/primitives_i128.tk`, `tests/primitives_i128_divzero.tk`,
-`tests/primitives_i128_math.tk`, every one of them `#include "wide.tk"` — differ by the
-SAME 61 lines each: the new `tk_w_sdiv_ovf` function and the one `if (tk_w_sdiv_ovf(a, b))
-panic(...)` line `tk_w_sdiv` gained (ruling 7). **Not one of the 102 accept fixtures'
-own AST moved from the plain-integer guard** (ruling 2-4): measured, every division already
-in the corpus divides by a literal. This crumb changes accepted RUN-TIME behaviour on
-purpose (a program dividing a non-literal divisor by zero now panics instead of reading the
-machine's own answer) without moving a single byte of any existing fixture's own AST — the
-two are not in tension, since no existing fixture exercises the case that changed.
+stand on `8d95c1ff`, base compiler built in its own worktree: **198 of 235 byte-identical,
+37 differ** — measured twice, the first pass wrongly read only 3 (the `tk_origin_of_file`
+draft of ruling 6 was ALSO excluding `lib/decimal.tk`/`lib/limbs.tk`/`lib/time.tk` by their
+own bare `#include`d name, the false-negative twin of the `mc/arena` false positive it was
+written to fix — corrected once the portable oracle landed). Every one of the 37 is fully
+explained by two sources and nothing else:
+
+- **Ruling 7's own `tk_w_sdiv_ovf`** — every fixture that `#include`s `wide.tk` gains the
+  new function and its one call site in `tk_w_sdiv`.
+- **Three EXISTING library helpers this crumb's guard now also reaches**, because they are
+  this project's own code (`lib/limbs.tk`, `lib/time.tk`) dividing by a PARAMETER, exactly
+  the shape ruling 2-4 guards anywhere else: `tk_dv_divs` (`lib/limbs.tk`, shared by
+  `decimal.tk` and `wide.tk`, `cur / d` and `cur % d`, unsigned — one zero-check each, no
+  prior guard at all) and `tk_ts_mul`/`tk_ts_div` (`lib/time.tk`'s `TimeSpan` arithmetic,
+  `r / n` and `a / n`, signed — a zero-check AND an overflow-check each). The last two
+  already special-cased `n == 0` and `n == -1` by hand before ever reaching the division
+  (`tk_ts_div`'s own header: "`-1` is taken out of the way BEFORE the division that checks
+  the product") — this crumb's guard is provably DEAD CODE there, redundant with logic
+  already proven correct, never fires, and does not change one exit code. `tk_dv_divs` had
+  no such hand guard and is the one place this crumb adds a genuinely NEW safety net inside
+  the standard library rather than only at a program's own division.
+
+Every fixture that transitively reaches one of those three functions — every `decimal`,
+`i128`/`u128`, `DateTime`/`DateOnly`/`TimeOnly`/`TimeSpan`/`DateTimeOffset` fixture in the
+corpus, 37 of them — shows the SAME small, fully-accounted diff (2, 4 or 6 new `panic`
+call sites depending on which of the three functions it reaches, 3 for the `i128`/`u128`
+trio which also carries ruling 7's own addition). **Not one of the 37 changed a single exit
+code** (`sh scripts/fixtures.sh`, above: 107 passed, 0 failed, same as the 102 the base
+compiler passes) and **not one of the OTHER 198 fixtures' own AST moved** — every plain
+division written directly IN a fixture's own source, rather than reached through one of
+those three library functions, divides by a literal. This crumb changes accepted RUN-TIME
+behaviour on purpose (a program dividing a non-literal divisor by zero now panics instead
+of reading the machine's own answer) without moving a single byte of AST where the case
+that changed is not exercised, and with no exit code moved anywhere it is.
 
 What is left open: nothing new. The `#include rt.tk` road (ruling 5) is a design choice this
 entry records rather than a gap; a program that needs it and does not have it is refused by
