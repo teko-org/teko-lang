@@ -7498,6 +7498,18 @@ current-pin quotes with it (`site.yml`, `CONTRIBUTING.md`, `build.md`, `00-getti
 the owner's: CLAUDE.md's "v1.0.0 ships only together with mc 1.0.0" is now satisfiable, and
 that tag is the owner's to cut, not this log's.
 
+**Fifth amendment (2026-09-15) — the pin rises to 1.0.1.** mc 1.0.1 (mc #99): `macho-exe` no
+longer loses its exported symbols to `dlopen` once `__bss` crosses a 16 KiB page — zerofill-only
+segments sit below `__TEXT` now. A patch under the 1.0.0 surface. The canary's first verdict
+was `fail` on a GitHub CDN 500 during the toolchain download (run 34994511029, eight of nine
+jobs green); the re-run judged it `ok` (run 34995172917), and mc promoted the release on it.
+The same 500 made this repository's own v0.19.0 release run fail once (re-run by hand), and
+`setup-mc` retries transient CDN errors since #745. The whole local recipe is green on 1.0.1
+over `baf0b420` (121 passed, 135 refused, 0 failed; `FIXPOINT OK`; docs ok) and `--dump-ast`
+is byte-identical between the compiler built by 1.0.0 and by 1.0.1 on all 256 fixtures. The
+move is D64's: `MC_VERSION` to 1.0.1 and the current-pin quotes with it; `[package].mc` stays
+0.17.0; nothing in the modules moves.
+
 ### D74 · A primitive may be a machine type; the closed list stays closed (C3, 2026-09-14)
 > A type teko registers with `type_new` carries whatever its representation needs to **move**: a
 > derived machine table per instruction set, deriving from the table in effect and delegating
