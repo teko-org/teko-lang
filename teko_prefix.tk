@@ -51,3 +51,89 @@ i64 tk_unary_rewrap(i64 n, i64 inner) {
 // `++`/`--`) stays off for it, exactly as it already is for any other
 // non-bare-identifier receiver.
 i64 tk_bracket_no_write = 0;
+
+// D80: the sink above is WRONG when the `- ! ~` chain stood inside a SOURCE
+// `(...)` group: `(-t).Duration().Hours` is `(-t)` first, THEN `.Duration()`
+// -- C#'s own reading, the postfix binding to the parenthesized group's own
+// result -- not `-(t.Duration().Hours)`, what the unconditional sink used to
+// answer. Parens are invisible to the AST: mc's core returns `(expr)` as
+// `expr` itself, no `N_PAREN`, no flag (src/parse.mc) -- so the one surviving
+// signal is lexical, read as raw bytes.
+//
+// How far back the probe reads before it gives up and falls back to the
+// ordinary sink: generous headroom, not a real limit -- no fixture or
+// library file needs a parenthesized unary receiver anywhere near this wide.
+#define TK_UNARY_PAREN_MAX 4096
+
+// 1 when the postfix token now at `p_start()` -- the position of whatever
+// `cur` is when a `syntax_infix` handler runs, since mc's own `parse_expr`
+// (M21, src/parse.mc) already consumed the operator before calling the
+// handler, so there is no token left to ask "was this parenthesized" -- was
+// immediately preceded, source bytes read backward with whitespace skipped,
+// by a `)` whose MATCHING `(` (parens counted, comments and string literals
+// NOT recognized as such -- ceiling 1 below) is itself immediately followed
+// by one of `- ! ~`, possibly through more redundant `(`s
+// (`((-t)).Duration()` peels both): the chain sunk through `tk_unary_base`
+// stood inside that group, so the postfix binds to the GROUP's own result
+// and the caller must not sink. `oplen` is the postfix token's own width (1
+// for `.` and `[`, 2 for `?.`), walked back first so the scan starts on
+// whatever came before the operator itself.
+//
+// Ceiling 1: a `(` or `)` inside a string literal or a comment, between the
+// group and the operator, is counted as a real paren -- a byte scan, no
+// lexical awareness. Nothing in this repository's fixtures or library files
+// puts one there.
+// Ceiling 2: the backward scan gives up -- answers 0, the ordinary sink --
+// after TK_UNARY_PAREN_MAX bytes without closing a paren at depth 0.
+i64 tk_unary_ws(i64 c) {
+    return c == ' ' || c == 9 || c == 10 || c == 13;   // space, tab, LF, CR
+}
+
+i64 tk_unary_parened(i64 oplen) {
+    uptr lo = p_start() - TK_UNARY_PAREN_MAX;
+    uptr p = p_start();
+    i64 skipped = 0;
+    loop {                                    // past the operator itself
+        if (p <= lo) return 0;
+        p = p - 1;
+        i64 c = ld8(p);
+        if (tk_unary_ws(c)) continue;
+        skipped = skipped + 1;
+        if (skipped == oplen) break;
+    }
+    loop {                                    // past the space before it
+        if (p <= lo) return 0;
+        p = p - 1;
+        if (!tk_unary_ws(ld8(p))) break;
+    }
+    if (ld8(p) != ')') return 0;
+    i64 depth = 1;
+    uptr open = 0;
+    loop {                                     // to the OUTERMOST matching `(`
+        if (p <= lo) return 0;
+        p = p - 1;
+        i64 c = ld8(p);
+        if (c == ')') depth = depth + 1;
+        else if (c == '(') {
+            depth = depth - 1;
+            if (depth == 0) { open = p; break; }
+        }
+    }
+    // peel every redundant `(` right after `open`: `left` is already known
+    // (by the caller) to be a pure `- ! ~` chain, and mc's own `(expr)`
+    // unwraps invisibly (src/parse.mc), so a leading `(` found here can only
+    // be one more such layer -- the grammar leaves no other way for the text
+    // between `open` and the matched `)` to still parse as one.
+    uptr r = open + 1;
+    loop {
+        loop {
+            if (r >= p_src_end()) return 0;
+            if (!tk_unary_ws(ld8(r))) break;
+            r = r + 1;
+        }
+        i64 c = ld8(r);
+        if (c == '-' || c == '!' || c == '~') return 1;
+        if (c != '(') return 0;
+        r = r + 1;
+    }
+}
