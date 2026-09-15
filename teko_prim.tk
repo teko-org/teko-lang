@@ -59,7 +59,9 @@ uptr tk_op_spell(i64 tok);
 uptr tk_op_side_msg(uptr side, uptr sp);
 
 #define TK_MAXPRIMT 8                 // primitive types carrying a member table
-#define TK_MAXPRIMM 160               // member rows, over every primitive
+#define TK_MAXPRIMM 192               // member rows, over every primitive (D79: 160 -> 192,
+                                       // C5's nineteen `decimal` rows take 141 to 160,
+                                       // which is the old table exactly full)
 #define TK_MAXPRIMO 80                // operator rows, over every primitive (D76: 48 -> 64,
                                        // N5's nine `DateTimeOffset` rows took it past 48;
                                        // D77: 64 -> 80, C4's twelve `decimal` rows took 50 to 62)
@@ -705,9 +707,31 @@ i64 tk_nd_moved(i64 n) {
 // the same rule `tk_num_widen` writes (`tk_num_widens`, teko_typeof.tk), asked
 // once the type is no longer a guess. Every other column wrote its node at
 // parse time and reads nothing here.
+//
+// D79: the rule is one and the NODE is two. A widening into a float column is
+// a cast; a widening into a WIDE one is the CALL the conversion table names
+// (`tk_dec_from_i64`), because `MTASK_CAST` on a sixteen-byte value has no
+// meaning at all -- `tw_cast` (teko_wide.tk) `die`s on one. Measured on this
+// branch with the first row whose ARGUMENT is wide (`decimal.Round(d, n)`,
+// C5): every integer argument the PARSER could not type -- a local, a
+// parameter, a `u8`, an array element, a call -- reached this function and
+// left it as `(decimal) n`, and the build died in codegen with
+// `teko: a cast is not defined on a sixteen-byte value yet`. A literal never
+// did, because the parser types it and `tk_rc_call_args` (teko_rc.tk) writes
+// the conversion against the declaration instead.
+//
+// `tk_num_widen` already answers both shapes -- it is the one function D77
+// gave the wide arm to -- so the node it builds REPLACES this one in place
+// (`tk_node_replace`, teko_struct.tk: the argument keeps its identity and its
+// sibling link, which is what a node already spliced into a call's list needs).
 void tk_prim_arg_widen(i64 pty, i64 n, i64 aty) {
     if (!tk_num_widens(pty, aty)) return;
     i64 inner = tk_nd_moved(n);
+    if (tk_wide_is(pty)) {
+        tk_node_replace(n, tk_num_widen(pty, aty, inner));
+        tk_xt_put(n, tk_struct_by_ty(pty), pty, 0, TK_OWNED);
+        return;
+    }
     set_nd_kind(n, N_CAST);
     set_nd_op(n, 0);
     set_nd_type(n, pty);
