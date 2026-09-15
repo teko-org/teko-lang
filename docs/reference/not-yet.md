@@ -231,16 +231,21 @@ not:
 
 ## `decimal`, and the rest of `docs/specs/decimal.md`
 
-C3 landed the sixteen-byte value, its literal and its movement (D74) and C4 the arithmetic,
-the comparisons and the four conversions (D77, [the type reference](types.md#decimal)). What
-is left is C5: round and text ([decimal.md](../specs/decimal.md) § 12).
+C3 landed the sixteen-byte value, its literal and its movement (D74), C4 the arithmetic,
+the comparisons and the four conversions (D77) and C5 the rounding, the text and the
+statics (D79, [the type reference](types.md#decimal)). What is left of
+[decimal.md](../specs/decimal.md) § 12 is C7 alone, a SPEED crumb nothing depends on: the
+limb arithmetic replaced by each machine's own 128-bit instructions, with every fixture
+unchanged at the same exit code.
 
 | written | what happens |
 |---|---|
-| `(str) d` | `teko: a decimal does not cast yet` — text is `ToString`, C5; the four casts § 6 opens are calls since C4 |
+| `(str) d` | ``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it`` — the four casts § 6 opens are calls since C4, and text is those two members since C5 |
 | `decimal g = 3.25m;` at file scope | `global initializer must be constant`, from the core — the literal is the `N_IDENT` of its own blob global and a `decimal` has no folded form at all. `decimal g = 5;` gets past that rule (`5` IS an `N_INT`) and is refused by name instead: `teko: a global decimal takes no initializer`. A global is a slot and an assignment |
-| `decimal.Round(d)`, `Truncate`, `Floor`, `Ceiling`, `Abs`, `MaxValue`, `Zero` (C5) | `teko: unknown static member of decimal` — no row is registered, and no `syntax_expr("decimal")` either, so the receiver form costs nothing until C5 needs it |
-| `d.ToString()`, `decimal.Parse(s)`, `TryParse` (C5) | `teko: unknown member of decimal` and its static twin — the crumb every other primitive's text waits on too |
+| `decimal.ToDouble(d)`, `decimal.FromDouble(x)` | `teko: unknown static member of decimal` — they are `(f64) d` and `(decimal) x`, C4's own conversion rows under C#'s other spelling, so C5 registers no second door to one road (D79, ruling 1) |
+| `Math.Round(x)` on an `f64`, `Math.Max`, `Math.Sqrt` | `teko: unknown member: Sqrt` — `lib/math.tk` is the `decimal` half C5 landed; a float half is a library crumb of its own |
+| a culture, a thousands separator or a currency sign in `Parse`/`ToString` | `teko: the string is not a decimal` on the way in, and never written on the way out — formatting is a library and not a primitive ([decimal.md § 9](../specs/decimal.md)) |
+| `decimal.Parse` on a value with more than 28 decimal places | `teko: decimal overflow`, exit 70 — exact or refused: this type never rounds a number the writer wrote out in full (D79, ruling 5) |
 | `const decimal RATE = 0.07m;` | `teko: const requires a constant expression` — a `const` is folded at compile time and the folder has no 128-bit arithmetic, so a `decimal` has no folded form. An array size is the same rule |
 | `case 1m:` | `teko: a case label must be a constant expression`, for the same reason |
 | `extern i64 f(decimal d);` | ``teko: an `extern` takes no decimal`` — the sixteen-byte convention is teko's own and is not a C ABI |

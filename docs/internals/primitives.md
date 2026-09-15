@@ -221,7 +221,7 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 | table | cap | counts |
 |---|---|---|
 | `TK_MAXPRIMT` | 8 | primitive types with a member table |
-| `TK_MAXPRIMM` | 160 | member rows, over every primitive |
+| `TK_MAXPRIMM` | 192 | member rows, over every primitive |
 | `TK_MAXPRIMO` | 80 | operator rows, over every primitive |
 | `TK_MAXPRIMX` | 8 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
@@ -237,7 +237,10 @@ would have overflowed both, and raising a `#define` costs nothing but the array 
 The operator cap was raised twice more for the same reason: to 64 by D76, whose nine
 `DateTimeOffset` rows took the true count past 48, and to **80** by D77, whose twelve
 `decimal` rows took it from 50 to 62. `TK_MAXPRIMX` is D77's own table and holds **5** of 8
-— four `decimal` conversions plus the `u64` source's own row.
+— four `decimal` conversions plus the `u64` source's own row. The MEMBER cap was raised once,
+by D79: C5's nineteen `decimal` rows take the total to **160 of 160**, the old cap exactly
+full, so it is **192** now and 101 of the 128 parameter positions are spent. Measured with a
+counter printed at the end of `teko_init()`, not by counting registration lines.
 `TimeOnly` itself (N4b) brings the totals to **4, 103 and 35**, with **71** parameter
 positions — twenty of its own rows plus the one N4a's own `DateOnly` table gained
 (`.ToDateTime(TimeOnly)`), seven operator rows, and twenty of its own positions plus one on

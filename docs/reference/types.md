@@ -804,9 +804,8 @@ yet.
 
 Sixteen bytes, sixteen-byte aligned, behind `#include "decimal.tk"`. It is C#'s type, and
 it exists because `0.1 + 0.2 == 0.3` is false in an `f64` and true in a `decimal`. It
-moves, it computes and it converts (C3 and C4, [the specification](../specs/decimal.md)
-§ 12); `decimal.Round`, `ToString` and `Parse` are C5 and are answered by name until then
-([not-yet.md](not-yet.md)).
+moves, it computes, it converts, it rounds and it is written and read back as text (C3,
+C4 and C5, [the specification](../specs/decimal.md) § 12).
 
 ```teko
 // expect-exit: 42
@@ -865,8 +864,68 @@ result past 28 decimal places rounds, and it rounds **half away from zero**, whi
 | `decimal` | any integer | **explicit** `(i64) d`, truncating toward zero |
 | `f32`, `f64` | `decimal` | **explicit** `(decimal) x`, the double's own value rounded to 15 significant digits |
 | `decimal` | `f64`, `f32` | **explicit** `(f64) d`, may lose precision |
-| `decimal` | `str` | `.ToString()`, C5 |
+| `decimal` | `str` | `.ToString()`, never implicit; `decimal.Parse(s)` is the way back |
 | `null`, a class, a struct, a `T[]` | `decimal` | refused |
+
+**The API** is C#'s, and every row is an ordinary call into `lib/decimal.tk`:
+
+| static | answers | |
+|---|---|---|
+| `decimal.Zero`, `One`, `MinusOne` | `decimal` | 0, 1, -1 at scale 0 |
+| `decimal.MaxValue`, `MinValue` | `decimal` | `±79228162514264337593543950335m`, the full 96-bit mantissa |
+| `decimal.Round(d)`, `Round(d, places)` | `decimal` | **half to even**, C#'s `MidpointRounding.ToEven`; the scale never grows, so `Round(1.5m, 3)` is `1.5m` at scale 1 |
+| `decimal.Truncate(d)`, `Floor(d)`, `Ceiling(d)` | `decimal` at scale 0 | toward zero, toward `-∞`, toward `+∞`: `Floor(-1.5m)` is `-2m` and `Ceiling(-1.5m)` is `-1m` |
+| `decimal.Abs(d)` | `decimal` | the sign bit cleared; the scale is untouched |
+| `decimal.Parse(s)` | `decimal` | `teko: the string is not a decimal` or `teko: decimal overflow`, exit 70 |
+| `decimal.TryParse(s, out d)` | `i64` 0/1 | never panics; `decimal.Zero` on failure |
+
+| instance | answers | |
+|---|---|---|
+| `d.ToString()` | `str` | the shortest exact form, trailing zeros KEPT: `1.50m` writes `"1.50"` |
+| `d.ToString(places)` | `str` | C#'s `"F<n>"`: rounded to `places`, then padded with zeros |
+| `d.CompareTo(e)` | `i64` `-1/0/1` | the VALUE, whatever the scales |
+| `d.Equals(e)` | `i64` 0/1 | the same question `==` asks |
+| `d.Scale` | `i64` | `0..28`, the raw byte of the layout |
+| `d.Sign` | `i64` `-1/0/1` | the VALUE's, so `-0m` answers 0 |
+
+A `places` outside `0..28` is `teko: the decimal places are out of range`, exit 70 —
+`ToString(places)` shares it, because it rounds first. `Math.Round`, `Truncate`, `Floor`,
+`Ceiling` and `Abs` are C#'s other spelling of five of them, an ordinary class of static
+methods behind `#include "math.tk"`.
+
+**The text** is exact in both directions. `ToString` places the point by the scale and
+keeps trailing zeros, because `1.50m` and `1.5m` are two values; a zero never carries a
+sign, so `-0m` writes `"0"` while `0.00m` writes `"0.00"`. `Parse` accepts exactly what
+`ToString` writes plus an optional exponent — `[+|-] digits [ . digits ] [ (e|E) [+|-]
+digits ]`, with `.5` and `5.` accepted as C# accepts them — and **nothing else**: no
+surrounding space, no thousands separator, no culture and no currency
+([decimal.md § 9](../specs/decimal.md)). A value it can read but not hold — a mantissa past
+96 bits, or a scale past 28 places once the exponent moved it — is `teko: decimal
+overflow`, because this type is exact or loud and never rounds a number the writer wrote
+out in full.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "decimal.tk"
+
+i64 main() {
+    if (decimal.Round(2.5m) != 2m) return 1;           // half to EVEN, not away from zero
+    if (decimal.Round(3.5m) != 4m) return 2;
+    if (decimal.Round(2.675m, 2) != 2.68m) return 3;   // 2.675 is exact here, so it ties
+    if (decimal.Floor(-1.5m) != -2m) return 4;
+    if (decimal.Ceiling(-1.5m) != -1m) return 5;
+    if (!tk_str_eq(1.50m.ToString(), "1.50")) return 6;
+    if (!tk_str_eq(1.5m.ToString(3), "1.500")) return 7;
+    if (decimal.Parse("1.5E-2") != 0.015m) return 8;
+    decimal v = 0m;
+    if (decimal.TryParse("x", out v)) return 9;
+    if (v != decimal.Zero) return 10;
+    if (1.0m.CompareTo(1.00m) != 0) return 11;
+    if (0.05m.Scale != 2) return 12;
+    return 42;
+}
+```
 
 **The literal** is `<digits>[.<digits>][e[+|-]<digits>]m`, case-insensitive in the suffix:
 `1m`, `0.1m`, `19.99M`, `1.5e3m`, `15e-2m`. It is refused where it is written when the

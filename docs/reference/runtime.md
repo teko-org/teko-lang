@@ -1,10 +1,11 @@
 # The runtime
 
-Four library files, all of them **program** code compiled under the same taught vocabulary
+Five library files, all of them **program** code compiled under the same taught vocabulary
 as the program that includes them: `lib/rt.tk`, the runtime every program links against,
 [`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` and `DateTime` member
-and operator lowers to, and the two files of the sixteen-byte types —
-[`lib/decimal.tk` and `lib/guid.tk`](#the-wide-libraries).
+and operator lowers to, the two files of the sixteen-byte types —
+[`lib/decimal.tk` and `lib/guid.tk`](#the-wide-libraries) — and `lib/math.tk`, C#'s `Math`
+over a `decimal`, which is an ordinary class and no mechanism at all.
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
 the compiler injects, the guards behind an index and an interface call, and a handful of
@@ -391,8 +392,32 @@ arrays, so a nested call cannot find another call's scratch.
 Everything a result goes through is `tk_dec_pack(uptr r, i64 scale, i64 sign)`: it reduces
 the scale by dividing by ten until the value fits both 28 places and 96 bits, rounding
 **half away from zero** on the last digit — the OPERATORS' rounding, C#'s own, and not
-`decimal.Round`'s half to even (C5). A value that cannot be reduced because it is already at
-scale zero is the overflow this type is loud about.
+`decimal.Round`'s half to even, which is the table below. A value that cannot be reduced
+because it is already at scale zero is the overflow this type is loud about.
+
+The same file carries the API of [`decimal`](types.md#decimal) — every static and every
+member is one of these, and none of them is an instruction either (D79,
+[the specification](../specs/decimal.md) § 7):
+
+| | |
+|---|---|
+| `decimal tk_dec_zero()` / `tk_dec_one` / `tk_dec_minusone` | `decimal.Zero`, `One`, `MinusOne`: a CALL and not a folded constant, because sixteen bytes have no `MTASK_CONST` |
+| `decimal tk_dec_max()` / `tk_dec_min()` | `±79228162514264337593543950335m`, the three mantissa limbs full at scale zero |
+| `decimal tk_dec_round_at(decimal d, i64 places)` / `tk_dec_round` | **half to even**, C#'s `MidpointRounding.ToEven`: the parity of what is kept is read off limb zero, because ten is even and a binary value shares the parity of its last decimal digit. The scale never grows; `places` outside `0..28` panics `teko: the decimal places are out of range` |
+| `decimal tk_dec_intpart(decimal d, i64 way)` | `Truncate`, `Floor` and `Ceiling` in one function, told apart by the SIGN a discarded fraction grows the magnitude for; all three answer at scale 0 |
+| `decimal tk_dec_abs(decimal d)` | the sign bit cleared, the scale untouched |
+| `i64 tk_dec_signum(decimal d)` | `.Sign`, `-1`/`0`/`1` over the VALUE — `tk_dec_scale`/`tk_dec_sign` are the raw scale byte and the raw sign BIT, and `.Scale` is the first of those two |
+| `i64 tk_dec_fmt(ptr buf, decimal d)` | the text into `buf` (32 bytes), NUL-terminated, returning the length: the allocation-free half, the split `<float_rt>` makes between `putf64` and `fmt_f64` |
+| `str tk_dec_tostring(decimal d)` | `.ToString()`: the shortest exact form, trailing zeros kept, the buffer `rt_alloc`-owned |
+| `str tk_dec_tostring_n(decimal d, i64 places)` | `.ToString(places)`, C#'s `"F<n>"`: rounded first, then padded with zeros in the TEXT — the mantissa never grows |
+| `i64 tk_dec_scan(ptr p, str s)` | the grammar, three-valued: `1` and the value, `0` for text that is no decimal, `-1` for a number that is one and does not fit |
+| `decimal tk_dec_parse(str s)` | `decimal.Parse(s)`: panics `teko: the string is not a decimal` or `teko: decimal overflow` |
+| `i64 tk_dec_tryparse(str s, out decimal o)` | `decimal.TryParse(s, out d)`: `0`/`1`, `decimal.Zero` on failure, and never a panic |
+
+`lib/math.tk` is C#'s other spelling of five of them — `Math.Round`, `Truncate`, `Floor`,
+`Ceiling`, `Abs` over a `decimal` — and is the one library file that needs **no mechanism
+at all**: a static method on a declared class is a construct this compiler already runs, so
+nothing there is registered and `mc limits` does not move for it.
 
 `lib/guid.tk` carries `Guid`'s own surface code on top of those three, and needs `rt.tk` for
 `rt_alloc` and `rt_panic`. Every member and every operator of [`Guid`](types.md#guid) lowers

@@ -47,10 +47,26 @@ apart from a float: `0.5` is an `f64` and `0.5m` is a `decimal`, in the same pro
 even in the same expression list. More than 96 bits of mantissa or more than 28 decimal
 places is refused at the literal.
 
-**Today it only moves.** A `decimal` travels through a local, a parameter, a return, a
-global, a field and an array element, and `&d` reads its two halves — and nothing else:
-`a + b`, `a < b`, `(i64) d`, `decimal d = 5;` and `decimal.Round(d)` are all refused by
-name, because the arithmetic, the conversions and the members are the crumbs after this one
+It **moves, computes, converts, rounds and is written as text**. A `decimal` travels
+through a local, a parameter, a return, a global, a field and an array element; `+ - * / %`
+and the six comparisons are exact in base ten (`0.1m + 0.2m == 0.3m`, which an `f64` fails);
+an integer converts implicitly and `(i64) d`, `(f64) d` and `(decimal) x` are the three
+explicit casts; and the API is C#'s —
+
+```
+decimal.Round(d, 2)      // half to EVEN, C#'s default: 2.5m rounds to 2m
+decimal.Floor(d)         // ...and Ceiling, Truncate, Abs, at scale 0
+decimal.Zero             // ...and One, MinusOne, MaxValue, MinValue
+d.ToString()             // "1.50" for 1.50m: the trailing zero is part of the value
+d.ToString(2)            // C#'s "F2": rounded, then padded
+decimal.Parse(s)         // what ToString writes, plus an exponent; panics otherwise
+decimal.TryParse(s, out d)
+d.Scale                  // 0..28          d.Sign      // -1, 0 or 1
+```
+
+`Math.Round`, `Truncate`, `Floor`, `Ceiling` and `Abs` are the same five under C#'s other
+name, behind `#include "math.tk"`. What is still out is a `const decimal`, a `decimal`
+`case` label, a `decimal` on an `extern` and any culture or separator in the text
 ([what is not there yet](99-what-is-not-there-yet.md),
 [the type reference](../reference/types.md#decimal)).
 
