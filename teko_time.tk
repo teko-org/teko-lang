@@ -41,10 +41,15 @@ i64 tk_ty_timespan = 0;
 i64 tk_ty_datetime = 0;
 i64 tk_ty_dateonly = 0;
 i64 tk_ty_timeonly = 0;
+i64 tk_ty_dto = 0;
 
 // the include the lowering symbols live in, named in the refusal a program
-// that forgot it gets (docs/specs/datetime.md § 9)
-uptr tk_time_include() { return "\"time.tk\""; }
+// that forgot it gets (docs/specs/datetime.md § 9). BARE, since D76: the
+// column carries no quote of its own anywhere in this table, and every
+// consumer (`tk_prim_need_include_of`, `tw_ret`) quotes it through
+// `tk_prim_inc_q` (teko_prim.tk) -- the one place that used to bake its own
+// quotes in, which is exactly the defect D76 fixes.
+uptr tk_time_include() { return "time.tk"; }
 
 void tk_ts_statics() {
     i64 ts = tk_ty_timespan;
@@ -386,6 +391,140 @@ void tk_do_operators() {
     tk_prim_op(K_GE, 2, dy, dy, "tk_ts_ge", TY_I64, 0);
 }
 
+// ---- `DateTimeOffset` (crumb N5, D76) ----
+// SIXTEEN bytes, the third `TK_WIDE` type after `decimal` and `Guid`
+// (`teko_wide.tk`, D74/D75): `+0` a `DateTime` whose `Kind` is ALWAYS `Utc`
+// (the instant), `+8` the offset in SIGNED MINUTES. Registered LAST in
+// `tk_time_init()`, below, so `tk_ty_datetime` and `tk_ty_timespan` are live
+// ids when its constructor and operator rows name them -- neither is a
+// `tk_prim_late` column, because neither is declared by an include this file
+// has not read yet, unlike `DateTimeKind`.
+//
+// Its receiver and its VALUE both cross by address, D75's own rule for a wide
+// type (`tk_prim_conv`/`tk_prim_emit`, teko_prim.tk): every row below names a
+// symbol of `lib/time.tk` that takes and answers the `DateTimeOffset` struct
+// itself, never a raw `i64` -- unlike `TimeSpan`/`DateTime`, whose eight bytes
+// cross under the compiler's own cast. `DateTime`/`TimeSpan` ARGUMENTS
+// (the constructor's first argument, `o + ts`'s second) still cross raw,
+// because those columns name an EIGHT-byte primitive and `tk_prim_conv`
+// answers that question by the COLUMN's own type, not by the row's.
+void tk_dto_statics() {
+    i64 o = tk_ty_dto;
+    tk_prim_member(o, "MinValue",  TK_PMSVAL, 0 - 1, "tk_dto_min",       o);
+    tk_prim_member(o, "MaxValue",  TK_PMSVAL, 0 - 1, "tk_dto_max",       o);
+    tk_prim_member(o, "UnixEpoch", TK_PMSVAL, 0 - 1, "tk_dto_unixepoch", o);
+    tk_prim_member(o, "FromUnixTimeSeconds",      TK_PMSFUN, TY_I64, "tk_dto_from_unix_seconds", o);
+    tk_prim_member(o, "FromUnixTimeMilliseconds", TK_PMSFUN, TY_I64, "tk_dto_from_unix_ms",      o);
+    tk_prim_member(o, "Parse", TK_PMSFUN, TY_UPTR, "tk_dto_parse", o);
+    // The row below never emits: `DateTimeOffset.TryParse(s, out o)` is
+    // hand-parsed (`tk_dto_expr`, below), exactly as `Guid.TryParse` is
+    // (D75) -- `out <name>` is no column the `pmr_*` table has. It is
+    // registered all the same, so an instance access answers "static; reach
+    // it through its type" rather than "unknown member".
+    tk_prim_membern(o, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_dto_tryparse", TY_I64);
+    // Ruling 7: blocked on the same wall clock `DateTime.Now` is
+    // (docs/specs/datetime.md § 8) -- teko has no time-zone database either,
+    // so "now" needs a host clock before it needs a zone.
+    tk_prim_member(o, "Now",    TK_PMSOON, 0 - 1, 0, o);
+    tk_prim_member(o, "UtcNow", TK_PMSOON, 0 - 1, 0, o);
+}
+
+// Ruling 1: ONE two-argument constructor, `new DateTimeOffset(DateTime,
+// TimeSpan)`. C#'s `(i64 ticks, TimeSpan)` overload is NOT taught -- there is
+// no second row of arity 2 to tell it from, `tk_prim_pick` picks a row by
+// COUNT alone, and `new DateTimeOffset(new DateTime(t), ts)` is the written
+// form (docs/reference/not-yet.md).
+void tk_dto_ctors() {
+    tk_prim_member2(tk_ty_dto, "new", TK_PMCTOR, tk_ty_datetime, tk_ty_timespan,
+                    "tk_dto_new", tk_ty_dto);
+}
+
+void tk_dto_members() {
+    i64 o = tk_ty_dto;
+    i64 ts = tk_ty_timespan;
+    i64 dt = tk_ty_datetime;
+    tk_prim_member(o, "Offset",             TK_PMPROP, 0 - 1, "tk_dto_offset", ts);
+    tk_prim_member(o, "TotalOffsetMinutes", TK_PMPROP, 0 - 1, "tk_dto_offmin", TY_I64);
+    tk_prim_member(o, "UtcDateTime",   TK_PMPROP, 0 - 1, "tk_dto_utcdatetime",   dt);
+    // `.DateTime` and `.LocalDateTime` are one function under two names: teko
+    // has no time-zone database, so "local" means "the offset this value
+    // carries" and nothing more (§ 4's own amendment).
+    tk_prim_member(o, "LocalDateTime", TK_PMPROP, 0 - 1, "tk_dto_localdatetime", dt);
+    tk_prim_member(o, "DateTime",      TK_PMPROP, 0 - 1, "tk_dto_localdatetime", dt);
+    // the components, of the LOCAL reading (§ 4's own table)
+    tk_prim_member(o, "Year",        TK_PMPROP, 0 - 1, "tk_dto_year",   TY_I64);
+    tk_prim_member(o, "Month",       TK_PMPROP, 0 - 1, "tk_dto_month",  TY_I64);
+    tk_prim_member(o, "Day",         TK_PMPROP, 0 - 1, "tk_dto_day",    TY_I64);
+    tk_prim_member(o, "Hour",        TK_PMPROP, 0 - 1, "tk_dto_hour",   TY_I64);
+    tk_prim_member(o, "Minute",      TK_PMPROP, 0 - 1, "tk_dto_minute", TY_I64);
+    tk_prim_member(o, "Second",      TK_PMPROP, 0 - 1, "tk_dto_second", TY_I64);
+    tk_prim_member(o, "Millisecond", TK_PMPROP, 0 - 1, "tk_dto_ms",     TY_I64);
+    tk_prim_member(o, "ToUnixTimeSeconds",      TK_PMFUN, 0 - 1, "tk_dto_to_unix_seconds", TY_I64);
+    tk_prim_member(o, "ToUnixTimeMilliseconds", TK_PMFUN, 0 - 1, "tk_dto_to_unix_ms",      TY_I64);
+    tk_prim_member(o, "ToOffset",  TK_PMFUN, ts, "tk_dto_to_offset", o);
+    tk_prim_member(o, "CompareTo", TK_PMFUN, o,  "tk_dto_cmp", TY_I64);
+    tk_prim_member(o, "Equals",    TK_PMFUN, o,  "tk_dto_eq",  TY_I64);
+    // the two `ToString` rows are one overload set told apart by the number
+    // of arguments written (`tk_prim_pick`), the same way `Guid`'s are
+    tk_prim_member(o, "ToString", TK_PMFUN, 0 - 1,   "tk_dto_tostring",     TY_UPTR);
+    tk_prim_member(o, "ToString", TK_PMFUN, TY_UPTR, "tk_dto_tostring_fmt", TY_UPTR);
+}
+
+// Ruling: ordering (`==` included) compares the INSTANT only, offset ignored
+// -- C#'s own rule, § 3, and the reason `tk_dto_eq`/`tk_dto_cmp` read
+// `tk_dto_instant` and never `tk_dto_offmin`.
+void tk_dto_operators() {
+    i64 o = tk_ty_dto;
+    i64 ts = tk_ty_timespan;
+    tk_prim_op(K_EQ, 2, o, o, "tk_dto_eq", TY_I64, 0);
+    tk_prim_op(K_NE, 2, o, o, "tk_dto_ne", TY_I64, 0);
+    tk_prim_op(K_LT, 2, o, o, "tk_dto_lt", TY_I64, 0);
+    tk_prim_op(K_LE, 2, o, o, "tk_dto_le", TY_I64, 0);
+    tk_prim_op(K_GT, 2, o, o, "tk_dto_gt", TY_I64, 0);
+    tk_prim_op(K_GE, 2, o, o, "tk_dto_ge", TY_I64, 0);
+    tk_prim_op(K_ADD, 2, o, ts, "tk_dto_add",    o,  0);
+    tk_prim_op(K_SUB, 2, o, ts, "tk_dto_sub_ts", o,  0);
+    tk_prim_op(K_SUB, 2, o, o,  "tk_dto_sub",    ts, 0);
+}
+
+// `DateTimeOffset.TryParse(s, out o)`, parsed by hand -- `teko_guid.tk`'s own
+// shape and reason (D75): `out o` is read directly through `tk_ref_addr`
+// (teko_ref.tk), tagged (`tk_rfarg_tag`) so `teko_ref.tk`'s own pass judges
+// the target -- a global's declared type, a `ref`/`out` parameter repassed as
+// the caller's own slot -- exactly as `Guid.TryParse`'s does.
+i64 tk_dto_tryparse_expr(i64 line, uptr fl) {
+    tk_prim_need_include(tk_ty_dto, "tk_dto_tryparse", line, fl);
+    p_expect(K_LPAR, "expected ( after TryParse");
+    i64 se = parse_expr(0);
+    p_expect(K_COMMA, "expected , after the string");
+    if (type_of_token(p_id()) != tk_ty_out)
+        err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+    p_next();
+    i64 pty = 0 - 1;
+    i64 oe = tk_ref_addr(line, fl, &pty);
+    p_expect(K_RPAR, "expected ) after TryParse");
+    if (pty >= 0 && pty != tk_ty_dto)
+        tk_reject_compat(tk_pointee_name(pty), "DateTimeOffset", line, fl);
+    tk_rfarg_tag(oe, TK_RP_OUT, pty);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call2("tk_dto_tryparse", se, oe);
+}
+
+// the type word in EXPRESSION position: this file's own handler, for the one
+// hand-parsed static above -- every other member goes straight to the table
+// (`tk_prim_static_m`, with the member name already read).
+i64 tk_dto_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "DateTimeOffset");
+    uptr m = tk_member_name();                   // D68
+    if (str_eq(m, "TryParse")) return tk_dto_tryparse_expr(line, fl);
+    return tk_prim_static_m(tk_ty_dto, m, line, fl);
+}
+
 // Called from teko.tk's `teko_init()` AFTER `tk_float_init()`: the `From*` and
 // `Add*` rows name `ty_f64`, the id `<float>`'s own registration returns, so
 // the float library has to be wired before this table is written.
@@ -393,7 +532,7 @@ void tk_time_init() {
     tk_ty_timespan = type_new("TimeSpan", 8, 8, TK_SINT);
     syntax_expr("TimeSpan", &tk_prim_expr);
     syntax_stmt("TimeSpan", &tk_prim_stmt);
-    tk_prim_type(tk_ty_timespan, "TimeSpan", tk_time_include(), "`.Ticks` reads it", "`new TimeSpan(...)` builds it");
+    tk_prim_type(tk_ty_timespan, "TimeSpan", tk_time_include(), "`.Ticks` reads it", "`new TimeSpan(...)` builds it", 0);
     tk_ts_statics();
     tk_ts_members();
     tk_ts_operators();
@@ -401,7 +540,7 @@ void tk_time_init() {
     tk_ty_datetime = type_new("DateTime", 8, 8, TK_SINT);
     syntax_expr("DateTime", &tk_prim_expr);
     syntax_stmt("DateTime", &tk_prim_stmt);
-    tk_prim_type(tk_ty_datetime, "DateTime", tk_time_include(), "`.Ticks` reads it", "`new DateTime(...)` builds it");
+    tk_prim_type(tk_ty_datetime, "DateTime", tk_time_include(), "`.Ticks` reads it", "`new DateTime(...)` builds it", 0);
     tk_dt_statics();
     tk_dt_ctors();
     tk_dt_members();
@@ -415,7 +554,7 @@ void tk_time_init() {
     tk_ty_timeonly = type_new("TimeOnly", 8, 8, TK_SINT);
     syntax_expr("TimeOnly", &tk_prim_expr);
     syntax_stmt("TimeOnly", &tk_prim_stmt);
-    tk_prim_type(tk_ty_timeonly, "TimeOnly", tk_time_include(), "`.Ticks` reads it", "`new TimeOnly(...)` builds it");
+    tk_prim_type(tk_ty_timeonly, "TimeOnly", tk_time_include(), "`.Ticks` reads it", "`new TimeOnly(...)` builds it", 0);
     tk_to_statics();
     tk_to_ctors();
     tk_to_members();
@@ -428,8 +567,25 @@ void tk_time_init() {
     tk_ty_dateonly = type_new("DateOnly", 4, 4, TK_SINT);
     syntax_expr("DateOnly", &tk_prim_expr);
     syntax_stmt("DateOnly", &tk_prim_stmt);
-    tk_prim_type(tk_ty_dateonly, "DateOnly", tk_time_include(), "`.DayNumber` reads it", "`new DateOnly(...)` builds it");
+    tk_prim_type(tk_ty_dateonly, "DateOnly", tk_time_include(), "`.DayNumber` reads it", "`new DateOnly(...)` builds it", 0);
     tk_do_statics();
     tk_do_members();
     tk_do_operators();
+
+    // LAST: `DateTimeOffset`'s columns name `DateTime` and `TimeSpan`, both
+    // live ids by now (Ruling 4). The third `TK_WIDE` type after `decimal`
+    // and `Guid` -- `tk_wide_init()` already ran in `teko_init()`
+    // (teko.tk, before `tk_guid_init()`, before this function), so
+    // `tk_wide_add` has a machine to register into.
+    tk_ty_dto = type_new("DateTimeOffset", 16, 16, TK_WIDE);
+    tk_wide_add(tk_ty_dto, "tk_dto_ld", "tk_dto_st", "tk_dto_retbuf");
+    syntax_expr("DateTimeOffset", &tk_dto_expr);
+    syntax_stmt("DateTimeOffset", &tk_prim_stmt);
+    tk_prim_type(tk_ty_dto, "DateTimeOffset", tk_time_include(),
+                 "`.UtcDateTime` reads it", "`new DateTimeOffset(...)` builds it",
+                 "DateTimeOffset.MinValue");
+    tk_dto_statics();
+    tk_dto_ctors();
+    tk_dto_members();
+    tk_dto_operators();
 }

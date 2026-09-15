@@ -605,3 +605,354 @@ i64 tk_to_sub(i64 a, i64 b) { return ((a - b) + TICKS_PER_DAY) % TICKS_PER_DAY; 
 // now, and the packing is exactly `tk_dt_ymd`'s own: the day number back into
 // ticks, plus a time of day already in ticks, `Kind` Unspecified.
 i64 tk_do_to_datetime(i64 n, i64 t) { return tk_dt_pack(n * TICKS_PER_DAY + t, 0); }
+
+// ============================================================================
+// `DateTimeOffset` (docs/specs/datetime-extras.md, crumb N5, D76)
+// ============================================================================
+//
+// SIXTEEN bytes, the third `TK_WIDE` type after `decimal` and `Guid`
+// (`teko_wide.tk`, D74/D75): `+0` is a `DateTime` whose `Kind` is ALWAYS
+// `Utc` (the instant), `+8` is the offset in SIGNED MINUTES. Unlike
+// `TimeSpan`/`DateTime`, which cross the primitive-member table as raw
+// `i64`, every function here takes and answers the `DateTimeOffset` STRUCT
+// itself (D75's rule for a wide value, `teko_prim.tk`'s `tk_prim_conv`) and
+// reads or writes its two halves through `tk_dto_instant`/`tk_dto_offmin`
+// rather than through a cast no sixteen-byte type can wear.
+//
+// THE CALENDAR IS NOT REWRITTEN HERE EITHER: every component is `DateTime`'s
+// own `tk_dt_*` function, called on the LOCAL reading -- the instant plus the
+// offset, an ordinary Unspecified-`Kind` tick count that needs no mask of its
+// own beyond what those functions already do.
+
+const i64 DTO_MAX_OFFSET_MIN = 840;                  // +-14:00, in minutes
+
+const i64 DTO_UNIX_EPOCH_SEC = 62135596800;          // UNIX_EPOCH_TICKS / TICKS_PER_SECOND
+const i64 DTO_UNIX_EPOCH_MS  = 62135596800000;       // UNIX_EPOCH_TICKS / TICKS_PER_MILLISECOND
+const i64 DTO_MAX_UNIX_SEC   = 253402300799;         // C#'s own bound
+const i64 DTO_MIN_UNIX_SEC   = 0 - 62135596800;
+const i64 DTO_MAX_UNIX_MS    = 253402300799999;
+const i64 DTO_MIN_UNIX_MS    = 0 - 62135596800000;
+
+// the return buffer (D75's fourth wide column) and the two copy helpers every
+// wide type owes (`tk_ldn`/`tk_stn`, teko_struct.tk) -- `tk_guid_ld`/`_st`'s
+// own shape (lib/guid.tk), two `ld64`/`st64` pairs over the address.
+DateTimeOffset tk_dto_retbuf;
+
+DateTimeOffset tk_dto_ld(ptr p) {
+    DateTimeOffset o;
+    ptr q = &o;
+    st64(q, ld64(p));
+    st64(q + 8, ld64(p + 8));
+    return o;
+}
+
+void tk_dto_st(ptr p, DateTimeOffset o) {
+    ptr q = &o;
+    st64(p, ld64(q));
+    st64(p + 8, ld64(q + 8));
+}
+
+// ---- the two halves ----
+DateTimeOffset tk_dto_make(i64 instant, i64 offmin) {
+    DateTimeOffset o;
+    ptr q = &o;
+    st64(q, instant);
+    st64(q + 8, offmin);
+    return o;
+}
+
+// the `+0` half AS IT IS: a `DateTime`, `Kind` `Utc`, already packed by
+// whichever function built this value
+i64 tk_dto_instant(DateTimeOffset o) { ptr q = &o; return ld64(q); }
+
+i64 tk_dto_offmin(DateTimeOffset o) { ptr q = &o; return ld64(q + 8); }
+
+// the LOCAL reading: the instant plus the offset, an ordinary Unspecified
+// tick count -- `.Year` … `.Millisecond` and the text both read this
+i64 tk_dto_local_ticks(DateTimeOffset o) {
+    return tk_dt_ticks(tk_dto_instant(o)) + tk_dto_offmin(o) * TICKS_PER_MINUTE;
+}
+
+// ---- the offset validator (§ 2's own panic) ----
+// A whole minute, `-14:00 .. +14:00` -- C#'s own bound -- panics where a bad
+// one is handed in, whether that is the constructor's second argument or
+// `.ToOffset`'s.
+i64 tk_dto_check_offset(i64 ts) {
+    if (ts % TICKS_PER_MINUTE != 0) panic("that UTC offset does not exist");
+    i64 m = ts / TICKS_PER_MINUTE;
+    if (m < 0 - DTO_MAX_OFFSET_MIN || m > DTO_MAX_OFFSET_MIN)
+        panic("that UTC offset does not exist");
+    return m;
+}
+
+// ---- the statics ----
+DateTimeOffset tk_dto_min() { return tk_dto_make(tk_dt_pack(tk_dt_min(), 1), 0); }
+DateTimeOffset tk_dto_max() { return tk_dto_make(tk_dt_pack(tk_dt_max(), 1), 0); }
+DateTimeOffset tk_dto_unixepoch() { return tk_dto_make(tk_dt_epoch(), 0); }
+
+// ---- the constructor: `new DateTimeOffset(DateTime, TimeSpan)` ----
+// The `DateTime` is read as a LOCAL (wall-clock) reading at `ts`'s offset --
+// C#'s own rule -- so the instant is that reading minus the offset, packed
+// `Utc` and range-checked by `tk_dt_pack` exactly as every other `DateTime`
+// build is (`teko: a date is out of range`, exit 70,
+// `tests/primitives_dto_bad_offset.tk`'s sibling case).
+DateTimeOffset tk_dto_new(i64 dt, i64 ts) {
+    i64 offmin = tk_dto_check_offset(ts);
+    i64 utc = tk_dt_ticks(dt) - offmin * TICKS_PER_MINUTE;
+    return tk_dto_make(tk_dt_pack(utc, 1), offmin);
+}
+
+// ---- the Unix conversions ----
+// The bounds are C#'s own: the whole range of a `DateTimeOffset` in Unix
+// seconds/milliseconds, checked BEFORE the multiply that would otherwise wrap
+// the `i64` in silence (the same order `tk_ts_scaled` takes).
+DateTimeOffset tk_dto_from_unix_seconds(i64 s) {
+    if (s < DTO_MIN_UNIX_SEC || s > DTO_MAX_UNIX_SEC) panic("a date is out of range");
+    i64 utc = (s + DTO_UNIX_EPOCH_SEC) * TICKS_PER_SECOND;
+    return tk_dto_make(tk_dt_pack(utc, 1), 0);
+}
+
+DateTimeOffset tk_dto_from_unix_ms(i64 ms) {
+    if (ms < DTO_MIN_UNIX_MS || ms > DTO_MAX_UNIX_MS) panic("a date is out of range");
+    i64 utc = (ms + DTO_UNIX_EPOCH_MS) * TICKS_PER_MILLISECOND;
+    return tk_dto_make(tk_dt_pack(utc, 1), 0);
+}
+
+i64 tk_dto_to_unix_seconds(DateTimeOffset o) {
+    return tk_dt_ticks(tk_dto_instant(o)) / TICKS_PER_SECOND - DTO_UNIX_EPOCH_SEC;
+}
+
+i64 tk_dto_to_unix_ms(DateTimeOffset o) {
+    return tk_dt_ticks(tk_dto_instant(o)) / TICKS_PER_MILLISECOND - DTO_UNIX_EPOCH_MS;
+}
+
+// ---- the readers ----
+i64 tk_dto_offset(DateTimeOffset o) { return tk_dto_offmin(o) * TICKS_PER_MINUTE; }
+
+i64 tk_dto_utcdatetime(DateTimeOffset o) { return tk_dto_instant(o); }
+
+// `.DateTime`/`.LocalDateTime`: the offset re-applied, `Kind` UNSPECIFIED --
+// teko has no time-zone database, so "local" means "the offset this value
+// carries" and nothing more (datetime-extras.md § 4).
+i64 tk_dto_localdatetime(DateTimeOffset o) { return tk_dt_pack(tk_dto_local_ticks(o), 0); }
+
+// the components, C#'s own: the LOCAL reading, reused straight through
+// `DateTime`'s own functions -- an Unspecified tick count is exactly what
+// they already mask for.
+i64 tk_dto_year(DateTimeOffset o)  { return tk_dt_year(tk_dto_local_ticks(o)); }
+i64 tk_dto_month(DateTimeOffset o) { return tk_dt_month(tk_dto_local_ticks(o)); }
+i64 tk_dto_day(DateTimeOffset o)   { return tk_dt_day(tk_dto_local_ticks(o)); }
+i64 tk_dto_hour(DateTimeOffset o)   { return tk_dt_hour(tk_dto_local_ticks(o)); }
+i64 tk_dto_minute(DateTimeOffset o) { return tk_dt_minute(tk_dto_local_ticks(o)); }
+i64 tk_dto_second(DateTimeOffset o) { return tk_dt_second(tk_dto_local_ticks(o)); }
+i64 tk_dto_ms(DateTimeOffset o)     { return tk_dt_ms(tk_dto_local_ticks(o)); }
+
+// ---- `.ToOffset` ----
+DateTimeOffset tk_dto_to_offset(DateTimeOffset o, i64 ts) {
+    return tk_dto_make(tk_dto_instant(o), tk_dto_check_offset(ts));
+}
+
+// ---- the arithmetic: the INSTANT moves, the offset is kept ----
+DateTimeOffset tk_dto_add(DateTimeOffset o, i64 t) {
+    return tk_dto_make(tk_dt_add(tk_dto_instant(o), t), tk_dto_offmin(o));
+}
+
+DateTimeOffset tk_dto_sub_ts(DateTimeOffset o, i64 t) {
+    return tk_dto_make(tk_dt_sub_ts(tk_dto_instant(o), t), tk_dto_offmin(o));
+}
+
+i64 tk_dto_sub(DateTimeOffset a, DateTimeOffset b) {
+    return tk_dt_sub(tk_dto_instant(a), tk_dto_instant(b));
+}
+
+// ---- the comparisons: the INSTANT only, offset ignored (C#'s own rule) ----
+i64 tk_dto_cmp(DateTimeOffset a, DateTimeOffset b) { return tk_dt_cmp(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_eq(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_eq(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_ne(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_ne(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_lt(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_lt(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_le(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_le(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_gt(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_gt(tk_dto_instant(a), tk_dto_instant(b)); }
+i64 tk_dto_ge(DateTimeOffset a, DateTimeOffset b)  { return tk_dt_ge(tk_dto_instant(a), tk_dto_instant(b)); }
+
+// ---- the text (§ 5) ----
+// zero-padded decimal digits, `w` wide, written at `buf`; returns `w`, the
+// same shape `tk_guid_fmt` (lib/guid.tk) gives its own caller.
+i64 tk_dto_put_num(ptr buf, i64 v, i64 w) {
+    i64 i = w - 1;
+    loop {
+        if (i < 0) break;
+        st8(buf + i, '0' + (v % 10));
+        v = v / 10;
+        i = i - 1;
+    }
+    return w;
+}
+
+// `"o"`: `yyyy-MM-ddTHH:mm:ss.fffffff+HH:MM`, 33 characters, the LOCAL
+// reading plus its own offset suffix -- C#'s own round-trip format, and the
+// default `ToString()` (§ 5's own table).
+str tk_dto_tostring_o(DateTimeOffset o) {
+    i64 lt = tk_dto_local_ticks(o);
+    i64 offmin = tk_dto_offmin(o);
+    i64 sign = '+';
+    i64 am = offmin;
+    if (am < 0) { sign = '-'; am = 0 - am; }
+    uptr buf = rt_alloc(34);
+    i64 k = 0;
+    k = k + tk_dto_put_num(buf + k, tk_dt_year(lt), 4);
+    st8(buf + k, '-'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_month(lt), 2);
+    st8(buf + k, '-'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_day(lt), 2);
+    st8(buf + k, 'T'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_hour(lt), 2);
+    st8(buf + k, ':'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_minute(lt), 2);
+    st8(buf + k, ':'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_second(lt), 2);
+    st8(buf + k, '.'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, lt % TICKS_PER_SECOND, 7);
+    st8(buf + k, sign); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, am / 60, 2);
+    st8(buf + k, ':'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, am % 60, 2);
+    st8(buf + k, 0);
+    return buf;
+}
+
+// `"s"`: `yyyy-MM-ddTHH:mm:ss`, 19 characters, the LOCAL reading with no
+// fraction and no offset -- C#'s own sortable format.
+str tk_dto_tostring_s(DateTimeOffset o) {
+    i64 lt = tk_dto_local_ticks(o);
+    uptr buf = rt_alloc(20);
+    i64 k = 0;
+    k = k + tk_dto_put_num(buf + k, tk_dt_year(lt), 4);
+    st8(buf + k, '-'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_month(lt), 2);
+    st8(buf + k, '-'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_day(lt), 2);
+    st8(buf + k, 'T'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_hour(lt), 2);
+    st8(buf + k, ':'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_minute(lt), 2);
+    st8(buf + k, ':'); k = k + 1;
+    k = k + tk_dto_put_num(buf + k, tk_dt_second(lt), 2);
+    st8(buf + k, 0);
+    return buf;
+}
+
+str tk_dto_tostring(DateTimeOffset o) { return tk_dto_tostring_o(o); }
+
+// `"o"`/`"s"`, either case is NOT accepted -- C#'s own format specifiers are
+// case-sensitive for these two -- and anything else panics where it is
+// written, the same rule `Guid.ToString(fmt)` follows.
+str tk_dto_tostring_fmt(DateTimeOffset o, str f) {
+    i64 c = ld8(f);
+    if (ld8(f + 1) != 0) panic("the DateTimeOffset format is not taught");
+    if (c == 'o') return tk_dto_tostring_o(o);
+    if (c == 's') return tk_dto_tostring_s(o);
+    panic("the DateTimeOffset format is not taught");
+    return 0;
+}
+
+// a single decimal field, `w` digits wide, at `s + off`; -1 on anything that
+// is not a digit -- the inverse of `tk_dto_put_num`
+i64 tk_dto_scan_num(str s, i64 off, i64 w) {
+    i64 v = 0;
+    i64 i = 0;
+    loop {
+        if (i >= w) break;
+        i64 c = ld8(s + off + i);
+        if (c < '0' || c > '9') return 0 - 1;
+        v = v * 10 + (c - '0');
+        i = i + 1;
+    }
+    return v;
+}
+
+// the inverse of `tk_dto_tostring_o`/`_s`: 0 on anything that is neither of
+// the two, writing the instant and the offset through `utcp`/`offp`
+// otherwise. `"s"` (19 characters) reads as UTC, offset zero -- teko has no
+// time-zone database to read a bare wall-clock string against
+// (docs/specs/datetime-extras.md § 8), and zero is the one offset every
+// reader agrees on.
+i64 tk_dto_try_scan(str s, ptr utcp, ptr offp) {
+    i64 n = tk_str_len(s);
+    if (n != 19 && n != 33) return 0;
+    i64 y = tk_dto_scan_num(s, 0, 4);
+    if (y < 0) return 0;
+    if (ld8(s + 4) != '-') return 0;
+    i64 mo = tk_dto_scan_num(s, 5, 2);
+    if (mo < 0) return 0;
+    if (ld8(s + 7) != '-') return 0;
+    i64 d = tk_dto_scan_num(s, 8, 2);
+    if (d < 0) return 0;
+    if (ld8(s + 10) != 'T') return 0;
+    i64 h = tk_dto_scan_num(s, 11, 2);
+    if (h < 0) return 0;
+    if (ld8(s + 13) != ':') return 0;
+    i64 mi = tk_dto_scan_num(s, 14, 2);
+    if (mi < 0) return 0;
+    if (ld8(s + 16) != ':') return 0;
+    i64 se = tk_dto_scan_num(s, 17, 2);
+    if (se < 0) return 0;
+    i64 frac = 0;
+    i64 offmin = 0;
+    if (n == 33) {
+        if (ld8(s + 19) != '.') return 0;
+        frac = tk_dto_scan_num(s, 20, 7);
+        if (frac < 0) return 0;
+        i64 sign = ld8(s + 27);
+        if (sign != '+' && sign != '-') return 0;
+        i64 oh = tk_dto_scan_num(s, 28, 2);
+        if (oh < 0) return 0;
+        if (ld8(s + 30) != ':') return 0;
+        i64 om = tk_dto_scan_num(s, 31, 2);
+        if (om < 0) return 0;
+        offmin = oh * 60 + om;
+        if (sign == '-') offmin = 0 - offmin;
+        if (offmin < 0 - DTO_MAX_OFFSET_MIN || offmin > DTO_MAX_OFFSET_MIN) return 0;
+    }
+    if (y < 1 || y > 9999) return 0;
+    if (mo < 1 || mo > 12) return 0;
+    if (d < 1 || d > tk_dt_days_in_month(y, mo)) return 0;
+    if (h < 0 || h > 23) return 0;
+    if (mi < 0 || mi > 59) return 0;
+    if (se < 0 || se > 59) return 0;
+    i64 local = tk_dt_days_from_ymd(y, mo, d) * TICKS_PER_DAY
+              + (h * 3600 + mi * 60 + se) * TICKS_PER_SECOND + frac;
+    i64 utc = local - offmin * TICKS_PER_MINUTE;
+    if (utc < 0 || utc > DATETIME_MAX_TICKS) return 0;
+    st64(utcp, tk_dt_pack(utc, 1));
+    st64(offp, offmin);
+    return 1;
+}
+
+// `DateTimeOffset.Parse(s)`: the value, or a panic (exit 70) -- C#'s own
+// `Parse`, whose failure is an exception and not a sentinel value
+DateTimeOffset tk_dto_parse(str s) {
+    i64 utc = 0;
+    i64 offmin = 0;
+    ptr up = &utc;
+    ptr op = &offmin;
+    if (!tk_dto_try_scan(s, up, op)) panic("the string is not a DateTimeOffset");
+    return tk_dto_make(utc, offmin);
+}
+
+// `DateTimeOffset.TryParse(s, out o)`: 1 and the value, or 0 and
+// `DateTimeOffset.MinValue` -- C#'s pair. `o` is an `out DateTimeOffset`, the
+// same road any teko function takes for one: the call site is judged by
+// `teko_ref.tk`'s own pass, which is what the hand-written `TryParse` parser
+// (teko_time.tk) hands it -- a tagged `out` argument, never a raw address.
+i64 tk_dto_tryparse(str s, out DateTimeOffset o) {
+    i64 utc = 0;
+    i64 offmin = 0;
+    ptr up = &utc;
+    ptr op = &offmin;
+    if (!tk_dto_try_scan(s, up, op)) {
+        o = tk_dto_min();
+        return 0;
+    }
+    o = tk_dto_make(utc, offmin);
+    return 1;
+}
