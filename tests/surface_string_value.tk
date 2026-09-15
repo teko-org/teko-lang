@@ -1,0 +1,123 @@
+// surface_string_value.tk -- N7b of docs/specs/string.md (§ 3-4, D88): a
+// `"..."` LITERAL written where a `string` is expected, in every one of
+// D33's nine slots (an initializer, an assignment, a `return`, an argument
+// of a free/method/virtual/interface call, an element of a `params
+// string[]`, a field store, an array element, a `??` arm and a `+`/`==`
+// operand), interns to the class N7a built rather than refusing the way
+// `tests/refuse/string_str_implicit.tk` still does for a NON-literal `str`.
+//
+// `str` <-> `string` at the boundary is proved through `tk_str_len` (the
+// `panic`-shaped `str` parameter `not-yet.md` names) reading a `string`'s
+// own text correctly (rule 3's `.data` load), which is the DIRECTION every
+// pre-existing class already had silently wrong (a raw object pointer read
+// as text) until this crumb's `tk_str_borrow` fixed it.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+// slot: an argument of a FREE call, and its own `return`
+string free_echo(string s) { return s; }
+
+// slot: an element of a `params string[]`
+i64 total_len(params string[] ss) {
+    i64 t = 0;
+    i64 i = 0;
+    loop {
+        if (i >= ss.Length) break;
+        t = t + ss[i].Length;
+        i = i + 1;
+    }
+    return t;
+}
+
+// slot: an argument of a VIRTUAL call
+class Greeter {
+    public virtual string greet(string who) {
+        return "hi " + who;
+    }
+}
+
+// slot: an argument of an INTERFACE call
+interface Echoer {
+    string echo(string s);
+}
+class EchoImpl : Echoer {
+    public string echo(string s) { return s; }
+}
+
+// slot: a FIELD store
+class Box {
+    public string s;
+}
+
+i64 main() {
+    // 1. initializer
+    string a = "hi";
+    if (a.Length != 2) return 1;
+
+    // 2. assignment
+    string b = "";
+    b = "there";
+    if (b.Length != 5) return 2;
+
+    // 3. return, and 4. argument of a free call
+    string c = free_echo("echoed");
+    if (c.Length != 6) return 3;
+
+    // 5. argument, a METHOD call (`Equals`, non-virtual) -- and the
+    // receiver of that same call stays the object itself, not `.data`
+    // (the very regression this crumb's own gate caught, D88)
+    if (a.Equals("hi") != 1) return 4;
+
+    // 6. argument, a VIRTUAL call
+    Greeter g = new Greeter();
+    string hi = g.greet("world");
+    if (hi.Length != 8) return 5;
+
+    // 7. argument, an INTERFACE call
+    Echoer e = new EchoImpl();
+    string echoed = e.echo("iface");
+    if (echoed.Length != 5) return 6;
+
+    // 8. an element of a `params string[]`
+    if (total_len("a", "bb", "ccc") != 6) return 7;
+
+    // 9. a field store, and an ARRAY element (the same door, D50/D88)
+    Box box = new Box();
+    box.s = "boxed";
+    if (box.s.Length != 5) return 8;
+
+    string[] arr = new string[2];
+    arr[0] = "one";
+    arr[1] = "two";
+    if (arr[0].Length != 3) return 9;
+    if (arr[1].Length != 3) return 10;
+
+    // the `??` arm (Q2): a literal on the right, over a `string?` on the left
+    string? n = null;
+    string d = n ?? "fallback";
+    if (d.Length != 8) return 11;
+    string? p = a;
+    string q = p ?? "unreached";
+    if (q.Length != 2) return 12;
+
+    // the `+`/`==`/`!=` operand: a literal beside a `string`, both sides
+    string h = a + " literal";
+    if (h.Length != 10) return 13;
+    string h2 = " literal" + a;
+    if (h2.Length != 10) return 14;
+    if ((a == "hi") != 1) return 15;
+    if (("hi" == a) != 1) return 16;
+    if ((a != "bye") != 1) return 17;
+    if (("bye" != a) != 1) return 18;
+
+    // rule 3, `str` <- `string`: `tk_str_len` (`panic`'s own shape) reads
+    // the TEXT, not the object's own address
+    if (tk_str_len(a) != 2) return 19;
+    if (tk_str_len(c) != 6) return 20;
+    if (tk_str_len(box.s) != 5) return 21;
+
+    return 42;
+}

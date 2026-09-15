@@ -1,0 +1,76 @@
+// surface_string_intern.tk -- N7b of docs/specs/string.md (§ 4, D88): a
+// `"..."` literal written where a `string` is expected interns to a
+// MODULE-PRIVATE GLOBAL, built once per distinct literal -- never through
+// `rt_alloc`, so `rt_live()`/`rt_used()` do not move for it at all, and the
+// SAME literal spelled twice names the SAME object (identity, proved
+// through `(uptr)`, since `==` is by VALUE and would not tell the two
+// apart).
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+i64 main() {
+    i64 floor_live = rt_live();
+    i64 floor_used = rt_used();
+
+    // two occurrences of `"hi"` are ONE global: the same address
+    string a = "hi";
+    string b = "hi";
+    if ((uptr) a != (uptr) b) return 1;
+
+    // a DIFFERENT literal is a different one
+    string c = "bye";
+    if ((uptr) a == (uptr) c) return 2;
+
+    // a hundred uses of the same literal move neither counter: the object
+    // is never `rt_alloc`'d, so there is nothing for `rt_used()` to grow
+    // by and nothing for `rt_live()` to count either
+    uptr first = 0;
+    i64 i = 0;
+    loop {
+        if (i >= 100) break;
+        string t = "churned literal";
+        if (t.Length != 15) return 3;
+        if (i == 0) first = (uptr) t;
+        else if ((uptr) t != first) return 4;         // every pass names the SAME global
+        i = i + 1;
+    }
+    if (rt_live() != floor_live) return 5;
+    if (rt_used() != floor_used) return 6;
+
+    // a literal survives being assigned and released in a loop: the
+    // reclaim's own `rc_inc`/`rc_dec` move the pinned count up and down
+    // around 2^40 and never reach zero, so the destructor never runs and
+    // `rt_free` never sees the interned block
+    string? held;
+    i = 0;
+    loop {
+        if (i >= 50) break;
+        held = "held literal";
+        i = i + 1;
+    }
+    if (held == null) return 7;
+    if (held.Value.Length != 12) return 8;
+    held = null;
+    if (rt_live() != floor_live) return 9;
+    if (rt_used() != floor_used) return 10;
+
+    // the pinned count itself: `GetHashCode`, `.Length`, `==` and `+` all
+    // read or copy from the interned object without ever driving its count
+    // to zero -- a hundred more operations over the very same literal,
+    // still standing at the end
+    i64 h0 = a.GetHashCode();
+    i = 0;
+    loop {
+        if (i >= 100) break;
+        string again = "hi";
+        if (again.GetHashCode() != h0) return 11;
+        if ((a + "!").Length != 3) return 12;
+        i = i + 1;
+    }
+    if (rt_live() != floor_live) return 13;
+
+    return 42;
+}
