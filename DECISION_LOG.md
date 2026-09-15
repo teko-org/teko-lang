@@ -7982,6 +7982,88 @@ and not only one that moves.
    over a `Guid` or a `DateTimeOffset` — still earns
    `teko: a decimal does not cast yet` / the reader-and-builder wording, unchanged.
 
+#### Four more rulings, from the review of the crumb (rulings 8–11)
+
+Copilot's five threads and the verifier's F1–F5 landed on the branch before the merge. Two
+of the five were **silently wrong answers**, which is the one class of defect this project
+refuses to ship, and both are fixed at the root rather than at the site that reported them.
+
+8. **A `u64` SOURCE converts through a row of its own.** `decimal d = x;` and `(decimal) x`
+   on a `u64` at or above 2^63 answered a NEGATIVE decimal — `0xFFFFFFFFFFFFFFFF` read as
+   `-1m` — on the explicit road, on the implicit one and on the mixed `d + u` alike. The
+   cause is one table and one sign test: `tk_prim_cast_find` matches EVERY integer against
+   the `TY_I64` row (`tk_prim_slot_fits`, which is what lets `u8`…`i32` ride the same row)
+   and `tk_dec_from_i64` asks `n < 0`. The fix is `tk_dec_from_u64`, which fills the limbs
+   from the two 32-bit halves and asks no sign question, plus its row registered BEFORE the
+   `i64` one: a column naming `TY_U64` takes nothing but `u64`, no slot rule widens into it,
+   so the other seven integer types stay exactly where they were and `u64` — the only one
+   whose magnitude an `i64` cannot hold — is the only one that moves. Both roads read that
+   one table (`tk_prim_cast_lower`, `tk_num_widen`, and `tk_ops_promote` through the
+   second), so neither grows a branch of its own. Measured before: sign 1 on all three
+   spellings. After: `9223372036854775808m`, `18446744073709551615m`,
+   `1m + x == 9223372036854775809m`, six new rows in
+   `tests/primitives_decimal_convert.tk`. This is the shape every future wide type takes
+   for the same question — the row is keyed on the source type, not on a branch inside the
+   lowering.
+
+9. **The quotient carries the smallest scale that preserves it** — C# § 12.9.3, and the one
+   operator of the five that decides a scale of its own. Every quotient used to come back
+   at scale 28: `5m / 2m` was `2.5m` with 28 places where C# gives 1, `1m / 8m` 28 where C#
+   gives 3. Equality cannot see a scale, so the fixture passed while half the division
+   results disagreed with C#. `tk_dec_div` is long division ONE decimal place per round
+   now, stopping at a remainder of zero (exact there, and every further place would be a
+   trailing zero), at the 28th place, or at a quotient that no longer fits 96 bits — the
+   ceiling `tk_dv_shl96` used to express as `dividend < divisor * 2^96`, read off the
+   quotient itself, so that helper left with its last caller. The trailing zeros the natural
+   scale `sa - sb` carries are then stripped for the same rule, which is what makes
+   `4.0m / 2m` equal `2m` at scale 0. **Nothing else in this type strips a zero**:
+   `1.0m == 1.00m` stays true, `1.0m * 1.0m` is still `1.00m`, and `+`/`-`/`*` keep the
+   scales § 5 gives them. `1m / 3m` still spends all 28 places and `1m / 3m * 3m` is still
+   `0.9999999999999999999999999999m`. The fixture asserts the SCALE of every quotient now,
+   read off `&d` per § 1's layout, and not only the value —
+   `docs/specs/decimal.md` § 5 and § 8 carry the rule, which they did not state at all.
+
+10. **The IMPLICIT conversion names the include, exactly as the explicit one does.**
+    `decimal d = 1;` with no `#include "decimal.tk"` reached the core's own `call to unknown
+    function` — no `teko:`, no file named — while `(decimal) 1` one line over already
+    answered `teko: decimal needs #include "decimal.tk" before it is used`. The check goes
+    into `tk_num_widen`'s wide arm and nowhere else: that one function IS the implicit road
+    in all nine of D33's slots and is what `tk_ops_promote` calls for a mixed operand, so
+    `d + 1` — which used to answer the unrelated `teko: the type of the right side of `+` is
+    not known here` — is covered by the same question.
+    `tests/refuse/decimal_implicit_no_include.tk` is the oracle.
+
+11. **A fixture's failure path may not return its success code.**
+    `tests/primitives_decimal_math.tk:111` answered `return 42` on a failed check, which is
+    the fixture's own `expect-exit`: the assertion could not fail. The audit over every
+    decimal fixture found one more of the same shape, older than this crumb
+    (`primitives_decimal_value.tk:160`), fixed here because it is an assertion THIS branch's
+    gate runs over code this branch changes. Both were proved live by mutation — the
+    expected value moved by one, the fixtures exit 55 and 47 instead of 42 — which is the
+    check `// expect-exit` alone cannot make.
+
+The two documentation findings are corrected in place:
+`docs/internals/primitives.md`'s ceilings table said `TK_MAXPRIMO | 48`, a number two crumbs
+stale (D76 raised it to 64, this one to 80), and carried no row for `TK_MAXPRIMX` at all —
+both fixed, with the live counts (62/80 and 5/8); every other `TK_MAXPRIM*` number in `docs/`
+was re-read and the only other mention is `docs/specs/datetime-extras.md`'s narrative of
+D76's own raise, which is history and correct. `docs/reference/not-yet.md`'s lambda-capture
+row spelled the capture `use (d)` with no context: measured on this branch, the spelling the
+row is about is `F f = () use (d) => d;` — the capture list FOLLOWS the parameter list — and
+it does still answer `mc: teko: a cast is not defined on a sixteen-byte value yet`, so the
+row stands and now shows the spelling it is true of. `use (d) () => d`, the order a reader
+guesses, is a different refusal (`call by name only`) that says nothing about the wide value,
+and the row says that too.
+
+**What this moved in the files listed below.** `lib/decimal.tk` is no longer append-only
+against `85901f5b`: `tk_dec_div`'s body is rewritten, `tk_dv_shl96` is deleted with its last
+caller, and `tk_dec_from_u64` is new. `teko_typeof.tk` gains the include check and one
+forward declaration; `teko_decimal.tk` one conversion row. The gate after the review:
+`sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **93 passed, 114 refused as expected,
+0 failed**; `sh scripts/check-docs.sh` → `docs ok: 674 links, 63 fragments, 406 diagnostics,
+114 refusals, 149 samples, manifest listed`. It supersedes the counts the section below
+recorded for the first pass.
+
 #### What the library turned out to be
 
 Eight 32-bit limbs in `u64` locals, 256 bits, which is what the widest intermediate needs:

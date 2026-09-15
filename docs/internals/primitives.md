@@ -222,7 +222,8 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 |---|---|---|
 | `TK_MAXPRIMT` | 8 | primitive types with a member table |
 | `TK_MAXPRIMM` | 160 | member rows, over every primitive |
-| `TK_MAXPRIMO` | 48 | operator rows, over every primitive |
+| `TK_MAXPRIMO` | 80 | operator rows, over every primitive |
+| `TK_MAXPRIMX` | 8 | conversion rows — a cast or an implicit widening the compiler lowers to a CALL, over every primitive (D77) |
 | `TK_MAXPRIMC` | 4096 | casts over a primitive the COMPILER wrote, in one unit |
 | `TK_MAXPRIMP` | 128 | parameter positions, over every row (N2c) |
 | `TK_MAXPRIML` | 4 | types a row names before they exist, resolved late by name (N2c) |
@@ -233,6 +234,10 @@ that measured it, 63 and 64 of `tests/surface_datetime_kind.tk`, pass without it
 them to 3, 82 and 28, with 51 parameter positions and no late type of its own. The second
 and third caps were 96 and 32 until that crumb and are 160 and 48 now — `TimeOnly` (N4b)
 would have overflowed both, and raising a `#define` costs nothing but the array it sizes.
+The operator cap was raised twice more for the same reason: to 64 by D76, whose nine
+`DateTimeOffset` rows took the true count past 48, and to **80** by D77, whose twelve
+`decimal` rows took it from 50 to 62. `TK_MAXPRIMX` is D77's own table and holds **5** of 8
+— four `decimal` conversions plus the `u64` source's own row.
 `TimeOnly` itself (N4b) brings the totals to **4, 103 and 35**, with **71** parameter
 positions — twenty of its own rows plus the one N4a's own `DateOnly` table gained
 (`.ToDateTime(TimeOnly)`), seven operator rows, and twenty of its own positions plus one on
