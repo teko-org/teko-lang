@@ -1,0 +1,155 @@
+// primitives_dto.tk -- `DateTimeOffset`, the third `TK_WIDE` type after
+// `decimal` and `Guid` (N5 of docs/specs/datetime-extras.md, D76): the UTC
+// instant and its offset in sixteen bytes, moved by `teko_wide.tk` with no
+// machine work of its own.
+//
+// Every reader, both Unix conversions, `ToOffset`, the six comparisons
+// (compared by INSTANT, offset ignored -- C#'s own rule), the two arithmetic
+// operators, `ToString`/`Parse` in both text forms, `TryParse` true and false
+// into a global, a parameter and an array element, and the value through a
+// local, a parameter, a return, a field, a global, an array element, a
+// `ref`/`out` pointee and a delegate -- the set every wide type's own fixture
+// proves (`primitives_guid.tk`, `primitives_decimal_value.tk`).
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "time.tk"
+
+DateTimeOffset g_dto;
+
+class Holder { public DateTimeOffset Value; }
+
+delegate DateTimeOffset Op0();
+
+DateTimeOffset giveDto() {
+    return new DateTimeOffset(new DateTime(2024, 2, 29, 13, 45, 30), TimeSpan.FromHours(0 - 3));
+}
+
+// `out`: the callee owes the write
+void setmin(out DateTimeOffset o) { o = DateTimeOffset.MinValue; }
+
+// `ref`: read the caller's slot, write it back
+void bumphour(ref DateTimeOffset o) {
+    DateTimeOffset cur = o;
+    o = cur + TimeSpan.FromHours(1);
+}
+
+// an `out` PARAMETER repassed one level down -- D75's own verifier, over the
+// third wide type: the callee's own slot is never what `TryParse` writes.
+i64 tryInto(str s, out DateTimeOffset o) { return DateTimeOffset.TryParse(s, out o); }
+
+// the return buffer under recursion: the ONE program buffer copies out
+// immediately after the branch, before the next call runs
+DateTimeOffset countdown(i64 n, DateTimeOffset acc) {
+    if (n == 0) return acc;
+    return countdown(n - 1, acc + TimeSpan.FromSeconds(1));
+}
+
+i64 main() {
+    DateTime dt = new DateTime(2024, 2, 29, 13, 45, 30);
+    TimeSpan minus3 = TimeSpan.FromHours(0 - 3);
+
+    // ---- the constructor and the readers, over a local
+    DateTimeOffset o = new DateTimeOffset(dt, minus3);
+    if (o.Year != 2024) return 1;
+    if (o.Month != 2) return 2;
+    if (o.Day != 29) return 3;
+    if (o.Hour != 13) return 4;
+    if (o.Minute != 45) return 5;
+    if (o.Second != 30) return 6;
+    if (o.Millisecond != 0) return 7;
+    if (o.TotalOffsetMinutes != 0 - 180) return 8;
+    if (o.Offset.TotalHours != 0.0 - 3.0) return 9;
+    if (o.UtcDateTime.Hour != 16) return 10;       // 13:45 at -03:00 is 16:45 UTC
+    if (o.DateTime.Hour != 13) return 11;          // the local reading, re-applied
+    if (o.LocalDateTime.Hour != 13) return 12;
+
+    // ---- the statics
+    if (DateTimeOffset.MinValue.Year != 1) return 13;
+    if (DateTimeOffset.MaxValue.Year != 9999) return 14;
+    if (DateTimeOffset.UnixEpoch.Year != 1970) return 15;
+    if (DateTimeOffset.UnixEpoch.ToUnixTimeSeconds() != 0) return 16;
+
+    // ---- same instant, different offsets: equal, and ordering agrees
+    DateTimeOffset p = new DateTimeOffset(o.UtcDateTime, TimeSpan.Zero);
+    if (!(o == p)) return 17;
+    if (o != p) return 18;
+    if (o < p || o > p) return 19;
+    if (!(o <= p) || !(o >= p)) return 20;
+    if (o.CompareTo(p) != 0) return 21;
+    if (!o.Equals(p)) return 22;
+
+    // ---- `ToOffset`: the instant is kept, the offset changes
+    DateTimeOffset q = o.ToOffset(TimeSpan.Zero);
+    if (q.Hour != 16) return 23;
+    if (q != o) return 24;
+
+    // ---- the Unix conversions, round-tripped
+    i64 secs = o.ToUnixTimeSeconds();
+    if (DateTimeOffset.FromUnixTimeSeconds(secs) != o) return 25;
+    i64 ms = o.ToUnixTimeMilliseconds();
+    if (DateTimeOffset.FromUnixTimeMilliseconds(ms) != o) return 26;
+
+    // ---- the arithmetic: the offset is kept, the instant moves
+    DateTimeOffset r = o + TimeSpan.FromDays(1);
+    if (r.Day != 1) return 27;                     // 2024-03-01
+    if (r.TotalOffsetMinutes != o.TotalOffsetMinutes) return 28;
+    DateTimeOffset s = r - TimeSpan.FromDays(1);
+    if (s != o) return 29;
+    TimeSpan since = r - o;
+    if (since.TotalDays != 1.0) return 30;
+
+    // ---- the text: "o" and "s", each round-tripped through `Parse`
+    str txt = o.ToString();
+    if (!tk_str_eq(txt, "2024-02-29T13:45:30.0000000-03:00")) return 31;
+    if (!tk_str_eq(o.ToString("o"), txt)) return 32;
+    DateTimeOffset back = DateTimeOffset.Parse(txt);
+    if (back != o) return 33;
+
+    str sform = o.ToString("s");
+    if (!tk_str_eq(sform, "2024-02-29T13:45:30")) return 34;
+    DateTimeOffset sback = DateTimeOffset.Parse(sform);
+    if (sback.Year != o.Year || sback.Month != o.Month || sback.Day != o.Day) return 35;
+    if (sback.Hour != o.Hour || sback.Minute != o.Minute || sback.Second != o.Second) return 36;
+    if (sback.TotalOffsetMinutes != 0) return 37;  // "s" carries no offset: read as UTC
+
+    // ---- `TryParse`: true into a GLOBAL, false into a PARAMETER's own slot
+    if (!DateTimeOffset.TryParse(txt, out g_dto)) return 38;
+    if (g_dto != o) return 39;
+    DateTimeOffset viaParam;
+    if (tryInto("not a date", out viaParam) != 0) return 40;
+    if (viaParam != DateTimeOffset.MinValue) return 41;
+    if (tryInto(txt, out viaParam) != 1) return 43;
+    if (viaParam != o) return 44;
+
+    // ---- an ARRAY ELEMENT, as `TryParse`'s own target and as an ordinary slot
+    DateTimeOffset arr[2];
+    if (!DateTimeOffset.TryParse(txt, out arr[1])) return 45;
+    if (arr[1] != o) return 46;
+
+    // ---- a field
+    Holder h = new Holder();
+    h.Value = o;
+    if (h.Value != o) return 47;
+
+    // ---- `ref`/`out`
+    DateTimeOffset v;
+    setmin(out v);
+    if (v != DateTimeOffset.MinValue) return 48;
+    bumphour(ref v);
+    if (v.Hour != 1) return 49;
+
+    // ---- a delegate returning a `DateTimeOffset`
+    Op0 f = giveDto;
+    DateTimeOffset got = f();
+    if (got != giveDto()) return 50;
+    if (got != o) return 51;
+
+    // ---- the return buffer, under recursion
+    DateTimeOffset acc = countdown(5, o);
+    TimeSpan grew = acc - o;
+    if (grew.TotalSeconds != 5.0) return 52;
+
+    return 42;
+}
