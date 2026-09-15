@@ -276,8 +276,9 @@ word: `i64 / 0` has no guard at all in teko today (it is the machine's own `sdiv
 answers 0 on aarch64), so there was no existing wording to join.
 
 **`#include <i128>` is never written.** Measured on mc 0.17.2: `<float>` and `<i128>` cannot
-coexist in one compiler — the opcode ranges collide on both instruction sets (arm64
-`FI_BASE` 100 unbounded against `WI_BASE` 200; x86_64 `FX_BASE` 100 == `XW_BASE` 100), the
+coexist in one compiler — the opcode ranges collide on x86_64 (`FX_BASE` 100 ==
+`XW_BASE` 100, either init order) and one init order executes an illegal instruction on arm64
+(measured on mc 0.17.2; mc's #93 delimits every band), the
 module adds four intrinsics, and its `iw_*` machine handlers break 34 of this repository's
 fixtures. § 13's last row already said teko carries its own; D81 is the ruling that closes
 it. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`, over the one

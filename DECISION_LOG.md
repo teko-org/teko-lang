@@ -8652,10 +8652,13 @@ purpose; every one of its spellings is refused by name today and is a row of
 1. **`<i128>` is closed, and this entry is what closes D74's "N6 re-decides".** D74 left
    `#include <i128>` out because it reserves the words `i128`/`u128` ahead of N6's own
    crumb, and said N6 would re-decide. It is decided: **never**. Three independent reasons,
-   each sufficient on its own. The opcode ranges COLLIDE -- on arm64 `<float>`'s `FI_BASE`
-   is 100 and unbounded while `<i128>`'s `WI_BASE` is 200, and on x86_64 `FX_BASE` and
-   `XW_BASE` are both 100 -- so a program mixing a float and a wide integer either executes
-   an illegal instruction or dies in `--dump-asm` with `no dump for a wide opcode`. It adds
+   each sufficient on its own. The opcode ranges COLLIDE on x86_64 -- `<float>`'s `FX_BASE`
+   and `<i128>`'s `XW_BASE` are both 100, so a plain `f64 a + a` dies in `--dump-asm` with
+   `no dump for a wide opcode` whichever module is initialised first -- and on arm64 the
+   measured init order `i128_init` then `machine_arm64_float_init` executes an illegal
+   instruction on `i128 y = x * 3i` (mc 0.17.2's `fa_mine` is bounded by `FI_MAXOP` 142,
+   so the arm64 half is a measurement, not a range claim; mc fixed both in its #93 by
+   delimiting every band). It adds
    **four intrinsics**, which D21 forbids without qualification. And its `iw_*` machine
    handlers claim the sixteen-byte depth `teko_wide.tk` already owns, which breaks 34
    fixtures. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`;
