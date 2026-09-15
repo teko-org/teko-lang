@@ -1,0 +1,230 @@
+// limbs.tk -- the wide-integer scratch vector: eight 32-bit limbs held one per
+// `u64` slot, and the sixteen operations every 128-bit arithmetic in this
+// repository is written over. Program code, not compiler code:
+// `#include "limbs.tk"` reaches it directly, and `decimal.tk` and `wide.tk`
+// both include it, so a source that includes either already has it.
+//
+// It is C4's own block, lifted out of `lib/decimal.tk` unchanged (D77's
+// `tk_dv_*`, D81's lift): N6a's `i128`/`u128` need exactly the same long
+// division, the same school product and the same carry-propagating add, and a
+// second `tk_dv_divmod` written beside the first is the one thing this
+// repository refuses more than it refuses a long file. Nothing here knows what
+// a `decimal` is or what an `i128` is -- a vector is eight limbs and a limb is
+// a number below 2^32.
+//
+// **Why 32-bit limbs and never 64.** `mc` compares every integer SIGNED,
+// `u64` included (measured on mc 0.17.2, reported), so `a < b` on two `u64`
+// halves of a 128-bit value answers backwards the moment bit 63 is set. A limb
+// below 2^32 has no such bit, so every compare below is right on both sides of
+// the defect and stays right when it is fixed.
+//
+// `rt.tk` is included for `panic`: a carry out of the TOP limb is a value past
+// 256 bits, which no caller can form, so it is a guard and not a path.
+#include "rt.tk"
+
+// ---- the scratch vector ----
+// A working value is TK_DEC_NL limbs of 32 bits each, little-endian, one limb
+// per `u64` slot so that a 32x32 product plus two carries still fits the 64
+// bits a multiply has. Eight limbs is 256 bits, and 256 is what the widest
+// intermediate any operation below forms needs:
+//
+//   aligning an operand of `+`  a 96-bit mantissa times 10^28   ~ 2^189
+//   the product of `*`          96 bits by 96 bits              = 192 bits
+//   a remainder of `/` times 10 below the divisor, so  96 + 4   = 100 bits
+//
+// The vectors are LOCAL arrays, never globals: `u64 a[8]` in a frame is its
+// own address (`tests/primitives_decimal_math.tk` walks a nested call), so
+// `tk_dec_add(tk_dec_mul(a, b), c)` cannot find another call's scratch.
+#define TK_DEC_NL 8
+
+u64  tk_dv_at(uptr v, i64 i)         { return ld64(v + i * 8); }
+void tk_dv_put(uptr v, i64 i, u64 x) { st64(v + i * 8, x); }
+
+void tk_dv_zero(uptr v) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        tk_dv_put(v, i, 0);
+        i = i + 1;
+    }
+}
+
+void tk_dv_copy(uptr d, uptr s) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        tk_dv_put(d, i, tk_dv_at(s, i));
+        i = i + 1;
+    }
+}
+
+i64 tk_dv_is_zero(uptr v) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        if (tk_dv_at(v, i)) return 0;
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 1 when the value needs more than the 96 bits a mantissa has
+i64 tk_dv_over96(uptr v) {
+    i64 i = 3;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        if (tk_dv_at(v, i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// -1, 0 or 1, from the top limb down
+i64 tk_dv_cmp(uptr a, uptr b) {
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 0) break;
+        u64 x = tk_dv_at(a, i);
+        u64 y = tk_dv_at(b, i);
+        if (x > y) return 1;
+        if (x < y) return 0 - 1;
+        i = i - 1;
+    }
+    return 0;
+}
+
+// a += b. The carry out of the TOP limb is a value past 256 bits, which no
+// caller can form (the table above) -- it is a guard and not a path.
+void tk_dv_add(uptr a, uptr b) {
+    u64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 s = tk_dv_at(a, i) + tk_dv_at(b, i) + c;
+        tk_dv_put(a, i, s & 0xffffffff);
+        c = s >> 32;
+        i = i + 1;
+    }
+    if (c) panic("decimal overflow");
+}
+
+// a -= b, with `a >= b` the caller's own business: the borrow out of the top
+// limb is read from the wrap and dropped, which is what makes the subtraction
+// of the smaller from the larger exact.
+void tk_dv_sub(uptr a, uptr b) {
+    u64 w = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 d = tk_dv_at(a, i) - tk_dv_at(b, i) - w;
+        tk_dv_put(a, i, d & 0xffffffff);
+        w = (d >> 32) & 1;
+        i = i + 1;
+    }
+}
+
+void tk_dv_inc(uptr a) {
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 s = tk_dv_at(a, i) + 1;
+        tk_dv_put(a, i, s & 0xffffffff);
+        if (s <= 0xffffffff) return;
+        i = i + 1;
+    }
+    panic("decimal overflow");
+}
+
+// a = a * m + add for a multiplier and an addend below 2^32; answers the carry
+// out of the top limb, which is how a caller tells "it no longer fits" from a
+// plain result. `add` is what a digit reader needs (D79): `tk_dec_scan` must
+// answer 0 where `tk_dv_add` would panic, because `TryParse` never panics.
+u64 tk_dv_muladds(uptr a, u64 m, u64 add) {
+    u64 c = add;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 p = tk_dv_at(a, i) * m + c;
+        tk_dv_put(a, i, p & 0xffffffff);
+        c = p >> 32;
+        i = i + 1;
+    }
+    return c;
+}
+
+// a *= m, the addend-free half every operator writes
+u64 tk_dv_muls(uptr a, u64 m) { return tk_dv_muladds(a, m, 0); }
+
+// a /= d for a divisor below 2^32; answers the remainder, which is the digit
+// every rounding decision below is made on
+u64 tk_dv_divs(uptr a, u64 d) {
+    u64 r = 0;
+    i64 i = TK_DEC_NL - 1;
+    loop {
+        if (i < 0) break;
+        u64 cur = (r << 32) | tk_dv_at(a, i);
+        tk_dv_put(a, i, cur / d);
+        r = cur % d;
+        i = i - 1;
+    }
+    return r;
+}
+
+void tk_dv_shl1(uptr a) {
+    u64 c = 0;
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 x = (tk_dv_at(a, i) << 1) | c;
+        tk_dv_put(a, i, x & 0xffffffff);
+        c = (x >> 32) & 1;
+        i = i + 1;
+    }
+}
+
+// r = a * b, the school product. `r` is neither `a` nor `b`, and the carry out
+// of the last limb is dropped because the only caller multiplies two 96-bit
+// mantissas, whose product is 192 bits.
+void tk_dv_mul(uptr r, uptr a, uptr b) {
+    tk_dv_zero(r);
+    i64 i = 0;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        u64 c = 0;
+        i64 j = 0;
+        loop {
+            if (j >= TK_DEC_NL) break;
+            if (i + j >= TK_DEC_NL) break;
+            u64 p = tk_dv_at(a, i) * tk_dv_at(b, j) + tk_dv_at(r, i + j) + c;
+            tk_dv_put(r, i + j, p & 0xffffffff);
+            c = p >> 32;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// q = a / b, and `a` BECOMES the remainder. Long division one bit at a time
+// over the whole 256: no quotient-digit estimate to get wrong, and the cost --
+// 256 rounds of a shift, a compare and at most a subtract -- is the price this
+// crumb pays for an algorithm that is read once and trusted (C7 is the speed
+// crumb, docs/specs/decimal.md § 12).
+void tk_dv_divmod(uptr q, uptr a, uptr b) {
+    u64 r[TK_DEC_NL];
+    tk_dv_zero(q);
+    tk_dv_zero(r);
+    i64 i = TK_DEC_NL * 32 - 1;
+    loop {
+        if (i < 0) break;
+        tk_dv_shl1(r);
+        u64 bit = (tk_dv_at(a, i / 32) >> (i % 32)) & 1;
+        tk_dv_put(r, 0, tk_dv_at(r, 0) | bit);
+        if (tk_dv_cmp(r, b) >= 0) {
+            tk_dv_sub(r, b);
+            u64 one = 1;
+            tk_dv_put(q, i / 32, tk_dv_at(q, i / 32) | (one << (i % 32)));
+        }
+        i = i - 1;
+    }
+    tk_dv_copy(a, r);
+}

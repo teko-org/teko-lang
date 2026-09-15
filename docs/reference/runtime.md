@@ -1,10 +1,11 @@
 # The runtime
 
-Five library files, all of them **program** code compiled under the same taught vocabulary
+Seven library files, all of them **program** code compiled under the same taught vocabulary
 as the program that includes them: `lib/rt.tk`, the runtime every program links against,
 [`lib/time.tk`](#the-time-library), the surface code every `TimeSpan` and `DateTime` member
-and operator lowers to, the two files of the sixteen-byte types —
-[`lib/decimal.tk` and `lib/guid.tk`](#the-wide-libraries) — and `lib/math.tk`, C#'s `Math`
+and operator lowers to, the three files of the sixteen-byte types —
+[`lib/decimal.tk`, `lib/guid.tk` and `lib/wide.tk`](#the-wide-libraries) — the limb vector
+they compute over ([`lib/limbs.tk`](#the-limb-library)), and `lib/math.tk`, C#'s `Math`
 over a `decimal`, which is an ordinary class and no mechanism at all.
 
 `lib/rt.tk` is the runtime a teko program links against: the arena, the reference counting
@@ -360,10 +361,24 @@ sixteen-byte FILE the way `decimal`/`Guid` each got one, only a third registrati
 slot — the core's own `MTASK_LOCAL_ADDR`, untouched by the wide machine — so surface code
 reaches the halves with no accessor and no intrinsic.
 
+### The limb library
+
+`lib/limbs.tk` is the scratch vector every 128-bit arithmetic in this repository is written
+over: eight 32-bit limbs held one per `u64` slot, and sixteen operations on them —
+`tk_dv_zero`, `tk_dv_copy`, `tk_dv_at`/`tk_dv_put`, `tk_dv_is_zero`, `tk_dv_over96`,
+`tk_dv_cmp`, `tk_dv_add`, `tk_dv_sub`, `tk_dv_inc`, `tk_dv_muladds`, `tk_dv_muls`,
+`tk_dv_divs`, `tk_dv_shl1`, `tk_dv_mul` and `tk_dv_divmod`. It knows nothing about the type
+above it: `lib/decimal.tk` and `lib/wide.tk` both include it, so `decimal` and
+`i128`/`u128` share one long division rather than carrying two (D81).
+
+The limbs are 32 bits and never 64 because `mc` compares every integer SIGNED, `u64`
+included: `a < b` on two `u64` halves of a 128-bit value answers backwards the moment bit
+63 is set. A limb below 2^32 has no such bit.
+
 ### The decimal library
 
-`lib/decimal.tk` carries `decimal`'s own arithmetic on top of those three, and includes
-`rt.tk` itself for `panic` and for `tk_f64_bits`. Every operator and every conversion of
+`lib/decimal.tk` carries `decimal`'s own arithmetic on top of those three plus
+`lib/limbs.tk`, and includes `rt.tk` itself for `panic` and for `tk_f64_bits`. Every operator and every conversion of
 [`decimal`](types.md#decimal) lowers to one of the symbols below, and **none of them is an
 instruction**: the whole of it is ordinary teko over 32-bit limbs held in `u64` locals — the
 technique `mc`'s own `<i128>` uses for a literal — so no leg needs a 128-bit instruction and
