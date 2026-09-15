@@ -305,7 +305,25 @@ i64 tk_div_applies(i64 n) {
 void tk_div_guard(i64 n, uptr dst) {
     i64 a = nd_a(n);
     i64 b = nd_b(n);
-    if (nd_kind(b) == N_INT && nd_val(b) != 0) return;   // a literal, nonzero: no guard
+    // A LITERAL divisor is never guarded, zero or nonzero (F3, measured):
+    // `x / 2` is left exactly as the core wrote it, and a literal ZERO is
+    // answered where it is WRITTEN rather than at run time -- C# refuses the
+    // same line outright (CS0020, "Division by constant zero"), whatever the
+    // dividend is. Guarding it instead was what hid mc's own compile-time
+    // refusal behind a run-time panic.
+    //
+    // The one shape left to mc is the one mc already answers: BOTH sides
+    // constant is `fold_binary`/`const_bin`'s own `division by zero` (no
+    // `teko:` prefix, `mc/src/parse.mc`), measured unchanged on `8d95c1ff`
+    // -- `fold()` runs after every `pass()`, so returning here hands it back.
+    // Measured too: mc folds nothing when the DIVIDEND is not constant, so
+    // `a / 0` was silence on aarch64 (exit 0) and SIGFPE on x86_64 -- the
+    // very split D82 exists to close, and the reason this line refuses.
+    if (nd_kind(b) == N_INT) {
+        if (nd_val(b) == 0 && nd_kind(a) != N_INT)
+            err_at(nd_file(n), nd_line(n), "teko: division by zero");
+        return;
+    }
     i64 ta = tk_ty_of(a);
     i64 tb = tk_ty_of(b);
     tk_line = nd_line(n);
