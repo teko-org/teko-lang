@@ -9261,8 +9261,9 @@ one.
    crumb extends the same caution to a narrowing float-to-int instruction it did not measure
    as safe at that boundary.
 2. **`(f64) x` rounds ONCE, to nearest even, over the WHOLE 128-bit magnitude.**
-   `tk_dec_to_f64`'s own three-limb accumulation (`r = r * 2^32 + limb`, twice) is exact for
-   96 bits and would round at every step for 128, which is not one rounding. `tk_w_mag_to_f64`
+   `tk_dec_to_f64`'s own three-limb accumulation (`r = r * 2^32 + limb`, twice) can already
+   round between limbs -- 96 bits exceed a `double`'s 53-bit significand -- and four limbs
+   would round at every step, which is not one rounding. `tk_w_mag_to_f64`
    instead finds the highest set bit, keeps the top 53 as the candidate mantissa, folds the
    next bit and everything below it into a round bit and one sticky bit, and assembles the
    IEEE754 bits directly (`tk_f64_from_bits`) -- the textbook software float-from-bignum
@@ -9314,7 +9315,7 @@ lines, none of them a machine handler. `lib/decimal.tk`: `tk_dec_from_i128`/
 
 **Two refuse fixtures deleted, both compile now:** `tests/refuse/i128_cast_float.tk` and
 `i128_cast_decimal.tk` -- the exact two programs D81's own header named as the doors this
-crumb would open. **Four fixtures added:** `tests/primitives_i128_convert.tk` (42, the run
+crumb would open. **Six fixtures added:** `tests/primitives_i128_convert.tk` (42, the run
 fixture every ruling above cites), `tests/primitives_i128_decovf.tk` and
 `_udec_neg.tk` (70 each, the two panics), and three under `tests/refuse/`
 (`i128_cast_str.tk`, the shorter wording D74 wrote, now naming only `(str) x`;

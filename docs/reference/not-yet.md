@@ -270,8 +270,8 @@ SAME wide type before the operator row is looked up and never to `i64`. N6b's se
 x` rounds once, to nearest even, over the whole 128-bit magnitude; `(i128)/(u128) x` on a
 `double` truncates toward zero and SATURATES rather than wraps (NaN → 0, a magnitude past the
 bound → that bound, .NET's own `Int128`/`UInt128` rule); `(decimal) x` panics `teko: decimal
-overflow` past `2^96`; `(i128)/(u128) d` truncates and can only overflow on the unsigned
-side, reading a negative `decimal`. None of the six is implicit either way — `tk_num_wide_
+overflow` at or past `2^96` (above `decimal.MaxValue`, `2^96 - 1`); `(i128)/(u128) d` truncates and can only overflow on the unsigned
+side, reading a negative `decimal`. None of the eight is implicit either way — `tk_num_wide_
 widens` still answers 0 for a wide source (D38). What is still N6b's — its third crumb,
 N6b-3 — and every row below is refused by name until it lands:
 

@@ -899,18 +899,18 @@ refusal that already existed: `x.ToString()` earns `teko: unknown member of i128
   target the conversion table does not name: `(str) x` alone now, N6b-3's own. The sixteen
   rows N6a and N6b-2 register between them — `(i128) n`/`(u128) n` from any integer, `(i64) x`
   and every narrower target, the two bit-preserving directions between `i128` and `u128`,
-  and D84's own six `f64`/`decimal` rows — are each a CALL and never reach this row. It is
+  and D84's own eight `f64`/`decimal` rows — are each a CALL and never reach this row. It is
   the short wording D74 wrote for a wide primitive whose reader and builder clauses are still
   empty, because a message naming a member the type does not have yet would be wrong.
   `(decimal) x` used to be refused under `decimal`'s own longer wording; D84 registers the
   row and it is a call now, on both sides.
-- `"teko: a value of type i128 does not convert to f64"` / `"...to decimal"` — D84's six new
+- `"teko: a value of type i128 does not convert to f64"` / `"...to decimal"` — D84's eight new
   rows are EXPLICIT only: `f64 x = v;` and `decimal d = v;` on an `i128`/`u128` `v` build no
   cast at all (`tk_num_wide_widens`, teko_typeof.tk, still answers 0 for a wide source, D38),
   so the ordinary "does not convert" wording every implicit-widening refusal already carries
   fires here too, not a wide-specific message.
 - `"teko: decimal overflow"` — already `decimal`'s own wording (D77), two more paths into it
-  now: `(decimal) x` on an `i128`/`u128` magnitude at or past `2^96` (`decimal.MaxValue`),
+  now: `(decimal) x` on an `i128`/`u128` magnitude at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`),
   and `(u128) d` on a negative `decimal` whose truncated magnitude is still nonzero (D84).
 
 Two are **run-time panics** raised by `lib/wide.tk` itself, exit 70 and on stderr with no

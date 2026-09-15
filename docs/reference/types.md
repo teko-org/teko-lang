@@ -1240,12 +1240,12 @@ same pair.
 | `i128` | `u128`, and back | **explicit**, the same bits: `(u128)(-1i)` is `2^128−1`, C#'s own answer |
 | `i128`, `u128` | `f64` | **explicit** `(f64) v`, ROUNDS once, to nearest even, over the whole 128-bit magnitude (D84) |
 | `f64` | `i128`, `u128` | **explicit** `(i128) x`, truncates toward zero and SATURATES: NaN → 0, a magnitude at or past the type's own bound → that bound — .NET's `Int128`/`UInt128` rule, and teko's own since there is no `checked` word (D84) |
-| `i128`, `u128` | `decimal` | **explicit** `(decimal) v`; a magnitude at or past `2^96` (`decimal.MaxValue`) panics `teko: decimal overflow`, exit 70 (D84) |
+| `i128`, `u128` | `decimal` | **explicit** `(decimal) v`; a magnitude at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`) panics `teko: decimal overflow`, exit 70 (D84) |
 | `decimal` | `i128`, `u128` | **explicit** `(i128) d`, truncates toward zero and never overflows the width it lands in; `(u128) d` panics `teko: decimal overflow`, exit 70, on a negative `d` whose truncated MAGNITUDE is still nonzero (`-0.5m` → `0u` is fine, `-1m` is not) — C#'s own rule for a negative decimal read into an unsigned type (D84) |
 | `i128`, `u128` | `str` | **not taught yet** (N6b-3): `teko: an i128 does not cast yet` |
 | `null`, a class, a struct, a `T[]` | either | refused |
 
-None of the six new rows opens an IMPLICIT door either way: `f64 x = v;` and `decimal d = v;`
+None of the eight new rows opens an IMPLICIT door either way: `f64 x = v;` and `decimal d = v;`
 on an `i128`/`u128` `v` are both refused, `teko: a value of type i128 does not convert to
 f64`/`decimal` — the conversion table's row is read only from an explicit `N_CAST`
 (`tk_prim_cast_lower`), and `tk_num_wide_widens` still answers 0 for a wide source (D38),

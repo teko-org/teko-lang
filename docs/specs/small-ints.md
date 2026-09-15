@@ -326,10 +326,10 @@ between `putf64` and `fmt_f64`.
 | `i128` | `u128`, and back | **explicit**, the same bits |
 | `i128`, `u128` | `f64` | **explicit**: `(f64) v`, lowered to a call — **landed, N6b-2, D84**: rounds ONCE, to nearest even, over the whole 128-bit magnitude |
 | `f64` | `i128`, `u128` | **explicit**, truncating toward zero — **landed, N6b-2, D84**: SATURATING (NaN → 0, past the bound → that bound), .NET's own `Int128`/`UInt128` rule and teko's own since there is no `checked` word |
-| `i128`, `u128` | `decimal` | **explicit**, both directions — **landed, N6b-2, D84**: `(decimal) v` panics `teko: decimal overflow` past `2^96`; `(i128)/(u128) d` truncates toward zero, and only the unsigned side can overflow (a negative `d` whose truncated magnitude is still nonzero) |
+| `i128`, `u128` | `decimal` | **explicit**, both directions — **landed, N6b-2, D84**: `(decimal) v` panics `teko: decimal overflow` at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`); `(i128)/(u128) d` truncates toward zero, and only the unsigned side can overflow (a negative `d` whose truncated magnitude is still nonzero) |
 | `null`, a class, a struct, a `T[]` | any of the four | refused (D32/D34) |
 
-None of the six new rows is implicit in either direction: `tk_num_wide_widens`
+None of the eight new rows is implicit in either direction: `tk_num_wide_widens`
 (teko_typeof.tk) still answers 0 for a wide source (D38), so `f64 x = v;` and
 `decimal d = v;` on an `i128`/`u128` `v` build no cast at all and are refused,
 `teko: a value of type i128 does not convert to f64`/`decimal`.
@@ -480,7 +480,7 @@ other, each reads the other type's sixteen bytes raw). `(f64) v` rounds ONCE, to
 even, over the whole 128-bit magnitude, never per 32-bit limb; `(i128)/(u128) x` on a
 `double` truncates toward zero and SATURATES (NaN -> 0, a magnitude past the bound -> that
 bound, .NET's own `Int128`/`UInt128` rule); `(decimal) v` panics `teko: decimal overflow`
-past `2^96`; `(i128)/(u128) d` truncates and only the unsigned side can overflow. `TK_MAXPRIMX`
+at or past `2^96`; `(i128)/(u128) d` truncates and only the unsigned side can overflow. `TK_MAXPRIMX`
 16 -> 32. Depends on N6a and, for the `decimal` direction, on C5.
 
 **Gate as run:** `tests/primitives_i128_convert.tk` at its code, `_decovf.tk` and
