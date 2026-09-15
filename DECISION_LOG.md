@@ -7422,7 +7422,9 @@ diff empty over 230438 lines); `sh scripts/check-docs.sh` → `docs ok: 615 link
 
 The move is the one D64 prescribed for a pin: `MC_VERSION` → `0.17.0`; `mc.toml`'s
 `[package].mc` follows the pin (the registry's own validator runs 0.17.0 since mc-registry #33,
-so the minimum this manifest states is the compiler that validates it); the four places that
+so the minimum this manifest states is the compiler that validates it) — **superseded by the
+second amendment below: the minimum is the oldest mc of the frozen surface, 0.17.0, and does
+not follow the pin**; the four places that
 quote the pinned number as the CURRENT one (`CONTRIBUTING.md`, `docs/guide/00-getting-started.md`,
 `docs/reference/build.md`'s staged path and message text, `.github/workflows/site.yml`'s comment)
 follow; every mention of 0.16.0/0.16.1 that narrates a past measurement stays. Nothing in the
@@ -7447,8 +7449,9 @@ lockstep) are patches under the same frozen surface. The canary judged 0.17.1 `o
 watching, and its verdict was written afterwards by a manual dispatch. The whole local recipe is
 green on 0.17.2 over `a1cf0b52` (94 passed, 119 refused, 0 failed; `FIXPOINT OK`; docs ok) and
 `--dump-ast` is byte-identical between the compiler built by 0.17.0 and by 0.17.2 on every
-fixture. The move is D64's: `MC_VERSION` and `[package].mc` to 0.17.2, the four current-pin
-quotes with them; nothing in the modules moves.
+fixture. The move is D64's: `MC_VERSION` to 0.17.2 and the four current-pin quotes with it;
+`[package].mc` moved to 0.17.2 too on that day and was put back to 0.17.0 by the second
+amendment (the minimum does not follow the pin); nothing in the modules moves.
 
 **Second amendment (2026-09-15) — the minimum is not the pin.** Two releases were refused by
 the registry's validator for the same reason: its sandbox ran the mc one patch behind the
