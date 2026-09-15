@@ -9550,6 +9550,14 @@ equal values hash equal). `operator+` (concatenation, a fresh owned `string`) an
 `operator==`/`!=`, by VALUE (a byte compare of the two `data` fields, `tk_str_eq` reused
 unchanged from `lib/rt.tk`), never by identity. `string.Empty`, `string.Concat`,
 `string.IsNullOrEmpty` (over a `string?`, D43's own widening -- see below).
+And a second constructor the review forced, `string()` with no argument: teko's allocator
+hands out a ZEROED object for any class that declares no parameterless constructor
+(`tk_allocators`, teko_class.tk -- "which is what every class written before constructors
+existed keeps doing"), and every member here dereferences `data`, so `new string()` would
+have been a null pointer with a vtable. C# has no `new string()` at all, and teko cannot
+refuse the form per class today; the safe value is the answer -- `new string()` IS the empty
+string (allocated, NUL-terminated, owned), equal to `string.Empty`
+(`surface_string_interop.tk`'s last rows).
 
 **Zero compiler-module changes, by construction and not by restraint.** `lib/string.tk` is
 program code, resolved through `[include].paths` the way `lib/rt.tk`, `lib/time.tk`,
