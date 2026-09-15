@@ -535,6 +535,18 @@ object is released when the last reference to it dies ([memory.md](memory.md)); 
 a class can carry — inheritance, `virtual`, interfaces, traits, properties, operators,
 constructors and destructors — is [classes.md](classes.md).
 
+**The allocator's own local.** `new Name(...)` lowers to a generated `Name_new` function
+that allocates the object, installs its vtable and reference count, and calls the
+constructor with the allocated address as its first argument. That address is held in a
+local of the allocator's own — gensym'd (`gensym_new()`, the `$`-prefixed convention the
+compiler's temporaries use wherever a user-chosen name can share the scope), never a fixed
+spelling such as `p`, so a constructor parameter written with that same ordinary identifier
+reads its own argument and never the allocator's local. (Four other generators still declare
+a fixed `p` — a delegate's, a heap array's, a struct's allocator, a DI getter — in functions
+whose every parameter is the compiler's own, where no collision is possible; D87.) A bare
+`this` used as a VALUE — `return this;`, `C d = this;` — is still refused today
+(`teko: a value of type uptr does not convert to C`): the redesign is owed, D87.
+
 ---
 
 ## `enum`

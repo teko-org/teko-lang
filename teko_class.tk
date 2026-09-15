@@ -1304,23 +1304,38 @@ i64 tk_release_fn(i64 ci, uptr name, i64 size) {
 
 // what every allocator runs before the constructor body: the vtable is filled
 // once (the stores are idempotent), installed in word 0, and the count starts
-// at 1 -- the one reference the `new` expression itself hands out
-i64 tk_new_install(uptr vt) {
+// at 1 -- the one reference the `new` expression itself hands out. `t` is the
+// allocator's own local (`tk_new_fn` below), gensym'd -- see the note there.
+i64 tk_new_install(uptr vt, uptr t) {
     i64 st = tk_stmt(tk_call(tk_join(vt, "_init"), 0));
-    st = list_append(st, tk_stmt(tk_call2("st64", tk_id("p"), tk_id(vt))));
-    i64 cnt = tk_bin(K_ADD, tk_id("p"), tk_int(8));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id(t), tk_id(vt))));
+    i64 cnt = tk_bin(K_ADD, tk_id(t), tk_int(8));
     return list_append(st, tk_stmt(tk_call2("st64", cnt, tk_int(1))));
 }
 
-// Name Name_new<sig>(params) { uptr p = rt_alloc(SIZE); <install>
-//                              [Name_ctor<sig>(p, params...)] return p; }
+// Name Name_new<sig>(params) { uptr $N = rt_alloc(SIZE); <install>
+//                              [Name_ctor<sig>($N, params...)] return $N; }
 // The parameter list is the constructor's own, cloned: the declaration already
 // owns the nodes the source produced, and a node sits in one sibling list only.
+//
+// The allocator's own local was spelled `p` -- a name a constructor parameter
+// may ALSO be spelled, since it is an ordinary identifier and not a reserved
+// word the way `this` is (teko_this.tk). `class Cell { public i64 v; public
+// Cell(i64 p) { v = p; } }` then read the wrong `p`: the constructor call
+// built below passes `tk_id(nd_name(pp))` for the parameter, and the core's
+// own scoping resolves an unqualified `p` to whichever declaration is
+// INNERMOST -- the allocator's local, not the argument the caller passed,
+// because the parameter is bound one call frame down, inside `Cell_ctor`
+// itself, and the identifier `p` written HERE, in `Cell_new`'s own body,
+// names the local this function just declared. `gensym_new()` is the fix
+// (`tk_div_lazy_lower`, teko_ternary.tk): a name no program can ever write,
+// so it cannot collide with a parameter however the source spells it.
 void tk_new_fn(i64 ci, uptr name, i64 size, uptr vt, uptr fn, i64 prs, uptr ctor) {
-    i64 st = tk_var(TY_UPTR, "p", tk_call("rt_alloc", tk_int(size)));
-    st = list_append(st, tk_new_install(vt));
+    uptr t = gensym_new();
+    i64 st = tk_var(TY_UPTR, t, tk_call("rt_alloc", tk_int(size)));
+    st = list_append(st, tk_new_install(vt, t));
     if (ctor) {
-        i64 args = tk_id("p");
+        i64 args = tk_id(t);
         i64 pp = prs;
         loop {
             if (pp == 0) break;
@@ -1329,7 +1344,7 @@ void tk_new_fn(i64 ci, uptr name, i64 size, uptr vt, uptr fn, i64 prs, uptr ctor
         }
         st = list_append(st, tk_stmt(tk_call(ctor, args)));
     }
-    i64 r = tk_id("p");
+    i64 r = tk_id(t);
     tk_xt_add(r, ci, 1, TK_OWNED);               // a NAME, so pure; the count is 1, the
                                                  // caller's own reference
     st = list_append(st, tk_ret(r));
