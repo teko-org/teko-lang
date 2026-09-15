@@ -196,9 +196,10 @@ i64 tk_prim_is(i64 ty);
 // safe to read twice as it stands and is never hoisted.
 //
 // `panic` IS PROGRAM CODE (`lib/rt.tk`), not something every unit carries, and
-// the guard checks WHOSE it is, not merely that the name exists: the
-// declaration `decl_find` answers with has to have been read from `lib/rt.tk`
-// itself (`nd_file` of the declaration node, `tk_div_ends`). A program that
+// the guard checks WHOSE it is, not merely that the name exists: SOME
+// declaration of the name has to have been read from `lib/rt.tk` itself
+// (`tk_div_rt_panic`: `nd_file` of the declaration node, `tk_div_ends`, over
+// the whole unit -- not `decl_find`'s first hit alone). A program that
 // declares its own `i64 panic(str)` and never includes the runtime is refused
 // here rather than compiled into a guard that calls a no-op and lets the
 // division run (`tests/refuse/divzero_own_panic.tk`); a program that declares
@@ -311,6 +312,27 @@ i64 tk_div_ends(uptr f, uptr suf) {
     }
 }
 
+// is SOME declaration of `panic` the runtime's own? The whole unit is
+// walked (`tk_div_root`, set by `tk_ternary_pass`) rather than asked through
+// `decl_find`, which answers about the FIRST declaration of a name alone: a
+// program that declares an unrelated overload such as `panic(i64)` ahead of
+// its `#include "rt.tk"` still carries the runtime's `panic(str)`, and the
+// generated call resolves to it like any other overload (teko_over.tk) --
+// `tests/surface_divpanic_overload.tk`. The check is the FILE the
+// declaration was read from (suffix `lib/rt.tk`), which is a ceiling and not
+// a proof: an include root of the project's own holding a `vendor/lib/rt.tk`
+// with a no-op `panic` passes it (D82 ruling 10).
+i64 tk_div_root = 0;
+i64 tk_div_rt_panic() {
+    i64 n = tk_div_root;
+    loop {
+        if (n == 0) return 0;
+        if (decl_valid(n) && str_eq(nd_name(n), "panic") && tk_div_ends(nd_file(n), "lib/rt.tk"))
+            return 1;
+        n = nd_next(n);
+    }
+}
+
 i64 tk_div_project_file(uptr f) {
     if (f == 0) return 0;
     if (tk_div_has(f, "lib/mc/v")) return 0;
@@ -357,8 +379,7 @@ void tk_div_guard(i64 n, uptr dst) {
     i64 tb = tk_ty_of(b);
     tk_line = nd_line(n);
     tk_file = nd_file(n);
-    i64 pd = decl_find("panic");
-    if (pd < 0 || !tk_div_ends(nd_file(pd), "lib/rt.tk"))
+    if (!tk_div_rt_panic())
         err_at(tk_file, tk_line, "teko: an integer division needs #include rt.tk");
     i64 sgn = type_signed(ta);
     uptr an = 0;
@@ -452,7 +473,10 @@ void tk_div_lazy_lower(i64 n, uptr dst) {
     tk_ty_scope_add(t, TY_I64);
     i64 shortv = 1;                        // what the left alone already decides
     if (andand) shortv = 0;
-    i64 taken = list_append(lazyOut, tk_tern_assign(t, y));
+    // `&&`/`||` answer a NORMALIZED truth value, never the right operand
+    // itself: `n != 0 && a / n` is 1, not the quotient (measured: the raw
+    // assignment returned 3 for `7 / 2`).
+    i64 taken = list_append(lazyOut, tk_tern_assign(t, tk_bin(K_NE, y, tk_int(0))));
     i64 other = list_append(0, tk_tern_assign(t, tk_int(shortv)));
     i64 thenOut = other;
     i64 elseOut = taken;
@@ -657,6 +681,7 @@ void tk_tern_fn(i64 f) {
 // included) that the old fast exit bought little a plain program would
 // notice.
 i64 tk_ternary_pass(i64 root) {
+    tk_div_root = root;
     i64 f = root;
     loop {
         if (f == 0) break;

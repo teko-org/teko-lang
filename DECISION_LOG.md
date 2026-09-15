@@ -8931,7 +8931,7 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    `tk_w_isneg` already reads. `u128` gets no such check: an unsigned divide never overflows
    its own width.
 
-8. **Six fixtures that run, three that are refused (amended by the PR's review, F4).**
+8. **Eight fixtures that run, three that are refused (amended by the PR's review, F4).**
    `tests/surface_divzero.tk` (70), `tests/surface_remzero.tk` (70),
    `tests/surface_divovf.tk` (70, `i64.MinValue / m` with `m` a parameter),
    `tests/surface_divguard.tk` (42: every width with a non-literal divisor, truncation
@@ -8940,6 +8940,9 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    literal divisor path left untouched, and — ruling 9 — the `&&`/`||`/`while`/nested rows
    whose division is never reached, side-effecting lazy divisor included),
    `tests/surface_divlazy.tk` (70: the same lazy division reached through a TRUE left side),
+   `tests/surface_divlazy_value.tk` (42: the `&&`/`||` temporary is a truth value, ruling 9),
+   `tests/surface_divpanic_overload.tk` (42: a `panic(i64)` of the program's own ahead of the
+   include, ruling 10),
    `tests/primitives_i128_divovf.tk` (70). Refused: `tests/refuse/divzero_no_rt.tk` (the
    missing include), `tests/refuse/divzero_own_panic.tk` (a `panic` of the program's own,
    ruling 5) and `tests/refuse/divzero_literal.tk` (`a / 0`, ruling 3). The first draft
@@ -8958,8 +8961,12 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    arm needs lands in that branch's own list. So `&&`/`||` takes the same road, ahead of the
    guard walk (`tk_div_lazy_lower`, teko_ternary.tk):
 
-       x && y  ->  i64 t = 0; if (x) { <y's own hoists>; t = y; } else { t = 0; }
-       x || y  ->  i64 t = 0; if (x) { t = 1; } else { <y's own hoists>; t = y; }
+       x && y  ->  i64 t = 0; if (x) { <y's own hoists>; t = y != 0; } else { t = 0; }
+       x || y  ->  i64 t = 0; if (x) { t = 1; } else { <y's own hoists>; t = y != 0; }
+
+   The temporary holds the operator's OWN value, a normalized truth value, never the right
+   operand itself: `n != 0 && a / n` is 1, not the quotient (the first draft assigned `y`
+   raw and answered 3 for `7 / 2`; `tests/surface_divlazy_value.tk` pins it).
 
    The LEFT operand always runs and keeps its own guard at the statement. The temporary is
    `TY_I64` outright — the truth value every comparison, `!`, `&&` and `||` already carries
@@ -8979,6 +8986,15 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
     its own that happened to keep sources in a directory literally named `lib/mc/v…` would
     be excluded from the guard along with mc's, and a locked `[deps]` package resolved to
     some third root is not covered either (this repository has no `[deps]` yet).
+    The runtime's own `panic` (ruling 5) is recognised the same way, by the suffix
+    `lib/rt.tk` of the file its declaration was read from, over EVERY declaration of the
+    name in the unit (`tk_div_rt_panic`, not `decl_find`'s first hit: an unrelated overload
+    such as `panic(i64)` declared ahead of the include leaves the runtime's `panic(str)`
+    declared and selectable, `tests/surface_divpanic_overload.tk`). That suffix is a
+    ceiling too: an include root of the project's own that holds a `vendor/lib/rt.tk` with
+    a no-op `panic` passes it, and the guard then calls that no-op. A project that ships a
+    counterfeit runtime under the runtime's own path gets what it wrote; the oracle that
+    would tell the two apart is the same one named below.
     `tk_origin_of_file` was measured and is NOT the oracle to replace it with — ruling 6
     records both ways it answers wrong for this question (the bare bundled name, and the
     Windows drive-letter path). A real oracle would be mc's own: a hook naming the resolved
@@ -8989,8 +9005,8 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
 #### The gate, mc 0.17.2, macos/aarch64
 
 `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
-mc.macos.toml` -> **108 passed, 133 refused as expected, 0 failed** (102 + 6, 121 + 12 --
-the six that run and the three that are refused of ruling 8, over the 102 + 121 the base
+mc.macos.toml` -> **110 passed, 133 refused as expected, 0 failed** (102 + 8, 121 + 12 --
+the eight that run and the three that are refused of ruling 8, over the 102 + 121 the base
 carries); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK** (stage 1
 through 3 each compile `mc_teko.tk` clean, `teko2.o == teko3.o`, `--dump-asm` diff empty,
 teko1 compiles all 108+133 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
