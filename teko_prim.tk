@@ -60,7 +60,8 @@ uptr tk_op_side_msg(uptr side, uptr sp);
 
 #define TK_MAXPRIMT 8                 // primitive types carrying a member table
 #define TK_MAXPRIMM 160               // member rows, over every primitive
-#define TK_MAXPRIMO 48                // operator rows, over every primitive
+#define TK_MAXPRIMO 64                // operator rows, over every primitive (D76: 48 -> 64,
+                                       // N5's nine `DateTimeOffset` rows took it past 48)
 #define TK_MAXPRIMC 4096              // casts over a primitive the COMPILER wrote
 
 // what a row is reached as, and therefore what the site may write after it
@@ -89,6 +90,13 @@ uptr pt_inc[TK_MAXPRIMT];             // the include its lowering symbols live i
 // a `DateOnly` is read by `.DayNumber` and has no `.Ticks` at all (N4a).
 uptr pt_read[TK_MAXPRIMT];            // "`.Ticks` reads it"
 uptr pt_build[TK_MAXPRIMT];           // "`new TimeSpan(...)` builds it"
+// D76: the spelling of the type's own ZERO, for `new T()` on a WIDE type --
+// `tk_prim_new`'s empty-argument branch writes `tk_cast(ty, tk_int(0))`, which
+// `tw_cast` (teko_wide.tk) `die`s on for any sixteen-byte destination, so a
+// wide primitive answers with a NAMED zero instead: `decimal`'s `0m`,
+// `Guid.Empty`, `DateTimeOffset.MinValue`. Unused (0) for a primitive `tk_wide_is`
+// never answers 1 for -- `new TimeSpan()` still IS the identity cast to zero.
+uptr pt_zero[TK_MAXPRIMT];            // "0m" / "Guid.Empty" / "DateTimeOffset.MinValue"
 i64  tk_nprimt = 0;
 
 i64  pt_ty_at(i64 i)   { return ld64(pt_ty + i * 8); }
@@ -96,6 +104,7 @@ uptr pt_name_at(i64 i) { return ld64(pt_name + i * 8); }
 uptr pt_inc_at(i64 i)  { return ld64(pt_inc + i * 8); }
 uptr pt_read_at(i64 i) { return ld64(pt_read + i * 8); }
 uptr pt_build_at(i64 i) { return ld64(pt_build + i * 8); }
+uptr pt_zero_at(i64 i) { return ld64(pt_zero + i * 8); }
 
 // ---- a column that names a type the row cannot see yet ----
 // Every column below carries a type ID, written at `teko_init()` time -- and
@@ -210,13 +219,17 @@ i64  po_swap_at(i64 i) { return ld64(po_swap + i * 8); }
 // `read`/`build` are the two clauses of the cast refusal, spelled exactly as
 // it shows them (above). A primitive that teaches neither yet -- `decimal` in
 // C3 -- passes 0 for both and gets the shorter wording.
-void tk_prim_type(i64 ty, uptr name, uptr inc, uptr read, uptr build) {
+// `zero` is D76's fourth column, `pt_zero` above: the spelling of `new T()`'s
+// answer for a WIDE type, unread for one that is not (`tk_wide_is` never
+// claims it, so `tk_prim_new` never asks).
+void tk_prim_type(i64 ty, uptr name, uptr inc, uptr read, uptr build, uptr zero) {
     if (tk_nprimt == TK_MAXPRIMT) err_at(tk_file, tk_line, "teko: too many primitive types");
     st64(pt_ty + tk_nprimt * 8, ty);
     st64(pt_name + tk_nprimt * 8, name);
     st64(pt_inc + tk_nprimt * 8, inc);
     st64(pt_read + tk_nprimt * 8, read);
     st64(pt_build + tk_nprimt * 8, build);
+    st64(pt_zero + tk_nprimt * 8, zero);
     tk_nprimt = tk_nprimt + 1;
 }
 
@@ -500,6 +513,16 @@ void tk_prim_readonly(i64 ty, uptr m, i64 line, uptr fl) {
     err_at2(fl, line, tk_join3("teko: a member of ", tk_prim_name(ty), " is read-only"), m);
 }
 
+// D76: the include COLUMN is bare everywhere (`pt_inc`, every `tk_prim_type`
+// call) -- `teko_time.tk` used to bake its own quotes in
+// (`tk_time_include() { return "\"time.tk\""; }`) while `teko_guid.tk` passed
+// the name bare, so a wide type registered under the first convention and
+// read by `teko_wide.tk`'s own quoting (below) would have printed
+// `include ""time.tk""`. One quoting point fixes both directions at once:
+// every consumer of the column asks THIS for the quoted form, and no column
+// carries a quote of its own.
+uptr tk_prim_inc_q(uptr inc) { return tk_join3("\"", inc, "\""); }
+
 // § 9: the include is part of the surface. Every row names a symbol that lives
 // in the owner module's own include, so a program that named the type without
 // it is told which file it forgot instead of reaching the core's own
@@ -507,7 +530,7 @@ void tk_prim_readonly(i64 ty, uptr m, i64 line, uptr fl) {
 void tk_prim_need_include_of(uptr word, uptr inc, uptr sym, i64 line, uptr fl) {
     if (decl_find(sym) >= 0) return;
     err_at(fl, line, tk_join3(tk_join3("teko: ", word, " needs #include "),
-                              inc, " before it is used"));
+                              tk_prim_inc_q(inc), " before it is used"));
 }
 
 // the include a primitive's lowering symbols live in, by type -- read by
@@ -923,7 +946,6 @@ i64 tk_prim_stmt() {
 // arguments not yet. It allocates nothing: `new TimeSpan(t)` IS `(TimeSpan) t`.
 i64 tk_prim_new(i64 ty, i64 line, uptr fl) {
     i64 ri = tk_prim_find(ty, "new");
-    if (ri < 0) err_at2(fl, line, "teko: this primitive has no constructor", tk_prim_name(ty));
     i64 na = 0;
     i64 args = 0;
     if (p_id() == K_LPAR) args = tk_args(&na);
@@ -931,10 +953,25 @@ i64 tk_prim_new(i64 ty, i64 line, uptr fl) {
     // value of a primitive, which for every one of them is the zero bit pattern
     // (`TimeSpan.Zero`, `DateTime.MinValue`).
     if (na == 0) {
+        // D76: NOT for a wide type. `tk_cast(ty, tk_int(0))` below reaches
+        // `tw_cast` (teko_wide.tk) at codegen, which `die`s on a sixteen-byte
+        // destination -- there is no zero BIT PATTERN this cast could write,
+        // because a wide value moves by address and never through a register.
+        // Every wide primitive answers with its own NAMED zero instead, read
+        // from `pt_zero` (D76's fourth column of `tk_prim_type`), so one guard
+        // here serves `decimal`, `Guid` and `DateTimeOffset` at once, and the
+        // refusal is a compile-time `teko:` line and not a codegen `die`.
+        if (tk_wide_is(ty)) {
+            i64 pi = tk_prim_slot(ty);
+            err_at(fl, line, tk_join(tk_join3("teko: new ", tk_prim_name(ty), "() is not taught; write "),
+                                      pt_zero_at(pi)));
+        }
+        if (ri < 0) err_at2(fl, line, "teko: this primitive has no constructor", tk_prim_name(ty));
         tk_line = line;
         tk_file = fl;
         return tk_cast(ty, tk_int(0));
     }
+    if (ri < 0) err_at2(fl, line, "teko: this primitive has no constructor", tk_prim_name(ty));
     return tk_prim_emit(tk_prim_pick(ty, "new", na, line, fl), 0, args, 0, line, fl);
 }
 
