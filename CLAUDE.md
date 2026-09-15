@@ -5,7 +5,8 @@
 **Teko is a language taught to [`mc`](https://github.com/minicompiler/mc)**, not a
 compiler of its own. The whole language lives at the root as hook modules — `teko.tk`
 and 38 `teko_*.tk` modules (39 module files in all) plus `lib/rt.tk`, `lib/time.tk`,
-`lib/limbs.tk`, `lib/decimal.tk`, `lib/guid.tk`, `lib/wide.tk` and `lib/math.tk`, driven by
+`lib/limbs.tk`, `lib/decimal.tk`, `lib/guid.tk`, `lib/wide.tk`, `lib/math.tk` and
+`lib/string.tk`, driven by
 `core_teko.mc` and `user.mc` — and `mc` is **pinned by `MC_VERSION`**: download exactly
 that release, no other one runs. `mc.toml` is the package manifest (`[package]` only);
 `teko.toml` is the build config (`mc build . --config teko.toml`).

@@ -287,6 +287,39 @@ there is no `checked` word to tell a wrapped conversion from a wrong one — and
 conversion table carries one row per source signedness and no implicit/explicit column
 (D81).
 
+## `string`, and the rest of `docs/specs/string.md`
+
+N7a (D86) landed the class alone ([the type reference](types.md#string)): the four fields,
+`new string(raw)` from a `str`, `.Length`/`.Utf8Length`/`.ToString()`/`.Equals`/
+`.CompareTo`/`.GetHashCode`, `operator+`/`operator==`/`operator!=`, and the three statics
+`Empty`/`Concat`/`IsNullOrEmpty`. Two crumbs still owe the rest of the design.
+
+**N7b** owes § 2-4 of the specification: literal interning (a `"..."` written where a
+`string` is expected becomes an interned object at compile time, no allocation), the two
+implicit conversions — `string` → `str`/`ptr`/`uptr`, and a literal `str` → `string` — in
+every one of D33's nine slots, and the named refusal a program gets for using `string`
+without `#include "string.tk"`.
+
+| written | what happens today, and why |
+|---|---|
+| `string s = "hi";` | `teko: a value of type uptr does not convert to string` — the literal is a `str` until N7b's interning lands; `new string("hi")` is the road today |
+| `puts(s)`, `panic(s)`, `tk_str_len(s)`, `extern ... (str ...)` given a `string` | `teko: a value of type string does not convert to i64`-shaped refusals at the call site — the implicit `string` → `str` conversion is N7b's; `s.ToString()` still answers `string`, not `str`, so there is no road around it in N7a |
+| `string` named with no `#include "string.tk"` | a plain parse error today (`string` is an ordinary, undeclared identifier) rather than the friendly `` teko: `string` needs #include "string.tk" `` the design names — N7b's own mechanism, not reachable yet |
+
+**N8** owes § 6-7's index and method surface, all of it over the class N7a already
+declares:
+
+| written | what happens today |
+|---|---|
+| `s[i]` | `` teko: `[` needs an array `` — `tk_bracket` (`teko_params.tk`, not `teko_array.tk`: the spec's own citation is corrected in this crumb) gains no `string`-receiver row until N8 |
+| `s[i] = c` | the same, ahead of N8's own `teko: a string is immutable` |
+| `.Substring`, `.IndexOf`, `.LastIndexOf`, `.Contains`, `.StartsWith`, `.EndsWith`, `.Trim`/`.TrimStart`/`.TrimEnd`, `.ToUpper`/`.ToLower`, `.Replace`, `.Split`, `.PadLeft`/`.PadRight` | `teko: unknown member of string: <name>` — N8's own method surface |
+| `string.Join(string, string[])` | the same — a static N8 owes beside the instance methods |
+
+`$"..."` (N10) and `"n=" + 5` (needing a universal `ToString`/`object`, § 11) are neither
+N7a's nor N7b's nor N8's; both stay exactly where
+[the specification](../specs/string.md) § 9-11 leaves them.
+
 ## `Guid.NewGuid`, and the rest of `docs/specs/guid.md`
 
 N3 landed the type whole but one member (D75, [the type reference](types.md#guid)): the
