@@ -8060,7 +8060,8 @@ against `85901f5b`** — `tk_dec_div`'s body is rewritten and `tk_dv_shl96` dele
 last caller, but both live inside C4's own new block, which is why the dumps below still show
 zero lines removed. `teko_typeof.tk` gains the include check and one forward declaration;
 `teko_decimal.tk` one conversion row; `tests/primitives_decimal_value.tk` one exit code, the
-only base fixture whose SOURCE this pass touched.
+only base fixture whose SOURCE this pass touched. The file is 695 lines now, not the 661 the
+section below recorded.
 
 The gate after the review, mc 0.17.0, macos/aarch64:
 `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **93 passed, 114 refused as expected,
