@@ -9522,3 +9522,192 @@ that cache is populated -- reproduced on a clean `65d54f40` checkout with a pre-
 package cache, unrelated to this crumb, outside its boundary to fix. `docs/reference/
 diagnostics.md`'s own count (`411` diagnostics, unmoved) confirms this crumb's new refusal
 wordings are measured, not merely claimed.
+
+### D87 · Two class defects fixed: the allocator's own `p` shadowing a constructor parameter, and a bare `this` typed `uptr` instead of the enclosing class (2026-09-15)
+
+Two pre-existing, general defects in `teko_class.tk`, confirmed by an independent verifier
+on `origin/main` `5c913517` (mc 1.0.1), fixed together because both are a value of the
+compiler's own that a program could never spell landing on the WRONG type.
+
+**Defect (a): the allocator's local `p` shadowed a constructor parameter also spelled
+`p`.** `tk_new_fn` (teko_class.tk) built `Name_new`'s own body with a FIXED local, `uptr p
+= rt_alloc(SIZE);`, and then the constructor CALL from the same function, `Name_ctor(p,
+params...)`, walking the constructor's own (cloned) parameter list and writing
+`tk_id(nd_name(pp))` for each. A parameter is an ordinary identifier, not a reserved word
+the way `this` is (teko_this.tk), so a constructor declared `Cell(i64 p) { v = p; }`
+compiled `Cell_ctor(p, p)`: the allocator's OWN local, twice -- the address just
+allocated, never the caller's argument. Measured on `5c913517`:
+
+```
+#include "rt.tk"
+class Cell  { public i64 v; public Cell(i64 p)  { v = p; } }
+class Cell2 { public i64 v; public Cell2(i64 x) { v = x; } }
+i64 main() { Cell a = new Cell(42); Cell2 b = new Cell2(42); if (b.v != 42) return 1; if (a.v != 42) return 2; return 42; }
+```
+
+exits **2**: `b.v` (parameter `x`) reads 42, `a.v` (parameter `p`) reads whatever bit
+pattern the fresh allocation left. `Bumper`'s own control in the fixture below --  a
+METHOD parameter spelled `p` (`Bump(i64 p)`), and a FIELD spelled `p` -- was measured
+clean on the base already: `tk_new_fn` builds only the ALLOCATOR, one function, and a
+method or a field store is compiled in a function of its own, never the allocator's, so
+neither was ever on this road.
+
+**FIX:** the allocator's local is `gensym_new()` now, the exact convention
+`tk_div_lazy_lower` (teko_ternary.tk) already uses for a temporary no program can ever
+write -- a name the `$`-prefixed lexer never forms into an identifier
+(`teko_decimal.tk`'s own `tk_dl_name`, § "the gensym", makes the same argument for its own
+`$tk_dec_<n>`). `tk_new_install`, which wrote the SAME fixed `"p"` a second time (the
+vtable/count install, folded into the same local), takes the gensym'd name as a parameter
+now instead of assuming it.
+
+**Every other synthesized local of this shape, checked.** `grep -n 'tk_var(TY_[A-Z0-9_]*,
+"' teko_class.tk teko_deleg.tk teko_heaparr.tk teko_struct.tk teko_prim.tk` finds four
+sites total that declare a local under a FIXED, ordinary (non-reserved) name:
+
+| site | local | scope carries a USER-CHOSEN name? | vulnerable? |
+|---|---|---|---|
+| `teko_class.tk`'s `tk_new_fn` | `p` | yes -- the constructor's OWN parameter list, cloned into the same function | **yes -- fixed above** |
+| `teko_deleg.tk`'s `tk_deleg_alloc_fn` | `p` | no -- `tk_func(sr_ty_at(si), allocname, 0, tk_blk(st))`, ZERO parameters | no |
+| `teko_heaparr.tk`'s `tk_ha_alloc_fn` | `p` | no -- its one parameter is `n` (the array length), a FIXED name of the compiler's own, never a name the source wrote | no |
+| `teko_struct.tk`'s `tk_ctor` | `p` | no -- a struct's own `Name_new()` takes ZERO parameters (a struct's own constructor is never user-parametrized; `tk_nctor`/`ctr_params_at`, teko_class.tk's own table, has no struct twin) | no |
+
+`teko_prim.tk` declares no synthesized local at all (no `tk_var` call in the file). A
+second sweep, `param_new(TY_[A-Z0-9_]*, "` across the same five files, finds three more
+FIXED parameter names -- `teko_deleg.tk`'s thunk `"env"`/`"a0".."aN"` (every name there is
+compiler-built, `tk_join("a", tk_num(i))`, never a name the delegate's own declaration
+carries), `teko_deleg.tk`'s lambda allocator `"p"` (the function's ONLY parameter -- no
+second name to collide with), `teko_heaparr.tk`'s element-store `"off"` and
+`teko_struct.tk`'s copy helper `"i"`/`"n"` (same shape: every parameter of those functions
+is the compiler's own, never a name a `class`/`struct`/`delegate` declaration supplied) --
+none carries a user-chosen name into the same scope either. `tk_new_fn`'s own `p` was the
+one site where a compiler-fixed LOCAL and a user-chosen PARAMETER LIST shared one function
+body, and it is the only one this crumb rewrites.
+
+**Defect (b): a bare `this` used as a VALUE typed `uptr`, not the enclosing class.**
+`this` is declared `param_new(TY_UPTR, tk_this_name())` at the C level -- the width
+`callp`/`ld64(this + OFF)` need -- and nothing ever re-typed it against the class whose
+method is being lowered for the PASS-TIME oracle every other consumer of a value's type
+reads (`tk_ty_of`, teko_typeof.tk). `this.field` already worked: it goes through
+`tk_this_ident` (teko_this.tk), which resolves the field directly off `tk_pass_class` and
+never asks the oracle what `this` itself is. A bare `this` handed to anything that DOES ask
+-- a `return`, a fresh local's initializer, an argument, an operand of `==` -- read `uptr`
+off it. Measured on `5c913517`:
+
+```
+class C { public i64 v; public C(i64 x) { v = x; } public C Self() { return this; } }
+i64 main() { C c = new C(7); return c.Self().v + 35; }
+```
+
+refused `teko: a value of type uptr does not convert to C` at `return this;` itself.
+
+**RULING (C#): `this` inside an instance method or constructor is an expression of the
+enclosing class type** -- assignable to a `C` slot, passable as a `C` argument, returnable
+as `C`, the receiver of `.member` (already true) and comparable with `==`/`!=` to another
+`C` through whatever `operator==` the class declares (D8: an operator is a static member,
+no vtable, and no class carries a built-in `==` -- reference identity, where that is what
+a program wants, is written explicitly inside the operator, a cast to `uptr` on each side,
+the road teko gives it today). A `static` member takes no receiver at all, so `this` names
+nothing there -- measured, unchanged by this crumb: `tk_this()` (teko_this.tk) already
+refuses it while the body is PARSED, `` teko: `this` is not there in a static member ``,
+before either pass this crumb touches ever runs.
+
+**FIX, and where.** `tk_ty_scope_params` (teko_typeof.tk) pushes every parameter's LOGICAL
+type into the pass-time scope table (`tk_ty_scope_add`, keyed by name, what `tk_ty_of`'s
+`N_IDENT` arm reads); for every parameter but one it reads `tk_param_ty(p)`, the C-level
+declared type. The one exception now is the RECEIVER: when the parameter is named
+`tk_this_name()` and `tk_pass_class`/`tk_pass_static` (already live -- `tk_this_enter_fn`
+runs before this call in `tk_ty_pass_walk`) say an INSTANCE member owns the body, the type
+pushed is `sr_ty_at(tk_pass_class)`, the enclosing type's own id, instead -- an interface's
+default body included, where `this` is the interface itself (teko_this.tk's own header,
+item 3), because `tk_pass_class` there is the interface's row too. The C-level parameter
+node itself is untouched: codegen, `ld64`, `callp` and every existing `.` road keep reading
+`uptr`, exactly as before.
+
+**The second site, found by testing rather than assumed.** The fix above alone left
+`return this;` still refused. `teko_rc.tk`'s reclaim pass runs its OWN loop over every
+`N_FUNC` (`tk_rc_pass` -> `tk_rc_fn`), calling `tk_ty_scope_params` a SECOND time to build
+its own copy of the scope table -- but never `tk_this_enter_fn` first, so
+`tk_pass_class`/`tk_pass_static` were whatever the LAST walk that called
+`tk_this_leave_fn` left them at (`-1`/`0`, `tk_ty_pass_walk`'s own cleanup, run for every
+earlier pass), not the function `tk_rc_fn` is actually walking. `tk_rc_return`
+(`return e;`'s own lowering) asks `tk_ty_of(e)` fresh, under THIS pass's scope table, and a
+bare `this` node carries no cached `tk_xt_ty` of its own -- so it read `uptr` a second
+time, from a different table than the one the first fix corrected. `tk_rc_fn` now brackets
+its own `tk_ty_scope_params` call with `tk_this_enter_fn`/`tk_this_leave_fn`, the same
+pair `tk_ty_pass_walk` already uses, so both walks that push a function's scope agree.
+
+With both sites fixed, `return this;` types `C`, `tk_rc_return`'s own `needinc =
+!tk_rc_own(e)` reads 1 (a bare name is never `TK_OWNED`), and the value is `rc_inc`'d on
+the way out -- exactly the road returning a local class reference already takes, proved
+below by `rt_live()` rather than merely typed.
+
+**Fixtures.** `tests/surface_ctor_param_p.tk` (42): the `Cell`/`Cell2` reproducer, a
+METHOD parameter spelled `p` (`Bumper.Bump`) and a FIELD spelled `p` (`Bumper.p`) --
+neither on the allocator's road, both measured clean. `tests/surface_this_value.tk` (42):
+`return this;`, `C d = this;` (a fresh local), `Take(this)` (an argument to a STATIC
+member of the same class, reached by its bare name), `this == other` through a declared
+`operator==` that casts each side to `uptr` for genuine reference identity (`a.SameAs(a)`
+== 1, the same object; `a.SameAs(other)` == 0, an equal but DIFFERENT one), and
+`rt_live()` back to the floor it held before the block -- every road that widened `this`
+into an owned reference released it again. `tests/refuse/this_static_method.tk`: `this` in
+a `static` member, the pre-existing message, unchanged, at the line the source actually
+wrote it on.
+
+**Docs.** `docs/reference/types.md` § `class` grows the two paragraphs: `this` as a value
+(D87b, with the runnable `self()`/`take(this)` sample) and the allocator's own gensym'd
+local (D87a). Nothing in `docs/reference/diagnostics.md` moves -- neither refusal's WORDING
+changed, and both were already rows there (`` `this` is not there in a static member ``,
+`a value of type X does not convert to Y`). No row of `docs/reference/not-yet.md` named
+`this` as a value before this crumb, so none is deleted.
+
+**Proof, on mc 1.0.1, macos/aarch64, head against base `5c913517`.** `mc build . --config
+mc.macos.toml` clean, both legs; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` ->
+**123 passed, 136 refused as expected, 0 failed** (base: 121 passed, 135 refused -- exactly
+the two new pass fixtures and the one new refuse fixture, nothing else moved); `sh
+scripts/bootstrap.sh --os macos --arch aarch64` -> `FIXPOINT OK` (the compiler's own
+sources use classes throughout -- `teko_deleg.tk`'s lambda objects, `teko_heaparr.tk`'s
+arrays, every module's own `this.field` -- and the fixed point still closes, so nothing in
+this repository itself wrote a bare `this` as a value or a ctor parameter spelled `p`); `sh
+scripts/check-docs.sh` -> `docs ok: 697 links, 74 fragments, 411 diagnostics, 136
+refusals, 153 samples, manifest listed` (135 -> 136 refusals is the one new
+`tests/refuse/` fixture; 152 -> 153 samples is the one new runnable doc block; 411
+diagnostics UNMOVED -- neither refusal's wording is new).
+
+`mc limits . --config mc.macos.toml` (`rm -rf build` first, both legs), base vs head. The
+COMPILER leg (`build/teko.mc`): `passes` 0/8, `syntax` 0/16, `alias` 1/16, `types` 1/8,
+`on_stmt` 0/8, `intrin` 0/8 -- every one identical on both. The `tests/hello.tk` leg:
+`passes` 15/30, `syntax` 20/40, `alias` 25/50, `types` 18/36, `on_stmt` 4/8, `intrin`
+8/16 -- likewise identical on both, and that whole leg's report is BYTE-IDENTICAL, base
+and head, every row (the fixed sample this crumb never touches). **All six UNMOVED on
+both legs -- zero new intrinsics.** Only the compiler leg's size-of-surface-code rows move,
+by the two functions' own extra lines: `nodes` 173917 -> 173953, `funcs`/`lowered`
+estimate 4188 -> 4189 (actual `funcs` USED stays 3426 -- no new function, only a bigger
+static estimate), `strings` estimate 3038 -> 3035, `ins` 240653 -> 240708, `symbols`
+estimate 8622 -> 8620 (`heap`, never cited).
+
+**`--dump-ast --include=lib --include=tests`, base vs head, over all 121 base fixtures**
+(`build/teko` moved out of its own `lib/mc/` tree refuses `<sys>`, so both binaries were
+run IN PLACE, next to the `build/lib/mc/v1.0.1/` a full `mc build .` stages -- copying only
+the binary out reads `unknown bundled include: sys` on both legs alike and would have
+proved nothing). **53 of 121 byte-identical**, the fixtures that never construct any
+class-typed object at all, directly or through `rt.tk`'s own helper types -- `tk_new_fn`
+never runs for them, so gensym's counter is never touched. **68 moved** -- every fixture
+that allocates at least ONE class, `rt.tk`'s own included, since `#include "rt.tk"` is
+near-universal and `rt.tk` itself declares classes whose allocator's `p` this crumb
+renames too. Checked programmatically, line by line, over all 68 (`base[i] == head[i]`
+once every `name=\S+` token in each is masked to a placeholder): **every moved fixture has
+the identical line count and every differing line differs in NOTHING but the `name=`
+field** -- `VAR type=uptr name=p` -> `VAR type=uptr name=$g1` and the matching `IDENT`
+reads that follow it, a pure rename, `type=` and every other field untouched on every
+line. `types_class.tk`'s own allocators (`Shape_new`, `Square_new`, `Circle_new`, ...) show
+this directly: `$g1`, `$g2`, `$g3`, ... in source order. Zero fixture in the 121 wrote a
+bare `this` as a value before this crumb (`grep -n '\bthis\b' tests/*.tk` outside
+`this.field`/`.`-position and prose finds none), so defect (b)'s fix moves NO existing
+dump at all -- confirmed by the same line-by-line check finding no `type=` difference
+anywhere in the 68.
+
+`mc pkg hash .`: base (`origin/main` `5c913517`)
+`848710edb98db8e81f40259a81760b50194eaa1132f5001c9b80369acebb8fd2`, head
+`29248ab977bb2c3e1d08bde7af8b616aa9e4a573fceb71620b4e1c7ac444d6eb` -- `teko_class.tk`,
+`teko_typeof.tk`, `teko_rc.tk` and `docs/reference/types.md` are listed files, so the hash
+moves by design.
