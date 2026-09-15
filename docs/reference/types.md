@@ -1211,8 +1211,9 @@ case-insensitive and **decimal digits only** — `0x` is not a wide literal. It 
 `<i128>` spelling; C# has no `Int128` literal at all and writes `Int128.Parse("…")`. The
 literal carries the MAGNITUDE only, so the ceiling is 2^127−1 for `i` and 2^128−1 for `u`,
 and a value above it is `teko: an i128 literal is out of range` at compile time.
-`i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` until the
-constants land.
+`i128.MinValue` the LITERAL is still written `-170141183460469231731687303715884105727i - 1i`
+(the literal grammar carries a magnitude only); `i128.MinValue` the STATIC (below) reads the
+same value a shorter way, a call rather than a literal (D85).
 
 **The operators** are C#'s, and every one of them is a call into `lib/wide.tk`:
 
@@ -1242,7 +1243,7 @@ same pair.
 | `f64` | `i128`, `u128` | **explicit** `(i128) x`, truncates toward zero and SATURATES: NaN → 0, a magnitude at or past the type's own bound → that bound — .NET's `Int128`/`UInt128` rule, and teko's own since there is no `checked` word (D84) |
 | `i128`, `u128` | `decimal` | **explicit** `(decimal) v`; a magnitude at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`) panics `teko: decimal overflow`, exit 70 (D84) |
 | `decimal` | `i128`, `u128` | **explicit** `(i128) d`, truncates toward zero and never overflows the width it lands in; `(u128) d` panics `teko: decimal overflow`, exit 70, on a negative `d` whose truncated MAGNITUDE is still nonzero (`-0.5m` → `0u` is fine, `-1m` is not) — C#'s own rule for a negative decimal read into an unsigned type (D84) |
-| `i128`, `u128` | `str` | **not taught yet** (N6b-3): `teko: an i128 does not cast yet` |
+| `i128`, `u128` | `str` | **never a cast** — text is `.ToString()`/`i128.Parse(s)`, two members (below), not a conversion row; `(str) x` is refused, `decimal`'s own rule (D85) |
 | `null`, a class, a struct, a `T[]` | either | refused |
 
 None of the eight new rows opens an IMPLICIT door either way: `f64 x = v;` and `decimal d = v;`
@@ -1251,6 +1252,22 @@ f64`/`decimal` — the conversion table's row is read only from an explicit `N_C
 (`tk_prim_cast_lower`), and `tk_num_wide_widens` still answers 0 for a wide source (D38),
 so a plain assignment builds no cast at all (D84).
 
+**The members and statics** (N6b-3, D85), each an ordinary call into `lib/wide.tk`, `decimal`'s
+own shape:
+
+| written | answers | notes |
+|---|---|---|
+| `x.ToString()` | `str` | the shortest decimal digits, a leading `-` for a negative `i128`; `MinValue`'s magnitude (`2^127`) is exact |
+| `i128.Parse(s)` | `i128` | `[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); panics `teko: the string is not an i128`, exit 70, on anything else or a number out of range |
+| `i128.TryParse(s, out v)` | `i64` (`bool`) | `1` and the value, or `0` and `v` zeroed — never panics; an INSTANCE reaching for it is refused, `TryParse` is static |
+| `x.CompareTo(y)` | `i64` | `-1`/`0`/`1`, signed for `i128`, unsigned for `u128` — the same comparison the six operators already lower to |
+| `x.Equals(y)` | `i64` (`bool`) | takes an `i128`/`u128`; there is no `Equals(object)` — teko has no boxed root type |
+| `i128.MinValue`, `MaxValue`, `Zero`, `One` | `i128` | each a CALL, never folded: `const i128 K = i128.One;` stays refused, the same rule every other wide `const` already follows |
+
+`u128.Parse("-1")` panics too: a leading `-` is a format failure exactly when the magnitude is
+nonzero — `u128.Parse("-0")` succeeds and answers `0`, C#'s own documented `UInt128.Parse`
+rule (D85).
+
 **What is refused**, and with which words:
 
 | written | message |
@@ -1258,9 +1275,8 @@ so a plain assignment builds no cast at all (D84).
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
 | `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
 | `f64 x = v;`, `decimal d = v;` on an `i128`/`u128` `v` | `teko: a value of type i128 does not convert to f64`/`decimal` — the eight rows above are explicit only (D84) |
-| `(str) x` | `teko: an i128 does not cast yet` (`a u128` for the other) — N6b-3 |
-| `x.ToString()` | `teko: unknown member of i128: ToString` — N6b |
-| `i128.MaxValue` | `teko: unknown static member of i128: MaxValue` — N6b |
+| `(str) x` | ``teko: an i128 does not cast; `.ToString()` writes it and `i128.Parse(s)` reads it`` (`a u128` for the other) — D85 |
+| `x.TryParse(...)` on an instance | ``teko: i128.TryParse is static; reach it through its type`` — D85 |
 | `170141183460469231731687303715884105728i` | `teko: an i128 literal is out of range` |
 | `const i128 K = 1i;`, `case 1i:` | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic |
 | `i128 g = 5;` at file scope | `teko: a global i128 takes no initializer` — a wide global is a slot and an assignment |

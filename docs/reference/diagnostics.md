@@ -881,29 +881,30 @@ N6b-1's (fourteen over the two types), and no MIXED row of any kind — `i128 + 
 ``teko: no operator `+` takes these operands`` because C# refuses the same expression
 without a cast. The `f64` and `decimal` conversions, both directions and both types, landed
 too (N6b-2, D84): eight new rows of the cast-to-call table, none of them opening an implicit
-door. What is their own is short, and most of what a reader will meet is a
-refusal that already existed: `x.ToString()` earns `teko: unknown member of i128: ToString`, and
-`i128.MaxValue` earns `teko: unknown static member of i128: MaxValue`, its static twin.
+door. N6b-3 (D85) closes the rest: `ToString`, `Parse`, `TryParse`, `CompareTo`, `Equals`,
+`MinValue`, `MaxValue`, `Zero`, `One`, both types — after this crumb N6b owes nothing more
+([not-yet.md](not-yet.md)).
 
 - `"teko: an i128 literal is out of range"` — an `i128` literal is the MAGNITUDE only, so
   the ceiling is 2^127−1 and `170141183460469231731687303715884105728i` is one too many. A
   leading `-` is the unary operator applied to the value the literal answers and is no part
-  of it, which is why `i128.MinValue` is written
-  `-170141183460469231731687303715884105727i - 1i` until N6b registers the constant. The
-  digits go into four 32-bit limbs and a carry out of the top one is remembered rather than
-  dropped, so the check is at compile time and never a silent wrap
-  (`tk_w128_lit`, [`teko_i128.tk`](../../teko_i128.tk)).
+  of it — `i128.MinValue` is still written `-170141183460469231731687303715884105727i - 1i`
+  at the LITERAL level (this refusal is about the literal grammar, which never gained a
+  constant of its own); `i128.MinValue` the STATIC (N6b-3, below) is the same value read a
+  second, shorter way, a call and not a literal. The digits go into four 32-bit limbs and a
+  carry out of the top one is remembered rather than dropped, so the check is at compile
+  time and never a silent wrap (`tk_w128_lit`, [`teko_i128.tk`](../../teko_i128.tk)).
 - `"teko: a u128 literal is out of range"` — the same check with all 128 bits available:
   the ceiling is 2^128−1.
-- `"teko: an i128 does not cast yet"` / `"teko: a u128 does not cast yet"` — a cast whose
-  target the conversion table does not name: `(str) x` alone now, N6b-3's own. The sixteen
-  rows N6a and N6b-2 register between them — `(i128) n`/`(u128) n` from any integer, `(i64) x`
-  and every narrower target, the two bit-preserving directions between `i128` and `u128`,
-  and D84's own eight `f64`/`decimal` rows — are each a CALL and never reach this row. It is
-  the short wording D74 wrote for a wide primitive whose reader and builder clauses are still
-  empty, because a message naming a member the type does not have yet would be wrong.
-  `(decimal) x` used to be refused under `decimal`'s own longer wording; D84 registers the
-  row and it is a call now, on both sides.
+- ``"teko: an i128 does not cast; `.ToString()` writes it and `i128.Parse(s)` reads it"`` /
+  the `u128` twin — a cast whose target the conversion table does not name: `(str) x` alone,
+  N6b-3's own wording now (D85), `decimal`'s own shape (D79) — text is a MEMBER call on
+  each side, never a cast, so `(str) x` still refuses even though `i128`/`u128` now register
+  a reader and a builder clause (`tk_i128_init`, [`teko_i128.tk`](../../teko_i128.tk)); only
+  the WORDING moved from N6a's shorter `"...does not cast yet"`. The sixteen rows N6a and
+  N6b-2 register between them — `(i128) n`/`(u128) n` from any integer, `(i64) x` and every
+  narrower target, the two bit-preserving directions between `i128` and `u128`, and D84's own
+  eight `f64`/`decimal` rows — are each a CALL and never reach this refusal.
 - `"teko: a value of type i128 does not convert to f64"` / `"...to decimal"` — D84's eight new
   rows are EXPLICIT only: `f64 x = v;` and `decimal d = v;` on an `i128`/`u128` `v` build no
   cast at all (`tk_num_wide_widens`, teko_typeof.tk, still answers 0 for a wide source, D38),
@@ -912,6 +913,21 @@ refusal that already existed: `x.ToString()` earns `teko: unknown member of i128
 - `"teko: decimal overflow"` — already `decimal`'s own wording (D77), two more paths into it
   now: `(decimal) x` on an `i128`/`u128` magnitude at or past `2^96` (`decimal.MaxValue` is `2^96 - 1`),
   and `(u128) d` on a negative `decimal` whose truncated magnitude is still nonzero (D84).
+- `"teko: the string is not an i128"` / `"teko: the string is not a u128"` — `i128.Parse(s)` /
+  `u128.Parse(s)` on text that is not exactly `[+|-] digits`, no surrounding white space, no
+  separator, no exponent, no suffix (D85, ruling 1: narrower than `decimal.Parse`'s own
+  grammar, and narrower than C#'s `NumberStyles.Integer`, which additionally accepts
+  surrounding white space) — or a number in that shape that does not fit the type's own
+  range. One message for both causes, `decimal`'s own SHAPE one level up: `TryParse` cannot
+  tell them apart either, so `Parse` does not pretend to (D85, ruling 2). `TryParse` is the
+  pair that answers `0` and zeroes the `out` argument instead of panicking, exit 70.
+  `u128.Parse("-1")` panics here too (D85, ruling 1): a leading `-` is a format failure
+  exactly when the magnitude is nonzero — C#'s own documented `UInt128.Parse` throws
+  `OverflowException` for `"-1"` and succeeds for `"-0"`, answering `0`.
+- ``"teko: i128.TryParse is static; reach it through its type"`` / the `u128` twin — an
+  INSTANCE reaching for `TryParse` (`x.TryParse(...)`); it is registered as a static row so
+  a program reaching for it this way is told why instead of reading as a member nobody ever
+  heard of, `decimal`'s own shape (D79).
 
 Two are **run-time panics** raised by `lib/wide.tk` itself, exit 70 and on stderr with no
 `file:line` ([runtime.md](runtime.md#the-wide-integer-library)). They share their wording
@@ -1975,10 +1991,10 @@ truncation; the fix is to split the unit.
 | `"teko: too many bare continues inside a switch"` | 128 |
 | `"teko: loops nested too deep"` | 32 open at one point of one function |
 | `"teko: too many primitive types"` | 16 primitives with a member table (D74's own row was stale at 8; D81 raised it to 16, because N6a's `i128` and `u128` took 6 to 8 and filled the old table exactly) |
-| `"teko: too many primitive members"` | 192 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74; D79 raises 160 to 192, C5's nineteen `decimal` rows having filled the old cap exactly) |
+| `"teko: too many primitive members"` | 192 rows, over every primitive (D76 corrects a stale `96` this table carried since before D74; D79 raises 160 to 192, C5's nineteen `decimal` rows having filled the old cap exactly; D85: 160 to 178, N6b-3's nine rows per type over `i128`/`u128`) |
 | `"teko: too many primitive operators"` | 128 rows, over every primitive (D76: raised from 48, itself a stale `32` this table carried since before D74 — `DateTimeOffset`'s nine rows took the true count past 48; D77: raised to 80, `decimal`'s twelve rows took 50 to 62; D81: raised to 128, N6a's twenty-two wide-integer rows took 62 to 84) |
 | `"teko: too many primitive conversions"` | 32 rows of the cast-to-call table, over every primitive — the five `decimal` registers, N6a's eight `i128`/`u128` rows and N6b-2's eight more `f64`/`decimal` rows (D77, D81: raised to 16, which those thirteen overflowed; D84: raised to 32, twenty-one of it now spent). A cast whose target the table does not name is refused, never lowered, so the ceiling is a COMPILER one and no source can reach it |
-| `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row — 101 spent after C5 (D79) |
+| `"teko: too many primitive parameter positions"` | 128 argument positions, summed over every member row — 101 spent after C5 (D79); 111 after D85, N6b-3's five positions per type over `i128`/`u128` |
 | `"teko: too many late type names over a primitive"` | 4 types a row names before the include that declares them is read |
 | `"teko: too many primitive arguments of unknown type"` | 128 arguments of primitive or `enum` position, in one unit, whose type only the pass can tell |
 | `"teko: too many casts over a primitive in one unit"` | 4096 casts the compiler wrote itself, in one compilation unit |
