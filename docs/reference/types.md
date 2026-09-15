@@ -110,8 +110,8 @@ did before this crumb, and `--dump-ast` is unmoved.
 
 | expression | is |
 |---|---|
-| `a / b`, `a % b` | any integer width; `b == 0` is `teko: division by zero`, exit 70 |
-| `a / b`, `a % b`, `b` a non-literal, signed only | `b == -1 && a == <the type's own MinValue>` is `teko: an integer division overflowed`, exit 70 |
+| `a / b`, `a % b`, `b` a non-literal | the eight core widths; `b == 0` is `teko: division by zero`, exit 70 (a literal `0` divisor is refused at compile time, `teko: division by zero` at the line; `i128`/`u128` `/` is `lib/wide.tk`'s own guard, and their `%` is not taught yet, N6b) |
+| `a / b`, `a % b`, `b` a non-literal, signed only | `b == -1 && a == <the type's own MinValue>` is `teko: an integer division overflowed`, exit 70 — for `%` too, as .NET throws `OverflowException` for `int.MinValue % -1` on both its ISAs (the C# specification ties the remainder's overflow to the quotient's) |
 
 ### `i8` and `i16`
 

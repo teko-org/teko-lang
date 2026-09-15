@@ -8782,7 +8782,7 @@ What is left open: N6b, whole, and the `u128` implicit-conversion width of rulin
 ### D82 · integer division by zero, and `MinValue / -1`, panic on every leg -- the machine's answer is no longer the language's (2026-09-15)
 
 Measured on `main` (`8d95c1ff`), aarch64 and x86_64 alike: a plain int `/`/`%` (`i64`,
-`u64`, `i32`, `i16`, `i8`, `u8`, every core width teko has) reached the machine's own
+`u64`, `i32`, `u32`, `i16`, `u16`, `i8`, `u8`, every core width teko has) reached the machine's own
 `sdiv`/`idiv` untouched (`tk_ops_binary`, teko_ops.tk, `if (sa < 0 && sb < 0) return;`).
 `sdiv` (aarch64) answers `0` for `x / 0` and `x` for `x % 0`, in silence; `idiv` (x86_64)
 raises `#DE`, SIGFPE, exit 136 on Linux; `MinValue / -1` overflows the quotient register on
@@ -8969,6 +8969,21 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
    operand itself: `n != 0 && a / n` is 1, not the quotient (the first draft assigned `y`
    raw and answered 3 for `7 / 2`; `tests/surface_divlazy_value.tk` pins it).
 
+   Amended by the PR's fourth review, after the merge (the follow-up PR): a guarded
+   division's DIVIDEND is hoisted before its divisor is walked, so a divisor that carries
+   preludes of its own — a nested guarded division, a ternary — evaluates after it:
+   `left() / (x / y)` runs `left()` first, as C# does; `tests/surface_divnested.tk` pins the
+   order. `MinValue % -1` panics like `MinValue / -1` and stays that way: .NET throws
+   `OverflowException` for `int.MinValue % -1` on x64 and arm64 alike (the C# specification
+   ties the remainder's overflow to the quotient's), and `tests/surface_removf.tk` pins it.
+   The `tk_div_lazy_ty` ceiling stated above is narrower than "same behaviour": an `&&`
+   whose right side is a division typed only after this walk (both operands behind `?:`
+   placeholders, resolving to `decimal`) takes the branch form, and the `y != 0` it writes
+   is then a decimal comparison where the plain operator would have been refused as an
+   `&&` over a primitive — a program that was refused is accepted with the comparison's own
+   answer. No fixture has that shape; the oracle that closes it is a type for a placeholder
+   before its lowering, which this walk does not have.
+
    The LEFT operand always runs and keeps its own guard at the statement. The temporary is
    `TY_I64` outright — the truth value every comparison, `!`, `&&` and `||` already carries
    (`tk_bool_lit`, teko_type.tk) — so `tk_tern_lower` is not reused as it stands: it types
@@ -9010,7 +9025,7 @@ mc.macos.toml` -> **110 passed, 133 refused as expected, 0 failed** (102 + 8, 12
 the eight that run and the three that are refused of ruling 8, over the 102 + 121 the base
 carries); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK** (stage 1
 through 3 each compile `mc_teko.tk` clean, `teko2.o == teko3.o`, `--dump-asm` diff empty,
-teko1 compiles all 108+133 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
+teko1 compiles all 110+133 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
 ok: 698 links, 74 fragments, 411 diagnostics, 133 refusals, 152 samples, manifest listed`.
 
 `mc limits . --config mc.macos.toml`, `rm -rf build` first on both legs, base `8d95c1ff`

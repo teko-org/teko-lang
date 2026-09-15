@@ -421,8 +421,8 @@ void tk_div_guard(i64 n, uptr dst) {
 // whose RIGHT operand carries a division that needs a guard is rewritten,
 // ahead of the guard walk, into the branch form this file already builds --
 //
-//     x && y  ->  i64 t = 0; if (x) { <y's own hoists>; t = y; } else { t = 0; }
-//     x || y  ->  i64 t = 0; if (x) { t = 1; } else { <y's own hoists>; t = y; }
+//     x && y  ->  i64 t = 0; if (x) { <y's own hoists>; t = y != 0; } else { t = 0; }
+//     x || y  ->  i64 t = 0; if (x) { t = 1; } else { <y's own hoists>; t = y != 0; }
 //
 // -- with `t` read in its place. The LEFT operand always runs, so its own
 // guard keeps landing where it landed before, ahead of the whole statement.
@@ -570,6 +570,21 @@ void tk_tern_scan(i64 n, uptr dst) {
             tk_div_lazy_lower(n, dst);
         } else {
             tk_tern_scan(nd_a(n), dst);
+            // D82 (the PR's fourth review): a guarded division's DIVIDEND is
+            // hoisted right after its own lowering and BEFORE the divisor is
+            // walked, so the divisor's own preludes -- a nested guarded
+            // division's zero check, a ternary's branch -- land after it:
+            // `left() / (x / y)` runs `left()` first, as C# does. The guard
+            // below then finds a bare name on the left and reads it as it is.
+            // A literal divisor never gets a guard (`tk_div_guard`'s first
+            // exit), so nothing is hoisted ahead of one and those dumps stay.
+            if (nd_kind(n) == N_BINARY && (nd_op(n) == K_DIV || nd_op(n) == K_MOD)
+                && nd_kind(nd_b(n)) != N_INT && nd_kind(nd_a(n)) != N_IDENT && tk_div_applies(n)) {
+                i64 ta = tk_ty_of(nd_a(n));
+                tk_line = nd_line(n);
+                tk_file = nd_file(n);
+                set_nd_a(n, tk_id(tk_div_hoist(nd_a(n), ta, dst)));
+            }
             tk_tern_scan(nd_b(n), dst);
             tk_tern_scan(nd_c(n), dst);
             tk_tern_scan(nd_d(n), dst);

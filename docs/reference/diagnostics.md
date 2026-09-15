@@ -902,9 +902,11 @@ not one mixed row — C# refuses the same expression without a cast.
   would be wrong. `(decimal) x` is refused under `decimal`'s own longer wording instead:
   `tk_prim_cast_check` names the TARGET when the target is a primitive.
 
-Two are **run-time panics** of `lib/wide.tk`, exit 70 and on stderr with no `file:line`
-([runtime.md](runtime.md#the-wide-integer-library)), the same wording ["Integer
-division"](#integer-division) above gives every plain integer width since D82:
+Two are **run-time panics** raised by `lib/wide.tk` itself, exit 70 and on stderr with no
+`file:line` ([runtime.md](runtime.md#the-wide-integer-library)). They share their wording
+with ["Integer division"](#integer-division) above, whose guards over the eight plain widths
+are a different source — built by `teko_ternary.tk` into the program and calling the
+runtime's `panic` (D82):
 
 - `"teko: division by zero"` — `x / 0i` and `x / 0u`. The divisor is asked about BEFORE the
   long division runs, because `tk_dv_divmod` over a zero divisor answers every bit set
