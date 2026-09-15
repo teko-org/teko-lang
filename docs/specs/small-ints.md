@@ -272,7 +272,8 @@ the unchecked default.
 there is ONE long division in this repository and not two. `lib/wide.tk` is about 340 lines,
 of which the arithmetic core is forty: everything else is the two type wrappers and the
 conversions. The limbs stay 32 bits wide for a second reason this page did not know: `mc`
-compares every integer SIGNED, `u64` included (measured on mc 0.17.2, reported), so `a < b`
+compared every integer SIGNED, `u64` included (measured on mc 0.17.2, reported; mc 0.17.5's
+contract v6 compares `u64`/`uptr` unsigned, and `[package].mc` still admits 0.17.0), so `a < b`
 on two `u64` halves answers backwards the moment bit 63 is set — no compare in `lib/wide.tk`
 ever meets a value with that bit set. The panic reads `teko: division by zero`, with no type
 word: `i64 / 0` had no guard at all when this page was written (it was the machine's own
