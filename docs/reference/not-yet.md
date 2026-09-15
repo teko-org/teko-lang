@@ -257,6 +257,38 @@ unchanged at the same exit code.
 `ref decimal` and `out decimal` left this table with N3 (D75): the wide pointee road is open
 for every `TK_WIDE` type at once, and `tests/primitives_decimal_out.tk` is its oracle.
 
+## `i128` and `u128`: what N6b still owes
+
+N6a landed the two types, their literal, `+ - * /`, unary `-`, the six comparisons and the
+explicit casts to and from a 64-bit integer and between the two
+(D81, [the type reference](types.md#i128-and-u128)). N6b is the rest of
+[small-ints.md](../specs/small-ints.md) § 6–§ 8, and every row below is refused by name
+until it lands.
+
+| written | what happens |
+|---|---|
+| `a % b` | ``teko: no operator `%` takes these operands`` — the remainder is a long division that keeps what it discards, and `lib/limbs.tk`'s `tk_dv_divmod` already answers it; only the row and the wrapper are missing |
+| `a << n`, `a >> n` | ``teko: no operator `<<` takes these operands`` — `>>` is arithmetic for an `i128` and logical for a `u128`, which is one of the three places the two types differ |
+| `a & b`, `a \| b`, `a ^ b`, `~a` | ``teko: no operator `&` takes these operands`` — the same bits either way, so one implementation serves both |
+| `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128` |
+| `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
+| `(f64) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` — the float rows are N6b's |
+| `(decimal) x` | ``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it`` — the refusal names the TARGET when the target is a primitive; `(i128) d` earns `teko: an i128 does not cast yet` for the same missing row |
+| `(str) x` | `teko: an i128 does not cast yet` — text is `.ToString()`/`i128.Parse(s)`, and both are N6b, so the type registers no reader and no builder clause yet |
+| `new i128()` | `teko: new i128() is not taught; write 0i` — D76's shared guard for every wide type's zero-argument constructor |
+| `const i128 K = 1i;`, `case 1i:`, an array size | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic, exactly as for `decimal` |
+| `i128 g = 1i;` at file scope | `global initializer must be constant`, from the core; `i128 g = 5;` gets past that rule and is refused by name, `teko: a global i128 takes no initializer`. A wide global is a slot and an assignment |
+| `extern i64 f(i128 v);` | ``teko: an `extern` takes no i128`` — the sixteen-byte convention is teko's own and is not a C ABI |
+| `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` — C# refuses the same pair without a cast, and this one is a RULE and not a gap: `(i128) u` and `(u128) x` are the two spellings, and neither moves a bit |
+| `Int128.PopCount`, `LeadingZeroCount`, `RotateLeft` | C# 11's generic-math surface; a library, once there is one ([small-ints.md § 9](../specs/small-ints.md)) |
+| `checked` / `unchecked` | teko has neither word; `i128` wraps, which is C#'s unchecked default and the only behaviour there is |
+
+`u128 x = -1;` is **accepted** and answers 2^128−1, where C# makes the signed source an
+explicit cast. teko's own `u64 x = -1;` has always been accepted for the same reason —
+there is no `checked` word to tell a wrapped conversion from a wrong one — and the
+conversion table carries one row per source signedness and no implicit/explicit column
+(D81).
+
 ## `Guid.NewGuid`, and the rest of `docs/specs/guid.md`
 
 N3 landed the type whole but one member (D75, [the type reference](types.md#guid)): the

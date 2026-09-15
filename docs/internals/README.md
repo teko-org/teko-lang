@@ -9,7 +9,7 @@ need it.
 
 | page | covers |
 |---|---|
-| [modules.md](modules.md) | the 38 module files, one entry each: what it teaches, what it registers, what it keeps |
+| [modules.md](modules.md) | the 39 module files, one entry each: what it teaches, what it registers, what it keeps |
 | [nullable-probes.md](nullable-probes.md) | the ten Q0 probes behind `T?`, measured: which declaration positions the `?` reaches, which slots the `null` literal reaches, and the five findings that shaped Q1a |
 | [primitives.md](primitives.md) | a primitive with members: the lowering table, the two identity casts, the four sites that read it, and the P0 probes that measured the mechanism |
 | [passes.md](passes.md) | the fifteen `pass()` registrations, in order, and why the order is what it is |
@@ -28,7 +28,7 @@ makes is in force from then on. Three files decide what gets registered:
 
 | file | role |
 |---|---|
-| [`teko.tk`](../../teko.tk) | `#include`s the 33 `teko_*.tk` modules, defines `teko_init()` — every `syntax*`, `on_stmt`, `pass()` and lexer callback in one place — and holds the `build`/`limits` subcommand handlers |
+| [`teko.tk`](../../teko.tk) | `#include`s the 38 `teko_*.tk` modules, defines `teko_init()` — every `syntax*`, `on_stmt`, `pass()` and lexer callback in one place — and holds the `build`/`limits` subcommand handlers |
 | [`core_teko.mc`](../../core_teko.mc) | the taught compiler's own `main()`: the parts of the mc core teko links, and the two `subcommand()` entries that make the binary answer to `teko` rather than to `mc` |
 | [`user.mc`](../../user.mc) | the project's own `user_init()`, whose whole body is `teko_init()` |
 

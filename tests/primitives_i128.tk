@@ -1,0 +1,165 @@
+// primitives_i128.tk -- N6a of docs/specs/small-ints.md (§ 6, § 11; D81): the
+// VALUE. Sixteen bytes that move through every slot the language has, a
+// literal that carries more than 64 bits of it, and the layout § 6 fixes --
+// the low half at `+0`, the high half at `+8`, little-endian.
+//
+// Nothing here computes anything a 64-bit machine could not: the arithmetic is
+// `primitives_i128_math.tk`'s. What this file proves is that the sixteen bytes
+// ARRIVE -- through a local, a parameter, a return (including a recursive
+// one, which is what makes the single return buffer honest), a class field, a
+// struct field, an array element, a global, a `ref`/`out` pointee and a
+// `decimal` beside them in the same program.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "wide.tk"
+#include "decimal.tk"
+
+// the two halves, read off `&v` -- the address of the value's own frame slot,
+// the core's own `MTASK_LOCAL_ADDR`, which the wide machine never touches
+u64 lo_of(i128 v) { ptr p = &v; return ld64(p); }
+u64 hi_of(i128 v) { ptr p = &v; return ld64(p + 8); }
+u64 ulo_of(u128 v) { ptr p = &v; return ld64(p); }
+u64 uhi_of(u128 v) { ptr p = &v; return ld64(p + 8); }
+
+// a wide value at file scope is a SLOT and an assignment: a global of a wide
+// type takes no initializer (`teko: a global i128 takes no initializer`,
+// tests/refuse/i128_global_init.tk)
+i128 g;
+u128 gu;
+
+class Box {
+    public i128 v;
+    public i64 tag;
+}
+
+struct Pair {
+    public i128 a;
+    public i128 b;
+}
+
+i128 give(i128 v) { return v; }
+
+// the RETURN buffer under recursion: every call site copies the sixteen bytes
+// out before the next branch is emitted, so the one global buffer cannot be
+// overwritten between a callee's `return` and its caller's use of it
+i128 down(i128 v, i64 n) {
+    if (n == 0) return v;
+    return down(v + 1i, n - 1);
+}
+
+void out_it(out i128 v) { v = 99i; }
+void bump(ref i128 v) { v = v + 1i; }
+
+i64 main() {
+    // ---- the literal, and the layout it writes
+    i128 a = 5i;
+    if (lo_of(a) != 5) return 1;
+    if (hi_of(a) != 0) return 2;
+
+    // 2^64 exactly: the low half is zero and the high half is one, which no
+    // 64-bit literal could say
+    i128 two64 = 18446744073709551616i;
+    if (lo_of(two64) != 0) return 3;
+    if (hi_of(two64) != 1) return 4;
+
+    // 2^64 - 1: every bit of the low half, none of the high
+    i128 u64max = 18446744073709551615i;
+    if (lo_of(u64max) != 18446744073709551615) return 5;
+    if (hi_of(u64max) != 0) return 6;
+
+    // the largest `i128` there is, bit 127 clear and everything below it set
+    i128 mx = 170141183460469231731687303715884105727i;
+    if (lo_of(mx) != 18446744073709551615) return 7;
+    if (hi_of(mx) != 9223372036854775807) return 8;
+
+    // ...and the largest `u128`, every one of the 128 bits
+    u128 umx = 340282366920938463463374607431768211455u;
+    if (ulo_of(umx) != 18446744073709551615) return 9;
+    if (uhi_of(umx) != 18446744073709551615) return 10;
+
+    // the suffix is case-insensitive, and the two spellings are one value
+    if (5I != 5i) return 11;
+    if (5U != 5u) return 12;
+
+    // ---- a local, and the slot it lives in
+    i128 b = a;
+    if (b != 5i) return 13;
+    b = mx;
+    if (b != mx) return 14;
+    if (b == a) return 15;
+
+    // ---- a parameter and a return
+    if (give(mx) != mx) return 16;
+    if (down(0i, 4) != 4i) return 17;
+    // two wide returns in one expression: each is copied out of the buffer
+    // before the next call is lowered at all
+    if (give(two64) + give(two64) != 36893488147419103232i) return 18;
+
+    // ---- a class field: the store and the load move all sixteen bytes, and
+    // the neighbour field is untouched
+    Box x = new Box();
+    x.v = mx;
+    x.tag = 7;
+    if (x.v != mx) return 19;
+    if (x.tag != 7) return 20;
+    x.v = 1i;
+    if (x.tag != 7) return 21;
+
+    // ---- a struct field, the same road one table lower
+    Pair p = new Pair();
+    p.a = two64;
+    p.b = u64max;
+    if (p.a != two64) return 22;
+    if (p.b != u64max) return 23;
+
+    // ---- an array element, fixed and of heap
+    i128 arr[3];
+    arr[0] = 1i;
+    arr[1] = mx;
+    arr[2] = two64;
+    if (arr[0] != 1i) return 24;
+    if (arr[1] != mx) return 25;
+    if (arr[2] != two64) return 26;
+    i128[] heap = new i128[2];
+    heap[0] = u64max;
+    heap[1] = 3i;
+    if (heap[0] != u64max) return 27;
+    if (heap[1] != 3i) return 28;
+
+    // ---- a global
+    g = mx;
+    if (g != mx) return 29;
+    gu = umx;
+    if (gu != umx) return 30;
+    g = g - g;
+    if (g != 0i) return 31;
+
+    // ---- `ref` and `out`: the pointee is reached through the same two
+    // library helpers a field is
+    i128 r = 1i;
+    bump(ref r);
+    if (r != 2i) return 32;
+    i128 o;
+    out_it(out o);
+    if (o != 99i) return 33;
+
+    // ---- the two types side by side, and a `decimal` in the same program:
+    // three wide ids in one wide set, three return buffers, one machine
+    u128 ub = 7u;
+    if (ub != 7u) return 34;
+    if (umx - 1u != 340282366920938463463374607431768211454u) return 35;
+    decimal d = 2.5m;
+    if (d + d != 5m) return 38;
+    if (a != 5i) return 39;
+    if (ub != 7u) return 40;
+
+    // ---- the default value of a wide slot is sixteen zero bytes
+    i128 zero;
+    zero = 0i;
+    if (lo_of(zero) != 0) return 36;
+    if (hi_of(zero) != 0) return 37;
+
+    return 42;
+}

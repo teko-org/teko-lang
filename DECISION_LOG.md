@@ -8627,3 +8627,151 @@ two functions this crumb adds -- `tk_unary_ws`, `tk_unary_parened`), `ins` 23573
 elements) moved from 101088544 to 101245504, +156960 bytes, +0.16% -- stated as what it is,
 not offered as proof of anything: the proof is the readings table above, the three new
 fixtures, and the 217 pre-existing fixtures' `--dump-ast` unmoved.
+
+---
+
+### D81 · `i128` and `u128` are teko's own two registrations, `<i128>` is never included, and the limb vector is lifted rather than copied (N6a, 2026-09-15)
+
+> Two `type_new` calls, one literal handler, twenty-two operator rows, eight conversion
+> rows and about 340 lines of surface teko in `lib/wide.tk` -- and `mc`'s bundled `<i128>`
+> is not included, now or ever. Measured: `<float>` and `<i128>` cannot coexist in one
+> compiler, the module adds four intrinsics D21 forbids outright, and its machine handlers
+> break 34 of this repository's fixtures. teko registers the two types itself, over the one
+> `teko_wide.tk` machine C3 built, with **nothing new in that file**. `mc limits`' `intrin`
+> row is 8 before and 8 after.
+
+N6a is `docs/specs/small-ints.md` § 6's first half. It depends on C3 (D74) for the
+sixteen-byte machine and on C4 (D77) for the limb technique -- and it duplicates neither,
+which is the point of its first ruling. N6b (`% << >> & | ^ ~`, `ToString`/`Parse`/
+`TryParse`, the members, `↔ decimal` and `↔ f64`) is the NEXT crumb and is left out on
+purpose; every one of its spellings is refused by name today and is a row of
+`docs/reference/not-yet.md`.
+
+#### The ten rulings this crumb was dispatched with, and what each became
+
+1. **`<i128>` is closed, and this entry is what closes D74's "N6 re-decides".** D74 left
+   `#include <i128>` out because it reserves the words `i128`/`u128` ahead of N6's own
+   crumb, and said N6 would re-decide. It is decided: **never**. Three independent reasons,
+   each sufficient on its own. The opcode ranges COLLIDE -- on arm64 `<float>`'s `FI_BASE`
+   is 100 and unbounded while `<i128>`'s `WI_BASE` is 200, and on x86_64 `FX_BASE` and
+   `XW_BASE` are both 100 -- so a program mixing a float and a wide integer either executes
+   an illegal instruction or dies in `--dump-asm` with `no dump for a wide opcode`. It adds
+   **four intrinsics**, which D21 forbids without qualification. And its `iw_*` machine
+   handlers claim the sixteen-byte depth `teko_wide.tk` already owns, which breaks 34
+   fixtures. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`;
+   `teko_wide.tk` gained one raised `#define` and not one line of logic, which is the proof
+   D74's machine generalises to a fourth and a fifth client.
+
+2. **The limb vector is LIFTED, not copied.** C4's `tk_dv_*` block -- eight 32-bit limbs and
+   the sixteen operations over them, including the one long division -- moved out of
+   `lib/decimal.tk` into `lib/limbs.tk`, which `decimal.tk` includes at the very line the
+   block used to start on and `wide.tk` includes too. A second `tk_dv_divmod` was not
+   written. The proof it is a no-op is stronger than the ruling asked for: `--dump-ast
+   --include=lib --include=tests` over **all 220 files under `tests/`** is **byte-identical**
+   to `a1d9ca46`, declaration order included -- the include sits exactly where the block sat,
+   so nothing even reorders and there is no sorted diff to enumerate. It is its own commit
+   (`846d88d2`), gated on its own.
+
+3. **The limbs stay 32 bits wide, and now for TWO reasons.** C4's was headroom. N6a's is
+   mc's own defect: **mc compares every integer SIGNED, `u64` included** (measured on mc
+   0.17.2, reported to `minicompiler/mc`, fix expected in 0.17.3), so `a < b` on the two
+   `u64` halves of a 128-bit value answers backwards the moment bit 63 is set. A limb below
+   2^32 has no such bit. Every compare in `lib/wide.tk` is a limb compare or an explicit
+   `(limb3 >> 31) & 1` sign test, so the whole file is right on both sides of the defect and
+   stays right when it is fixed. `lib/limbs.tk`'s header says so in the file, not only here.
+
+4. **The literal is `<digits>i` / `<digits>u`, decimal digits only, registered before
+   `tk_float_init()`.** `mc`'s own `<i128>` spelling, both suffixes case-insensitive; C# has
+   no `Int128` literal at all. The mechanism is `tk_dec_lit`'s: a module-private global with
+   an `N_BLOB` initializer, gensym'd `$tk_w128_<n>` with a `$` the lexer never forms into an
+   identifier, and the node returned is the `N_IDENT` naming it. It carries the MAGNITUDE
+   only -- a leading `-` is the unary operator applied to the value -- so the ceiling is
+   2^127-1 for `i` and 2^128-1 for `u`, checked on the four limbs at compile time with the
+   carry remembered rather than dropped: `teko: an i128 literal is out of range` /
+   `teko: a u128 literal is out of range`. `i128.MinValue` is written
+   `-170141183460469231731687303715884105727i - 1i` until N6b registers the constant, which
+   is the same hole C# has and fills with `Int128.MinValue`.
+
+5. **Eleven operator rows per type, no mixed row, and the promotion through D77's own
+   door.** `tk_ops_promote`'s wide arm needed no change at all: it asks `tk_num_widens`,
+   which asks the primitive's own conversion table, so registering the four integer-source
+   rows made `x + 1`, `1 + x`, `x += 1`, `x++` and `x--` work with no line in `teko_ops.tk`.
+   `i128 op u128` gets no row and is refused -- ``teko: no operator `+` takes these
+   operands`` -- because `tk_is_int_ty` answers 0 for every wide id (D38's rule), so no
+   promotion opens a door between them; C# refuses the same expression without a cast.
+   Unary `+` has no row either: `tk_prim_unary_plus` reads the `T + T` row and hands the
+   operand back.
+
+6. **The conversion rows are keyed on the source's SIGNEDNESS, and there are four and not
+   two.** `tk_i128_from_u64` before `tk_i128_from_i64`, and the same pair for `u128`: a
+   column naming `TY_I64` takes every integer teko has, `u64` included, and a `u64` at or
+   above 2^63 through a sign-extending door is a negative 128-bit value in silence. That is
+   D77's ruling 8 exactly, applied at registration time rather than found by a verifier. The
+   two wide-to-wide rows move no bit. The `(u64) x`, `(i32) x` and every other narrow target
+   ride the single `(TY_I64, i128)` row: the call answers an `i64` and the cast the source
+   wrote is the ordinary narrowing over it -- measured, `(i32) x` on a 6 answers 6 and
+   `(i64) 18446744073709551616i` answers 0, which is C#'s unchecked narrowing.
+
+   **The one place this is wider than C#.** `u128 x = -1;` is accepted here and answers
+   2^128-1, where C# makes every signed source an explicit cast to `UInt128`. The table has
+   no implicit/explicit column and teko's own `u64 x = -1;` has always been accepted for the
+   same reason -- there is no `checked` word to tell a wrapped conversion from a wrong one.
+   Recorded in `not-yet.md` rather than fixed with a column a single type would use.
+
+7. **`x / 0i` panics `teko: division by zero`, exit 70 -- and the wording joins no family,
+   because there is none.** The ruling asked for a measurement of what `i64 / 0` does in
+   teko today. It does **nothing**: there is no guard at all, the machine's own `sdiv` runs,
+   and aarch64 answers 0. So `decimal division by zero` is the only neighbour and it carries
+   a type word this one does not need. The divisor is tested BEFORE the long division,
+   because `tk_dv_divmod` over a zero divisor answers every bit set rather than failing, and
+   a wrong quotient is worse than an abort.
+
+8. **The caps, and one wording fix that fell out.** `TK_MAXWIDE` 4 -> 8 (the two
+   registrations filled the old table exactly), `TK_MAXPRIMT` 8 -> 16 (6 -> 8, same),
+   `TK_MAXPRIMO` 80 -> 128 (62 -> 84), `TK_MAXPRIMX` 8 -> 16 (5 -> 13, which the ruling did
+   not name and the build found at once). And `tk_prim_cast_check`'s refusal opened
+   `"teko: a "` unconditionally, which reads *a i128*. `tk_prim_article` answers *an* before
+   a vowel SOUND and not a vowel letter -- *an i128*, *a u128*, "you-128", the rule that
+   gives *a union* -- and every primitive registered before this crumb begins with a
+   consonant, so `decimal`, `Guid`, `DateTime`, `TimeSpan` and `DateTimeOffset` read exactly
+   as they always did.
+
+9. **Three run fixtures and nine refusal fixtures.** `tests/primitives_i128.tk` (42, 40
+   assertions) walks the value through a local, a parameter, a return, a recursive return, a
+   class field, a struct field, a fixed array element, a heap array element, a global, a
+   `ref` pointee, an `out` pointee, and a `decimal` in the same program -- three wide types,
+   three return buffers, one machine. `tests/primitives_i128_math.tk` (42, 68 assertions) is
+   the arithmetic, every value chosen so a 64-bit implementation gives a different answer.
+   `tests/primitives_i128_divzero.tk` (70) puts the zero behind a call the folder cannot see
+   through. The nine under `tests/refuse/` are the literal range in both types, the mixed
+   signedness, the two N6b casts, `const`, a `case` label, an `extern` and a global
+   initializer. Both run fixtures were **proved live by mutation** -- a value moved by one
+   answers the assertion's own code and not 42 -- and no failure path returns 42 (D77's
+   ruling 11, checked on both).
+
+10. **This entry is D81**, after D80.
+
+#### The gate, mc 0.17.2, macos/aarch64
+
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **102 passed, 130 refused as expected, 0 failed** (99 + 3, 121 + 9);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK**;
+`sh scripts/check-docs.sh` -> `docs ok: 694 links, 71 fragments, 409 diagnostics, 130
+refusals, 152 samples, manifest listed`.
+
+`mc limits . --config mc.macos.toml`, `rm -rf build` first on both legs, base `a1d9ca46`
+against this branch: `intrin` **8 -> 8 (unmoved, the law's own row)**, `passes` **15 -> 15
+(unmoved)**, `syntax` **18 -> 20 (+2**, the two type words, each counted once by name
+however many `syntax_expr`/`syntax_stmt` pairs it takes; `syntax_lit` is not counted
+there**)**, `types` **16 -> 18 (+2**, the two `type_new` rows**)**, `alias` **23 -> 25 (+2**,
+the side effect of `type_new` reserving each word, exactly as D74 recorded for
+`decimal`**)**. Verdict `grew` on both legs with the SAME four rows `grew` before this crumb
+(`passes`, `syntax`, `alias`, `types`) and **no new one**.
+
+`--dump-ast --include=lib --include=tests` over all 220 `.tk` files under `tests/` (99
+accept + 121 refuse, as they stand on `a1d9ca46`), base compiler built in its own worktree:
+**220 of 220 byte-identical**, after the limb lift and after the compiler change alike. The
+`decimal` fixtures included: the lift reorders nothing, so the sorted-diff enumeration the
+ruling asked for is empty in the strongest sense -- there is no diff at all.
+
+What is left open: N6b, whole, and the `u128` implicit-conversion width of ruling 6.

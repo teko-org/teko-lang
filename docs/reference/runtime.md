@@ -343,19 +343,22 @@ file, the same as the constants above.
 
 ## The wide libraries
 
-`lib/decimal.tk` and `lib/guid.tk` are what a `TK_WIDE` type owes the **program**: a machine
-emits code for the program being compiled, and the three things a sixteen-byte value needs
-are declarations of the program's own ([`teko_wide.tk`](../../teko_wide.tk), D74/D75).
+`lib/decimal.tk`, `lib/guid.tk` and `lib/wide.tk` are what a `TK_WIDE` type owes the
+**program**: a machine emits code for the program being compiled, and the three things a
+sixteen-byte value needs are declarations of the program's own
+([`teko_wide.tk`](../../teko_wide.tk), D74/D75).
 Each file declares the same three, under its own names. `DateTimeOffset`'s own three are the
 same shape, but live in `lib/time.tk` rather than in a file of their own — N5 folds the third
 wide type into the include `DateTime`/`TimeSpan` already read, since there is no third
 sixteen-byte FILE the way `decimal`/`Guid` each got one, only a third registration (D76).
+`lib/wide.tk` is the one file that declares **two** sets, for `i128` and `u128`: the pair is
+one include because the two types are one representation (N6a, D81).
 
 | | |
 |---|---|
-| `decimal tk_dec_retbuf;` / `Guid tk_guid_retbuf;` / `DateTimeOffset tk_dto_retbuf;` | the buffer a sixteen-byte RETURN travels through. The callee copies its value here and returns the ADDRESS; the call site copies it out into the call depth's own slot immediately after the branch, which is what makes ONE buffer safe under recursion and under nesting. It is **per type**, so a program that returns a `Guid` and never mentions `decimal` includes `guid.tk` alone. A program that forgot it is refused by name: `teko: include "guid.tk" before returning a sixteen-byte value` |
-| `decimal tk_dec_ld(ptr p)` / `Guid tk_guid_ld(ptr p)` / `DateTimeOffset tk_dto_ld(ptr p)` | the INDIRECT load: two `ld64`s over the address of the sixteen bytes. `tk_ldn` ([`teko_struct.tk`](../../teko_struct.tk)) lowers every field, array element, `ref`/`out` pointee and closure capture of a wide type to it, because no raw `ldW` moves sixteen bytes and the width table would answer `ld64` and move half the value in silence |
-| `void tk_dec_st(ptr p, decimal d)` / `void tk_guid_st(ptr p, Guid g)` / `void tk_dto_st(ptr p, DateTimeOffset o)` | the store, the same two words the other way |
+| `decimal tk_dec_retbuf;` / `Guid tk_guid_retbuf;` / `DateTimeOffset tk_dto_retbuf;` / `i128 tk_i128_retbuf;` / `u128 tk_u128_retbuf;` | the buffer a sixteen-byte RETURN travels through. The callee copies its value here and returns the ADDRESS; the call site copies it out into the call depth's own slot immediately after the branch, which is what makes ONE buffer safe under recursion and under nesting. It is **per type**, so a program that returns a `Guid` and never mentions `decimal` includes `guid.tk` alone. A program that forgot it is refused by name: `teko: include "guid.tk" before returning a sixteen-byte value` |
+| `decimal tk_dec_ld(ptr p)` / `Guid tk_guid_ld(ptr p)` / `DateTimeOffset tk_dto_ld(ptr p)` / `i128 tk_i128_ld(ptr p)` / `u128 tk_u128_ld(ptr p)` | the INDIRECT load: two `ld64`s over the address of the sixteen bytes. `tk_ldn` ([`teko_struct.tk`](../../teko_struct.tk)) lowers every field, array element, `ref`/`out` pointee and closure capture of a wide type to it, because no raw `ldW` moves sixteen bytes and the width table would answer `ld64` and move half the value in silence |
+| `void tk_dec_st(ptr p, decimal d)` / `void tk_guid_st(ptr p, Guid g)` / `void tk_dto_st(ptr p, DateTimeOffset o)` / `void tk_i128_st(ptr p, i128 v)` / `void tk_u128_st(ptr p, u128 v)` | the store, the same two words the other way |
 
 `&d` on a local or on a parameter of wide type is the address of its own sixteen-byte frame
 slot — the core's own `MTASK_LOCAL_ADDR`, untouched by the wide machine — so surface code
@@ -374,6 +377,34 @@ above it: `lib/decimal.tk` and `lib/wide.tk` both include it, so `decimal` and
 The limbs are 32 bits and never 64 because `mc` compares every integer SIGNED, `u64`
 included: `a < b` on two `u64` halves of a 128-bit value answers backwards the moment bit
 63 is set. A limb below 2^32 has no such bit.
+
+### The wide-integer library
+
+`lib/wide.tk` is what `i128` and `u128` owe the program: the two return buffers
+(`tk_i128_retbuf`, `tk_u128_retbuf`), the four indirect-access helpers (`tk_i128_ld`,
+`tk_i128_st`, `tk_u128_ld`, `tk_u128_st`), and the arithmetic every operator and every cast
+of the two types lowers to. One include carries the pair
+([the specification](../specs/small-ints.md) § 6, N6a, D81).
+
+Everything in it is ordinary teko over `lib/limbs.tk`'s eight 32-bit limbs, so no leg needs
+a 128-bit instruction and `mc limits`' `intrin` row does not move. `mc`'s own bundled
+`<i128>` is deliberately **not** included and never will be: measured on mc 0.17.2, it
+cannot coexist with `<float>` (the opcode ranges collide on both instruction sets), it adds
+four intrinsics, and its machine handlers break 34 of this repository's fixtures.
+
+| | |
+|---|---|
+| `tk_i128_add`, `_sub`, `_mul`, `_div`, `_neg` | `+ - * /` and unary `-`, all modulo 2^128 — C#'s unchecked default, which is the only behaviour teko has. `/` truncates toward zero and takes the sign from the two operands; `/ 0i` panics `teko: division by zero`, exit 70 |
+| `tk_i128_cmp`, `_eq`, `_ne`, `_lt`, `_le`, `_gt`, `_ge` | the six comparisons, SIGNED: the sign bits decide first and the limbs after them |
+| `tk_u128_*` | the same twelve, with `/` and the four orderings UNSIGNED. `+ - *` and unary `-` are the same bits either way and the wrappers differ only in the type they build |
+| `tk_i128_from_i64` / `_from_u64` / `tk_u128_from_i64` / `_from_u64` | an integer widened. The SIGNED source sign-extends and the UNSIGNED one does not, which is why there are four and not two: a `u64` at or above 2^63 through a signed door is a negative 128-bit value, in silence (D77's ruling 8, the shape every wide type takes for this question) |
+| `tk_i128_to_i64` / `tk_u128_to_i64` | back to 64 bits, truncating — C#'s own unchecked narrowing. `(u64) x` and `(i32) x` ride these too: the call answers an `i64` and the cast the source wrote narrows it |
+| `tk_i128_from_u128` / `tk_u128_from_i128` | the two directions that move no bit at all |
+| `tk_i128_lo`/`_hi`, `tk_u128_lo`/`_hi`, `tk_i128_of`, `tk_u128_of` | the two halves of the layout § 6 fixes, read off `&v` and written back |
+
+`%`, `<<`, `>>`, `&`, `|`, `^`, `~`, `ToString`, `Parse`, `TryParse`, the members and the
+`decimal`/`f64` conversions are **N6b** and are not here
+([not-yet.md](not-yet.md)).
 
 ### The decimal library
 

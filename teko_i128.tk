@@ -1,0 +1,287 @@
+// teko_i128.tk -- `i128` and `u128`: the two registrations, the literal, and
+// the rows every operator and every cast reads. N6a of
+// docs/specs/small-ints.md (§ 6, § 8, § 11), D81.
+//
+// It is `teko_wide.tk`'s fourth and fifth client and carries none of its
+// machine: the sixteen bytes MOVE because `tk_wide_add` put these two ids in
+// the wide set, and the three derived tables never name either type. What is
+// here is the same three things `teko_decimal.tk` carries for `decimal` --
+// the `type_new`, the literal, and the `tk_prim_op`/`tk_prim_cast_op` rows --
+// with the arithmetic itself in `lib/wide.tk` as ordinary teko (D21: zero new
+// intrinsics, `mc limits`' `intrin` row unmoved at 8).
+//
+// **`mc`'s bundled `<i128>` is NOT included, and never will be** (D81, which
+// closes D74's "N6 re-decides"). Measured on mc 0.17.2: `<float>` and `<i128>`
+// cannot coexist in one compiler. Their opcode ranges collide on both
+// instruction sets -- on arm64 `<float>`'s `FI_BASE` is 100 and unbounded
+// while `<i128>`'s `WI_BASE` is 200, and on x86_64 `FX_BASE` and `XW_BASE` are
+// both 100 -- so a program mixing the two either executes an illegal
+// instruction or dies in `--dump-asm` with `no dump for a wide opcode`. It
+// adds four intrinsics on top of that, which D21 forbids outright, and its
+// `iw_*` machine handlers break 34 of this repository's fixtures. teko
+// registers the two types ITSELF, exactly as it registered `decimal`.
+//
+// What stays out is N6b's, and is refused by name until it lands:
+//
+//   x % y, x << 1, x & y, ~x    teko_ops.tk    no operator `%` takes these operands
+//   x.ToString(), i128.Parse    teko_expr.tk   unknown member of i128
+//   (decimal) x, (f64) x        teko_prim.tk   an i128 does not cast yet
+//   const i128 K = 1i;          teko_const.tk  const requires a constant expression
+//   case 1i:                    teko_switch.tk a case label must be a constant expression
+//   i128 g = 5;                 teko_rc.tk     a global i128 takes no initializer
+//   extern i128 f();            teko_over.tk   an `extern` takes no i128
+
+// ---- the representation (docs/specs/small-ints.md § 6) ----
+// Sixteen bytes, sixteen-byte aligned, little-endian:
+//
+//   +0  bits   0..63    the low half
+//   +8  bits  64..127   the high half, whose bit 63 is an `i128`'s sign
+//
+// The two types are THE SAME BITS. They differ in `/` and in the four ordering
+// comparisons, and in nothing else this crumb builds -- `lib/wide.tk` writes
+// the core once and gives each type a wrapper.
+i64 tk_ty_i128 = 0;
+i64 tk_ty_u128 = 0;
+
+// ---- the literal: <digits>(i|I|u|U) ----
+// `mc`'s own `<i128>` suffix, `i` for the signed and `u` for the unsigned,
+// both case-insensitive. C# has no `Int128` literal at all -- it writes
+// `Int128.Parse("...")` -- so there is no C# form to follow and the market's
+// nearest neighbour is the compiler this one is taught to
+// (docs/specs/small-ints.md § 6).
+//
+// DECIMAL DIGITS ONLY: `0x...` is declined here and reaches whatever reads it
+// today, unchanged. A value above 64 bits does not fit `MTASK_CONST`'s single
+// `i64` and an `N_INT`'s `val` is one `i64`, so the literal becomes a
+// module-private GLOBAL with an `N_BLOB` initializer and the node returned is
+// an `N_IDENT` naming it -- `tk_dec_lit`'s own shape (teko_decimal.tk, D74).
+//
+// **The registration order is load-bearing**, for the same reason `decimal`'s
+// is: handlers run in registration order and the first non-zero node wins, so
+// this one is registered BEFORE `tk_float_init()` and declines -- `return 0` --
+// everything that does not end in `i` or `u`.
+u64 tk_wl0 = 0;                       // the value in four 32-bit limbs
+u64 tk_wl1 = 0;
+u64 tk_wl2 = 0;
+u64 tk_wl3 = 0;
+i64 tk_wl_ovf = 0;                    // a carry past bit 127
+i64 tk_nwidelit = 0;                  // the literal globals, numbered
+
+void tk_wl_reset() { tk_wl0 = 0; tk_wl1 = 0; tk_wl2 = 0; tk_wl3 = 0; tk_wl_ovf = 0; }
+
+i64 tk_wl_isdig(i64 c) { return c >= '0' && c <= '9'; }
+
+// value = value * m + add, over 128 bits. A carry out of the top limb is
+// remembered rather than dropped, so a literal past 2^128 is refused instead
+// of wrapping.
+void tk_wl_muladd(u64 m, u64 add) {
+    u64 c = add;
+    u64 p = tk_wl0 * m + c;  tk_wl0 = p & 0xffffffff;  c = p >> 32;
+    p = tk_wl1 * m + c;      tk_wl1 = p & 0xffffffff;  c = p >> 32;
+    p = tk_wl2 * m + c;      tk_wl2 = p & 0xffffffff;  c = p >> 32;
+    p = tk_wl3 * m + c;      tk_wl3 = p & 0xffffffff;  c = p >> 32;
+    if (c) tk_wl_ovf = 1;
+}
+
+uptr tk_wl_skip(uptr q, uptr e) {
+    loop {
+        if (q >= e || !tk_wl_isdig(ld8(q))) break;
+        q = q + 1;
+    }
+    return q;
+}
+
+// the gensym: `$tk_w128_<n>`, in the arena. The `$` is a byte the lexer never
+// forms into an identifier, so the name cannot collide with anything a program
+// wrote (`tk_dl_name`'s own rule, teko_decimal.tk).
+uptr tk_wl_name() {
+    u8 nb[24];
+    i64 nn = 0;
+    i64 v = tk_nwidelit;
+    tk_nwidelit = tk_nwidelit + 1;
+    loop {
+        st8(nb + nn, '0' + v % 10);
+        v = v / 10;
+        nn = nn + 1;
+        if (v == 0) break;
+    }
+    uptr name = xalloc(11 + nn);
+    mem_copy(name, "$tk_w128_", 9);
+    i64 k = 0;
+    loop {
+        if (k >= nn) break;
+        st8(name + 9 + k, ld8(nb + nn - 1 - k));
+        k = k + 1;
+    }
+    st8(name + 9 + nn, 0);                    // the terminator, written, never assumed
+    return name;
+}
+
+// the sixteen bytes, little-endian, byte by byte
+uptr tk_wl_blob(u64 lo, u64 hi) {
+    uptr b = xalloc(16);
+    i64 i = 0;
+    loop {
+        if (i >= 8) break;
+        st8(b + i, (lo >> (i * 8)) & 0xff);
+        st8(b + 8 + i, (hi >> (i * 8)) & 0xff);
+        i = i + 1;
+    }
+    return b;
+}
+
+i64 tk_w128_lit() {
+    uptr s = p_start();
+    uptr e = p_src_end();
+    if (s >= e || !tk_wl_isdig(ld8(s))) return 0;
+
+    // ---- first pass: find the suffix, and decline everything that is not one
+    // Nothing is accumulated and nothing is consumed until the suffix is in
+    // hand, so `1`, `0.5`, `1.5m`, `1.5e3` and `0x10` all leave this handler
+    // exactly as they reached it and go on to the next one.
+    uptr q = tk_wl_skip(s, e);
+    if (q >= e) return 0;
+    i64 suf = ld8(q);
+    if (suf != 'i' && suf != 'I' && suf != 'u' && suf != 'U') return 0;
+    if (q + 1 < e && is_alnum(ld8(q + 1))) return 0;
+    i64 signed_ = suf == 'i' || suf == 'I';
+
+    // ---- second pass: the digits, most significant first
+    i64 line = p_line();
+    uptr fl = p_file();
+    tk_wl_reset();
+    uptr r = s;
+    loop {
+        if (r >= q) break;
+        tk_wl_muladd(10, ld8(r) - '0');
+        r = r + 1;
+    }
+
+    // An `i128` literal is the MAGNITUDE only -- a leading `-` is the unary
+    // operator and is applied to the value this node answers -- so the ceiling
+    // is 2^127-1 and `i128.MinValue` is written `-170...727i - 1i` (C# has the
+    // same hole and writes `Int128.MinValue`, which is N6b).
+    if (signed_) {
+        if (tk_wl_ovf || ((tk_wl3 >> 31) & 1))
+            err_at(fl, line, "teko: an i128 literal is out of range");
+    } else {
+        if (tk_wl_ovf) err_at(fl, line, "teko: a u128 literal is out of range");
+    }
+
+    q = q + 1;
+    p_take_lit(q);
+
+    i64 ty = tk_ty_u128;
+    if (signed_) ty = tk_ty_i128;
+    uptr name = tk_wl_name();
+    i64 blob = node_new(N_BLOB, line, fl);
+    set_nd_name(blob, tk_wl_blob(tk_wl0 | (tk_wl1 << 32), tk_wl2 | (tk_wl3 << 32)));
+    set_nd_val(blob, 16);
+    i64 g = node_new(N_GLOBAL, line, fl);
+    set_nd_type(g, ty);
+    set_nd_name(g, name);
+    set_nd_val(g, 0);
+    set_nd_a(g, blob);
+    tk_top_emit(g);
+    i64 id = node_new(N_IDENT, line, fl);     // the expression IS the global
+    set_nd_name(id, name);
+    set_nd_type(id, ty);
+    p_next();
+    return id;
+}
+
+// ---- registration ----
+// Called from `teko_init()` BEFORE `tk_float_init()`, for the literal's sake,
+// beside `tk_dec_init()`; the MACHINE is registered separately and after both
+// (`tk_wide_init`, teko_wide.tk).
+//
+// `type_new(name, 16, 16, TK_WIDE)` is the whole of the representation: the
+// sixteen-byte frame slot, the sixteen-byte global and the sixteen-byte array
+// element all come from `type_width`. Each type gets its OWN return buffer
+// (D75's fourth column of the wide set), so a program that returns a `u128`
+// and never mentions `i128` still has exactly the buffer it needs -- both live
+// in `lib/wide.tk`, which is one include for the pair.
+//
+// The reader and builder clauses are EMPTY: `.ToString()` and `i128.Parse` are
+// N6b, and a refusal naming a member the type does not have yet would be
+// wrong (D74's own rule). `(str) x` therefore earns the shorter
+// `teko: an i128 does not cast yet` until that crumb lands.
+void tk_i128_init() {
+    tk_ty_i128 = type_new("i128", 16, 16, TK_WIDE);
+    tk_ty_u128 = type_new("u128", 16, 16, TK_WIDE);
+    tk_wide_add(tk_ty_i128, "tk_i128_ld", "tk_i128_st", "tk_i128_retbuf");
+    tk_wide_add(tk_ty_u128, "tk_u128_ld", "tk_u128_st", "tk_u128_retbuf");
+    tk_prim_type(tk_ty_i128, "i128", "wide.tk", 0, 0, "0i");
+    tk_prim_type(tk_ty_u128, "u128", "wide.tk", 0, 0, "0u");
+    syntax_lit(&tk_w128_lit);
+    // the type word in EXPRESSION and STATEMENT position. N6a registers no
+    // member at all, so `i128.MaxValue` answers `teko: unknown member of i128`
+    // -- which is what a reader needs to hear until N6b registers it -- rather
+    // than a parse error about a stray type name.
+    syntax_expr("i128", &tk_prim_expr);
+    syntax_stmt("i128", &tk_prim_stmt);
+    syntax_expr("u128", &tk_prim_expr);
+    syntax_stmt("u128", &tk_prim_stmt);
+}
+
+// ---- the operators and the conversions (§ 6, § 8) ----
+// Eleven rows per type and no mixed row of any kind. An integer beside an
+// `i128` is CONVERTED before the operator pass looks for a row
+// (`tk_ops_promote`, teko_ops.tk), which is C# §12.4.5's binary numeric
+// promotion and the reason `x + 1`, `1 + x`, `x += 1` and `x++` are all
+// covered by the rows below.
+//
+// `i128 op u128` gets NO row either, and is refused by name: C# refuses the
+// same expression without a cast, `tk_is_int_ty` answers 0 for a wide id, so
+// the promotion never opens a door between them, and the site earns
+// `teko: no operator `+` takes these operands`.
+//
+// Unary `+` has no row: `tk_prim_unary_plus` (teko_prim.tk) reads the
+// `T + T` row to know this is a number and hands the operand straight back.
+void tk_i128_rows(i64 t, uptr add, uptr sub, uptr mul, uptr div, uptr neg,
+                  uptr eq, uptr ne, uptr lt, uptr le, uptr gt, uptr ge) {
+    tk_prim_op(K_ADD, 2, t, t, add, t, 0);
+    tk_prim_op(K_SUB, 2, t, t, sub, t, 0);
+    tk_prim_op(K_MUL, 2, t, t, mul, t, 0);
+    tk_prim_op(K_DIV, 2, t, t, div, t, 0);
+    tk_prim_op(K_SUB, 1, t, 0 - 1, neg, t, 0);
+    tk_prim_op(K_EQ, 2, t, t, eq, TY_I64, 0);
+    tk_prim_op(K_NE, 2, t, t, ne, TY_I64, 0);
+    tk_prim_op(K_LT, 2, t, t, lt, TY_I64, 0);
+    tk_prim_op(K_LE, 2, t, t, le, TY_I64, 0);
+    tk_prim_op(K_GT, 2, t, t, gt, TY_I64, 0);
+    tk_prim_op(K_GE, 2, t, t, ge, TY_I64, 0);
+}
+
+void tk_i128_ops() {
+    tk_i128_rows(tk_ty_i128, "tk_i128_add", "tk_i128_sub", "tk_i128_mul",
+                 "tk_i128_div", "tk_i128_neg", "tk_i128_eq", "tk_i128_ne",
+                 "tk_i128_lt", "tk_i128_le", "tk_i128_gt", "tk_i128_ge");
+    tk_i128_rows(tk_ty_u128, "tk_u128_add", "tk_u128_sub", "tk_u128_mul",
+                 "tk_u128_div", "tk_u128_neg", "tk_u128_eq", "tk_u128_ne",
+                 "tk_u128_lt", "tk_u128_le", "tk_u128_gt", "tk_u128_ge");
+
+    // § 8's conversions. The `u64` SOURCE row comes FIRST on each target, for
+    // D77's ruling 8: a column naming `TY_I64` takes every integer teko has
+    // (`tk_prim_slot_fits`), `u64` included, and a `u64` at or above 2^63
+    // through a SIGN-EXTENDING door is a negative 128-bit value -- in silence.
+    // A column naming `TY_U64` takes nothing but `u64`, so this one row is
+    // asked first and leaves the other seven integer types where they were.
+    tk_prim_cast_op(tk_ty_i128, TY_U64, "tk_i128_from_u64");
+    tk_prim_cast_op(tk_ty_i128, TY_I64, "tk_i128_from_i64");
+    tk_prim_cast_op(tk_ty_u128, TY_U64, "tk_u128_from_u64");
+    tk_prim_cast_op(tk_ty_u128, TY_I64, "tk_u128_from_i64");
+    // ...and the two wide-to-wide rows, which move no bit at all. Neither
+    // opens an IMPLICIT door: `tk_num_wide_widens` (teko_typeof.tk) asks
+    // `tk_is_int_ty` of the source, which answers 0 for every `type_new` id
+    // this project did not list by name (D38), so `i128 x = u;` is refused
+    // and `(i128) u` is the one spelling that converts -- C#'s own rule.
+    tk_prim_cast_op(tk_ty_i128, tk_ty_u128, "tk_i128_from_u128");
+    tk_prim_cast_op(tk_ty_u128, tk_ty_i128, "tk_u128_from_i128");
+    // ...and back to 64 bits, truncating. `(u64) x`, `(i32) x` and every
+    // narrower target ride these two as well: the call answers an `i64` and
+    // the cast the source wrote is the ordinary narrowing over it
+    // (`tk_prim_cast_lower`'s second branch).
+    tk_prim_cast_op(TY_I64, tk_ty_i128, "tk_i128_to_i64");
+    tk_prim_cast_op(TY_I64, tk_ty_u128, "tk_u128_to_i64");
+}

@@ -51,7 +51,8 @@ fixes the order.
 | 12 | ~~**N5** `DateTimeOffset`~~ **landed**, D76 | datetime-extras.md | M | C2, C3 |
 | 13 | ~~**C4** the `decimal` arithmetic~~ **landed**, D77 | `docs/specs/decimal.md` | L | C3 |
 | 14 | ~~**C5** `decimal` round and text~~ **landed**, D79 | `docs/specs/decimal.md` | M | C4 |
-| 15 | **N6** `i128` and `u128` | small-ints.md | L | C3, C4 |
+| 15a | ~~**N6a** `i128`/`u128`: the two types, the literal, `+ - * /`, the six comparisons, unary `-`, the explicit casts~~ **landed**, D81 | small-ints.md | L | C3, C4 |
+| 15b | **N6b** `i128`/`u128`: `% << >> & \| ^ ~`, `ToString`/`Parse`/`TryParse`, the members, `↔ decimal` and `↔ f64` | small-ints.md | M | N6a, C5 |
 | 16 | **N7** `string`, the value | string.md | L | — |
 | 17 | **N8** `string`, the methods and the index | string.md | L | N7 |
 | 18 | **C6** `DateTime.Now`, `UtcNow`, `Today` | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |

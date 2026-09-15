@@ -1,0 +1,145 @@
+// primitives_i128_math.tk -- N6a of docs/specs/small-ints.md (§ 6, § 8, § 11;
+// D81): `+ - * /`, the unary `-` and the six comparisons, on both types, over
+// values chosen so that a 64-bit implementation gives a DIFFERENT answer.
+//
+//   18446744073709551615i * 2i        36893488147419103230i, which needs 65 bits
+//   MaxValue + 1i                     MinValue -- the wrap is C#'s unchecked
+//                                     default and the only behaviour teko has
+//   -MinValue                         MinValue again, two's complement's own
+//                                     fixed point
+//   (0i - 1i) < 1i                    true, signed; the same bits as `u128`'s
+//                                     largest value, which is GREATER than 1u
+//   -7i / 2i                          -3i: truncation toward zero, not floor
+//
+// and the mixed forms -- `x + 1`, `2 * x` -- carry NO operator row of their
+// own: the integer is converted first (`tk_ops_promote`, teko_ops.tk), which
+// is C# §12.4.5's binary numeric promotion.
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "wide.tk"
+
+u64 lo_of(i128 v) { ptr p = &v; return ld64(p); }
+u64 hi_of(i128 v) { ptr p = &v; return ld64(p + 8); }
+
+i128 i128_max() { return 170141183460469231731687303715884105727i; }
+i128 i128_min() { return (0i - 170141183460469231731687303715884105727i) - 1i; }
+u128 u128_max() { return 340282366920938463463374607431768211455u; }
+
+i64 main() {
+    // ---- + and -, across the 64-bit boundary
+    i128 u64max = 18446744073709551615i;
+    if (u64max + 1i != 18446744073709551616i) return 1;
+    if (u64max + u64max != 36893488147419103230i) return 2;
+    if (18446744073709551616i - 1i != u64max) return 3;
+    if (hi_of(u64max + 1i) != 1) return 4;
+    if (lo_of(u64max + 1i) != 0) return 5;
+
+    // ---- * across 2^64: the product of two values that each fit 64 bits
+    if (u64max * 2i != 36893488147419103230i) return 6;
+    if (4294967296i * 4294967296i != 18446744073709551616i) return 7;
+    // 2^126, which is one doubling short of the top bit
+    i128 half = 42535295865117307932921825928971026432i;
+    if (half * 2i != 85070591730234615865843651857942052864i) return 8;
+
+    // ---- the WRAP at 2^127 (C# unchecked; teko has no `checked` word)
+    i128 mx = i128_max();
+    i128 mn = i128_min();
+    if (mx + 1i != mn) return 9;
+    if (mn - 1i != mx) return 10;
+    if (mx * 2i != 0i - 2i) return 11;
+
+    // ---- unary `-`, and its one fixed point
+    if (0i - 5i != -5i) return 12;
+    if (-(-5i) != 5i) return 13;
+    if (-mn != mn) return 14;
+    if (-mx != mn + 1i) return 15;
+    if (-0i != 0i) return 16;
+    // unary `+` is the operand itself and carries no row at all
+    if (+mx != mx) return 17;
+
+    // ---- signed `/`: magnitudes and a sign, truncating toward zero
+    if (7i / 2i != 3i) return 18;
+    if (-7i / 2i != -3i) return 19;
+    if (7i / -2i != -3i) return 20;
+    if (-7i / -2i != 3i) return 21;
+    if (1i / 2i != 0i) return 22;
+    if (36893488147419103230i / 2i != u64max) return 23;
+    if (mx / mx != 1i) return 24;
+
+    // ---- unsigned `/`: the same bits, the other rule. `u128`'s largest value
+    // and `i128`'s `-1` ARE the same sixteen bytes, and this is where they
+    // part company.
+    u128 umx = u128_max();
+    if (umx / 2u != 170141183460469231731687303715884105727u) return 25;
+    if (umx / umx != 1u) return 26;
+    if (18446744073709551615u * 2u != 36893488147419103230u) return 27;
+    if (umx + 1u != 0u) return 28;
+    if (0u - 1u != umx) return 29;
+
+    // ---- the six comparisons, signed
+    i128 neg = 0i - 1i;
+    if (!(neg < 1i)) return 30;
+    if (!(neg < 0i)) return 31;
+    if (!(mn < mx)) return 32;
+    if (!(mx > mn)) return 33;
+    if (!(neg <= neg)) return 34;
+    if (!(neg >= neg)) return 35;
+    if (neg == 1i) return 36;
+    if (!(neg != 1i)) return 37;
+    if (!(u64max > 1i)) return 38;
+    if (!(0i - u64max < 1i)) return 39;
+
+    // ---- ...and unsigned, where every one of those bits is a magnitude
+    u128 ubig = 340282366920938463463374607431768211455u;   // the same bits as -1i
+    if (!(ubig > 1u)) return 40;
+    if (ubig < 1u) return 41;
+    // 2^127 exactly: an `i128` would read it as negative, a `u128` never does
+    u128 top = 170141183460469231731687303715884105728u;
+    if (!(top > 1u)) return 43;
+    if (!(top > 170141183460469231731687303715884105727u)) return 44;
+    if (!((i128) top < 0i)) return 45;
+
+    // ---- an integer beside a wide value: converted, never a mixed row
+    i128 x = 5i;
+    if (x + 1 != 6i) return 46;
+    if (1 + x != 6i) return 47;
+    if (2 * x != 10i) return 48;
+    if (x - 1 != 4i) return 49;
+    if (x / 2 != 2i) return 50;
+    if (!(x > 4)) return 51;
+    if (!(x == 5)) return 52;
+    x += 1;
+    if (x != 6i) return 53;
+    x++;
+    if (x != 7i) return 54;
+    x--;
+    if (x != 6i) return 55;
+    i128 implicit = 5;
+    if (implicit != 5i) return 56;
+
+    // a `u64` at or above 2^63 goes through a door of its own: the signed one
+    // would answer a NEGATIVE 128-bit value, in silence (D77's ruling 8)
+    u64 huge = 18446744073709551615;
+    i128 fromu = (i128) huge;
+    if (fromu != u64max) return 57;
+    if (!(fromu > 0i)) return 58;
+    i64 minus = 0 - 1;
+    if ((i128) minus != neg) return 59;
+
+    // ---- the casts, and the round trips
+    if ((i64) x != 6) return 60;
+    if ((i32) x != 6) return 61;
+    if ((u64) fromu != 18446744073709551615) return 62;
+    // the truncation is the low 64 bits, C#'s own unchecked narrowing
+    if ((i64) 18446744073709551616i != 0) return 63;
+    if ((i64) (18446744073709551616i + 5i) != 5) return 64;
+    // `i128` and `u128` are the same bits and the cast moves none of them
+    if ((u128) neg != umx) return 65;
+    if ((i128) umx != neg) return 66;
+    if ((u128) x != 6u) return 67;
+    if ((i128)((u128) mx) != mx) return 68;
+
+    return 42;
+}

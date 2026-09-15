@@ -264,6 +264,25 @@ and no decimal rounding to do. Overflow **wraps**, which is C#'s unchecked defau
 (`docs/specs/decimal.md` § 9), so wrapping is the only behaviour there is and the fixture
 asserts it. Division by zero panics, exit 70.
 
+**N6a's amendments, from building it (D81).** The limb helpers are not rewritten: C4's own
+`tk_dv_*` block moved into `lib/limbs.tk` and `decimal.tk` and `wide.tk` both include it, so
+there is ONE long division in this repository and not two. `lib/wide.tk` is about 340 lines,
+of which the arithmetic core is forty: everything else is the two type wrappers and the
+conversions. The limbs stay 32 bits wide for a second reason this page did not know: `mc`
+compares every integer SIGNED, `u64` included (measured on mc 0.17.2, reported), so `a < b`
+on two `u64` halves answers backwards the moment bit 63 is set — no compare in `lib/wide.tk`
+ever meets a value with that bit set. The panic reads `teko: division by zero`, with no type
+word: `i64 / 0` has no guard at all in teko today (it is the machine's own `sdiv`, which
+answers 0 on aarch64), so there was no existing wording to join.
+
+**`#include <i128>` is never written.** Measured on mc 0.17.2: `<float>` and `<i128>` cannot
+coexist in one compiler — the opcode ranges collide on both instruction sets (arm64
+`FI_BASE` 100 unbounded against `WI_BASE` 200; x86_64 `FX_BASE` 100 == `XW_BASE` 100), the
+module adds four intrinsics, and its `iw_*` machine handlers break 34 of this repository's
+fixtures. § 13's last row already said teko carries its own; D81 is the ruling that closes
+it. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`, over the one
+`teko_wide.tk` machine, with nothing new in that file.
+
 ## 7. The API
 
 | static | instance |
@@ -342,11 +361,16 @@ reaches.
 | `tests/primitives_small_int.tk` | a negative `i8` and `i16` round-trip through a local, a parameter, a return, a field, a global, an array element and an `extern`-shaped declaration; `>>` is arithmetic; `/` and `%` are signed; the six comparisons are signed; widening to `i64` carries the sign | `42` |
 | `tests/primitives_small_int_convert.tk` | an `i8` and an `i16` convert to `f64` in all nine slots D33 enumerated; a positive value only on the `aarch64` path the `not-yet.md` row names; nothing narrows back | `42` |
 | `tests/primitives_small_int_wrap.tk` | `(i8) 100 + (i8) 100` is `200` in flight and `-56` stored back; `(i16) 32767 + (i16) 1` is `-32768` stored back | `42` |
-| `tests/primitives_i128.tk` | a literal above `2^64` round-trips through a local, a parameter, a return, a field, a global and an `i128[]` element; a recursive `i128` function proves the return buffer; `MaxValue + 1` wraps to `MinValue` | `42` |
-| `tests/primitives_i128_math.tk` | `+ - * / % & \| ^ ~ << >>` against values chosen so a 64-bit implementation gives a different answer; `u128` division and `>>` are unsigned where `i128`'s are signed | `42` |
-| `tests/primitives_i128_text.tk` | `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
-| `tests/primitives_i128_divzero.tk` | `(i128) 1 / (i128) 0` | `70` |
-| `tests/primitives_i128_parse_bad.tk` | `i128.Parse("x")` | `70` |
+| `tests/primitives_i128.tk` | **N6a, landed.** a literal above `2^64` round-trips through a local, a parameter, a return, a class field, a struct field, a global, a fixed `i128[]` element, a heap `i128[]` element and a `ref`/`out` pointee; a recursive `i128` function proves the return buffer; a `decimal` in the same program proves three wide types share one machine | `42` |
+| `tests/primitives_i128_math.tk` | **N6a, landed.** `+ - * /`, unary `-` and the six comparisons against values chosen so a 64-bit implementation gives a different answer; `MaxValue + 1i` wraps to `MinValue` and `-MinValue` is `MinValue`; `u128` division and the four orderings are unsigned where `i128`'s are signed; the promotion `x + 1`/`2 * x` and every cast round trip. `% & \| ^ ~ << >>` are N6b's | `42` |
+| `tests/primitives_i128_text.tk` | **N6b.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
+| `tests/primitives_i128_divzero.tk` | **N6a, landed.** `7i / zero()`, the divisor behind a call the folder cannot see through | `70` |
+| `tests/primitives_i128_parse_bad.tk` | **N6b.** `i128.Parse("x")` | `70` |
+
+N6a's nine refusal fixtures, each with its exact message and line:
+`tests/refuse/i128_literal_range.tk`, `u128_literal_range.tk`, `i128_mixed_signedness.tk`,
+`i128_cast_float.tk`, `i128_cast_decimal.tk`, `i128_const.tk`, `i128_case_label.tk`,
+`i128_extern.tk` and `i128_global_init.tk`.
 
 The constant-range crumb adds no fixture of its own: a refusal had no harness at the time
 (D33's own closing note), so `teko: the constant 300 does not fit u8` is documented with a
@@ -388,18 +412,26 @@ stores an out-of-range constant, and that is a claim the crumb proves rather tha
 compiler). **Owes:** [not-yet.md](../reference/not-yet.md)'s row moved from "what happens"
 to "refused", diagnostics.md and types.md.
 
-### N6 — `i128` and `u128` (L)
+### ~~N6a — `i128` and `u128`, the value and the arithmetic (L)~~ landed, D81
 
-Two `type_new` calls in a new `teko_wide.tk`-adjacent registration, the two literals,
-`lib/wide.tk`'s limb arithmetic, the operator rows, the explicit casts, `ToString`/`Parse`.
+Two `type_new` calls in `teko_i128.tk`, the literal, `lib/wide.tk`'s limb arithmetic over
+the lifted `lib/limbs.tk`, the operator rows for `+ - * /`, unary `-` and the six
+comparisons, and the explicit casts to and from a 64-bit integer and between the two types.
 **Depends on `docs/specs/decimal.md`'s C3** for the sixteen-byte machine module and on its
-C4 for the limb technique the arithmetic reuses; it duplicates neither.
+C4 for the limb technique the arithmetic reuses; it duplicates neither — C4's `tk_dv_*`
+block moved into `lib/limbs.tk` and both types compute over the one long division.
 
-**Gate:** the five `i128` fixtures at their codes **on all five legs** — a sixteen-byte
-value's ABI is the one thing a single leg cannot prove — everything N0 gated on, and
-`mc limits` with `intrin` and `passes` unmoved. **Owes:** the two rows in types.md, the
-conversion table, diagnostics.md, runtime.md for `lib/wide.tk`, and
-[modules.md](../internals/modules.md).
+**Gate as run:** `tests/primitives_i128.tk`, `_math.tk` and `_divzero.tk` at their codes and
+nine refusal fixtures at their exact messages and lines, **on all five legs**; `FIXPOINT
+OK`; `mc limits` with `intrin` and `passes` unmoved, `types`/`syntax`/`alias` each +2;
+`--dump-ast` byte-identical over all 220 base fixtures.
+
+### N6b — the rest of `i128` and `u128` (M)
+
+`%`, `<<`, `>>`, `&`, `|`, `^`, `~`; `ToString`/`Parse`/`TryParse` and § 7's members and
+statics; the `decimal` and `f64` conversions of § 8. Depends on N6a and, for the `decimal`
+direction, on C5. Every one of them is refused by name today
+([not-yet.md](../reference/not-yet.md)).
 
 ## 13. Risks and law tensions
 

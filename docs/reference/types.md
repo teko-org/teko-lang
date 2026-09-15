@@ -45,6 +45,15 @@ literals (`2.0`, `0.5f`) and the intrinsics `ldf64`/`ldf32`/`stf64`/`stf32`/`sqr
 core words nor an alias of one: they are two primitives of teko's own, C#'s `sbyte` and
 `short`.
 
+Two more are sixteen bytes, behind `#include "wide.tk"` — the widest integers teko has,
+and primitives of teko's own rather than anything `mc` brings
+([below](#i128-and-u128), N6a):
+
+| word | width | signed | notes |
+|---|---|---|---|
+| `i128` | 16 | **yes** | C#'s `Int128` under `mc`'s own word; `−2^127 .. 2^127−1`, literal suffix `i` |
+| `u128` | 16 | no | C#'s `UInt128`; `0 .. 2^128−1`, literal suffix `u` |
+
 A type word is **reserved program-wide**: `i64 str = 1;` is refused, exactly as C#
 refuses a variable named `int`.
 
@@ -1140,6 +1149,99 @@ offset zero, since teko has no time-zone database to read a bare wall-clock stri
 | an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
 | a value whose LOCAL clock (instant + offset) leaves the `DateTime` range (`MaxValue.ToOffset(+01:00)`) | `teko: the local time of that DateTimeOffset is out of range`, exit 70 — refused where the value is built (`tk_dto_make`), as C# does at construction |
 | `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `DateTime.Now` is blocked on |
+
+---
+
+## `i128` and `u128`
+
+Sixteen bytes each, sixteen-byte aligned, behind `#include "wide.tk"` — one include for the
+pair, because the two types are one representation. They are C#'s `Int128` and `UInt128`
+under `mc`'s own words (`i128`/`u128`: a type `mc` already has a word for keeps it, D3), and
+they exist for the arithmetic that runs out of room in an `i64`
+([the specification](../specs/small-ints.md) § 6, N6a).
+
+The layout is little-endian: the low half at `+0`, the high half at `+8`. `i128` and `u128`
+are **the same bits** and part company in exactly two places — `/`, and the four ordering
+comparisons.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "wide.tk"
+
+i128 total;
+
+i128 echo(i128 v) { return v; }
+
+i64 main() {
+    i128 big = 18446744073709551616i;             // 2^64, which no i64 literal says
+    total = big;                                  // a global: a slot and an assignment
+    i128 copy = echo(total);                      // a parameter, and a return
+    i128 cells[2];
+    cells[1] = copy;                              // an element, sixteen bytes of it
+    i128 back = cells[1];
+    ptr p = &back;                                // `&` on a local of wide type
+    if (ld64(p) != 0) return 1;                   // the low half
+    if (ld64(p + 8) != 1) return 2;               // ...and the high half
+    if (18446744073709551615i * 2i != 36893488147419103230i) return 3;
+    if (-7i / 2i != -3i) return 4;                // truncating toward zero
+    i128 mx = 170141183460469231731687303715884105727i;
+    if (mx + 1i != -mx - 1i) return 5;            // the wrap: MaxValue + 1 is MinValue
+    if ((u128)(0i - 1i) != 340282366920938463463374607431768211455u) return 6;
+    i128 n = 5;                                   // an integer converts
+    if (n + 1 != 6i) return 7;                    // ...and so does one beside a wide value
+    return 42;
+}
+```
+
+**The literal** is `<digits>i` for an `i128` and `<digits>u` for a `u128`, both suffixes
+case-insensitive and **decimal digits only** — `0x` is not a wide literal. It is `mc`'s own
+`<i128>` spelling; C# has no `Int128` literal at all and writes `Int128.Parse("…")`. The
+literal carries the MAGNITUDE only, so the ceiling is 2^127−1 for `i` and 2^128−1 for `u`,
+and a value above it is `teko: an i128 literal is out of range` at compile time.
+`i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` until the
+constants land.
+
+**The operators** are C#'s, and every one of them is a call into `lib/wide.tk`:
+
+| written | answers | how it fails |
+|---|---|---|
+| `a + b`, `a - b`, `a * b` | `i128` / `u128` | **wraps** modulo 2^128 — C#'s unchecked default, and teko has no `checked` word |
+| `a / b` | `i128` / `u128` | truncates toward zero, signed for `i128` and unsigned for `u128`; `b == 0` is `teko: division by zero`, exit 70 |
+| `-a` | `i128` / `u128` | wraps: `-MinValue` is `MinValue` |
+| `+a` | the operand | no call at all |
+| `==` `!=` `<` `<=` `>` `>=` | `i64` 0/1 | signed for `i128`, unsigned for `u128`: the same sixteen bytes read `-1i` and `340282366920938463463374607431768211455u` |
+| `a + 1`, `1 + a` | `i128` / `u128` | the integer converts first, then the row above |
+
+`i128 + u128` takes **no** row and is refused without a cast, which is C#'s rule for the
+same pair. `%`, `<<`, `>>`, `&`, `|`, `^` and `~` are **not taught yet**
+([not-yet.md](not-yet.md)).
+
+**The conversions**, none of them an instruction — every one is a call:
+
+| from | to | how |
+|---|---|---|
+| any integer (`u8`..`i64`, `i8`, `i16`, `i32`) | `i128`, `u128` | **implicit**, and `(i128) n` writes it down. A `u64` at or above 2^63 goes through a row of its own, so it never converts through a signed door |
+| `i128`, `u128` | any integer | **explicit** `(i64) v`, `(i32) v`, `(u64) v` — the low 64 bits, then the ordinary narrowing |
+| `i128` | `u128`, and back | **explicit**, the same bits: `(u128)(-1i)` is `2^128−1`, C#'s own answer |
+| `i128`, `u128` | `f64`, `decimal`, `str` | **not taught yet** (N6b): `teko: an i128 does not cast yet` |
+| `null`, a class, a struct, a `T[]` | either | refused |
+
+**What is refused**, and with which words:
+
+| written | message |
+|---|---|
+| `a % b`, `a << 1`, `a & b`, `~a` | ``teko: no operator `%` takes these operands`` — N6b |
+| `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
+| `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
+| `(f64) x`, `(str) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` (`a u128` for the other) |
+| `x.ToString()`, `i128.MaxValue` | `teko: unknown member of i128` and its static twin — N6b |
+| `170141183460469231731687303715884105728i` | `teko: an i128 literal is out of range` |
+| `const i128 K = 1i;`, `case 1i:` | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic |
+| `i128 g = 5;` at file scope | `teko: a global i128 takes no initializer` — a wide global is a slot and an assignment |
+| `extern i128 f();` | ``teko: an `extern` takes no i128`` — the sixteen-byte convention is teko's own, not a C ABI |
+| `new i128()` | `teko: new i128() is not taught; write 0i` |
+| `x / 0i` | `teko: division by zero`, exit 70 |
 
 ---
 

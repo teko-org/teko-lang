@@ -1,0 +1,349 @@
+// wide.tk -- `i128` and `u128`: the two copy helpers a sixteen-byte value
+// needs, the buffer a sixteen-byte RETURN travels through, and the arithmetic
+// every operator of the two types lowers to. Program code, not compiler code:
+// `#include "wide.tk"` from the `.tk` source itself, exactly as `rt.tk`,
+// `decimal.tk` and `guid.tk` are included (docs/reference/runtime.md).
+//
+// N6a of docs/specs/small-ints.md (§ 6, § 8, § 11) and D81. Everything here is
+// ordinary teko over `lib/limbs.tk`'s eight 32-bit limbs -- the same vector
+// `decimal` computes over, lifted for exactly this file -- so no leg needs a
+// 128-bit instruction, `mc`'s bundled `<i128>` is not included (D81: it cannot
+// coexist with `<float>`), and `mc limits`' `intrin` row does not move (D21).
+//
+// The representation is docs/specs/small-ints.md § 6's: sixteen bytes,
+// sixteen-byte aligned, little-endian, the low half at `+0` and the high half
+// at `+8`. `i128` and `u128` are THE SAME BITS and differ in exactly two
+// places here -- `/` and the four ordering comparisons -- which is why the core
+// below is written once over a vector and each type gets a four-line wrapper.
+//
+// What is NOT here is N6b's: `%`, `<<`, `>>`, `&`, `|`, `^`, `~`, `ToString`,
+// `Parse`, `TryParse`, the members and the `decimal`/`f64` conversions
+// (docs/reference/not-yet.md).
+#include "limbs.tk"
+
+// ---- the three declarations a wide type owes the PROGRAM ----
+// The return buffer, one per TYPE (D75): a function returning an `i128` copies
+// its sixteen bytes here and returns the ADDRESS of this global, and the call
+// site copies them out into the call depth's own slot immediately after the
+// branch, which is what makes ONE buffer safe under recursion and nesting
+// (`tw_call`/`tw_ret`, teko_wide.tk).
+i128 tk_i128_retbuf;
+u128 tk_u128_retbuf;
+
+// The field road and the array-element road: two `ld64`/`st64` pairs over the
+// address of the sixteen bytes, which `tk_ldn`/`tk_stn` (teko_struct.tk) lower
+// every indirect access of a wide type to -- no raw `ldW` moves sixteen bytes
+// and the width table would answer `ld64` and move half the value in silence.
+i128 tk_i128_ld(ptr p) {
+    i128 v;
+    ptr q = &v;
+    st64(q, ld64(p));
+    st64(q + 8, ld64(p + 8));
+    return v;
+}
+
+void tk_i128_st(ptr p, i128 v) {
+    ptr q = &v;
+    st64(p, ld64(q));
+    st64(p + 8, ld64(q + 8));
+}
+
+u128 tk_u128_ld(ptr p) {
+    u128 v;
+    ptr q = &v;
+    st64(q, ld64(p));
+    st64(q + 8, ld64(p + 8));
+    return v;
+}
+
+void tk_u128_st(ptr p, u128 v) {
+    ptr q = &v;
+    st64(p, ld64(q));
+    st64(p + 8, ld64(q + 8));
+}
+
+// ---- the two halves, and a value built out of them ----
+// `&v` on a parameter of wide type is the address of its own frame slot, so
+// each half is one `ld64` and no accessor, no member and no intrinsic is
+// needed to reach it. The four below are what `tests/primitives_i128.tk`
+// checks the layout with, and what every wrapper in this file is written over.
+u64 tk_i128_lo(i128 v) { ptr p = &v; return ld64(p); }
+u64 tk_i128_hi(i128 v) { ptr p = &v; return ld64(p + 8); }
+u64 tk_u128_lo(u128 v) { ptr p = &v; return ld64(p); }
+u64 tk_u128_hi(u128 v) { ptr p = &v; return ld64(p + 8); }
+
+i128 tk_i128_of(u64 lo, u64 hi) {
+    i128 v;
+    ptr p = &v;
+    st64(p, lo);
+    st64(p + 8, hi);
+    return v;
+}
+
+u128 tk_u128_of(u64 lo, u64 hi) {
+    u128 v;
+    ptr p = &v;
+    st64(p, lo);
+    st64(p + 8, hi);
+    return v;
+}
+
+// ---- the core, over four of `lib/limbs.tk`'s eight limbs ----
+// A 128-bit value is limbs 0..3; limbs 4..7 are the headroom a product and a
+// long division need. Every operation that can overflow ends in `tk_w_mask`,
+// which is the WRAP docs/specs/small-ints.md § 6 fixes: C#'s unchecked default,
+// and the only behaviour there is, since teko has no `checked` word.
+#define TK_W_NL 4
+
+void tk_w_vec(u64 lo, u64 hi, uptr v) {
+    tk_dv_zero(v);
+    tk_dv_put(v, 0, lo & 0xffffffff);
+    tk_dv_put(v, 1, (lo >> 32) & 0xffffffff);
+    tk_dv_put(v, 2, hi & 0xffffffff);
+    tk_dv_put(v, 3, (hi >> 32) & 0xffffffff);
+}
+
+u64 tk_w_lo(uptr v) { return tk_dv_at(v, 0) | (tk_dv_at(v, 1) << 32); }
+u64 tk_w_hi(uptr v) { return tk_dv_at(v, 2) | (tk_dv_at(v, 3) << 32); }
+
+// modulo 2^128: everything above limb 3 is dropped
+void tk_w_mask(uptr v) {
+    i64 i = TK_W_NL;
+    loop {
+        if (i >= TK_DEC_NL) break;
+        tk_dv_put(v, i, 0);
+        i = i + 1;
+    }
+}
+
+// bit 127, the sign of an `i128`. It is read off limb 3 and never off a `u64`
+// half, so no comparison in this file ever meets `mc`'s signed-`u64` defect.
+i64 tk_w_isneg(uptr v) { return (tk_dv_at(v, 3) >> 31) & 1; }
+
+// v = -v, modulo 2^128. `tk_dv_sub` drops the borrow out of the top limb,
+// which is exactly two's complement: `-MinValue == MinValue` falls out of it
+// and is asserted by `tests/primitives_i128_math.tk`.
+void tk_w_neg(uptr v) {
+    u64 z[TK_DEC_NL];
+    tk_dv_zero(z);
+    tk_dv_sub(z, v);
+    tk_dv_copy(v, z);
+    tk_w_mask(v);
+}
+
+// a += b, a -= b, a *= b -- all three modulo 2^128. The carry `tk_dv_add`
+// guards is a value past 256 bits, which two 128-bit operands cannot form.
+void tk_w_add(uptr a, uptr b) { tk_dv_add(a, b); tk_w_mask(a); }
+void tk_w_sub(uptr a, uptr b) { tk_dv_sub(a, b); tk_w_mask(a); }
+
+void tk_w_mul(uptr r, uptr a, uptr b) {
+    tk_dv_mul(r, a, b);
+    tk_w_mask(r);
+}
+
+// q = a / b, unsigned, truncating. The divisor is asked about FIRST, because
+// `tk_dv_divmod` over a zero divisor would answer every bit set rather than
+// fail: `teko: division by zero`, exit 70, the road every runtime guard in
+// this project already takes (docs/reference/memory.md).
+void tk_w_udiv(uptr q, uptr a, uptr b) {
+    if (tk_dv_is_zero(b)) panic("division by zero");
+    tk_dv_divmod(q, a, b);
+    tk_w_mask(q);
+}
+
+// ...and the signed one: magnitudes, then the sign of the quotient. The
+// operands are the caller's own scratch and are consumed.
+void tk_w_sdiv(uptr q, uptr a, uptr b) {
+    i64 sa = tk_w_isneg(a);
+    i64 sb = tk_w_isneg(b);
+    if (sa) tk_w_neg(a);
+    if (sb) tk_w_neg(b);
+    tk_w_udiv(q, a, b);
+    if (sa != sb) tk_w_neg(q);
+}
+
+// -1, 0 or 1, signed. The sign bits decide first and the limbs after them,
+// which is what makes `-1i < 1i` true where a raw limb compare says otherwise.
+i64 tk_w_scmp(uptr a, uptr b) {
+    i64 sa = tk_w_isneg(a);
+    i64 sb = tk_w_isneg(b);
+    if (sa != sb) {
+        if (sa) return 0 - 1;
+        return 1;
+    }
+    return tk_dv_cmp(a, b);
+}
+
+// ---- i128: the wrappers ----
+void tk_iv(i128 v, uptr o) { tk_w_vec(tk_i128_lo(v), tk_i128_hi(v), o); }
+i128 tk_iw(uptr v) { return tk_i128_of(tk_w_lo(v), tk_w_hi(v)); }
+
+i128 tk_i128_add(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_add(x, y);
+    return tk_iw(x);
+}
+
+i128 tk_i128_sub(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_sub(x, y);
+    return tk_iw(x);
+}
+
+i128 tk_i128_mul(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    u64 r[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_mul(r, x, y);
+    return tk_iw(r);
+}
+
+i128 tk_i128_div(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    u64 q[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    tk_w_sdiv(q, x, y);
+    return tk_iw(q);
+}
+
+i128 tk_i128_neg(i128 a) {
+    u64 x[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_w_neg(x);
+    return tk_iw(x);
+}
+
+i64 tk_i128_cmp(i128 a, i128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_iv(a, x);
+    tk_iv(b, y);
+    return tk_w_scmp(x, y);
+}
+
+i64 tk_i128_eq(i128 a, i128 b) { return tk_i128_cmp(a, b) == 0; }
+i64 tk_i128_ne(i128 a, i128 b) { return tk_i128_cmp(a, b) != 0; }
+i64 tk_i128_lt(i128 a, i128 b) { return tk_i128_cmp(a, b) < 0; }
+i64 tk_i128_le(i128 a, i128 b) { return tk_i128_cmp(a, b) <= 0; }
+i64 tk_i128_gt(i128 a, i128 b) { return tk_i128_cmp(a, b) > 0; }
+i64 tk_i128_ge(i128 a, i128 b) { return tk_i128_cmp(a, b) >= 0; }
+
+// ---- u128: the same wrappers over the unsigned core ----
+void tk_uv(u128 v, uptr o) { tk_w_vec(tk_u128_lo(v), tk_u128_hi(v), o); }
+u128 tk_uw(uptr v) { return tk_u128_of(tk_w_lo(v), tk_w_hi(v)); }
+
+u128 tk_u128_add(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_add(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_sub(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_sub(x, y);
+    return tk_uw(x);
+}
+
+u128 tk_u128_mul(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    u64 r[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_mul(r, x, y);
+    return tk_uw(r);
+}
+
+u128 tk_u128_div(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    u64 q[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    tk_w_udiv(q, x, y);
+    return tk_uw(q);
+}
+
+// C#'s `UInt128` declares `operator -(UInt128)` too, and it wraps outside a
+// `checked` block exactly as the signed one does.
+u128 tk_u128_neg(u128 a) {
+    u64 x[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_w_neg(x);
+    return tk_uw(x);
+}
+
+i64 tk_u128_cmp(u128 a, u128 b) {
+    u64 x[TK_DEC_NL];
+    u64 y[TK_DEC_NL];
+    tk_uv(a, x);
+    tk_uv(b, y);
+    return tk_dv_cmp(x, y);
+}
+
+i64 tk_u128_eq(u128 a, u128 b) { return tk_u128_cmp(a, b) == 0; }
+i64 tk_u128_ne(u128 a, u128 b) { return tk_u128_cmp(a, b) != 0; }
+i64 tk_u128_lt(u128 a, u128 b) { return tk_u128_cmp(a, b) < 0; }
+i64 tk_u128_le(u128 a, u128 b) { return tk_u128_cmp(a, b) <= 0; }
+i64 tk_u128_gt(u128 a, u128 b) { return tk_u128_cmp(a, b) > 0; }
+i64 tk_u128_ge(u128 a, u128 b) { return tk_u128_cmp(a, b) >= 0; }
+
+// ---- the conversions (docs/specs/small-ints.md § 8) ----
+// Each is a row of teko_prim.tk's conversion table (teko_i128.tk), so a cast
+// the source wrote and an integer the compiler converts on its own both reach
+// the same four functions -- `tk_prim_cast_lower` and `tk_num_widen`.
+//
+// The SIGNED source sign-extends and the UNSIGNED one does not, which is the
+// whole of the difference and the reason there are four and not two: a `u64`
+// at or above 2^63 through a signed door is a negative 128-bit value, the
+// silent wrong answer D77's ruling 8 caught on `decimal`.
+u64 tk_w_ones() {
+    u64 z = 0;
+    return z - 1;
+}
+
+i128 tk_i128_from_i64(i64 n) {
+    u64 hi = 0;
+    if (n < 0) hi = tk_w_ones();
+    return tk_i128_of(n, hi);
+}
+
+i128 tk_i128_from_u64(u64 n) { return tk_i128_of(n, 0); }
+
+// C#'s own `(UInt128)(-1L)`: the value sign-extends to 128 bits and the bits
+// are then read unsigned, which is 2^128-1. It is an EXPLICIT conversion in
+// C# and an implicit one here, for the same reason `u64 x = -1;` is already
+// accepted by teko -- there is no `checked` word to tell the two apart.
+u128 tk_u128_from_i64(i64 n) {
+    u64 hi = 0;
+    if (n < 0) hi = tk_w_ones();
+    return tk_u128_of(n, hi);
+}
+
+u128 tk_u128_from_u64(u64 n) { return tk_u128_of(n, 0); }
+
+// ...and back, truncating to the low 64 bits, which is C#'s own unchecked
+// narrowing. `(u64) v` rides this row too: the call answers an `i64` and the
+// cast the source wrote is the ordinary 64-bit reinterpretation over it.
+i64 tk_i128_to_i64(i128 v) { return tk_i128_lo(v); }
+i64 tk_u128_to_i64(u128 v) { return tk_u128_lo(v); }
+
+// the two that move no bit at all
+i128 tk_i128_from_u128(u128 v) { return tk_i128_of(tk_u128_lo(v), tk_u128_hi(v)); }
+u128 tk_u128_from_i128(i128 v) { return tk_u128_of(tk_i128_lo(v), tk_i128_hi(v)); }
