@@ -8517,3 +8517,97 @@ cannot tell a bare prefix from a PARENTHESIZED one, so `(-d).ToString()` also re
 `(-t).Hours` on a `TimeSpan` reads as `-(t.Hours)` the same way. On a `decimal` the
 consequence is louder, because the `-` then lands on a `str` and the read segfaults, so
 every fixture here binds a negative receiver to a local first and says why.
+
+### D80 (D79 is C5's, on its own branch) · a postfix after a parenthesized `- ! ~` binds to the GROUP, not past it (2026-09-15)
+
+> `.`/`[`/`?.` already sink through a BARE `- ! ~` chain (delivery 5, `teko_prefix.tk`):
+> `-a.x` reads `-(a.x)`, matching C#. The sink fired on the AST alone -- a receiver shaped
+> `N_UNARY(op, x)` -- and the AST carries no mark for a SOURCE `(...)`, so it fired the
+> same way when the source had written the parentheses on purpose: `(-t).Duration().Hours`
+> answered -3 for a 3-hour `TimeSpan`, read as `-(t.Duration().Hours)`; `(-arr)[0]` compiled
+> to `-(arr[0])`, a value, where C# refuses the array negation outright; `(-oc)?.M()` failed,
+> but late and on the WRONG type -- C5's own verifier found the same shape on `decimal`,
+> where `(-d).ToString()` negates a `str` and segfaults (`docs/reference/not-yet.md`, the
+> row this entry removes). Silent-wrong on `.`/`[`, late-and-wrong on `?.`.
+
+**The signal is lexical, because the AST has none.** mc's core returns `(expr)` as `expr`
+itself -- no `N_PAREN`, no flag (`src/parse.mc:911-913`) -- so `tk_unary_parened`
+(`teko_prefix.tk`) reads raw SOURCE BYTES backward from `p_start()`, the position of
+whatever `cur` is when a `syntax_infix` handler runs: mc's own `parse_expr` (M21) already
+consumed the operator before calling the handler, so there is no token left to ask "was
+this parenthesized" -- the byte scan is the only road open. It skips whitespace back past
+the operator itself (`oplen` bytes: 1 for `.` and `[`, 2 for `?.`) and the space before it,
+checks for a `)`, matches it back to its `(` (parens counted; ceiling 1 below), and peels
+any further redundant `(` right after that one -- `((-t))`'s outer pair wraps `(-t)`
+itself, so the peel is not optional -- until it finds `- ! ~` or gives up. The three call
+sites (`tk_dot` teko_expr.tk, `tk_bracket` teko_params.tk, `tk_qd_infix` teko_null.tk) gate
+their existing sink on `!tk_unary_parened(oplen)`; the sink's own shape (`tk_unary_base`,
+`tk_unary_rewrap`) is untouched.
+
+**Ceiling 1 (documented, not fixed): a string literal or a comment between the group and
+the operator is not read as one.** The scan is bytes, not tokens -- a `(`/`)` inside either
+is counted as a real paren. Nothing in this repository's fixtures or library files puts one
+there, and a lexically-aware scan would need the lexer's own token stream, which a
+`syntax_infix` handler receives only going FORWARD (`p_skip_balanced`'s own road, mc core);
+going backward past an already-consumed token, there is none.
+
+**Ceiling 2: the scan gives up after `TK_UNARY_PAREN_MAX` (4096) bytes without closing a
+paren at depth 0**, answering "not parenthesized" -- today's sink -- rather than reading
+arbitrarily far back with no floor. Far more than any real parenthesized unary receiver
+spans; a floor this wide costs nothing measurable and keeps the scan inside the buffer
+`p_src_end()` already bounds going forward.
+
+**Neither refuse fixture needed a new refusal.** `(-arr)[0]` and `(-oc)?.M()` both
+already end at `teko: <row> declares no operator \`-\`` (`tk_op_none_msg`,
+`teko_ops.tk`) -- the SAME pre-existing rule that already refuses `i64[] narr = -arr;` and
+`!oc`/`-oc` on any nullable class today. The fix only changes which node that rule is asked
+about: before, `(-arr)[0]` sank to `-(arr[0])`, which COMPILED and answered the silently
+wrong value (measured on `758ad9ce`: exit 251, `-(arr[0])` = -5); `(-oc)?.M()` sank to
+`-(oc?.M())`, refused too, but naming `i64?` -- the boxed RETURN of `M()`, never the `Cell?`
+a reader actually negated. After the fix, both refuse pointing at the receiver the source
+wrote, `i64[]` and `Cell?`, at the line the source wrote it on.
+
+**The readings table**, `t = TimeSpan.FromHours(-3)` throughout, measured on this branch:
+
+| source | before (`758ad9ce`) | after |
+|---|---|---|
+| `(-t).Duration().Hours` | -3 (wrong) | 3 |
+| `-t.Duration().Hours` | -3 | -3 (unchanged: no group to bind to) |
+| `-(t).Duration().Hours` | -3 | -3 (unchanged: the `(` wraps only `t`, C#'s own reading) |
+| `(-(t)).Duration().Hours` | 3 | 3 (unchanged: outer group wraps `-(t)` whole already) |
+| `((-t)).Duration().Hours` | 3 | 3 (unchanged: one more redundant layer, peeled either way) |
+| `(-arr)[0]` | compiles, -5 (wrong) | `teko: i64[] declares no operator \`-\`` |
+| `(-oc)?.M()` | `teko: i64? declares no operator \`-\`` (wrong receiver named) | `teko: Cell? declares no operator \`-\`` (the real one) |
+| `(-d).ToString()` (`decimal`) | measured: exit 139 (SIGSEGV) -- `d.ToString()` returns a `str`, an 8-byte pointer, and `tk_dec_neg` reads it as a 16-byte `decimal` | `"-1.5"` |
+| `(-1m).CompareTo(1m)` (`decimal`) | 0 (`-(1m.CompareTo(1m))` = `-0`) | -1 |
+
+Five of the nine rows move: the `TimeSpan` reading that used to answer the wrong VALUE
+silently, the array and the nullable that used to compile wrong or refuse the wrong
+receiver, and the two `decimal` rows (one of them a segfault). The other four stand exactly
+where they stood: `-t...`/`-(t)...` had no group to bind to in the first place (the sink is
+C#'s own reading there, unchanged), and the two redundantly-nested forms already collapsed
+to the same AST either way. No existing fixture wrote the parenthesized form, so nothing
+already accepted moves.
+
+**The gate.** `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh
+./build/teko mc.macos.toml` -> **99 passed, 121 refused as expected, 0 failed** (98 + 1 new
+accept fixture, 119 + 2 new refuse fixtures); `sh scripts/bootstrap.sh --os macos --arch
+aarch64` -> **FIXPOINT OK**; `sh scripts/check-docs.sh` -> `docs ok: 683 links, 67
+fragments, 406 diagnostics, 121 refusals, 151 samples, manifest listed`.
+
+`--dump-ast` of every fixture that predates this crumb (`758ad9ce`, `--include=lib
+--include=tests[/refuse]`, single-file mode, base and this crumb each its own worktree):
+**98 of 98 `tests/*.tk` and 119 of 119 `tests/refuse/*.tk` byte-identical** -- every
+pre-existing program, accepted or refused, parses to the exact same tree either compiler
+builds. None of them writes the parenthesized form the probe reads, so the probe never
+fires on any of them; this is the no-op proof.
+
+`mc build . --config mc.macos.toml --compiler-only --limits`, `rm -rf build` first on both
+legs, `758ad9ce` (before) vs this branch (after): `intrin` 0 -> 0, `types` 1 -> 1, `syntax`
+0 -> 0, `alias` 1 -> 1, `passes` 0 -> 0 -- every budget row D21 (zero new intrinsics) is
+measured against, unmoved. `nodes` 170902 -> 171117 (+215), `funcs` 3384 -> 3386 (+2, the
+two functions this crumb adds -- `tk_unary_ws`, `tk_unary_parened`), `ins` 235739 -> 236053
+(+314), `symbols` 6695 -> 6697 (+2). `heap` (the one row `mc limits` reports in bytes, never
+elements) moved from 101088544 to 101245504, +156960 bytes, +0.16% -- stated as what it is,
+not offered as proof of anything: the proof is the readings table above, the three new
+fixtures, and the 217 pre-existing fixtures' `--dump-ast` unmoved.

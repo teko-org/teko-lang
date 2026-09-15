@@ -55,9 +55,23 @@ message, the two functions alternating on the stack.
 **A core prefix never sees a module's postfix.** `- ! ~` are in the core's own prefix
 table, and it reads their operand by a recursion that never reaches the point where
 `syntax_expr` lives. Registering `syntax_expr("-")` is unreachable code. The fix belongs to
-the **postfix** side: `.`/`[` sink through the `- ! ~` chain they received as their left
-operand and rebuild it around the result ([`teko_prefix.tk`](../../teko_prefix.tk)).
+the **postfix** side: `.`/`[`/`?.` sink through the `- ! ~` chain they received as their
+left operand and rebuild it around the result ([`teko_prefix.tk`](../../teko_prefix.tk)).
 *Symptom:* `!b[1]` parses as `(!b)[1]`.
+
+**...but the sink must stop at a SOURCE `(...)`.** The chain above is only the receiver
+when nothing in the source set it apart — `(-t).Duration()` is `(-t)` first, C#'s own
+reading, and the unconditional sink used to answer `-(t.Duration())` for it too (D80): a
+3-hour `TimeSpan` read `-3` through `.Hours`, `(-arr)[0]` compiled to `-(arr[0])` where C#
+refuses, and `(-oc)?.M()` failed late, on the wrong type, once `-` landed on `?.`'s own
+boxed result. Parens carry no AST signal to gate on — mc's core returns `(expr)` as `expr`
+itself, no `N_PAREN`, no flag (`mc/src/parse.mc`) — so the probe reads raw source bytes
+backward from wherever the postfix handler's `cur` sits (`tk_unary_parened`,
+`teko_prefix.tk`): skip whitespace, match a `)` back to its `(` (a string literal or a
+comment with an unmatched paren inside is not read as one — the documented ceiling), peel
+any redundant nested parens, and check for `- ! ~` right after. *Symptom:* a parenthesized
+negation silently returns the WRONG value through `.`/`[`, or refuses on the wrong type
+through `?.`, never on the receiver a reader actually wrote.
 
 **A bare `break;` arrives with level 1, a bare `continue;` with level 0.** The two are not
 symmetric in the core, and a lowering that treats them alike is wrong on one of them.
