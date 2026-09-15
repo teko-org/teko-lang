@@ -1,0 +1,121 @@
+// primitives_decimal_round.tk -- C5 of docs/specs/decimal.md (§ 7, § 11, § 12;
+// D79): the five statics that reshape a value, the two that read it, and the
+// five that ARE one.
+//
+// The values are the ones that only come out right under C#'s own rules:
+//
+//   decimal.Round(2.5m) == 2m     HALF TO EVEN -- half away from zero, the
+//   decimal.Round(3.5m) == 4m     rule the OPERATORS carry (§ 5), would answer
+//   decimal.Round(-2.5m) == -2m   3m and -3m here
+//   Round(2.675m, 2) == 2.68m     2.675 is EXACT in base ten, so it is a tie
+//                                 and the kept digit 7 is odd: it goes up
+//   Round(1.5m, 3) == 1.5m        the scale never GROWS: still scale 1
+//   Floor(-1.5m) == -2m           toward minus infinity
+//   Ceiling(-1.5m) == -1m         toward plus infinity
+//   Truncate(-1.5m) == -1m        toward zero
+//   Floor(1.50m).Scale == 0       the three answer at scale zero, as C# does
+//
+// `Math.Round(d, n)` is C#'s other spelling of the same five, an ordinary
+// class of static methods in `lib/math.tk` that needs no mechanism at all.
+//
+// expect-exit: 42
+#include "rt.tk"
+#include "decimal.tk"
+#include "math.tk"
+
+// the wide ARGUMENT road no row had before this crumb (D79): the integer
+// reaches a `decimal` column through `tk_dec_from_i64`, written by
+// `tk_prim_arg_widen` (teko_prim.tk) for every argument the parser cannot type
+// -- a parameter is one of them.
+decimal half_of(i64 n) {
+    return decimal.Round(n, 0);
+}
+
+i64 main() {
+    // ---- half to even, at zero places ----
+    if (decimal.Round(2.5m) != 2m) return 1;
+    if (decimal.Round(3.5m) != 4m) return 2;
+    if (decimal.Round(-2.5m) != -2m) return 3;
+    if (decimal.Round(2.4m) != 2m) return 4;
+    if (decimal.Round(2.6m) != 3m) return 5;
+    // not a tie: something is left below the five
+    if (decimal.Round(2.51m) != 3m) return 6;
+
+    // ---- half to even, at n places ----
+    if (decimal.Round(2.675m, 2) != 2.68m) return 7;
+    if (decimal.Round(2.665m, 2) != 2.66m) return 8;   // the kept 6 is even
+    if (decimal.Round(21.385m, 2) != 21.38m) return 9; // the kept 8 is even
+    if (decimal.Round(2.6651m, 2) != 2.67m) return 10; // not a tie at all
+
+    // the scale never grows, and the value is handed back untouched
+    decimal keep = decimal.Round(1.5m, 3);
+    if (keep != 1.5m) return 11;
+    if (keep.Scale != 1) return 12;
+    if (decimal.Round(21.385m, 2).Scale != 2) return 13;
+
+    // ---- Truncate, Floor, Ceiling on both signs ----
+    if (decimal.Truncate(1.5m) != 1m) return 14;
+    if (decimal.Truncate(-1.5m) != -1m) return 15;
+    if (decimal.Floor(1.5m) != 1m) return 16;
+    if (decimal.Floor(-1.5m) != -2m) return 17;
+    if (decimal.Ceiling(1.5m) != 2m) return 18;
+    if (decimal.Ceiling(-1.5m) != -1m) return 19;
+    // an integral value keeps it, whatever the sign
+    if (decimal.Floor(-2m) != -2m) return 20;
+    if (decimal.Ceiling(2m) != 2m) return 21;
+    // and all three answer at scale zero
+    if (decimal.Floor(1.50m).Scale != 0) return 22;
+    if (decimal.Ceiling(1.50m).Scale != 0) return 23;
+    if (decimal.Truncate(1.50m).Scale != 0) return 24;
+
+    // ---- Abs ----
+    if (decimal.Abs(-1.5m) != 1.5m) return 25;
+    if (decimal.Abs(1.5m) != 1.5m) return 26;
+    if (decimal.Abs(-1.50m).Scale != 2) return 27;   // the scale is untouched
+
+    // ---- .Sign and .Scale ----
+    decimal neg = -0.001m;
+    if (neg.Sign != 0 - 1) return 28;
+    if (1.5m.Sign != 1) return 29;
+    if (0m.Sign != 0) return 30;
+    // `-0m` is a live bit pattern whose VALUE is zero, and `.Sign` reads the
+    // value and not the bit. It is bound to a local first, because `.` sinks
+    // THROUGH a prefix `-` (teko_prefix.tk) and `(-0m).Sign` would read as
+    // `-(0m.Sign)` -- C#'s grouping of a parenthesized prefix is not this
+    // compiler's yet, and it is no part of this crumb.
+    decimal mzero = -0m;
+    if (mzero.Sign != 0) return 31;
+    if (neg.Scale != 3) return 32;
+    if (1m.Scale != 0) return 33;
+    if (1.0000m.Scale != 4) return 34;
+
+    // ---- the five constant statics ----
+    if (decimal.Zero != 0m) return 35;
+    if (decimal.One != 1m) return 36;
+    if (decimal.MinusOne != -1m) return 37;
+    if (decimal.MaxValue != 79228162514264337593543950335m) return 38;
+    if (decimal.MinValue != -79228162514264337593543950335m) return 39;
+    if (decimal.MaxValue.Sign != 1) return 40;
+    if (decimal.MinValue.Sign != 0 - 1) return 41;
+
+    // ---- an integer where a `decimal` is asked for ----
+    if (decimal.Round(5, 0) != 5m) return 43;
+    i64 n = 7;
+    if (decimal.Round(n, 0) != 7m) return 44;
+    if (decimal.Abs(-9) != 9m) return 45;
+    if (half_of(11) != 11m) return 46;
+    // ...and a nested call on a wide column, which crosses under its own type
+    if (decimal.Round(decimal.Abs(-2.5m)) != 2m) return 47;
+
+    // ---- `Math`, C#'s other spelling (lib/math.tk) ----
+    // An ordinary class with static methods that forward: no mechanism, no
+    // registration, and the same five answers.
+    if (Math.Round(2.5m) != 2m) return 48;
+    if (Math.Round(2.675m, 2) != 2.68m) return 49;
+    if (Math.Truncate(-1.5m) != -1m) return 50;
+    if (Math.Floor(-1.5m) != -2m) return 51;
+    if (Math.Ceiling(-1.5m) != -1m) return 52;
+    if (Math.Abs(-1.5m) != 1.5m) return 53;
+
+    return 42;
+}

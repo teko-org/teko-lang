@@ -231,6 +231,97 @@ i64 tk_dec_lit() {
     return id;
 }
 
+// ---- the API (docs/specs/decimal.md § 7; D79) ----
+// Every row names an ordinary function of `lib/decimal.tk` with surface code,
+// and the mechanism is teko_prim.tk's member table -- the one `TimeSpan`
+// brought and `Guid` reads with a WIDE receiver (D75). `decimal` is the first
+// type whose rows take a wide ARGUMENT as well (`decimal.Round(d, 2)`), which
+// is the one line of teko_prim.tk this crumb owed (`tk_prim_arg_widen`, D79).
+//
+// `ToDouble` and `FromDouble` are NOT registered (D79, ruling 1): `(f64) d`
+// and `(decimal) x` are C4's own conversion rows and are the same two
+// functions under C#'s own spelling of them (§ 6), so a member would be a
+// second door to one road.
+void tk_dec_statics() {
+    i64 d = tk_ty_decimal;
+    tk_prim_member(d, "Zero",     TK_PMSVAL, 0 - 1, "tk_dec_zero",     d);
+    tk_prim_member(d, "One",      TK_PMSVAL, 0 - 1, "tk_dec_one",      d);
+    tk_prim_member(d, "MinusOne", TK_PMSVAL, 0 - 1, "tk_dec_minusone", d);
+    tk_prim_member(d, "MaxValue", TK_PMSVAL, 0 - 1, "tk_dec_max",      d);
+    tk_prim_member(d, "MinValue", TK_PMSVAL, 0 - 1, "tk_dec_min",      d);
+    // the two `Round` rows are one overload set told apart by the number of
+    // arguments written (`tk_prim_pick`), the way `.ToString()` and
+    // `.ToString(n)` are below
+    tk_prim_member(d,  "Round", TK_PMSFUN, d, "tk_dec_round", d);
+    tk_prim_member2(d, "Round", TK_PMSFUN, d, TY_I64, "tk_dec_round_at", d);
+    tk_prim_member(d, "Truncate", TK_PMSFUN, d, "tk_dec_trunc", d);
+    tk_prim_member(d, "Floor",    TK_PMSFUN, d, "tk_dec_floor", d);
+    tk_prim_member(d, "Ceiling",  TK_PMSFUN, d, "tk_dec_ceil",  d);
+    tk_prim_member(d, "Abs",      TK_PMSFUN, d, "tk_dec_abs",   d);
+    tk_prim_member(d, "Parse",    TK_PMSFUN, TY_UPTR, "tk_dec_parse", d);
+    // The row `tk_dec_tryparse_expr` below never emits: `decimal.TryParse(s,
+    // out d)` is hand-parsed, because `out <name>` is no column this table has
+    // (teko_prim.tk's `pmr_*` rows carry a type per position and no KIND). It
+    // is registered all the same, so `d.TryParse(...)` on an instance answers
+    // ``teko: decimal.TryParse is static; reach it through its type`` instead
+    // of reading as a member nobody ever heard of -- `Guid`'s own shape (D75).
+    tk_prim_membern(d, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_dec_tryparse", TY_I64);
+}
+
+void tk_dec_members() {
+    i64 d = tk_ty_decimal;
+    tk_prim_member(d, "ToString", TK_PMFUN, 0 - 1,  "tk_dec_tostring",   TY_UPTR);
+    tk_prim_member(d, "ToString", TK_PMFUN, TY_I64, "tk_dec_tostring_n", TY_UPTR);
+    tk_prim_member(d, "CompareTo", TK_PMFUN, d, "tk_dec_cmp", TY_I64);
+    tk_prim_member(d, "Equals",    TK_PMFUN, d, "tk_dec_eq",  TY_I64);
+    // `.Scale` is the raw byte of the layout (§ 1) and `.Sign` is C#'s
+    // `-1`/`0`/`1` over the VALUE -- `tk_dec_signum` and not `tk_dec_sign`,
+    // which is the sign BIT and answers 1 for `-0m`.
+    tk_prim_member(d, "Scale", TK_PMPROP, 0 - 1, "tk_dec_scale",   TY_I64);
+    tk_prim_member(d, "Sign",  TK_PMPROP, 0 - 1, "tk_dec_signum", TY_I64);
+}
+
+// ---- `decimal.TryParse(s, out d)`, parsed by hand ----
+// `tk_guid_tryparse_expr`'s own shape (teko_guid.tk) and for the same reason:
+// `out d` is read through `tk_ref_addr` (teko_ref.tk) rather than through
+// `parse_expr`'s registered `out` handler, and the argument is TAGGED after
+// the fact so teko_ref.tk's pass judges what parse time could not -- a
+// global's declared type, and a `ref`/`out` parameter repassed as the caller's
+// own slot rather than `&name`, the callee's slot that dies on return.
+i64 tk_dec_tryparse_expr(i64 line, uptr fl) {
+    tk_prim_need_include(tk_ty_decimal, "tk_dec_tryparse", line, fl);
+    p_expect(K_LPAR, "expected ( after TryParse");
+    i64 se = parse_expr(0);
+    p_expect(K_COMMA, "expected , after the string");
+    if (type_of_token(p_id()) != tk_ty_out)
+        err_at(fl, line, "teko: TryParse's second argument is `out <name>`");
+    p_next();
+    i64 pty = 0 - 1;
+    i64 oe = tk_ref_addr(line, fl, &pty);
+    p_expect(K_RPAR, "expected ) after TryParse");
+    if (pty >= 0 && pty != tk_ty_decimal)
+        tk_reject_compat(tk_pointee_name(pty), "decimal", line, fl);
+    tk_rfarg_tag(oe, TK_RP_OUT, pty);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call2("tk_dec_tryparse", se, oe);
+}
+
+// the type word in EXPRESSION position: this file's own handler rather than
+// teko_prim.tk's `tk_prim_expr`, for the one static above. Every other member
+// goes straight to the table, with the member name already read
+// (`tk_prim_static_m`), so nothing is duplicated here.
+i64 tk_dec_expr() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                    // the type word
+    if (!p_accept(tk_dot_tok))
+        err_at2(fl, line, "teko: a type name reaches its static members", "decimal");
+    uptr m = tk_member_name();                   // D68
+    if (str_eq(m, "TryParse")) return tk_dec_tryparse_expr(line, fl);
+    return tk_prim_static_m(tk_ty_decimal, m, line, fl);
+}
+
 // ---- registration ----
 // Called from `teko_init()` BEFORE `tk_float_init()`, for the literal's sake
 // (§ 3); the MACHINE is registered separately and after it (`tk_wide_init`,
@@ -247,21 +338,24 @@ i64 tk_dec_lit() {
 // `decimal` in a loop would be a block to reclaim. C# gives it value semantics
 // and no heap, and `type_new` is the mechanism that gives exactly that.
 //
-// No `syntax_expr("decimal")` and no `syntax_stmt("decimal")`: those are what a
-// primitive needs to be written as a RECEIVER (`decimal.Round(d)`), and C3 has
-// no static member to reach. The core's own type parser already reads
-// `decimal d = ...;` from the registry, so the two rows stay unspent until C5
-// needs them (`mc limits`' `syntax` row, D74).
+// `syntax_expr("decimal")` and `syntax_stmt("decimal")` are what let the type
+// word open an expression and a statement (`decimal.Zero`, `decimal.Round(d)`);
+// the core's own type parser already reads `decimal d = ...;` from the
+// registry. They are the two rows D74 left unspent for C5, and they count as
+// ONE row of `mc limits`' `syntax`, which is keyed by NAME.
 void tk_dec_init() {
     tk_ty_decimal = type_new("decimal", 16, 16, TK_WIDE);
     tk_wide_add(tk_ty_decimal, "tk_dec_ld", "tk_dec_st", "tk_dec_retbuf");
-    // C4 fills the OPERATOR half of this table (`tk_dec_ops` below) and leaves
-    // the MEMBER half empty: `decimal.Round`, `.ToString` and `Parse` are C5,
-    // and an empty member table answers every one of them by name. The reader
-    // and the builder columns stay 0 for the same reason -- `(str) d` earns
-    // "a decimal does not cast yet" until the pair exists to be named.
-    tk_prim_type(tk_ty_decimal, "decimal", "decimal.tk", 0, 0, "0m");
+    // D79: the reader and the builder columns are filled, so `(str) d` --
+    // the one cast the conversion table does not name -- says what writes the
+    // text and what reads it back instead of C3's shorter "does not cast yet".
+    tk_prim_type(tk_ty_decimal, "decimal", "decimal.tk",
+                 "`.ToString()` writes it", "`decimal.Parse(s)` reads it", "0m");
     syntax_lit(&tk_dec_lit);
+    syntax_expr("decimal", &tk_dec_expr);
+    syntax_stmt("decimal", &tk_prim_stmt);
+    tk_dec_statics();
+    tk_dec_members();
 }
 
 // ---- the operators and the conversions (§ 5, § 6; D77) ----

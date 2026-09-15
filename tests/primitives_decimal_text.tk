@@ -1,0 +1,108 @@
+// primitives_decimal_text.tk -- C5 of docs/specs/decimal.md (§ 7, § 11, § 12;
+// D79): the text in both directions.
+//
+// `ToString` writes the SHORTEST EXACT form -- the mantissa with the point
+// placed by the scale -- and keeps trailing zeros, because `1.50m` and `1.5m`
+// are two values with two scales and text that dropped the zero would read
+// back as the other one. `Parse` accepts exactly what `ToString` writes plus
+// an optional exponent, and `TryParse` answers 0/1 without ever panicking.
+//
+//   1.50m       -> "1.50"      trailing zeros kept
+//   0m, -0m     -> "0"         the sign is the VALUE's (D79, ruling 4)
+//   0.00m       -> "0.00"      ...and a zero still carries its scale
+//   1m / 3m     -> 28 places, the answer the operators give (§ 5)
+//   1.5m.ToString(3) -> "1.500"   C#'s "F3": rounded, then padded
+//   "1e3"       -> 1000m       the exponent moves the scale
+//   "1.5E-2"    -> 0.015m      ...in the other direction
+//
+// expect-exit: 42
+#include "rt.tk"
+#include "decimal.tk"
+
+i64 same(str a, str b) { return tk_str_eq(a, b); }
+
+i64 main() {
+    // ---- ToString(): the shortest exact form ----
+    if (!same(1.50m.ToString(), "1.50")) return 1;
+    if (!same(1.5m.ToString(), "1.5")) return 2;
+    if (!same(0m.ToString(), "0")) return 3;
+    // every negative receiver is bound to a local first: `.` sinks THROUGH a
+    // prefix `-` (teko_prefix.tk), so `(-0m).ToString()` reads as
+    // `-(0m.ToString())` -- C#'s grouping of a parenthesized prefix is not
+    // this compiler's yet, and it is no part of this crumb.
+    decimal mzero = -0m;
+    if (!same(mzero.ToString(), "0")) return 4;
+    if (!same(0.00m.ToString(), "0.00")) return 5;
+    decimal mbig = -123.456m;
+    if (!same(mbig.ToString(), "-123.456")) return 6;
+    if (!same(0.05m.ToString(), "0.05")) return 7;
+    decimal mhalf = -0.5m;
+    if (!same(mhalf.ToString(), "-0.5")) return 8;
+    if (!same(123m.ToString(), "123")) return 9;
+    // the two ends of the range, 29 digits each
+    if (!same(decimal.MaxValue.ToString(), "79228162514264337593543950335")) return 10;
+    if (!same(decimal.MinValue.ToString(), "-79228162514264337593543950335")) return 11;
+    // ...and the longest fraction, all 28 places
+    if (!same((1m / 3m).ToString(), "0.3333333333333333333333333333")) return 12;
+    if (!same((1m / 3m * 3m).ToString(), "0.9999999999999999999999999999")) return 13;
+
+    // ---- ToString(places): C#'s "F<n>" ----
+    if (!same(1.5m.ToString(3), "1.500")) return 14;
+    if (!same(1.5m.ToString(0), "2")) return 15;          // half to even: 1 is odd
+    if (!same(2.5m.ToString(0), "2")) return 16;          // ...and 2 is even
+    if (!same(2.675m.ToString(2), "2.68")) return 17;
+    if (!same(0m.ToString(2), "0.00")) return 18;
+    if (!same(123m.ToString(1), "123.0")) return 19;
+    decimal mtie = -1.005m;
+    if (!same(mtie.ToString(2), "-1.00")) return 20;      // the tie keeps the 0
+    // the padding is TEXT and not a mantissa: 29 digits and two more places is
+    // a number no 96-bit mantissa holds
+    if (!same(decimal.MaxValue.ToString(2), "79228162514264337593543950335.00")) return 21;
+
+    // ---- Parse: what ToString writes ----
+    if (decimal.Parse("1.50") != 1.5m) return 22;
+    if (decimal.Parse("1.50").Scale != 2) return 23;
+    if (decimal.Parse("-123.456") != -123.456m) return 24;
+    if (decimal.Parse("0") != 0m) return 25;
+    if (decimal.Parse("0").Sign != 0) return 26;
+    if (decimal.Parse("-0").Sign != 0) return 27;
+    if (decimal.Parse("+2") != 2m) return 28;
+    if (decimal.Parse("79228162514264337593543950335") != decimal.MaxValue) return 29;
+    // ...and the exponent, which is what it accepts BEYOND that
+    if (decimal.Parse("1e3") != 1000m) return 30;
+    if (decimal.Parse("1e3").Scale != 0) return 31;
+    if (decimal.Parse("1.5E-2") != 0.015m) return 32;
+    if (decimal.Parse("1.5E-2").Scale != 3) return 33;
+    if (decimal.Parse("1E+2") != 100m) return 34;
+    // C# accepts both sides of the point empty, one at a time
+    if (decimal.Parse(".5") != 0.5m) return 35;
+    if (decimal.Parse("5.") != 5m) return 36;
+    // the round trip, over a value whose text is the long one
+    if (decimal.Parse((1m / 3m).ToString()) != 1m / 3m) return 37;
+
+    // ---- TryParse: 1 and the value, or 0 and Zero ----
+    decimal v = 9m;
+    if (!decimal.TryParse("2.25", out v)) return 38;
+    if (v != 2.25m) return 39;
+    if (v.Scale != 2) return 40;
+    if (decimal.TryParse("x", out v)) return 41;
+    if (v != decimal.Zero) return 43;
+    if (decimal.TryParse("", out v)) return 44;
+    if (decimal.TryParse("1 000", out v)) return 45;     // no separator of any kind
+    if (decimal.TryParse(" 1", out v)) return 46;        // and no space around it
+    if (decimal.TryParse("1.2.3", out v)) return 47;
+    if (decimal.TryParse("1e", out v)) return 48;
+    if (decimal.TryParse("1e40", out v)) return 49;      // parsable, does not fit
+    if (decimal.TryParse("0.12345678901234567890123456789", out v)) return 50;  // 29 places
+    if (!decimal.TryParse("0.1234567890123456789012345678", out v)) return 51;  // 28, exactly
+
+    // ---- CompareTo and Equals: the VALUE, whatever the scale ----
+    if (1.0m.CompareTo(1.00m) != 0) return 52;
+    if (1m.CompareTo(2m) != 0 - 1) return 53;
+    if (2m.CompareTo(1m) != 1) return 54;
+    if (!1.50m.Equals(1.5m)) return 55;
+    if (0.5m.Equals(0.6m)) return 56;
+    if (mzero.CompareTo(0m) != 0) return 57;
+
+    return 42;
+}
