@@ -265,21 +265,28 @@ reference](types.md#i128-and-u128)). N6b's first crumb (N6b-1, D83) landed `%`, 
 `&`, `|`, `^` and `~` too — `%` truncating with the sign of the DIVIDEND alone, `>>`
 arithmetic for `i128` and logical for `u128`, and a shift count masked to its own low 7
 bits (`count & 127`, .NET's own `Int128`/`UInt128` mask), since the count converts to the
-SAME wide type before the operator row is looked up and never to `i64`. What is still
-N6b's, and every row below is refused by name until it lands:
+SAME wide type before the operator row is looked up and never to `i64`. N6b's second crumb
+(N6b-2, D84) landed the `f64` and `decimal` conversions, both directions, both types: `(f64)
+x` rounds once, to nearest even, over the whole 128-bit magnitude; `(i128)/(u128) x` on a
+`double` truncates toward zero and SATURATES rather than wraps (NaN → 0, a magnitude past the
+bound → that bound, .NET's own `Int128`/`UInt128` rule); `(decimal) x` panics `teko: decimal
+overflow` past `2^96`; `(i128)/(u128) d` truncates and can only overflow on the unsigned
+side, reading a negative `decimal`. None of the six is implicit either way — `tk_num_wide_
+widens` still answers 0 for a wide source (D38). What is still N6b's — its third crumb,
+N6b-3 — and every row below is refused by name until it lands:
 
 | written | what happens |
 |---|---|
 | `x.ToString()`, `x.CompareTo(y)`, `x.Equals(y)` | `teko: unknown member of i128: ToString` (the member's own name after the colon) |
 | `i128.MaxValue`, `MinValue`, `Zero`, `One`, `Parse`, `TryParse` | `teko: unknown static member of i128: <name>` — `i128.MinValue` is written `-170141183460469231731687303715884105727i - 1i` meanwhile, because the literal carries the magnitude only |
-| `(f64) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` — the float rows are N6b's |
-| `(decimal) x` | ``teko: a decimal does not cast; `.ToString()` writes it and `decimal.Parse(s)` reads it`` — the refusal names the TARGET when the target is a primitive; `(i128) d` earns `teko: an i128 does not cast yet` for the same missing row |
-| `(str) x` | `teko: an i128 does not cast yet` — text is `.ToString()`/`i128.Parse(s)`, and both are N6b, so the type registers no reader and no builder clause yet |
+| `(str) x` | `teko: an i128 does not cast yet` — text is `.ToString()`/`i128.Parse(s)`, and both are N6b-3's, so the type registers no reader and no builder clause yet |
 | `new i128()` | `teko: new i128() is not taught; write 0i` — D76's shared guard for every wide type's zero-argument constructor |
 | `const i128 K = 1i;`, `case 1i:`, an array size | `teko: const requires a constant expression` / `teko: a case label must be a constant expression` — the folder has no 128-bit arithmetic, exactly as for `decimal` |
 | `i128 g = 1i;` at file scope | `global initializer must be constant`, from the core; `i128 g = 5;` gets past that rule and is refused by name, `teko: a global i128 takes no initializer`. A wide global is a slot and an assignment |
 | `extern i64 f(i128 v);` | ``teko: an `extern` takes no i128`` — the sixteen-byte convention is teko's own and is not a C ABI |
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` — C# refuses the same pair without a cast, and this one is a RULE and not a gap: `(i128) u` and `(u128) x` are the two spellings, and neither moves a bit |
+| `f64 x = v;`, `decimal d = v;` on an `i128`/`u128` `v` | `teko: a value of type i128 does not convert to f64`/`decimal` — D84's own six rows are explicit only, the same rule every other conversion of a wide type already follows |
+| `a & b == c` on `i128`/`i128`/`i128` | **accepted, and read as `a & (b == c)`** where a reader used to C#'s precedence expects `(a & b) == c` — `mc`'s core grammar gives `&`/`\|`/`^` LOWER precedence than `==` (C's own table, D3), and `b == c` answers `i64` 0/1, which `tk_ops_promote` widens to the wide type before `&` is looked up, so the expression TYPE CHECKS rather than refuses. `%`, `<<`, `>>`, `&`, `\|`, `^` opened this door for `i128`/`u128` (D83); it was already open for `i8`/`u8`/every other integer. Write `(a & b) == c` |
 | `Int128.PopCount`, `LeadingZeroCount`, `RotateLeft` | C# 11's generic-math surface; a library, once there is one ([small-ints.md § 9](../specs/small-ints.md)) |
 | `checked` / `unchecked` | teko has neither word; `i128` wraps, which is C#'s unchecked default and the only behaviour there is |
 

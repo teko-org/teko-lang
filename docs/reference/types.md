@@ -1238,8 +1238,18 @@ same pair.
 | any integer (`u8`..`i64`, `i8`, `i16`, `i32`) | `i128`, `u128` | **implicit**, and `(i128) n` writes it down. A `u64` at or above 2^63 goes through a row of its own, so it never converts through a signed door |
 | `i128`, `u128` | any integer | **explicit** `(i64) v`, `(i32) v`, `(u64) v` — the low 64 bits, then the ordinary narrowing |
 | `i128` | `u128`, and back | **explicit**, the same bits: `(u128)(-1i)` is `2^128−1`, C#'s own answer |
-| `i128`, `u128` | `f64`, `decimal`, `str` | **not taught yet** (N6b): `teko: an i128 does not cast yet` |
+| `i128`, `u128` | `f64` | **explicit** `(f64) v`, ROUNDS once, to nearest even, over the whole 128-bit magnitude (D84) |
+| `f64` | `i128`, `u128` | **explicit** `(i128) x`, truncates toward zero and SATURATES: NaN → 0, a magnitude at or past the type's own bound → that bound — .NET's `Int128`/`UInt128` rule, and teko's own since there is no `checked` word (D84) |
+| `i128`, `u128` | `decimal` | **explicit** `(decimal) v`; a magnitude at or past `2^96` (`decimal.MaxValue`) panics `teko: decimal overflow`, exit 70 (D84) |
+| `decimal` | `i128`, `u128` | **explicit** `(i128) d`, truncates toward zero and never overflows the width it lands in; `(u128) d` panics `teko: decimal overflow`, exit 70, on a negative `d` whose truncated MAGNITUDE is still nonzero (`-0.5m` → `0u` is fine, `-1m` is not) — C#'s own rule for a negative decimal read into an unsigned type (D84) |
+| `i128`, `u128` | `str` | **not taught yet** (N6b-3): `teko: an i128 does not cast yet` |
 | `null`, a class, a struct, a `T[]` | either | refused |
+
+None of the six new rows opens an IMPLICIT door either way: `f64 x = v;` and `decimal d = v;`
+on an `i128`/`u128` `v` are both refused, `teko: a value of type i128 does not convert to
+f64`/`decimal` — the conversion table's row is read only from an explicit `N_CAST`
+(`tk_prim_cast_lower`), and `tk_num_wide_widens` still answers 0 for a wide source (D38),
+so a plain assignment builds no cast at all (D84).
 
 **What is refused**, and with which words:
 
@@ -1247,7 +1257,8 @@ same pair.
 |---|---|
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
 | `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
-| `(f64) x`, `(str) x`, `(i128) 1.5` | `teko: an i128 does not cast yet` (`a u128` for the other) |
+| `f64 x = v;`, `decimal d = v;` on an `i128`/`u128` `v` | `teko: a value of type i128 does not convert to f64`/`decimal` — the six rows above are explicit only (D84) |
+| `(str) x` | `teko: an i128 does not cast yet` (`a u128` for the other) — N6b-3 |
 | `x.ToString()` | `teko: unknown member of i128: ToString` — N6b |
 | `i128.MaxValue` | `teko: unknown static member of i128: MaxValue` — N6b |
 | `170141183460469231731687303715884105728i` | `teko: an i128 literal is out of range` |

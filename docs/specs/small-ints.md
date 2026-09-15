@@ -324,10 +324,15 @@ between `putf64` and `fmt_f64`.
 | any integer | `i128`, `u128` | **explicit**: `(i128) n`, lowered to `tk_i128_from_i64` / `tk_u128_from_u64` |
 | `i128`, `u128` | any integer | **explicit**: `(i64) v`, lowered to `tk_i128_to_i64`, truncating |
 | `i128` | `u128`, and back | **explicit**, the same bits |
-| `i128`, `u128` | `f64` | **explicit**: `(f64) v`, lowered to a call, rounding |
-| `f64` | `i128`, `u128` | **explicit**, truncating toward zero |
-| `i128`, `u128` | `decimal` | **explicit**, both directions, when both pages have landed |
+| `i128`, `u128` | `f64` | **explicit**: `(f64) v`, lowered to a call — **landed, N6b-2, D84**: rounds ONCE, to nearest even, over the whole 128-bit magnitude |
+| `f64` | `i128`, `u128` | **explicit**, truncating toward zero — **landed, N6b-2, D84**: SATURATING (NaN → 0, past the bound → that bound), .NET's own `Int128`/`UInt128` rule and teko's own since there is no `checked` word |
+| `i128`, `u128` | `decimal` | **explicit**, both directions — **landed, N6b-2, D84**: `(decimal) v` panics `teko: decimal overflow` past `2^96`; `(i128)/(u128) d` truncates toward zero, and only the unsigned side can overflow (a negative `d` whose truncated magnitude is still nonzero) |
 | `null`, a class, a struct, a `T[]` | any of the four | refused (D32/D34) |
+
+None of the six new rows is implicit in either direction: `tk_num_wide_widens`
+(teko_typeof.tk) still answers 0 for a wide source (D38), so `f64 x = v;` and
+`decimal d = v;` on an `i128`/`u128` `v` build no cast at all and are refused,
+`teko: a value of type i128 does not convert to f64`/`decimal`.
 
 Everything about `i128` and `u128` that is not a comparison is a **call**, so `tk_cast`
 (teko_array.tk) is where the explicit direction lives — a cast whose source or target is
@@ -383,15 +388,20 @@ reaches.
 | `tests/primitives_i128_bits.tk` | **N6b-1, landed (D83).** `% << >> & \| ^ ~` on both types at values a 64-bit implementation answers differently: `>>` arithmetic on a negative `i128` against the same bits `>>` logical on a `u128`; `<<` across the 64-bit limb boundary; a shift count past 127 and a negative one, both masked to 7 bits; `%`'s sign follows the dividend alone | `42` |
 | `tests/primitives_i128_remzero.tk` | **N6b-1, landed (D83).** `7i % zero()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_removf.tk` | **N6b-1, landed (D83).** `i128.MinValue % negone()`, the divisor behind a call the folder cannot see through | `70` |
-| `tests/primitives_i128_text.tk` | **N6b.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
+| `tests/primitives_i128_convert.tk` | **N6b-2, landed (D84).** `(f64)`/`(i128)`/`(u128)` truncation and saturation (NaN, both bounds); a value above `2^53` whose `f64` round trip is lossy and one exact power of two that is not; `(decimal)` and back, both types, exact within range | `42` |
+| `tests/primitives_i128_decovf.tk` | **N6b-2, landed (D84).** `(decimal) (1i << 96i)`, the magnitude behind a call the folder cannot see through | `70` |
+| `tests/primitives_i128_udec_neg.tk` | **N6b-2, landed (D84).** `(u128) (0m - 1m)`, the value behind a call the folder cannot see through | `70` |
+| `tests/primitives_i128_text.tk` | **N6b-3.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
 | `tests/primitives_i128_divzero.tk` | **N6a, landed.** `7i / zero()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_divovf.tk` | **D82.** `i128.MinValue / negone()`, the divisor behind a call the folder cannot see through | `70` |
-| `tests/primitives_i128_parse_bad.tk` | **N6b.** `i128.Parse("x")` | `70` |
+| `tests/primitives_i128_parse_bad.tk` | **N6b-3.** `i128.Parse("x")` | `70` |
 
-N6a's nine refusal fixtures, each with its exact message and line:
+N6a's seven remaining refusal fixtures, each with its exact message and line:
 `tests/refuse/i128_literal_range.tk`, `u128_literal_range.tk`, `i128_mixed_signedness.tk`,
-`i128_cast_float.tk`, `i128_cast_decimal.tk`, `i128_const.tk`, `i128_case_label.tk`,
-`i128_extern.tk` and `i128_global_init.tk`.
+`i128_const.tk`, `i128_case_label.tk`, `i128_extern.tk` and `i128_global_init.tk`
+(`i128_cast_float.tk` and `i128_cast_decimal.tk` were two more; both compile now, N6b-2,
+and are DELETED). N6b-2's own three, each with its exact message and line:
+`tests/refuse/i128_cast_str.tk`, `i128_implicit_f64.tk` and `i128_implicit_decimal.tk`.
 
 The constant-range crumb adds no fixture of its own: a refusal had no harness at the time
 (D33's own closing note), so `teko: the constant 300 does not fit u8` is documented with a
@@ -460,11 +470,30 @@ Depends on N6a. **Gate as run:** `tests/primitives_i128_bits.tk`, `_remzero.tk` 
 `_removf.tk` at their codes; `FIXPOINT OK`; `mc limits` with `intrin`, `passes`, `syntax`,
 `alias`, `types` and `on_stmt` unmoved; `--dump-ast` byte-identical over every base fixture.
 
-### N6b — the rest of `i128` and `u128` (M)
+### ~~N6b-2 — the `f64` and `decimal` conversions, both directions (S)~~ landed, D84
 
-`ToString`/`Parse`/`TryParse` and § 7's members and statics; the `decimal` and `f64`
-conversions of § 8. Depends on N6a and, for the `decimal` direction, on C5. Every one of
-them is refused by name today ([not-yet.md](../reference/not-yet.md)).
+Eight new rows of `teko_i128.tk`'s conversion table: `(f64) v`/`(i128) x`/`(u128) x`
+(`lib/wide.tk`'s `tk_i128_to_f64`/`tk_i128_from_f64` and their `u128` twins) and
+`(decimal) v`/`(i128) d`/`(u128) d` (`lib/wide.tk`'s `tk_i128_from_dec`/`tk_u128_from_dec`,
+`lib/decimal.tk`'s `tk_dec_from_i128`/`tk_dec_from_u128` -- neither wide file includes the
+other, each reads the other type's sixteen bytes raw). `(f64) v` rounds ONCE, to nearest
+even, over the whole 128-bit magnitude, never per 32-bit limb; `(i128)/(u128) x` on a
+`double` truncates toward zero and SATURATES (NaN -> 0, a magnitude past the bound -> that
+bound, .NET's own `Int128`/`UInt128` rule); `(decimal) v` panics `teko: decimal overflow`
+past `2^96`; `(i128)/(u128) d` truncates and only the unsigned side can overflow. `TK_MAXPRIMX`
+16 -> 32. Depends on N6a and, for the `decimal` direction, on C5.
+
+**Gate as run:** `tests/primitives_i128_convert.tk` at its code, `_decovf.tk` and
+`_udec_neg.tk` at theirs, and three refusal fixtures (`i128_cast_str.tk`, the shorter
+wording that stays; `i128_implicit_f64.tk`, `i128_implicit_decimal.tk`, the two new implicit
+refusals) at their exact messages and lines; `FIXPOINT OK`; `mc limits` with `intrin`,
+`passes`, `syntax`, `alias`, `types` and `on_stmt` unmoved; `--dump-ast` byte-identical over
+every base fixture.
+
+### N6b-3 — `ToString`/`Parse`/`TryParse` and § 7's members and statics (M)
+
+What is left of N6b. Depends on N6a. Every one of them is refused by name today
+([not-yet.md](../reference/not-yet.md)).
 
 ## 13. Risks and law tensions
 
