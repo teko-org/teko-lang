@@ -248,8 +248,13 @@ conversions of `i128`/`u128`, both directions, added eight more CONVERSION rows 
 the same reason D81 raised it the first time: eight more rows than the sixteen it had room
 for. The MEMBER cap was raised once, by
 D79: C5's nineteen `decimal` rows take the total to **160 of 160**, the old cap exactly
-full, so it is **192** now and 101 of the 128 parameter positions are spent. Measured with a
-counter printed at the end of `teko_init()`, not by counting registration lines.
+full, so it is **192** now and 101 of the 128 parameter positions are spent. N6b-3 (D85),
+`i128`/`u128`'s own `ToString`, `Parse`, `TryParse`, `CompareTo`, `Equals` and the four
+statics, added eighteen more member rows (nine per type) — the fill is **178 of 192** now,
+no cap move needed — and ten more parameter positions (five per type: `Parse`'s one,
+`TryParse`'s two, `CompareTo`'s one, `Equals`'s one), taking `TK_MAXPRIMP`'s own fill to
+**111 of 128**. Measured with a counter printed at the end of `teko_init()`, not by counting
+registration lines.
 `TimeOnly` itself (N4b) brings the totals to **4, 103 and 35**, with **71** parameter
 positions — twenty of its own rows plus the one N4a's own `DateOnly` table gained
 (`.ToDateTime(TimeOnly)`), seven operator rows, and twenty of its own positions plus one on

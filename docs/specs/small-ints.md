@@ -300,7 +300,7 @@ fixtures. § 13's last row already said teko carries its own; D81 is the ruling 
 it. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`, over the one
 `teko_wide.tk` machine, with nothing new in that file.
 
-## 7. The API
+## 7. The API — landed, N6b-3, D85
 
 | static | instance |
 |---|---|
@@ -312,7 +312,16 @@ it. teko's own registration is `teko_i128.tk`, beside `teko_decimal.tk`, over th
 `ToString` writes the decimal digits, with a leading `-` for a negative `i128`; `Parse`
 reads what `ToString` writes and panics otherwise (`teko: the string is not an i128`).
 `tk_i128_fmt(ptr buf, i128 v)` is the allocation-free half, the split `<float_rt>` makes
-between `putf64` and `fmt_f64`.
+between `putf64` and `fmt_f64`. Each static is a CALL, never folded (`const i128 K =
+i128.One;` stays refused). Every statically-named member above is registered as a
+`TK_PMSFUN`/`TK_PMSVAL` row of `teko_prim.tk`'s own table, `decimal`'s own mechanism (D79);
+`TryParse` reached from an INSTANCE (`x.TryParse(...)`) is refused by name,
+``teko: i128.TryParse is static; reach it through its type``. `Parse`'s grammar is
+`[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix — narrower
+than `decimal.Parse`'s own (D79, ruling 5) and narrower than C#'s `NumberStyles.Integer`,
+which additionally accepts surrounding white space; one repository, one rule (D85). A
+leading `-` on a `u128` is a format failure only when the magnitude is nonzero: `"-0"`
+parses to `0`, `"-1"` panics, C#'s own documented `UInt128.Parse` rule.
 
 ## 8. Conversions
 
@@ -376,6 +385,18 @@ from 7 to about 19 once every page of this plan has landed. The registry grows
 `[limits] tolerance` is the knob — the same resolution `docs/specs/datetime.md` § 13
 reaches.
 
+**Remeasured, N6b-3 (D85), on the `tests/hello.tk` leg** — the table above is this page's own
+DESIGN-TIME estimate and was already stale before this crumb: N6a/N6b-1/N6b-2's own arithmetic,
+bitwise core, and `f64`/`decimal` conversions moved rows this page never priced in (every
+crumb's own gate carries the true delta at the time it landed, D81/D83/D84). The baseline
+this crumb measured against, `mc limits . --config mc.macos.toml` with `rm -rf build` first,
+base and head alike: `intrin` **8**, `passes` **15**, `syntax` **20**, `alias` **25**,
+`types` **18**, `on_stmt` **4**, unmoved on both legs — N6b-3 adds member/static/text rows to
+an existing table (`teko_prim.tk`) and no `type_new`, no new `syntax_expr`/`syntax_stmt`
+name, no new pass. Verdict `grew` on both legs, the same four rows (`passes`, `syntax`,
+`alias`, `types`) grown before this crumb and no new one — D81's own tolerance knob, unrelated
+to this crumb.
+
 ## 11. Fixtures
 
 | fixture | asserts | `expect-exit` |
@@ -391,17 +412,21 @@ reaches.
 | `tests/primitives_i128_convert.tk` | **N6b-2, landed (D84).** `(f64)`/`(i128)`/`(u128)` truncation and saturation (NaN, both bounds); a value above `2^53` whose `f64` round trip is lossy and one exact power of two that is not; `(decimal)` and back, both types, exact within range | `42` |
 | `tests/primitives_i128_decovf.tk` | **N6b-2, landed (D84).** `(decimal) (1i << 96i)`, the magnitude behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_udec_neg.tk` | **N6b-2, landed (D84).** `(u128) (0m - 1m)`, the value behind a call the folder cannot see through | `70` |
-| `tests/primitives_i128_text.tk` | **N6b-3.** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue` and zero; `TryParse` on a good and a bad string | `42` |
+| `tests/primitives_i128_text.tk` | **N6b-3, landed (D85).** `ToString`/`Parse` round-trip at `MinValue`, `MaxValue`, zero, `-1` and a 39-digit `u128`; `TryParse` good and bad text, one past `MaxValue`, `u128`'s own `"-1"`/`"-0"`; `CompareTo`/`Equals`; the four statics, both types | `42` |
 | `tests/primitives_i128_divzero.tk` | **N6a, landed.** `7i / zero()`, the divisor behind a call the folder cannot see through | `70` |
 | `tests/primitives_i128_divovf.tk` | **D82.** `i128.MinValue / negone()`, the divisor behind a call the folder cannot see through | `70` |
-| `tests/primitives_i128_parse_bad.tk` | **N6b-3.** `i128.Parse("x")` | `70` |
+| `tests/primitives_i128_parse_bad.tk` | **N6b-3, landed (D85).** `i128.Parse("x")` | `70` |
+| `tests/primitives_u128_parse_neg.tk` | **N6b-3, landed (D85).** `u128.Parse("-1")` — a nonzero magnitude behind a leading `-` | `70` |
 
 N6a's seven remaining refusal fixtures, each with its exact message and line:
 `tests/refuse/i128_literal_range.tk`, `u128_literal_range.tk`, `i128_mixed_signedness.tk`,
 `i128_const.tk`, `i128_case_label.tk`, `i128_extern.tk` and `i128_global_init.tk`
 (`i128_cast_float.tk` and `i128_cast_decimal.tk` were two more; both compile now, N6b-2,
 and are DELETED). N6b-2's own three, each with its exact message and line:
-`tests/refuse/i128_cast_str.tk`, `i128_implicit_f64.tk` and `i128_implicit_decimal.tk`.
+`tests/refuse/i128_cast_str.tk` (D85 moves its wording, the shorter one N6a wrote to the
+longer two-clause one N6b-3's own filled reader/builder clauses produce; still refused,
+only the words moved), `i128_implicit_f64.tk` and `i128_implicit_decimal.tk`. N6b-3 adds
+one more: `tests/refuse/i128_tryparse_instance.tk` (D85), `x.TryParse(...)` on an instance.
 
 The constant-range crumb adds no fixture of its own: a refusal had no harness at the time
 (D33's own closing note), so `teko: the constant 300 does not fit u8` is documented with a
@@ -490,10 +515,26 @@ refusals) at their exact messages and lines; `FIXPOINT OK`; `mc limits` with `in
 `passes`, `syntax`, `alias`, `types` and `on_stmt` unmoved; `--dump-ast` byte-identical over
 every base fixture.
 
-### N6b-3 — `ToString`/`Parse`/`TryParse` and § 7's members and statics (M)
+### ~~N6b-3 — `ToString`/`Parse`/`TryParse` and § 7's members and statics (M)~~ landed, D85
 
-What is left of N6b. Depends on N6a. Every one of them is refused by name today
-([not-yet.md](../reference/not-yet.md)).
+The rest of N6b, closing it whole: `tk_i128_fmt`/`tk_i128_tostring`/`tk_i128_scan`/
+`tk_i128_parse`/`tk_i128_tryparse` and the `u128` twins (`lib/wide.tk`), `tk_i128_min`/
+`_max`/`_zero`/`_one` and the same for `u128`, `CompareTo`/`Equals` reusing `tk_i128_cmp`/
+`tk_i128_eq` (already in file since N6a) with no function of their own, and `tk_i128_expr`/
+`tk_u128_expr` replacing the generic `tk_prim_expr` registration to intercept `TryParse`'s
+hand-parsed `out` argument, `decimal`'s own shape throughout (D79). `i128`/`u128`'s reader
+and builder clauses are filled too, which moves `(str) x`'s wording without opening the
+cast. Depends on N6a.
+
+**Gate as run:** `tests/primitives_i128_text.tk` at its code, `_parse_bad.tk` and
+`primitives_u128_parse_neg.tk` at `70`, and `tests/refuse/i128_tryparse_instance.tk` at its
+exact message and line, `i128_cast_str.tk` updated to the new wording; `FIXPOINT OK`;
+`mc limits` with `intrin`, `passes`, `syntax`, `alias`, `types` and `on_stmt` unmoved (the
+member/static/text rows land on an existing table, `teko_prim.tk`, with no new `type_new`
+and no new pass); `TK_MAXPRIMM` 160 → 178 of 192, `TK_MAXPRIMP` 101 → 111 of 128, neither
+cap raised; `--dump-ast` single-file, every pre-existing fixture identical except the ten
+that transitively include `lib/wide.tk`, each a pure-addition diff (new `FUNC`s appended,
+zero deletions) and `i128_cast_str.tk`'s own refusal LINE, whose wording moved on purpose.
 
 ## 13. Risks and law tensions
 

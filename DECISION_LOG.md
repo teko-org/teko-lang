@@ -9386,3 +9386,127 @@ own AST changed a single node.
 What is left open: N6b-3 (`ToString`/`Parse`/`TryParse`, § 7's members and statics) is the
 next and last crumb of N6b, unblocked and unchanged by this one. The two adjacent findings
 above are reported, not fixed, in keeping with the crumb's own boundary.
+
+### D85 · text, members and statics of `i128`/`u128` -- one grammar narrower than
+`decimal`'s own, one failure message for two causes, and every static a CALL, never
+folded (N6b-3, 2026-09-15)
+
+> `ToString`, `Parse`, `TryParse`, `CompareTo`, `Equals`, `MinValue`, `MaxValue`, `Zero`,
+> `One`, both types -- about 220 lines of ordinary teko appended to `lib/wide.tk`, copying
+> `tk_dec_fmt`/`tk_dec_scan`'s own SPLIT and not their code (neither wide file includes the
+> other, D81's own ruling), and nine member/static rows per type registered over the same
+> `teko_prim.tk` table `decimal`'s own `tk_dec_statics`/`tk_dec_members` already ride. Zero
+> mc changes, zero new intrinsics: `mc limits`' `intrin` row is 8 before and 8 after.
+> `TK_MAXPRIMM`'s fill moves from 160 to 178 of the 192 the cap already had room for,
+> `TK_MAXPRIMP`'s from 101 to 111 of 128 -- neither cap raised.
+
+N6b-3 is the last crumb of N6b, `docs/specs/small-ints.md` § 7. It depends on N6a (D81) for
+the eight-limb scratch and on `decimal`'s own text crumb (C5, D79) for the SHAPE every
+routine here copies. After this crumb N6b owes nothing more.
+
+#### The rulings this crumb was dispatched with, and what each became
+
+1. **`Parse`'s grammar is `[+|-] digits`, narrower than `decimal.Parse`'s own and narrower
+   than C#'s `NumberStyles.Integer`.** D79's ruling 5 is the newest in-repo ruling on a
+   primitive's parse grammar and it wins over what C# would additionally accept (surrounding
+   white space): one repository, one rule for "the text `ToString` writes, and nothing it
+   does not". `u128.Parse("-1")` follows C#'s own DOCUMENTED `UInt128.Parse`: a leading `-`
+   is a format failure exactly when the magnitude is nonzero -- `"-0"` parses to `0`
+   (`tk_u128_scan`'s own `neg && !tk_dv_is_zero(v)` line), `"-1"` panics.
+
+2. **One failure message, `"teko: the string is not an i128"` / `"...u128"`, for both causes
+   a scan can find.** `tk_i128_scan`/`tk_u128_scan` still answer three values, `tk_dec_scan`'s
+   own split (`0` for no number, `-1` for one that does not fit, `1` for parsed) -- the split
+   costs nothing extra to keep -- but `Parse` reads `!= 1` as one panic and `TryParse` reads
+   it as one `false`, because a wide integer's two causes have the same one remedy ("write a
+   number in range") where `decimal`'s two have different ones (a scale to trim, a magnitude
+   that never fits at all).
+
+3. **`ToString` of `MinValue` negates into the 256-bit vector before formatting.**
+   `tk_i128_fmt` reads `tk_w_isneg`, negates with `tk_w_neg` (the same three lines the unary
+   `-` operator already runs, `tests/primitives_i128_math.tk`'s own identity), and formats
+   the magnitude -- `2^127` for `MinValue`, exact, the same way `tk_w_neg`'s own header
+   already documents the fixed point.
+
+4. **`TryParse(s, out x)` zeroes `x` on failure and never panics; an INSTANCE reaching for
+   it is refused by name.** `tk_i128_tryparse`/`tk_u128_tryparse` are `tk_dec_tryparse`'s own
+   shape exactly: the `out` argument is registered as a `TK_PMSFUN` row anyway
+   (`tk_prim_membern`), never emitted (no column of this table spells `out <name>`), so
+   `x.TryParse(...)` on an instance reaches `tk_prim_is_static` --
+   ``teko: i128.TryParse is static; reach it through its type`` -- measured and pinned,
+   `tests/refuse/i128_tryparse_instance.tk`.
+
+5. **The four statics are calls, never folded.** `tk_i128_min`/`_max`/`_zero`/`_one` and the
+   `u128` twins are ordinary functions reusing the same limb pairs
+   `tk_i128_from_f64`/`tk_u128_from_f64`'s own saturating bounds already build; `const i128 K
+   = i128.One;` stays refused exactly as it was before this crumb -- the `const` pass never
+   folds a call, and none of the eight rows is one that would change that.
+
+6. **`CompareTo` returns `i64` (`-1`/`0`/`1`); `Equals(i128)` returns `i64` (`0`/`1`); there
+   is no `Equals(object)`.** Both reuse `tk_i128_cmp`/`tk_i128_eq` -- already in file since
+   N6a, the same two functions the six comparison operators already lower to -- so neither
+   needed a function of its own; teko has no boxed root type for a second overload to reach
+   through.
+
+#### What changed, file by file
+
+`lib/wide.tk`: `tk_w_isdig`, `tk_w_over128`, `tk_w_fmt_mag`, `tk_i128_fmt`/`tk_u128_fmt`,
+`tk_i128_tostring`/`tk_u128_tostring`, `tk_i128_scan`/`tk_u128_scan`,
+`tk_i128_parse`/`tk_u128_parse`, `tk_i128_tryparse`/`tk_u128_tryparse`, and the eight statics
+-- about 220 lines, none of them a machine handler. `teko_i128.tk`: `tk_i128_statics`/
+`tk_i128_members` and the `u128` twins (the nine-row shape `teko_decimal.tk` already has),
+`tk_i128_tryparse_expr`/`tk_u128_tryparse_expr` (`tk_dec_tryparse_expr`'s own hand-parse of
+`out`), `tk_i128_expr`/`tk_u128_expr` replacing the generic `tk_prim_expr` registration so
+`TryParse` is intercepted before the table, and `tk_i128_init`'s `tk_prim_type` calls filled
+with a reader and a builder clause (`decimal`'s own filled form, D79) -- which moves `(str)
+x`'s refusal from the short "does not cast yet" to the long two-clause wording, MEASURED and
+not merely asserted: `(str) x` still does not compile (no cast row names `str`; text is two
+member calls, never a cast), only the WORDING moved, exactly as `decimal`'s did between C3
+and C5. `teko_prim.tk`: a running comment on `TK_MAXPRIMM`, no cap moved.
+
+**Nine fixtures.** `tests/primitives_i128_text.tk` (42, 50 assertions): `ToString`/`Parse`
+round trip at `MinValue`, `MaxValue`, zero, `-1`, `u128.MaxValue` itself (39 digits);
+`TryParse` on good text, six shapes of bad text (`"x"`, `""`, `"1 "`, `" 1"`, `"+"`, `"-"`),
+one past `MaxValue`, `u128`'s own `"-1"`/`"-0"`; `CompareTo`/`Equals`; the four statics, both
+types. `tests/primitives_i128_parse_bad.tk` (70, `i128.Parse("x")`) and
+`tests/primitives_u128_parse_neg.tk` (70, `u128.Parse("-1")`). `tests/refuse/
+i128_tryparse_instance.tk` (new) and `tests/refuse/i128_cast_str.tk` (updated wording, same
+line).
+
+#### Proof of this crumb (mc 1.0.0, macos/aarch64, head `ecb6ef27`, base `65d54f40`)
+
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` -> **121 passed, 135 refused as expected, 0 failed** (118 + 3 new; 134 - 0 + 1
+= 135, the one new refuse fixture, `i128_cast_str.tk`'s own message updated in place);
+`sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK** (`teko2.o == teko3.o`,
+`--dump-asm` diff empty, teko1 compiles the same 121/135/0); `sh scripts/check-docs.sh` ->
+`docs ok: 697 links, 74 fragments, 411 diagnostics, 135 refusals, 152 samples, manifest
+listed`.
+
+`mc build . --config <hello-entry> --limits` (`rm -rf build` first, both legs): on the
+`tests/hello.tk` leg, every row against `65d54f40` UNMOVED except the size-of-surface-code
+ones (`nodes`, `funcs`, `lowered`, `globals`, `strings`, `ins`, `symbols`, `heap`) -- `intrin`
+**8**, `passes` **15**, `syntax` **20**, `alias` **25**, `types` **18**, `on_stmt` **4**,
+identical on both legs; verdict `grew` on both, the cold-build artifact a fresh `rm -rf
+build` always reads on this leg (D72's own tolerance knob), unrelated to this crumb.
+`TK_MAXPRIMM` **178**/192 (160 before), `TK_MAXPRIMP` **111**/128 (101 before), every other
+primitive cap unmoved.
+
+`--dump-ast --include=lib`, single-file mode, base `65d54f40` in its own worktree, this
+branch its own: **241 of 252 fixtures byte-identical**, ten more -- every pre-existing
+fixture that transitively includes `lib/wide.tk` -- a PURELY ADDITIVE diff (one contiguous
+insertion of new `FUNC`s where this crumb's own symbols land in the file, zero deletions,
+confirmed by grepping every diff for a `<` line and finding none); the 252nd,
+`tests/refuse/i128_cast_str.tk`, differs in its refusal TEXT alone (the wording this crumb's
+own ruling moves on purpose), not in any AST node. No pre-existing program's own tree moved
+a node.
+
+What is left open: nothing of N6b. Two adjacent findings surfaced and are reported, not
+fixed, in keeping with the crumb's own boundary: `teko_ternary.tk`'s `tk_div_project_file`
+(D82) checks the substring `"lib/mc/v"` to tell an `mc`-bundled source from the project's
+own, and that check misses the GLOBAL PACKAGE CACHE convention (`$HOME/.mc/libs/mc/v<ver>/
+lib/...`, "libs" plural) a self-hosting bootstrap can resolve `<mc/core_min>` through when
+that cache is populated -- reproduced on a clean `65d54f40` checkout with a pre-populated
+package cache, unrelated to this crumb, outside its boundary to fix. `docs/reference/
+diagnostics.md`'s own count (`411` diagnostics, unmoved) confirms this crumb's new refusal
+wordings are measured, not merely claimed.
