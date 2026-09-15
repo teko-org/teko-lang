@@ -1258,7 +1258,7 @@ own shape:
 | written | answers | notes |
 |---|---|---|
 | `x.ToString()` | `str` | the shortest decimal digits, a leading `-` for a negative `i128`; `MinValue`'s magnitude (`2^127`) is exact |
-| `i128.Parse(s)`, `u128.Parse(s)` | `i128`, `u128` | `[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); panics `teko: the string is not an i128`, exit 70, on anything else or a number out of range |
+| `i128.Parse(s)`, `u128.Parse(s)` | `i128`, `u128` | `[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); panics `teko: the string is not an i128` (`…not a u128` for `u128.Parse`), exit 70, on anything else or a number out of range |
 | `i128.TryParse(s, out v)`, `u128.TryParse(s, out v)` | `i64` (`bool`) | `1` and the value, or `0` and `v` zeroed — never panics; an INSTANCE reaching for it is refused, `TryParse` is static |
 | `x.CompareTo(y)` | `i64` | `-1`/`0`/`1`, signed for `i128`, unsigned for `u128` — the same comparison the six operators already lower to |
 | `x.Equals(y)` | `i64` (`bool`) | takes an `i128`/`u128`; there is no `Equals(object)` — teko has no boxed root type |
