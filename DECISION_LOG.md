@@ -9021,11 +9021,12 @@ yet). `decimal` (`lib/decimal.tk`) and `i128`/`u128` (`lib/wide.tk`, D81) alread
 #### The gate, mc 0.17.2, macos/aarch64
 
 `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
-mc.macos.toml` -> **110 passed, 133 refused as expected, 0 failed** (102 + 8, 121 + 12 --
-the eight that run and the three that are refused of ruling 8, over the 102 + 121 the base
+mc.macos.toml` -> **112 passed, 133 refused as expected, 0 failed** (102 + 10, 121 + 12 --
+the eight that run and the three that are refused of ruling 8 plus the two of the fourth
+review's amendment, over the 102 + 121 the base
 carries); `sh scripts/bootstrap.sh --os macos --arch aarch64` -> **FIXPOINT OK** (stage 1
 through 3 each compile `mc_teko.tk` clean, `teko2.o == teko3.o`, `--dump-asm` diff empty,
-teko1 compiles all 110+133 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
+teko1 compiles all 112+133 fixtures at its own oracle); `sh scripts/check-docs.sh` -> `docs
 ok: 698 links, 74 fragments, 411 diagnostics, 133 refusals, 152 samples, manifest listed`.
 
 `mc limits . --config mc.macos.toml`, `rm -rf build` first on both legs, base `8d95c1ff`
