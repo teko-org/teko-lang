@@ -65,6 +65,35 @@ i64 tk_bracket_no_write = 0;
 // library file needs a parenthesized unary receiver anywhere near this wide.
 #define TK_UNARY_PAREN_MAX 4096
 
+// The buffers the lexer has opened -- announced by `on_source` (mc hooks.md),
+// recorded from `tk_fwd_on_source` (teko_fwd.tk), the one registration teko
+// holds -- so a backward scan over raw source never reads before the buffer
+// it is in (Copilot on #735). A source past the table's room is simply not
+// probed: the ordinary sink, never a read outside the buffer.
+#define TK_MAXSRCS 256
+uptr tk_src_lo[TK_MAXSRCS];
+uptr tk_src_hi[TK_MAXSRCS];
+i64  tk_nsrc = 0;
+
+void tk_src_note(uptr src, i64 len) {
+    if (tk_nsrc >= TK_MAXSRCS) return;
+    st64(tk_src_lo + tk_nsrc * 8, src);
+    st64(tk_src_hi + tk_nsrc * 8, src + len);
+    tk_nsrc = tk_nsrc + 1;
+}
+
+// the start of the buffer `p` points into, or 0 when no announced buffer holds it
+uptr tk_src_begin_of(uptr p) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nsrc) break;
+        uptr lo = ld64(tk_src_lo + i * 8);
+        if (p >= lo && p < ld64(tk_src_hi + i * 8)) return lo;
+        i = i + 1;
+    }
+    return 0;
+}
+
 // 1 when the postfix token now at `p_start()` -- the position of whatever
 // `cur` is when a `syntax_infix` handler runs, since mc's own `parse_expr`
 // (M21, src/parse.mc) already consumed the operator before calling the
@@ -90,7 +119,10 @@ i64 tk_unary_ws(i64 c) {
 }
 
 i64 tk_unary_parened(i64 oplen) {
+    uptr base = tk_src_begin_of(p_start());
+    if (base == 0) return 0;                  // an unannounced buffer is never scanned
     uptr lo = p_start() - TK_UNARY_PAREN_MAX;
+    if (lo < base - 1) lo = base - 1;         // `lo` is never read: the loops stop AT it
     uptr p = p_start();
     i64 skipped = 0;
     loop {                                    // past the operator itself
