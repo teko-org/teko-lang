@@ -62,6 +62,7 @@ know are traps:
 
 ```teko
 // no-run
+#include "rt.tk"
 #include "guid.tk"
 
 i64 main() {
@@ -72,10 +73,10 @@ i64 main() {
 
     str s = a.ToString();                        // the "D" form, lowercase
     if (Guid.Parse(s) != a) return 3;
-    if (a.ToString("N") != "f81d4fae7dec11d0a76500a0c91e6bf6") return 4;
+    if (!tk_str_eq(a.ToString("N"), "f81d4fae7dec11d0a76500a0c91e6bf6")) return 4;   // `str` is bytes: compare with tk_str_eq (lib/rt.tk)
 
     Guid z = Guid.Empty;
-    if (z.ToString() != "00000000-0000-0000-0000-000000000000") return 5;
+    if (!tk_str_eq(z.ToString(), "00000000-0000-0000-0000-000000000000")) return 5;
     if (z >= a) return 6;                        // ordered by the bytes, left to right
 
     Guid out_v = Guid.Empty;

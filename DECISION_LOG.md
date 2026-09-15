@@ -7726,3 +7726,14 @@ between them**)**, `types` **14 → 15 (+1)**, `alias` **21 → 22 (+1**, and
 `docs/specs/guid.md` § 8's "alias unmoved" was wrong: `type_new` reserves the word in the very
 table `type_alias` uses, so the two move together and always have — the page is corrected**)**.
 Verdict `ok` on both sides; **no new `grew` row**, and the three derived tables still add none.
+
+**The verifier of D75, and the `out` of `TryParse`.** The hand-written parser handed
+`tk_guid_tryparse` a raw address and checked the pointee's type only when parse time could
+answer it: a GLOBAL (`pty` -1) failed OPEN and sixteen bytes went into an eight-byte `i64`
+global, and an `out`/`ref` PARAMETER as the target would have been `&name`, the callee's own
+slot. Closed at the root: the argument is TAGGED (`tk_rfarg_tag(oe, TK_RP_OUT, pty)`) and
+`tk_guid_tryparse` declares `out Guid o`, so teko_ref.tk's own pass judges it exactly as any
+`out` argument — the global's declared type, the repass of a parameter as the caller's slot.
+Measured: local, global and parameter targets write the value (exit 42);
+`out victim` with `i64 victim;` refuses `teko: a value of type i64 does not convert to Guid`
+(`tests/refuse/guid_tryparse_out_global.tk`).
