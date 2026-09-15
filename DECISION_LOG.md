@@ -9352,7 +9352,7 @@ that meant `(a & b) == c` gets a silently different answer instead of a parse er
 Recorded as a `docs/reference/not-yet.md` row (this crumb's own deliverable named it); the
 grammar itself is `mc`'s core and D2 forbids working around it here.
 
-**Proof of this crumb** (mc 1.0.0, macos/aarch64, head `338ac19f`, merged with `origin/main`
+**Proof of this crumb** (mc 1.0.0, macos/aarch64, PR #742's head, merged with `origin/main`
 at `2656b0fe`): `mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
 mc.macos.toml` -> **118 passed, 134 refused as expected, 0 failed** (115 + 3 new; 133 - 2 + 3
 = 134, the two N6a refuse fixtures this crumb deletes and the three it adds); `sh scripts/

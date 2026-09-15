@@ -882,7 +882,7 @@ N6b-1's (fourteen over the two types), and no MIXED row of any kind — `i128 + 
 without a cast. The `f64` and `decimal` conversions, both directions and both types, landed
 too (N6b-2, D84): eight new rows of the cast-to-call table, none of them opening an implicit
 door. What is their own is short, and most of what a reader will meet is a
-refusal that already existed: `x.ToString()` earns `teko: unknown member of i128`, and
+refusal that already existed: `x.ToString()` earns `teko: unknown member of i128: ToString`, and
 `i128.MaxValue` earns `teko: unknown static member of i128: MaxValue`, its static twin.
 
 - `"teko: an i128 literal is out of range"` — an `i128` literal is the MAGNITUDE only, so

@@ -1173,8 +1173,8 @@ they exist for the arithmetic that runs out of room in an `i64`
 ([the specification](../specs/small-ints.md) § 6, N6a).
 
 The layout is little-endian: the low half at `+0`, the high half at `+8`. `i128` and `u128`
-are **the same bits** and part company in exactly two places — `/`, and the four ordering
-comparisons.
+are **the same bits** and part company in exactly four places — `/`, the four ordering
+comparisons (D81), `%` and `>>` (D83).
 
 ```teko
 // expect-exit: 42
@@ -1257,7 +1257,7 @@ so a plain assignment builds no cast at all (D84).
 |---|---|
 | `a + b` on an `i128` and a `u128` | ``teko: no operator `+` takes these operands`` |
 | `u128 u = x;` on an `i128 x` | `teko: a value of type i128 does not convert to u128` |
-| `f64 x = v;`, `decimal d = v;` on an `i128`/`u128` `v` | `teko: a value of type i128 does not convert to f64`/`decimal` — the six rows above are explicit only (D84) |
+| `f64 x = v;`, `decimal d = v;` on an `i128`/`u128` `v` | `teko: a value of type i128 does not convert to f64`/`decimal` — the eight rows above are explicit only (D84) |
 | `(str) x` | `teko: an i128 does not cast yet` (`a u128` for the other) — N6b-3 |
 | `x.ToString()` | `teko: unknown member of i128: ToString` — N6b |
 | `i128.MaxValue` | `teko: unknown static member of i128: MaxValue` — N6b |
