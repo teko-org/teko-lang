@@ -1258,11 +1258,11 @@ own shape:
 | written | answers | notes |
 |---|---|---|
 | `x.ToString()` | `str` | the shortest decimal digits, a leading `-` for a negative `i128`; `MinValue`'s magnitude (`2^127`) is exact |
-| `i128.Parse(s)` | `i128` | `[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); panics `teko: the string is not an i128`, exit 70, on anything else or a number out of range |
-| `i128.TryParse(s, out v)` | `i64` (`bool`) | `1` and the value, or `0` and `v` zeroed — never panics; an INSTANCE reaching for it is refused, `TryParse` is static |
+| `i128.Parse(s)`, `u128.Parse(s)` | `i128`, `u128` | `[+|-] digits`, no surrounding white space, no separator, no exponent, no suffix (narrower than `decimal.Parse`'s own grammar); panics `teko: the string is not an i128`, exit 70, on anything else or a number out of range |
+| `i128.TryParse(s, out v)`, `u128.TryParse(s, out v)` | `i64` (`bool`) | `1` and the value, or `0` and `v` zeroed — never panics; an INSTANCE reaching for it is refused, `TryParse` is static |
 | `x.CompareTo(y)` | `i64` | `-1`/`0`/`1`, signed for `i128`, unsigned for `u128` — the same comparison the six operators already lower to |
 | `x.Equals(y)` | `i64` (`bool`) | takes an `i128`/`u128`; there is no `Equals(object)` — teko has no boxed root type |
-| `i128.MinValue`, `MaxValue`, `Zero`, `One` | `i128` | each a CALL, never folded: `const i128 K = i128.One;` stays refused, the same rule every other wide `const` already follows |
+| `i128.MinValue`, `MaxValue`, `Zero`, `One`; the same four on `u128` | `i128`, `u128` | each a CALL, never folded: `const i128 K = i128.One;` stays refused, the same rule every other wide `const` already follows |
 
 `u128.Parse("-1")` panics too: a leading `-` is a format failure exactly when the magnitude is
 nonzero — `u128.Parse("-0")` succeeds and answers `0`, C#'s own documented `UInt128.Parse`
