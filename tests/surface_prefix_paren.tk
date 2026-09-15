@@ -1,0 +1,52 @@
+// surface_prefix_paren.tk -- D80: a `.`/`[`/`?.` after a parenthesized
+// `- ! ~` binds to the GROUP's own result, not past it. `.`/`[`/`?.` already
+// sink through a BARE `- ! ~` (teko_prefix.tk, delivery 5): `-a.x` reads
+// `-(a.x)`, matching C#. The sink was WRONG when the chain stood inside a
+// SOURCE `(...)`: `(-t).Duration().Hours` used to answer -3 for a 3-hour
+// span (`-(t.Duration().Hours)`), because parens are invisible to the AST
+// (mc's core returns `(expr)` as `expr`, no `N_PAREN`, no flag). The fix is
+// lexical (`tk_unary_parened`, teko_prefix.tk): a `)` immediately before the
+// postfix token, matched back to its `(`, with `- ! ~` immediately after it
+// (redundant nested parens peeled) means the group won -- the sink stays off.
+//
+// `!`/`~` route through the very same lexical check (`tk_unary_op_ok`
+// already treats `- ! ~` alike, and `tk_unary_parened`'s own final compare
+// is `c == '-' || c == '!' || c == '~'`), but neither has a member-bearing
+// result anywhere in this surface today: `!`/`~` apply only to `i64`/`bool`,
+// and a scalar declares no member at all (`tk_reject_scalar_member`,
+// teko_typeof.tk) -- there is no discriminating `(!b).member`/`(~n).member`
+// to write. `-` is the one op this fixture exercises through `.`/`?.`/`[`,
+// on `TimeSpan` and `decimal`, both of which DO declare members and an
+// overloaded unary `-`.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+#include "../lib/time.tk"
+#include "decimal.tk"
+
+i64 fromArg(TimeSpan t) { return t.Duration().Hours; }   // the receiver is a
+                                                           // CALL: never reached
+                                                           // by the sink at all
+i64 main() {
+    TimeSpan t = TimeSpan.FromHours(0 - 3);
+
+    // ---- the readings table (D80) ----
+    if ((-t).Duration().Hours != 3) return 1;             // (-t) first, THEN .Duration()
+    if (-t.Duration().Hours != 0 - 3) return 2;            // no parens: the sink still fires
+    if (-(t).Duration().Hours != 0 - 3) return 3;          // `(` wraps only `t`: sink fires
+    if ((-(t)).Duration().Hours != 3) return 4;            // outer group wraps `-(t)` whole
+    if (((-t)).Duration().Hours != 3) return 5;            // one more redundant layer, peeled
+
+    // ---- combined with other syntax, unaffected ----
+    if (5 + (-t).Duration().Hours != 8) return 6;
+    if (fromArg(TimeSpan.FromHours(3)) != 3) return 7;     // a CALL receiver: untouched
+
+    // ---- `decimal`, C5's own pair (D79) ----
+    decimal d = 1.5m;
+    if (!tk_str_eq((-d).ToString(), "-1.5")) return 8;
+    decimal m1 = 1m;
+    if ((-m1).CompareTo(m1) != 0 - 1) return 9;
+
+    return 42;
+}
