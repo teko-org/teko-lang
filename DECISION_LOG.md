@@ -5222,11 +5222,14 @@ begin with `$` (D87's gensym prefix, which the lexer never forms into an identif
 `$` name is the compiler's by construction); and it is not `this` (`tk_this_name`,
 teko_this.tk — a method's parameter 0, declared `uptr`, which is why `a.Length` on a
 `string a` used to call `string_get_Length` on the `data` field's ADDRESS). The CEILING
-this draws is named rather than hidden: a `string` handed straight to a `lib/rt.tk`
-function no longer borrows — `tk_str_len(s)` is spelled `str p = s; tk_str_len(p);`, or
-through a `str` parameter of the program's own, one hop either way, and
-`docs/reference/not-yet.md` § string carries the row. `puts(s)` is unaffected (the core
-declares it, not `lib/rt.tk`). Fixture: `tests/surface_string_capture.tk` (`42`) — a
+this draws is named rather than hidden, and then narrowed once more: a `string` handed
+to a `lib/rt.tk` function borrows its text ONLY for the runtime's own text readers —
+`panic`, `tk_str_len`, `tk_str_slice`, `tk_str_eq`, the enum readers (`tk_rc_rt_text`, a
+closed list of the runtime's own, positive) — because a `panic(s)` that printed the object
+header would be a silently wrong answer (D3); every other runtime function (`rt_own`,
+`rc_inc`, `tk_cap_own`, the plumbing that takes any counted reference) receives the
+object. `puts(s)` is unaffected (the core declares it, not `lib/rt.tk`).
+`docs/reference/not-yet.md` § string carries the row. Fixture: `tests/surface_string_capture.tk` (`42`) — a
 `string` captured by value, an interned literal captured, two captures in one closure, a
 closure returned from a block and called after it closed, `rt_live()` back to its baseline
 once the work returns. By REFERENCE is not a road at all: `use (&s)` on a counted type is

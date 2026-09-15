@@ -167,8 +167,7 @@ i64 main() {
     if (c.StartsWith("hi") == false) return 7;
 
     puts(c);                                     // a `string` in a `str` slot
-    str raw_c = c;                               // ...and one hop for rt.tk's own,
-    if (tk_str_len(raw_c) != 8) return 8;        // whose `uptr` is generic (D88)
+    if (tk_str_len(c) != 8) return 8;            // ...and in rt.tk's own text readers
 
     string d = new string("raw");                // an explicit copy of a `str`
     if (d != "raw") return 9;
