@@ -682,3 +682,51 @@ public class string {
         return r;
     }
 }
+
+// ---- N10 (docs/specs/string.md § 9): the two formatters `$"..."` reaches
+// for a hole `teko_interp.tk` cannot build directly from the class's own
+// `str` constructor (an integer's decimal text, a `char`'s UTF-8 bytes) ----
+
+// the UTF-8 bytes of ONE code point, into `buf` (needs 4 bytes); returns the
+// width written. The inverse of `tk_string_cp_decode` above, and kept beside
+// it for the same reason that one is kept here rather than in `lib/rt.tk`:
+// a line added to `rt.tk` moves the `--dump-ast` include chain of every
+// fixture in the tree.
+i64 tk_string_cp_encode(uptr buf, i64 cp) {
+    if (cp < 128) { st8(buf, cp); return 1; }
+    if (cp < 2048) {
+        st8(buf, 192 | (cp >> 6));
+        st8(buf + 1, 128 | (cp & 63));
+        return 2;
+    }
+    if (cp < 65536) {
+        st8(buf, 224 | (cp >> 12));
+        st8(buf + 1, 128 | ((cp >> 6) & 63));
+        st8(buf + 2, 128 | (cp & 63));
+        return 3;
+    }
+    st8(buf, 240 | (cp >> 18));
+    st8(buf + 1, 128 | ((cp >> 12) & 63));
+    st8(buf + 2, 128 | ((cp >> 6) & 63));
+    st8(buf + 3, 128 | (cp & 63));
+    return 4;
+}
+
+// an `i64` hole (and, through the call-argument widening every other
+// integer already gets, `u8`/`i8`/`u16`/`i16`/`u32`/`u64` too): the decimal
+// text `tk_i64_to_dec` (`lib/rt.tk`) already writes, on the STACK -- no
+// `rt_alloc`, so no free for this one to forget (§ 9's decision 4).
+string tk_str_from_i64(i64 v) {
+    u8 buf[24];
+    tk_i64_to_dec(v, buf);
+    return new string(buf);
+}
+
+// a `char` hole: its UTF-8 bytes, on the stack, NUL-terminated for the
+// class's own `str` constructor to measure.
+string tk_str_from_char(char c) {
+    u8 buf[5];
+    i64 n = tk_string_cp_encode(buf, c);
+    st8(buf + n, 0);
+    return new string(buf);
+}
