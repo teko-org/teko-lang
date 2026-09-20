@@ -137,7 +137,7 @@ thing that crosses is a URL each side reads anonymously.
 | poll | teko, every 15 min | `repos/minicompiler/mc/releases` — the newest pre-release with no verdict on the `canary` branch yet |
 | judge | teko | `ngen.yml` called with `mc_version` = that candidate: the five legs, the five fixpoint legs, `docs` and the aggregator; plus `teko_std` at its newest tag |
 | publish | teko | `<version>.json` at the root of the `canary` branch, committed with this repository's own `GITHUB_TOKEN` |
-| promote | mc | reads that file every 60 s for 90 minutes: `ok` flips the pre-release to a release, `fail` leaves it a pre-release, and a file that never appears is neither — advisory before mc 1.0.0 |
+| promote | mc | reads that file — contents API first, raw only as a fallback (raw served a stale `fail` for minutes after a push, 2026-09-15) — in two places since 2026-09-20: a short poll inside mc's own release run (~15 min) and a scheduled `promote-pending.yml` of mc's own, every 30 min, which promotes any pre-release whose verdict is green whenever it lands. `ok` flips the pre-release to a release, `fail` leaves it a pre-release, and a file that never appears is neither — no longer a deadline, since the scheduled job picks up a late verdict |
 
 The verdict is one line at a fixed URL:
 
@@ -161,15 +161,19 @@ standard library, which mc counts as part of the recipe, so a `std` job runs
 the registry.
 
 Three properties the branch has on purpose: it **accumulates**, one file per mc version, and
-is never force-pushed (mc polls one file for up to 90 minutes, and a file must not vanish
-under a reader); the workflow holds a single `concurrency` group so two runs cannot race the
-same push; and a dispatch naming a `version` explicitly rewrites a verdict already there,
-which is how a re-run corrects itself.
+is never force-pushed (mc reads one file and it must not vanish under a reader); the workflow
+holds a single `concurrency` group so two runs cannot race the same push; and a dispatch
+naming a `version` explicitly rewrites a verdict already there, which is how a re-run
+corrects itself.
 
-The 15 minutes are mc's number, not a preference: its `promote` budgets a quarter of an hour
-for this schedule to notice inside its 90-minute poll. Cron is GitHub's least punctual
-trigger and the schedule is disabled after 60 days with no push to `main`, so the manual road
-— `gh workflow run mc-canary.yml -f version=0.17.0` — is the one that removes the wait.
+The 15 minutes were mc's number, not a preference: its `promote` budgeted a quarter of an
+hour for this schedule to notice inside a 90-minute poll — the contract until 2026-09-20,
+when `promote-pending.yml` took the deadline away. The cron stays because it is still the
+road a verdict travels by default. Cron is GitHub's least punctual trigger and the schedule
+is disabled after 60 days with no push to `main` — measured on 2026-09-19/20, `*/15`
+delivered about one run every two hours, and mc v1.1.0 (tagged 03:42Z) fell in a
+three-and-a-half-hour gap — so the manual road, `gh workflow run mc-canary.yml -f
+version=1.1.0`, is the one that removes the wait.
 
 `canary` must be **pushable by `GITHUB_TOKEN`**: the `All Green` ruleset covers `~ALL` and
 requires a pull request, so `refs/heads/canary` needs to sit in its exclude list beside

@@ -12,9 +12,15 @@ name: mc canary
 #       https://raw.githubusercontent.com/teko-org/teko-lang/canary/<version>.json
 #       {"version":"0.17.0","status":"ok","run":"<this run>","utc":"<ISO 8601>"}
 #
-#   mc's `promote` job reads that URL anonymously, every 60 s for 90 minutes:
-#   `ok` turns the pre-release into a release, `fail` leaves it a pre-release,
-#   a missing file is NEITHER and times out (advisory before mc 1.0.0).
+#   mc reads that file anonymously -- through GitHub's contents API first, the
+#   raw URL only as a fallback, since raw served a stale `fail` for minutes
+#   after a push (2026-09-15, mc 1.0.1). `ok` turns the pre-release into a
+#   release, `fail` leaves it a pre-release, and a missing file is NEITHER.
+#   Since 2026-09-20 mc reads it in two places: a SHORT poll inside its own
+#   release run (~15 minutes), and a scheduled `promote-pending.yml` of its
+#   own, every 30 minutes, that promotes any pre-release whose verdict is
+#   green whenever it lands. So a verdict this repository publishes late is
+#   picked up on its own -- the in-run timeout stopped being an error.
 #
 # The recipe is not repeated here. `ngen.yml` IS the recipe -- five native
 # legs, five fixpoint legs, `docs` and the aggregator -- and it is called with
@@ -24,14 +30,27 @@ name: mc canary
 # library, which mc counts as part of the recipe: the `std` job below is
 # `teko-org/teko-std`'s own CI leg, run against the same candidate.
 #
-# EVERY 15 MINUTES, and that number is mc's, not a preference: its `promote`
-# budgets "up to 15 minutes for teko's schedule to notice, plus its recipe"
-# inside a 90-minute poll (M53 § 6.2.4). Cron is GitHub's least punctual
-# trigger -- a scheduled run is queued, not guaranteed, and the whole schedule
-# is disabled after 60 days without a push to the default branch -- so a
-# `workflow_dispatch` with an explicit `version` is the manual road, and it is
-# the road that removes the 15 minutes.
+# EVERY 15 MINUTES, and that number was mc's, not a preference: its `promote`
+# budgeted "up to 15 minutes for teko's schedule to notice, plus its recipe"
+# inside a 90-minute poll (M53 § 6.2.4, the contract until 2026-09-20 --
+# `promote-pending.yml` replaced the deadline, see above). The cron stays what
+# it is because it is still the road a verdict travels by default, and cron is
+# GitHub's least punctual trigger -- a scheduled run is queued, not guaranteed,
+# and the whole schedule is disabled after 60 days without a push to the
+# default branch -- so a `workflow_dispatch` with an explicit `version` is the
+# manual road, and it is the road that removes the wait.
 
+# Why there is no `repository_dispatch` here, so it is not proposed again:
+# mc publishing straight into this workflow would need a token with write
+# access to this repository sitting in mc's secrets, and the canary is built
+# around the opposite property -- no credential in either direction, in either
+# repository (mc's `docs/specs/M53.md` § 6, the owner's ruling of 2026-09-07).
+# Minting such a token is the owner's call alone. mc covers a late verdict on
+# its own side instead (a scheduled `promote-pending.yml`, every 30 minutes,
+# promoting any pre-release whose verdict is green whenever it lands), which
+# is why a schedule this repository does not control is no longer a deadline:
+# measured 2026-09-19/20, the `*/15` below actually ran about every two hours,
+# and mc v1.1.0 (tagged 03:42Z) fell in a three-and-a-half-hour gap.
 on:
   schedule:
     - cron: '*/15 * * * *'
@@ -259,10 +278,13 @@ jobs:
           run="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           # The branch ACCUMULATES, one file per mc version, and is never
-          # force-pushed: mc polls a file for up to 90 minutes, so an orphan
-          # commit holding only the newest verdict could make a file vanish
-          # under a reader mid-poll. The workflow-level concurrency group is
-          # what keeps this push from racing another run of itself.
+          # force-pushed: a verdict is not read once and forgotten. mc's
+          # release run reads it while it is up, and mc's scheduled
+          # `promote-pending.yml` reads it again every 30 minutes for as long
+          # as a pre-release is unpromoted -- so an orphan commit holding only
+          # the newest verdict could make a file vanish under a reader at any
+          # time, not just inside some window. The workflow-level concurrency
+          # group is what keeps this push from racing another run of itself.
           mkdir canary
           cd canary
           git init -q -b canary
