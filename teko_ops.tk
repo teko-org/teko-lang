@@ -839,15 +839,6 @@ void tk_ops_binary(i64 n) {
     i64 b = nd_b(n);
     i64 ta = tk_ty_of(a);
     i64 tb = tk_ty_of(b);
-    // D95: `%` promotes neither operand (`tk_ops_promotes` above leaves it out --
-    // this backend has no float remainder instruction), so a float on either side
-    // reaches the core exactly as written and its bits are read as an integer's.
-    // One side already refuses at the mc level (`mc: no float remainder`, no
-    // `file:line`, unpinnable by a D52 fixture); the other silently truncates
-    // instead of promoting like C# would. Both are refused here, symmetrically,
-    // with a `teko:` message the harness can pin.
-    if (nd_op(n) == K_MOD && (type_kind(ta) == TK_FLOAT || type_kind(tb) == TK_FLOAT))
-        err_at(nd_file(n), nd_line(n), "teko: `%` takes no float operand");
     i64 sa = tk_op_row(ta);
     i64 sb = tk_op_row(tb);
     if (tk_is_nl(sa) || tk_is_nl(sb)) { tk_nl_binary_check(n, sa, sb, a, b); return; }
@@ -858,7 +849,30 @@ void tk_ops_binary(i64 n) {
     // `lib/` -- the raw `+` the core would emit does not panic on overflow --
     // so the claim both lowers and refuses (teko_prim.tk's own `tk_prim_binary`).
     if (tk_prim_is(ta) || tk_prim_is(tb)) { tk_prim_binary(n, ta, tb); return; }
-    if (sa < 0 && sb < 0) return;
+    if (sa < 0 && sb < 0) {
+        // D95: reached only once nullable, enum and primitive-with-members
+        // operands are ruled out, and only when NEITHER side declares an
+        // operator of its own (`sa < 0 && sb < 0`) -- a type that names its
+        // own `operator%(…, f64)` still resolves through the row below, and
+        // this guard must not shadow it. `%` promotes neither operand
+        // (`tk_ops_promotes` above leaves it out -- this backend has no
+        // float remainder instruction), so a float on either side of a pair
+        // the CORE would otherwise own reaches it exactly as written and its
+        // bits are read as an integer's. One side already refused at the mc
+        // level (`mc: no float remainder`, no `file:line`, unpinnable by a
+        // D52 fixture); the other silently truncated instead of promoting
+        // like C# would. Both are refused here, symmetrically, with a
+        // `teko:` message the harness can pin -- `ta >= 0`/`tb >= 0` is
+        // checked before `type_kind` because an UNRESOLVED operand types
+        // `-1`, the same id `tk_op_row` already answers `-1` for, and
+        // `type_kind` on that id is not this guard's to ask.
+        if (nd_op(n) == K_MOD) {
+            i64 af = ta >= 0 && type_kind(ta) == TK_FLOAT;
+            i64 bf = tb >= 0 && type_kind(tb) == TK_FLOAT;
+            if (af || bf) err_at(nd_file(n), nd_line(n), "teko: `%` takes no float operand");
+        }
+        return;
+    }
     i64 tok = nd_op(n);
     i64 line = nd_line(n);
     uptr fl = nd_file(n);

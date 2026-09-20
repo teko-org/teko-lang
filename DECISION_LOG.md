@@ -10908,14 +10908,23 @@ surface-code alternative in this project's own numeric libraries, and porting a 
 `fmod` is a bigger change than this crumb's subject calls for; the only exit that does not
 regress the mirror shapes' own coverage is a refusal that reads the same on every shape.
 
-**Where.** `tk_ops_binary`, right after `tk_ops_promote(n)` and the two lines that compute
-`ta`/`tb` from the (already promoted, for every operator that promotes) operands — before
-`tk_op_row` is asked of either type, so the guard runs ahead of every later clause and never
-shadows a more specific one. `nd_op(n) == K_MOD` and either side's `type_kind` answering
-`TK_FLOAT` (the same predicate `tk_num_widens` already asks, `teko_typeof.tk`) is symmetric
-by construction: it catches the float on either operand in one guard, so `7 % 2.5`, `2.5 %
-7` and `f64 % f64` all reach it and all three move from silence or `mc:` to a pinnable
-`` teko: `%` takes no float operand ``, at the node's own `nd_file`/`nd_line`.
+**Where, amended after review.** The first draft put the guard right after `tk_ops_promote`,
+ahead of `tk_op_row`; the independent review's own findings moved it. `tk_ops_binary`
+(`teko_ops.tk`) now asks it beside the fallthrough it belongs to — `if (sa < 0 && sb < 0)`,
+the exact branch the file's own header already names "the core owns it": neither side
+declares an operator of its own, nullable, enum and primitive-with-members operands are
+already ruled out above it, and this is where a raw core `srem` would otherwise be emitted
+untouched. A type that names its own `operator%(…, f64)` is unaffected — `sa`/`sb` is not
+negative for it, and it still resolves through the rows below exactly as before. `nd_op(n)
+== K_MOD` and either side's `type_kind` answering `TK_FLOAT` (the same predicate
+`tk_num_widens` already asks, `teko_typeof.tk`) is symmetric by construction: it catches the
+float on either operand in one guard, so `7 % 2.5`, `2.5 % 7` and `f64 % f64` all reach it
+and all three move from silence or `mc:` to a pinnable `` teko: `%` takes no float operand
+``, at the node's own `nd_file`/`nd_line`. `type_kind` is asked only of a RESOLVED side (`ta
+>= 0`/`tb >= 0` first) — `tk_ty_of` answers `-1` for an operand the pass could not type, the
+same id `tk_op_row` already answers `-1` for, and indexing the type table by that id is not
+this guard's business; an unresolved operand is left to whatever the rest of the pass (or
+`res_binary` itself) already does with it, unchanged by this crumb.
 
 **Adjacent, measured and found clean.** Integer `/` with a float operand: `tk_ops_promotes`
 does list `K_DIV`, and `f64 r = 7 / 2.5;` measures `2` — the same truncating result C#
@@ -10924,7 +10933,16 @@ Compound assignment: `f64 r = 7.0; r %= 2.5;` and even the plain-integer `i64 r 
 2;` both fail to PARSE at all (`tests/_scratch/…tk:1: expression expected`, no `teko:`
 prefix) — `%=` is not a construct this backend's grammar accepts for any operand type
 today, a pre-existing gap this crumb's subject does not reach and does not widen; it is left
-for whichever crumb takes up compound assignment as its own subject.
+for whichever crumb takes up compound assignment as its own subject. A user-declared
+operator with a FLOAT parameter, of any token: `class Vec { public i64 x; public static i64
+operator%(Vec v, f64 f) { return v.x + (i64) f; } }` beside `a % 2.5` (`a.x` 40) refuses
+`` teko: no operator `%` takes these operands `` on `origin/main` `66645d57` already, before
+this crumb; the same shape with `operator+(Vec v, f64 f)` refuses the same way for `+`. A
+declaration with an `i64` parameter in the identical position resolves and runs correctly
+(`operator%(Vec, i64)`, `40 % 6` → `4`). This is a pre-existing operator-resolution gap
+this crumb's subject does not reach — the guard added here is scoped so it never shadows a
+declared operator regardless, but the declaration itself already fails to be found for an
+unrelated reason. Reported as an adjacent finding, not fixed here.
 
 **Fixtures (D52).** `tests/refuse/rem_float_right.tk` (`7 % 2.5`, the shape that used to
 compile wrong), `tests/refuse/rem_float_left.tk` (`2.5 % 7`, the mirror that used to fail at
@@ -10940,4 +10958,7 @@ refuse fixtures added, none removed); `sh scripts/bootstrap.sh --os macos --arch
 `FIXPOINT OK`; `sh scripts/check-docs.sh` → docs gate green. `--dump-ast`, base vs head, over
 every accepted fixture that still compiles: byte-identical — this crumb only turns three
 programs that used to accept (silently wrong) or fail without a `file:line` into a pinned
-`teko:` refusal; it rewrites nothing the core still accepts.
+`teko:` refusal; it rewrites nothing the core still accepts. Re-measured after the review
+round moved the guard's placement (the "Where, amended after review" paragraph above): the
+same numbers, unmoved — `--dump-ast` empty diff again, fixtures `135 passed, 154 refused as
+expected, 0 failed`, `FIXPOINT OK`, docs gate green.
