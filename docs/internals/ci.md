@@ -87,7 +87,8 @@ the citation rule the very citations that would have tripped it — the check ab
 against that commit, prints `ok decisions: 56 entries, D1..D56, D73 reserved` and exits 0.
 So the check has a **floor**: the `### D<n>` header set of the same file at the base commit
 (the merge-base with `origin/main`, or `HEAD~1` when that is HEAD itself), read with `git
-show`. A header that existed there and is gone here fails, whatever shape the removal took —
+show`. A clone with no `origin/main` at all falls back to `HEAD~1` too, and says so in the
+line it prints (`no origin/main: HEAD~1 only`) because that floor proves only the last commit. A header that existed there and is gone here fails, whatever shape the removal took —
 truncation, hole, or hole plus a reservation marker. Run against `433b18d3` the check now
 refuses, naming `D57`-`D86` less the reserved `D73`. A base that cannot be read is itself a
 failure, which is why the `docs` job checks out with `fetch-depth: 0`. What is still not
