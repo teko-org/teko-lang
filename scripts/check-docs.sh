@@ -447,9 +447,14 @@ done < "$tmp/dec_cited"
 # that had a header there and has none here -- the shape of every loss.
 : > "$tmp/dec_lost"
 dec_base=""
+# Said out loud when it happens: with no `origin/main` the floor is one commit
+# deep whatever the branch is, which proves less than a merge-base does.
+dec_weak=""
 if git rev-parse --git-dir >/dev/null 2>&1; then
     if git rev-parse --verify -q origin/main >/dev/null; then
         dec_base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+    else
+        dec_weak=", no origin/main: HEAD~1 only"
     fi
     # origin/main absent, or it IS this commit: the previous commit is the base.
     if [ -z "$dec_base" ] || [ "$dec_base" = "$(git rev-parse HEAD)" ]; then
@@ -462,7 +467,7 @@ if [ -n "$dec_base" ] && git show "$dec_base:DECISION_LOG.md" >"$tmp/dec_base_lo
     grep -oE '^### D[0-9]+\b' "$tmp/dec_base_log" | sed -E 's/^### D//' | sort -u > "$tmp/dec_base_headers"
     sort -u "$tmp/dec_headers" > "$tmp/dec_headers_u"
     comm -23 "$tmp/dec_base_headers" "$tmp/dec_headers_u" | sort -n > "$tmp/dec_lost"
-    dec_floor="floor $(git rev-parse --short "$dec_base"), $(grep -c . "$tmp/dec_base_headers") entries"
+    dec_floor="floor $(git rev-parse --short "$dec_base"), $(grep -c . "$tmp/dec_base_headers") entries$dec_weak"
 else
     dec_floor=""
 fi
