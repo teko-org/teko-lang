@@ -637,7 +637,8 @@ void tk_ops_emit(i64 n, i64 r, i64 args, i64 line, uptr fl) {
 // comparisons. A shift and the bitwise trio take no float in C# at all, and
 // `%` has no float instruction on this backend (`<float>`'s own FI_ table has
 // add, sub, mul, div and compare, no remainder), so a `%` promoted here would
-// only move the failure; all of them are left to behave as they did.
+// only move the failure from one side to the other rather than remove it --
+// D95 refuses a float `%` outright, in `tk_ops_binary`, instead.
 //
 // This runs on a node whose OPERANDS have already been visited, so a nested
 // binary is settled first and `1 + 2 + 2.5` converts the whole `1 + 2` rather
@@ -838,6 +839,15 @@ void tk_ops_binary(i64 n) {
     i64 b = nd_b(n);
     i64 ta = tk_ty_of(a);
     i64 tb = tk_ty_of(b);
+    // D95: `%` promotes neither operand (`tk_ops_promotes` above leaves it out --
+    // this backend has no float remainder instruction), so a float on either side
+    // reaches the core exactly as written and its bits are read as an integer's.
+    // One side already refuses at the mc level (`mc: no float remainder`, no
+    // `file:line`, unpinnable by a D52 fixture); the other silently truncates
+    // instead of promoting like C# would. Both are refused here, symmetrically,
+    // with a `teko:` message the harness can pin.
+    if (nd_op(n) == K_MOD && (type_kind(ta) == TK_FLOAT || type_kind(tb) == TK_FLOAT))
+        err_at(nd_file(n), nd_line(n), "teko: `%` takes no float operand");
     i64 sa = tk_op_row(ta);
     i64 sb = tk_op_row(tb);
     if (tk_is_nl(sa) || tk_is_nl(sb)) { tk_nl_binary_check(n, sa, sb, a, b); return; }

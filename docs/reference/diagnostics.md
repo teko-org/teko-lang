@@ -997,6 +997,10 @@ runtime's `panic` (D82):
 - `` "teko: `" `` — completed by *`X` is a binary operator; it names two operands*, by
   *`X` is a unary operator; it names one operand*, or, for a generic, by *`X` takes N
   arguments*.
+- `` "teko: `%` takes no float operand" `` — D95: `%` is not one of the promoted operators
+  (this backend has no float remainder instruction), and either side being an `f32`/`f64`
+  used to compile clean and read the float's bits as an integer's — refused outright now,
+  symmetrically on either operand.
 
 ## Integer division
 

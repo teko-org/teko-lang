@@ -10881,3 +10881,63 @@ For check two: lowering `[limits] tolerance` in a scratch `teko.toml` to `0.2` m
 compiler table's own `ins` row into `grow` (244874 used against a 227880 reservation at that
 tolerance) and check two refuses with `compiler (build/teko.mc) verdict grew -- a budget row
 moved`. All mutations restored before the crumb's own commits.
+
+### D95 · `%` refuses a float operand rather than promoting it (2026-09-20)
+
+`docs/reference/not-yet.md:42`'s own row, measured live at `origin/main` `66645d57`: `i64
+main() { f64 r = 7 % 2.5; return (i64) r; }` compiled clean and exited `7` — C# gives `2.0`
+for the same expression, both operands read as its declared literal types. The same is true
+with the operands read from locals rather than literals. The mirror shapes already refused
+before this crumb, but at the mc level: `2.5 % 7` and `f64 % f64` both give `mc: no float
+remainder`, a message with no `file:line` that the D52 fixture harness cannot pin.
+
+**Root.** `tk_ops_promotes` (`teko_ops.tk`) names `K_ADD`/`K_SUB`/`K_MUL`/`K_DIV` and the six
+comparisons, and leaves `%` off the list on purpose — its own header already says why: this
+backend's `<float>` FI_ table has add, sub, mul, div and compare, no remainder, so promoting
+`%` would only move the failure from whichever side the promotion converts to whichever side
+`res_binary` (mc/src/gen_resolve.mc) reads the site's type from, not remove it. Left
+unpromoted, `res_binary` types `7 % 2.5` from its LEFT operand (`i64`) and the core emits an
+ordinary integer `srem` over the float's eight bytes read as a mantissa — nothing refuses,
+because `tk_ops_binary` (`teko_ops.tk`) only claims enum, nullable and wide operands before
+falling through to the core's own resolution.
+
+**Ruling: refuse, not implement.** The backend has no float remainder instruction at all —
+promoting is not an option that removes the failure, only one that relocates it, exactly as
+the omission's own comment already argued. Adding one would be a new intrinsic (D21) with no
+surface-code alternative in this project's own numeric libraries, and porting a software
+`fmod` is a bigger change than this crumb's subject calls for; the only exit that does not
+regress the mirror shapes' own coverage is a refusal that reads the same on every shape.
+
+**Where.** `tk_ops_binary`, right after `tk_ops_promote(n)` and the two lines that compute
+`ta`/`tb` from the (already promoted, for every operator that promotes) operands — before
+`tk_op_row` is asked of either type, so the guard runs ahead of every later clause and never
+shadows a more specific one. `nd_op(n) == K_MOD` and either side's `type_kind` answering
+`TK_FLOAT` (the same predicate `tk_num_widens` already asks, `teko_typeof.tk`) is symmetric
+by construction: it catches the float on either operand in one guard, so `7 % 2.5`, `2.5 %
+7` and `f64 % f64` all reach it and all three move from silence or `mc:` to a pinnable
+`` teko: `%` takes no float operand ``, at the node's own `nd_file`/`nd_line`.
+
+**Adjacent, measured and found clean.** Integer `/` with a float operand: `tk_ops_promotes`
+does list `K_DIV`, and `f64 r = 7 / 2.5;` measures `2` — the same truncating result C#
+gives for `(int)(7 / 2.5)` promoted to `double` division, `2.8` truncated. No hole there.
+Compound assignment: `f64 r = 7.0; r %= 2.5;` and even the plain-integer `i64 r = 7; r %=
+2;` both fail to PARSE at all (`tests/_scratch/…tk:1: expression expected`, no `teko:`
+prefix) — `%=` is not a construct this backend's grammar accepts for any operand type
+today, a pre-existing gap this crumb's subject does not reach and does not widen; it is left
+for whichever crumb takes up compound assignment as its own subject.
+
+**Fixtures (D52).** `tests/refuse/rem_float_right.tk` (`7 % 2.5`, the shape that used to
+compile wrong), `tests/refuse/rem_float_left.tk` (`2.5 % 7`, the mirror that used to fail at
+the mc level), `tests/refuse/rem_float_both.tk` (`f64 % f64` through two locals, the
+variable form rather than two literals). `docs/reference/not-yet.md:42`'s row is replaced by
+a line stating the refusal and pointing at `diagnostics.md`, since the gap it named is no
+longer a silent one.
+
+**Proof, mc 1.0.1, macos/aarch64, head against `origin/main` `66645d57`.** `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**135 passed, 154 refused as expected, 0 failed** (base: 135 passed, 151 refused — three
+refuse fixtures added, none removed); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK`; `sh scripts/check-docs.sh` → docs gate green. `--dump-ast`, base vs head, over
+every accepted fixture that still compiles: byte-identical — this crumb only turns three
+programs that used to accept (silently wrong) or fail without a `file:line` into a pinned
+`teko:` refusal; it rewrites nothing the core still accepts.
