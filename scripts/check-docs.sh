@@ -1,5 +1,5 @@
 #!/bin/sh
-# check-docs.sh [MC] -- the docs gate. Six checks, in this order, run from the
+# check-docs.sh [MC] -- the docs gate. Seven checks, in this order, run from the
 # repository root as the `docs` job in .github/workflows/ngen.yml does:
 #
 #   1. links        every relative markdown link under docs/ and site/, plus the two root
@@ -30,6 +30,11 @@
 #                    roots (`core_teko.mc`, `mc_teko.tk`, `teko.tk`) are listed in
 #                    `mc.toml`'s `[package].files` -- the registry's validator checks
 #                    out only what is listed (v0.13.0 was refused for a missing row).
+#   7. decisions    DECISION_LOG.md's own numbering (D93/D94): every `### D<n>` header is
+#                    unique, the set is dense from D1 to the highest with no gap except a
+#                    number a docs/ page explicitly reserves, and every `D<n>` cited under
+#                    docs/ or in a root `*.tk` module resolves to a header. `433b18d3` lost
+#                    D57-D86 and five merges passed with none of checks 1-6 noticing.
 mc="${1:-mc}"
 
 if command -v "$mc" >/dev/null 2>&1; then
@@ -370,9 +375,78 @@ if [ "$missing" = 0 ]; then echo "manifest ok: every module and lib file is in [
 
 echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
+# --------------------------------------------------------------- 7. decisions
+# DECISION_LOG.md's own numbering (D93). `433b18d3` carried D57-D86 (31
+# rulings) out of the file and five merges passed with a green docs gate,
+# because none of the six checks above reads the log's own numbering. This
+# one does: every `### D<n>` header is unique and the set is dense from D1 to
+# the highest, with no gap except a number a page RESERVES (today exactly
+# D73, `docs/specs/tekoc-tool.md`'s own draft -- read from that page, never
+# hardcoded, so a reservation that disappears while its gap remains fails
+# here); and every `D<n>` cited under docs/ or in a root `*.tk` module, at or
+# below the highest header, resolves to a header (a citation to a reserved,
+# headerless number is not a failure -- that is what "reserved" means).
+#
+# A header format note: `### D80 (D79 is C5's, on its own branch) · ...`
+# carries a parenthetical BETWEEN the number and the ` · ` title separator,
+# so the header pattern matches `### D<n>` at a word boundary, not `### D<n> ·`
+# literally -- the latter silently missed D80 in a first draft of this check.
+grep -oE '^### D[0-9]+\b' DECISION_LOG.md | sed -E 's/^### D//' | sort -n > "$tmp/dec_headers"
+ndecisions=$(grep -c . "$tmp/dec_headers")
+highest=$(tail -1 "$tmp/dec_headers")
+
+: > "$tmp/dec_dupes"
+uniq -d "$tmp/dec_headers" > "$tmp/dec_dupes"
+
+# `## D<n> — draft, not yet in the log` is the reservation marker
+# `docs/specs/tekoc-tool.md` carries for D73; read every page under docs/ for
+# it rather than trusting one path, and rather than trusting the number.
+grep -hoE '^## D[0-9]+ — draft, not yet in the log' docs -r 2>/dev/null \
+    | sed -E 's/^## D//; s/ .*//' | sort -nu > "$tmp/dec_reserved"
+
+: > "$tmp/dec_gap"
+n=1
+while [ "$n" -le "$highest" ]; do
+    if ! grep -qx "$n" "$tmp/dec_headers"; then
+        grep -qx "$n" "$tmp/dec_reserved" || echo "$n" >> "$tmp/dec_gap"
+    fi
+    n=$((n + 1))
+done
+
+: > "$tmp/dec_bad_citations"
+{ grep -rhoE '\bD[0-9]+\b' docs --include='*.md' 2>/dev/null; grep -hoE '\bD[0-9]+\b' ./*.tk 2>/dev/null; } \
+    | sed 's/^D//' | sort -nu > "$tmp/dec_cited"
+while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$n" -le "$highest" ] || continue
+    grep -qx "$n" "$tmp/dec_headers" && continue
+    grep -qx "$n" "$tmp/dec_reserved" && continue
+    echo "D$n" >> "$tmp/dec_bad_citations"
+done < "$tmp/dec_cited"
+
+dec_ok=1
+if [ -s "$tmp/dec_dupes" ]; then
+    fail "duplicate ### D<n> headers in DECISION_LOG.md" "$(sed 's/^/D/' "$tmp/dec_dupes")"
+    dec_ok=0
+fi
+if [ -s "$tmp/dec_gap" ]; then
+    fail "gap in DECISION_LOG.md's numbering (D1..D$highest), not reserved by any docs/ page" \
+        "$(sed 's/^/D/' "$tmp/dec_gap")"
+    dec_ok=0
+fi
+if [ -s "$tmp/dec_bad_citations" ]; then
+    fail "D<n> cited under docs/ or a root *.tk module with no header in DECISION_LOG.md" "$(cat "$tmp/dec_bad_citations")"
+    dec_ok=0
+fi
+if [ "$dec_ok" = 1 ]; then
+    reserved_list=$(sed 's/^/D/' "$tmp/dec_reserved" | paste -sd, - 2>/dev/null)
+    [ -n "$reserved_list" ] || reserved_list="none"
+    echo "ok decisions: $ndecisions entries, D1..D$highest, $reserved_list reserved"
+fi
+
 # ------------------------------------------------------------------- verdict
 if [ "$fails" -eq 0 ]; then
-    echo "docs ok: $nlinks links, $nfrags fragments, $ndiag diagnostics, $nrefuse refusals, $nblocks samples, manifest listed"
+    echo "docs ok: $nlinks links, $nfrags fragments, $ndiag diagnostics, $nrefuse refusals, $nblocks samples, manifest listed, $ndecisions decisions"
     exit 0
 fi
 echo "$fails documentation check(s) failed"
