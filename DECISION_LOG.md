@@ -10761,9 +10761,43 @@ gate-decisions-and-limits`, because both are checks the gate owed and both are s
 highest, with no gap except a number a docs/ page explicitly reserves: today exactly D73,
 `docs/specs/tekoc-tool.md`'s own `## D73 — draft, not yet in the log` marker, read by grep
 from that page rather than hardcoded, so a reservation that disappears while its gap remains
-fails the check instead of passing silently. Every `D<n>` cited anywhere under `docs/` or in
-a root `*.tk` module, at or below the highest header, has to resolve to a header — the
-citation a `D57`-`D86` loss would have tripped.
+fails the check instead of passing silently. Every `D<n>` cited anywhere under `docs/`, in
+a root `*.tk` module, or in `scripts/` and `.github/`, at or below the highest header, has
+to resolve to a header.
+
+**Check one's floor, and why density alone was never going to catch `433b18d3`.** The first
+version of this check read nothing but the file under test, and anything that reads nothing
+but the file under test is satisfied by deleting more of it. `433b18d3` did not punch a hole
+in the middle: it TRUNCATED THE TOP, D1..D86 down to D1..D56. Density anchors on the highest
+header present, so a truncation lowers the ceiling and the shortened list reads perfectly
+dense; and the citation rule skips everything above the ceiling, so the very citations that
+would have tripped it — every `D57`-`D86` written across `docs/` — were exempted by the same
+act that removed the headers. Measured, the first version of this check run against the real
+loss commit: `ok decisions: 56 entries, D1..D56, D73 reserved`, exit 0. It was GREEN on the
+commit it was written for.
+
+So check one takes a SECOND source it cannot edit: the `### D<n>` header set of the same
+file at the BASE commit, read with `git show`. Every number that had a header there and has
+none here fails — a truncation, a hole, and a hole dressed up with a reservation marker are
+one shape to a set difference, while a new entry only adds and passes. The base is the
+merge-base with `origin/main`, which is a pull request's own base; when that resolves to HEAD
+itself (a push to `main`, or a detached head at the commit under test) it is `HEAD~1`, the
+previous commit. A base that cannot be read is a FAILURE and never a silent skip — the floor
+is the only part of check one that does not read the file under test, and a shallow checkout
+that quietly dropped it would put the gate back exactly where `433b18d3` found it, so the
+`docs` job now checks out with `fetch-depth: 0`.
+
+Measured, the new check run on a detached worktree at `433b18d3` itself:
+`FAIL ### D<n> headers present at the base commit and gone from DECISION_LOG.md (floor
+6f8d0af7, 85 entries)`, naming `D57`-`D86` less the reserved `D73`, exit 1. The commit that
+caused the loss is refused by the check written because of it.
+
+A committed floor file — a number checked in and compared against — was rejected: it drifts,
+and the same commit that removes the rulings edits it, which is the self-service exemption
+this ruling exists to close. Git history is the one source a commit under test cannot
+rewrite in passing. The reservation marker is subordinate to the floor for the same reason:
+`## D<n> — draft, not yet in the log` still excuses a gap at a number that never had a
+header, and no longer excuses anything that did.
 
 One thing the first draft of this check got wrong and a second pass caught: the header
 pattern has to match `### D<n>` at a word boundary, not `### D<n> ·` literally.
@@ -10775,12 +10809,20 @@ even the UTF-16 surrogate range literal `D800` in `docs/specs/string.md`) are no
 all: several root `*.tk` modules cite the RETIRED standalone compiler's own frozen decision
 log by number in comments (`docs/history/README.md`'s "its decision log (D1-D210)"), a
 different file with different numbering, and a citation the current log could not possibly
-own is not this check's business.
+own is not this check's business. That exemption cannot hide a gap — the floor sees a removal
+whatever its number — but it does hide a TYPO: `D205` written where `D95` was meant is above
+the ceiling, so it resolves to nothing and is never checked.
 
 **What it does not cover.** A header whose NUMBER is right but whose TEXT drifted from what
 actually shipped is invisible to a check that reads numbering alone; D93's own restoration
 proved that only a `git show` of the pre-damage commit and a manual read caught the mismatch
 between D87's header and its grafted body. This check catches disappearance, not corruption.
+The floor is one commit deep, not the whole history: it is the chain of gated commits that
+carries a ruling forward, and a number that vanished before the base commit is the base
+commit's own business, not this run's. And a header added on the branch UNDER TEST is not
+yet floored — deleting `### D94` on this very branch passes, because at the base it never
+existed and dropping it is a revert of an unmerged addition, not a loss. Once this branch is
+on `main`, D94 is part of the floor like every other number.
 
 **Check two — `mc limits` in `docs`, `scripts/check-limits.sh`.** `teko.toml`'s own
 `[target]` is linux/x86_64, the same pair the `docs` job already runs on, so no config is
@@ -10809,11 +10851,33 @@ not move with pointer width) but `heap` and a handful of others are, so a row th
 only on a pair `docs` does not run on would not be caught here — the same argument that
 already keeps `docs` off the five-way matrix, taken the other way.
 
-**Proof, on mc 1.0.1.** Deleting a `### D80 ·` header in a scratch copy of `DECISION_LOG.md`
-makes check one refuse with `gap in DECISION_LOG.md's numbering`, naming `D80`. Citing a
-`D99` that has no header (added to a scratch `docs/` page) makes check one refuse with
-`D<n> cited under docs/ or a root *.tk module with no header`, naming `D99`. Lowering
-`[limits] tolerance` in a scratch `teko.toml` to `0.2` moves the compiler table's own `ins`
-row into `grow` (244874 used against a 227880 reservation at that tolerance) and check two
-refuses with `compiler (build/teko.mc) verdict grew -- a budget row moved`. All three
-restored before the crumb's own commits.
+**Proof, on mc 1.0.1.** Twelve mutations, each on its own detached worktree at this
+branch's head, the whole `sh scripts/check-docs.sh` run on each. Refused: deleting a middle
+header (`### D50`, three failures — floor, gap, citation); deleting `### D93`, the highest
+header the floor knows (three failures, the same three); truncating everything from
+`### D57` to the end of the file, `433b18d3`'s own shape (one failure, the floor, naming
+`D57`-`D86` and `D87`-`D93` less the reserved `D73`); deleting `### D22` AND appending
+`## D22 — draft, not yet in the log` to a docs page, the self-service exemption (one
+failure, the floor — a marker no longer excuses a number that had a header); duplicating a
+header; removing the `D73` reservation while its gap stands; and running with no git at all
+(`FAIL no base commit to floor DECISION_LOG.md against`). Accepted, each by design: the
+unmutated tree; appending a real `### D95` entry (`94 entries, D1..D95`); citing a `D95`
+that has no header, and citing a `D205` typo — both above the ceiling, the exemption
+disclosed above; and deleting `### D94`, this branch's own unmerged addition.
+
+And the demonstration that matters, on the loss commit itself — `git worktree add --detach
+… 433b18d3`, the new `scripts/check-docs.sh` copied in, run there:
+
+```
+FAIL ### D<n> headers present at the base commit and gone from DECISION_LOG.md (floor 6f8d0af7, 85 entries)
+     D57,D58,D59,D60,D61,D62,D63,D64,D65,D66,D67,D68,D69,D70,D71,D72,D74,D75,D76,D77,D78,D79,D80,D81,D82,D83,D84,D85,D86
+1 documentation check(s) failed
+```
+
+exit 1, against `ok decisions: 56 entries, D1..D56, D73 reserved` and exit 0 from the
+version without the floor.
+
+For check two: lowering `[limits] tolerance` in a scratch `teko.toml` to `0.2` moves the
+compiler table's own `ins` row into `grow` (244874 used against a 227880 reservation at that
+tolerance) and check two refuses with `compiler (build/teko.mc) verdict grew -- a budget row
+moved`. All mutations restored before the crumb's own commits.
