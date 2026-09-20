@@ -472,23 +472,18 @@ void tk_this_iface_prop(i64 n, i64 wantset) {
     tk_xt_put(n, tk_struct_by_ty(rty), rty, 0, TK_OWNED);
 }
 
-// D97, the third site with the same gap: `&Prop` inside a DEFAULT body. The
-// only member of an interface a bare name can reach is a property, and it is
-// reached through the itab -- there is no slot for an address to name at all, so
-// this one is a refusal by nature rather than a deferred teaching. Measured on
-// `55cdf69e`: `ld64(&Label)` in a default body, over a global `Label = 100` and
-// an implementing `Label` worth 5, answered 100.
-void tk_this_iface_addr(i64 n) {
-    uptr nm = nd_name(n);
-    if (tk_ty_scope_find(nm) >= 0) return;
-    uptr pdecl = xalloc(8);
-    if (tk_ifprop_find_deep(tk_pass_class, nm, pdecl)) tk_addr_of_member(n, nm);
-}
-
 void tk_this_iface_fix(i64 n, i64 k) {
     if (k == N_IDENT)  { tk_this_iface_prop(n, 0); return; }
     if (k == N_ASSIGN) { tk_this_iface_prop(n, 1); return; }
-    if (k == N_ADDR)   { tk_this_iface_addr(n);    return; }
+    // D97, the third site with the same gap: `&Prop` inside a DEFAULT body. The
+    // only member of an interface a bare name can reach is a property, and it is
+    // reached through the itab -- there is no slot for an address to name at all,
+    // so this one is a refusal by nature rather than a deferred teaching. The
+    // judge is the METHOD body's own, unchanged: `tk_pass_class` is the interface
+    // here and `tk_addr_is_member` asks the deep interface question itself.
+    // Measured on `55cdf69e`: `ld64(&Label)` in a default body, over a global
+    // `Label = 100` and an implementing `Label` worth 5, answered 100.
+    if (k == N_ADDR)   { tk_this_addr_reject(n);   return; }
     if (k == N_CALL)     tk_this_iface_call(n);
 }
 
@@ -530,7 +525,17 @@ i64 tk_addr_is_member(i64 cls, uptr nm) {
     if (cls < 0) return 0;
     if (tk_field_find(cls, nm) >= 0) return 1;
     if (tk_mconst_find(cls, nm) >= 0) return 1;
-    return tk_prop_find(cls, nm) >= 0;
+    if (tk_prop_find(cls, nm) >= 0) return 1;
+    // an interface property a BASE interface declares: `tk_prop_find` answers
+    // the interface's OWN property and stops there, which is why the read road
+    // has `tk_ifprop_find_deep` (`tk_this_iface_prop`) and why the address road
+    // needs it too. Measured on `55cdf69e` AND on this crumb's first commit:
+    // `ld64(&Label)` inside a lambda in `interface I2 : I1`'s default body, over
+    // `I1`'s own `Label`, still answered the global 100 with only the shallow
+    // question asked (found by the Copilot review).
+    if (!tk_is_iface(cls)) return 0;
+    uptr pdecl = xalloc(8);
+    return tk_ifprop_find_deep(cls, nm, pdecl) != 0;
 }
 
 void tk_this_addr_reject(i64 n) {

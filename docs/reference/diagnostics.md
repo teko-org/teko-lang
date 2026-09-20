@@ -148,7 +148,8 @@ with that line in its stderr (D52).
   inline array field; write the receiver.
 - `"teko: the address of a member is not taught yet"` — completed by the name: `&n`,
   `ref n` or `out n` on a bare member name (a field, a static field, a member `const`, a
-  property, an interface property in a default body), in a method or inside a lambda
+  property, an interface property in a default body, a base interface's included), in a
+  method or inside a lambda
   alike. No spelling of a member's address works from inside the type yet; from outside,
   `ref h.n` / `out h.n` through a variable holding the object does.
 - `"teko: methods take no explicit receiver; use this"` — a parameter named as the

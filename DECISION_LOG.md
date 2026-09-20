@@ -11107,9 +11107,22 @@ and for a static the fix would not be `this.` anyway. "Not taught yet" is honest
 instance member, the static, the `const`, the property and the interface property alike,
 so one message covers all five.
 
+**The Copilot review's own finding**, measured and fixed in the second commit: an
+interface property a BASE interface declares, reached bare under `&` INSIDE A LAMBDA in a
+derived interface's default body, still answered the global. `tk_prop_find` answers an
+interface's OWN property and stops there, so every shallow shape was already refused --
+the direct default body (`tk_ifprop_find_deep`, which the first commit called from a
+separate `tk_this_iface_addr`) and a lambda over the interface's own property -- and only
+the inherited-and-in-a-lambda one fell through. The deep question moved INTO
+`tk_addr_is_member`, where all three walks ask it at once, and `tk_this_iface_addr` was
+deleted: `tk_pass_class` is the interface inside `tk_this_iface_fix` anyway, so that arm
+is `tk_this_addr_reject` like the other two. Fixture:
+`tests/refuse/addr_member_iface_lambda.tk`.
+
 **Roads covered**, each with a fixture: `&` in an expression, a `ref` argument, an `out`
 argument, an instance field, a static field, a base class's field, a member `const`, a
-property, an interface property in a default body, and inside a lambda. **Roads proved
+property, an interface property in a default body, an interface property INHERITED from a
+base interface, and inside a lambda. **Roads proved
 UNTOUCHED** by `tests/addr_not_member.tk`: `&`/`ref` on a plain local and on a plain
 global, `ref h.n` / `out h.n` through a local object (the one member-address spelling that
 works, `tk_ref_addr`'s `p.x` branch), the repassed `ref` parameter of `tk_ref_walk`'s own
@@ -11125,7 +11138,7 @@ bare name and none is made worse by this one): `&this.n` inside a method builds
 because a capture answers before the member question.
 
 **Gate.** `136 passed, 162 refused as expected, 0 failed` at `55cdf69e` →
-`137 passed, 170 refused as expected, 0 failed`: eight refusals and one positive fixture,
-refused rising by exactly the eight added. `FIXPOINT OK`, docs gate green, and `--dump-ast`
+`137 passed, 171 refused as expected, 0 failed`: nine refusals and one positive fixture,
+refused rising by exactly the nine added. `FIXPOINT OK`, docs gate green, and `--dump-ast`
 against `55cdf69e` over every one of the 136 fixtures accepted by both compilers: an EMPTY
 diff.
