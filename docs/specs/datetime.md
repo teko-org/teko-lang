@@ -449,7 +449,7 @@ a function nothing calls, so its `extern` still has to link). The mechanism used
 the one `minicompiler/mc` already ships for exactly this shape of problem —
 `#include <mc/host>`, whose bundle resolver answers differently per host with no change to
 the two include lines a generated compiler carries. `teko_time.tk` wraps that SAME resolver
-(`lex_set_bundle`) for one more name, `<teko/clock>`, answered by `host_os()` and falling
+(`lex_set_bundle`) for one more name, `<teko/clock.tk>`, answered by `host_os()` and falling
 through to `host_bundle_open` for everything else; `lib/time.tk` includes it unconditionally,
 and the text it expands to differs by host. Zero mc changes, zero new intrinsics: the
 generated text is ordinary `extern`/function surface, parsed the same way any other include
@@ -470,7 +470,7 @@ offset `+0` for both, for the same reason.
 | **The include.** `#include "time.tk"` is a build-time step C# does not have. | Refuse the type word with the include in the message, and leave the flip to `lib/rt.tk` open for the owner: it is a one-line change either way. |
 | **`types 10/14` in `mc limits`.** Three primitives spend three of a program's type ids before the program declares one. | P0 measures it. If the heaviest fixture goes over, the fix is `[limits] tolerance`, not fewer types — and `tolerance` is already 1.0, so the row would be a `grew` verdict rather than an error. |
 | **`ToString()` leaks into the arena.** A `str` is not counted. | Ship the `fmt` half in the same crumb and document both, exactly as `mc`'s `<float_rt>` does. A counted string type is a separate decision. |
-| **`[include].paths` cannot vary by host, so a per-host FILE cannot be picked by a quoted include (C6, D90).** | Wrap the bundle resolver ANGLE includes already use (`lex_set_bundle`), the same mechanism `#include <mc/host>` relies on for a generated compiler to be portable. `<teko/clock>` is teko's own name; every other one still reaches `host_bundle_open` unchanged. |
+| **`[include].paths` cannot vary by host, so a per-host FILE cannot be picked by a quoted include (C6, D90).** | Wrap the bundle resolver ANGLE includes already use (`lex_set_bundle`), the same mechanism `#include <mc/host>` relies on for a generated compiler to be portable. `<teko/clock.tk>` is teko's own name; every other one still reaches `host_bundle_open` unchanged. |
 
 ## 14. What the `mc` channel is asked
 

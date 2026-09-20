@@ -5469,15 +5469,30 @@ host": `#include <mc/host>`, whose bundle resolver (`lex_set_bundle`, one functi
 pointer) already special-cases that one name to `host_include()`'s own per-host answer,
 which is what makes a GENERATED compiler portable with no change to its two include
 lines (`minicompiler/mc` `src/core_bundle.mc`). `teko_time.tk` wraps that SAME pointer
-for one more name, `<teko/clock>` — answered by `host_os()`, never `drv_os()` (the five
+for one more name, `<teko/clock.tk>` — answered by `host_os()`, never `drv_os()` (the five
 CI legs are all NATIVE, so host and target are the same machine, and `host_os()` needs no
 `--config` to answer where `drv_os()` reads `0` on the bare-CLI path) — and falls through
 to `host_bundle_open` for every other name, so `<sys>`/`<prelude>`/`<mc/host>` itself stay
-untouched. `lib/time.tk` includes `<teko/clock>` unconditionally; the TEXT it expands to
+untouched. `lib/time.tk` includes `<teko/clock.tk>` unconditionally; the TEXT it expands to
 differs by host, and only ONE host's wrapper is ever compiled into a given build. Zero mc
 changes (`lex_set_bundle` is `src/lex.mc`'s own exposed hook, already called once by
 `mc_bundle_init()`), zero new intrinsics: the generated text is ordinary `extern`/function
 surface, parsed the same as any other include.
+
+**The bundle name MUST end `.tk`, measured the hard way.** The first draft answered the
+bare name `teko/clock`, which compiled the POSIX text fine (core mc vocabulary only —
+`extern`, `i64`, a plain function) but refused the Windows text at its own `const` line:
+`` teko: type expected at top level ``. Root cause, not routed around: `tk_source_claim`
+(`teko_fwd.tk`) scopes every teko-TAUGHT word — `const` among them, registered through
+`syntax("const", ...)` — to sources whose NAME passes `tk_fwd_is_source_name`, a bare
+`.tk`-suffix check; a bundle name with no such suffix is read with the CORE's own
+vocabulary, where a module-taught word with no matching `#rule` never gets its own token
+id at all (`lex_word_id`, gated on `lex_claimed()`) and lexes as a plain identifier —
+`parse_top` then finds neither a registered handler NOR a type keyword and refuses. Renamed
+to `<teko/clock.tk>` throughout (the `#include`, the `str_eq`, the `pcanon`); the reference
+build below is the one that carries the fix, and `lib/time.tk`'s own comment above the
+`#include` states the requirement so the next bundle name teko answers does not lose the
+same afternoon.
 
 **`TK_PMSOON` → `TK_PMSVAL`, five rows.** `DateTime.Now`/`UtcNow`/`Today` and
 `DateTimeOffset.Now`/`UtcNow` move from the "named, refused by name" row `Guid.NewGuid`
@@ -5504,7 +5519,7 @@ new fixture and the one refusal this crumb removes); `sh scripts/bootstrap.sh --
 identical on both, **all six UNMOVED**, on the `tests/hello.tk` leg (the fixed sample this
 crumb never touches, byte-identical top to bottom) and on the compiler's own leg alike.
 Only the compiler leg's own surface-code rows move, by the new module code: `nodes`
-207117->207652, `funcs`/`lowered` 4207/4207->4214/4214 (declared) and 3444/3425->3448/3429
+207117->207654, `funcs`/`lowered` 4207/4207->4214/4214 (declared) and 3444/3425->3448/3429
 (used), `strings` 3071->3080, `symbols` 8680->8698, `ins` 242597->242701 (`heap`, never
 cited).
 
@@ -5513,7 +5528,7 @@ cited).
 one refusal removed) — byte-identical on 255 of them; the 20 that `#include`
 `lib/time.tk` (directly or through a chain) each gained the SAME 66 lines, a pure append
 after every pre-existing node (`diff` measured zero removed lines on every one of the
-twenty) — the new `<teko/clock>` extern-and-function pair plus `tk_dt_now_utc`/`_local`/
+twenty) — the new `<teko/clock.tk>` extern-and-function pair plus `tk_dt_now_utc`/`_local`/
 `tk_dt_today`/`tk_dto_now`/`tk_dto_now_utc`, the accepted surface this crumb adds. No
 pre-existing node moved.
 

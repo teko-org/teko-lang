@@ -216,7 +216,7 @@ not the identity cast `TimeSpan.Ticks` is:
 | `i64 tk_dt_hour(i64)` `tk_dt_minute(i64)` `tk_dt_second(i64)` `tk_dt_ms(i64)` | the time of day |
 | `i64 tk_dt_date(i64)` `i64 tk_dt_tod(i64)` | `.Date` and `.TimeOfDay` |
 | `i64 tk_dt_min()` `tk_dt_max()` `tk_dt_epoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
-| `i64 tk_dt_raw_utc_ticks()` | C6, D90: the host wall clock, one function per host answered by `#include <teko/clock>` (`teko_time.tk`'s bundle wrapper); `tk_dt_now_utc`/`_local` are the only callers |
+| `i64 tk_dt_raw_utc_ticks()` | C6, D90: the host wall clock, one function per host answered by `#include <teko/clock.tk>` (`teko_time.tk`'s bundle wrapper); `tk_dt_now_utc`/`_local` are the only callers |
 | `i64 tk_dt_now_utc()` `tk_dt_now_local()` `tk_dt_today()` | `UtcNow`, `Now` (same clock read, `DateTimeKind.Local`), `Today` (`Now` at midnight) |
 | `i64 tk_dt_from_ticks(i64)` `i64 tk_dt_from_ticks_kind(i64, i64)` | the two raw constructors |
 | `i64 tk_dt_ymd(i64, i64, i64)` `tk_dt_ymdhms(...)` `tk_dt_ymdhmsms(...)` | the three calendar constructors |
