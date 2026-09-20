@@ -11081,8 +11081,10 @@ capture) binds nearer than any member; then a field, a base's and a static's ali
 member `const`; then a property:
 
 - `tk_this_addr_reject` (`teko_this.tk`), the fourth arm of `tk_this_fix`;
-- `tk_this_iface_addr` (`teko_this.tk`), the fourth arm of `tk_this_iface_fix` — a default
-  body reaches its members through the itab and has no slot at all;
+- the same `tk_this_addr_reject`, wired as the fourth arm of `tk_this_iface_fix` too — a
+  default body reaches its members through the itab and has no slot at all. It started as a
+  separate `tk_this_iface_addr` and was deleted when the interface question moved into the
+  shared judge (the Copilot finding below);
 - `tk_lam_addr_reject` (`teko_deleg.tk`), the fourth arm of `tk_lam_walk` — a lambda body
   is lifted to a top-level function, so `tk_pass_class` is -1 there and teko_this.tk's arm
   cannot see the enclosing class.
@@ -11102,7 +11104,8 @@ it names a road that does not exist. Measured on `55cdf69e`, from inside the typ
 spelling of a member's address works: `ref this.n` is refused (`this` is no `T_IDENT` for
 `tk_ref_addr`), `&this.n` builds the address of the receiver SLOT plus the offset and
 answers garbage, `&H.n` is the core's own `& expects a name`, and `ref H.n` is
-`teko: not an object of a known type`. A message pointing at `this.`/`H.` would be a lie,
+``teko: `ref`/`out` requires a variable: H `` (the same for an instance field through a
+type name). A message pointing at `this.`/`H.` would be a lie,
 and for a static the fix would not be `this.` anyway. "Not taught yet" is honest for the
 instance member, the static, the `const`, the property and the interface property alike,
 so one message covers all five.
@@ -11132,8 +11135,9 @@ capture shadowing a same-named field, and `&freeFunction` inside a method body.
 **Roads NOT reached, reported and left open** (each is a separate crumb, none involves a
 bare name and none is made worse by this one): `&this.n` inside a method builds
 `ADDR(this-slot) + OFF` and answers garbage — 192 against a field worth 42, confirmed in
-`--dump-ast` as `BINARY + / ADDR name=this / INT 24`; `&h.n` on a local object segfaults
-(exit 139) for the same reason; `&H.n` on a static is refused by the CORE, without a
+`--dump-ast` as `BINARY + / ADDR name=this / INT 24`; `&h.n` on a local object is the same
+miscompile, not a crash: measured at 243 against a field worth 42, and it faults only when
+the offset happens to land outside the mapping -- a wrong answer is the worse half; `&H.n` on a static is refused by the CORE, without a
 `teko:` prefix. `&acc` on a by-REFERENCE lambda capture is a fourth one, untouched here
 because a capture answers before the member question.
 
