@@ -345,6 +345,10 @@ taught, over a hole:
 | `$"{x,10}"` — C#'s alignment | `teko: an interpolation hole holds one expression, no alignment or format specifier` — a hole holds one expression, nothing else (§ 9's own decision) |
 | `$"{x:N2}"` — C#'s format specifier | the same message |
 | `$"{x}"` where `x` is `f64`/`f32`/`decimal`/`DateTime`/`TimeSpan`/`Guid`/an `enum` | `` teko: no interpolation of a value of type Foo `` — each one's own `.ToString()` (where it has one) hands back an `rt_alloc`-owned `str` this crumb cannot free with the right size from outside the module that sized it; write the value into a `string` first and concatenate with `+` |
+| `$"{(a > 0 ? 5 : 6)}"`, `$"{x ?? 3}"`, `$"{o?.Name}"` | `teko: an interpolation hole holds no ternary, ?? or ?.` — each parks as a marker call (`tk_ternary`/`tk_coalesce`/`tk_qdot`, `teko_ternary.tk`) that `tk_ternary_pass` unpacks, and that pass runs AFTER the one this crumb types a hole in, so `tk_ty_of` has nothing to answer with yet. Moving the hole's own walk behind `tk_ternary_pass` is the upgrade; it needs a scope walk of its own and is not this crumb's. Compute into a local, interpolate the local |
+| `$"{x // note}"` | `teko: a line comment does not fit in an interpolation hole` — the `+` chain is pushed back through the lexer as ONE line. `$"{x /* note */}"` works |
+| `$"a{n}".Length` — a `.` directly on the literal | `` teko: uptr has no members: Length `` — NOT this construct's: `"abc".Length` and `("a" + s).Length` are refused identically without any interpolation, a `str` literal carrying no members. Bind to a `string` local first |
+| `$"{u}"` where `u` is `u32` | the UTF-8 encoding of the code point, not the decimal — `char` is `type_alias("char", TY_U32)`, the same core id, so the two cannot be told apart (D92). `u8`, `u16`, `i8`, `i16`, `i32`, `i64` and `u64` all give decimal |
 
 `"n=" + 5` (needing a universal `ToString`/`object`, § 11) is neither N7a's, N7b's, N8's
 nor N10's; it stays exactly where [the specification](../specs/string.md) § 11 leaves it.
