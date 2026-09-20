@@ -11048,3 +11048,84 @@ paths and nothing pinned them. `--dump-ast` compared
 against `63951cb0` over every one of the 136 accepted fixtures: an EMPTY diff, the new
 positive fixture included (it is a legal program on both compilers). `FIXPOINT OK`, docs gate
 green.
+
+### D97 · `&n`, `ref n` and `out n` on a bare member name (2026-09-20)
+
+**The split.** Every other use of a bare member name is rewritten by teko's own passes —
+the read (`tk_this_ident`), the write (`tk_this_assign`), the call (`tk_this_call`), and
+their lambda twins D70 built (`tk_lam_member`, `tk_lam_member_store`,
+`tk_lam_check_call`). The ADDRESS was in none of them: `tk_this_fix` dispatched exactly
+`N_IDENT`, `N_ASSIGN` and `N_CALL`, `tk_this_iface_fix` the same three, and
+`tk_lam_walk` the same three again. So a name under `&`, `ref` or `out` fell through to
+the core's own resolver, which found a same-named GLOBAL and took its address. One name
+then carried two bindings inside one method, with no diagnostic at all.
+
+**Measured on `55cdf69e`** (the base of this crumb; the scout's numbers at `66645d57`
+reproduced exactly, and D95/D96 moved nothing here):
+
+| program | answered | C# |
+|---|---|---|
+| global `i64 n = 100`, field `n = 5`, `bump(ref n); return this.n;` | **5**, and the global became 101 | 6 |
+| the same, reading the global afterwards | **101** | 100 |
+| `public static i64 n = 5`, `setit(out n); return H.n * 1000 + n;` | **5005** — the static kept 5, the global took the 7 | 7007 |
+| field `n = 5`, `uptr p = &n; return ld64(p);` | **100**, the global's address | the field's |
+| the same over a member `const C = 9` shadowed by a global `C = 100` | **100** | refused |
+| the same over a property `Side` shadowed by a global `Side` | the global took the write, the `return` read the property | 6 |
+| the same over a field inherited from a BASE class | **100** | the field's |
+| `ld64(&n)` INSIDE a lambda over the same field | **100**, and no capture refusal either | the field's |
+| `ld64(&Label)` in an interface DEFAULT body over an interface property | **100** | the property's |
+
+**What lands.** Three arms, one per walk that owns a bare member name, each asking the
+same question in `tk_this_ident`'s own order — a local or a parameter (and, in a lambda, a
+capture) binds nearer than any member; then a field, a base's and a static's alike; then a
+member `const`; then a property:
+
+- `tk_this_addr_reject` (`teko_this.tk`), the fourth arm of `tk_this_fix`;
+- `tk_this_iface_addr` (`teko_this.tk`), the fourth arm of `tk_this_iface_fix` — a default
+  body reaches its members through the itab and has no slot at all;
+- `tk_lam_addr_reject` (`teko_deleg.tk`), the fourth arm of `tk_lam_walk` — a lambda body
+  is lifted to a top-level function, so `tk_pass_class` is -1 there and teko_this.tk's arm
+  cannot see the enclosing class.
+
+The wording is written once, in `tk_addr_of_member`, and the member question once, in
+`tk_addr_is_member`, the way D70 factored `tk_lam_not_captured` for the same reason.
+
+**Refusal, not implementation.** Taking the address of a counted field opens
+`teko_rc.tk`'s lifetime question — a raw pointer into an object the reclaim pass walks —
+and `out` on a member opens D46's definite assignment on a member. Neither is a crumb.
+The read half is nearly built: `tk_this_addr` already produces `this + OFF` and
+`fd_sym_at` already gives a static's symbol.
+
+**The message: `teko: the address of a member is not taught yet`.** The parallel wording
+``teko: an array field is reached through `this.` `` was considered and REJECTED, because
+it names a road that does not exist. Measured on `55cdf69e`, from inside the type NO
+spelling of a member's address works: `ref this.n` is refused (`this` is no `T_IDENT` for
+`tk_ref_addr`), `&this.n` builds the address of the receiver SLOT plus the offset and
+answers garbage, `&H.n` is the core's own `& expects a name`, and `ref H.n` is
+`teko: not an object of a known type`. A message pointing at `this.`/`H.` would be a lie,
+and for a static the fix would not be `this.` anyway. "Not taught yet" is honest for the
+instance member, the static, the `const`, the property and the interface property alike,
+so one message covers all five.
+
+**Roads covered**, each with a fixture: `&` in an expression, a `ref` argument, an `out`
+argument, an instance field, a static field, a base class's field, a member `const`, a
+property, an interface property in a default body, and inside a lambda. **Roads proved
+UNTOUCHED** by `tests/addr_not_member.tk`: `&`/`ref` on a plain local and on a plain
+global, `ref h.n` / `out h.n` through a local object (the one member-address spelling that
+works, `tk_ref_addr`'s `p.x` branch), the repassed `ref` parameter of `tk_ref_walk`'s own
+`N_ADDR` branch (`teko_ref.tk`), a local shadowing a same-named field, a by-value lambda
+capture shadowing a same-named field, and `&freeFunction` inside a method body.
+
+**Roads NOT reached, reported and left open** (each is a separate crumb, none involves a
+bare name and none is made worse by this one): `&this.n` inside a method builds
+`ADDR(this-slot) + OFF` and answers garbage — 192 against a field worth 42, confirmed in
+`--dump-ast` as `BINARY + / ADDR name=this / INT 24`; `&h.n` on a local object segfaults
+(exit 139) for the same reason; `&H.n` on a static is refused by the CORE, without a
+`teko:` prefix. `&acc` on a by-REFERENCE lambda capture is a fourth one, untouched here
+because a capture answers before the member question.
+
+**Gate.** `136 passed, 162 refused as expected, 0 failed` at `55cdf69e` →
+`137 passed, 170 refused as expected, 0 failed`: eight refusals and one positive fixture,
+refused rising by exactly the eight added. `FIXPOINT OK`, docs gate green, and `--dump-ast`
+against `55cdf69e` over every one of the 136 fixtures accepted by both compilers: an EMPTY
+diff.

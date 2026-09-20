@@ -1,0 +1,90 @@
+// addr_not_member.tk -- D97's control: every road to an address that is NOT a
+// bare member's, still answering exactly what it answered before the three
+// `N_ADDR` arms landed (teko_this.tk's `tk_this_addr_reject` and
+// `tk_this_iface_addr`, teko_deleg.tk's `tk_lam_addr_reject`).
+//
+//   1. `&loc` / `ref loc` on a plain LOCAL, and `&g` / `ref g` on a plain
+//      GLOBAL -- the two the `&` operator has always answered.
+//   2. `ref h.n` / `out h.n` through a LOCAL OBJECT: the one spelling of a
+//      member's address that works today (`tk_ref_addr`'s `p.x` branch,
+//      teko_ref.tk), and the reason the refusal says "not taught yet" instead
+//      of naming a qualified form the way ``an array field is reached through
+//      `this.` `` can -- from INSIDE the class there is no such form at all.
+//   3. the repassed `ref` parameter of `tk_ref_walk`'s own `N_ADDR` branch
+//      (teko_ref.tk): `mid(ref v)` where `v` is itself a `ref` parameter. A
+//      parameter binds nearer than any member, which is exactly the first
+//      question all three new arms ask.
+//   4. a LOCAL shadowing a same-named FIELD: `&n` there is the local's
+//      address, not a refusal -- C#'s order, and `tk_ty_scope_find`'s.
+//   5. a by-value lambda CAPTURE shadowing a same-named field: `&k` inside the
+//      lambda is the capture's own local, judged by `tk_lc_find` before the
+//      member question is asked at all.
+//   6. `&freeFn`, a function's address inside a method -- no member, untouched.
+//
+// expect-exit: 0
+#include "../lib/rt.tk"
+
+i64 g = 77;
+i64 n = 100;
+
+void bump(ref i64 v) { v = v + 1; }
+void mid(ref i64 v) { bump(ref v); }
+void setit(out i64 v) { v = 7; }
+i64 twice(i64 x) { return x * 2; }
+
+delegate i64 Op(i64 x);
+
+class H {
+    public i64 n;
+    public H() { n = 5; }
+
+    // 4: a LOCAL named like the field wins, and `&` takes its address
+    public i64 shadow() {
+        i64 n = 11;
+        uptr p = &n;
+        bump(ref n);
+        return ld64(p);                          // 12, never the field nor the global
+    }
+
+    // 5: a by-value capture named like the field answers before the field
+    public i64 captured() {
+        i64 k = 21;
+        Op f = new Op((i64 x) use (k) => ld64(&k) + x);
+        return f(1);                             // 22
+    }
+
+    // 6: a function's address, taken inside a method body
+    public i64 fnptr() {
+        return callp(&twice, 4);                 // 8
+    }
+}
+
+i64 main() {
+    // 1
+    i64 loc = 5;
+    bump(ref loc);
+    if (ld64(&loc) != 6) return 1;
+    bump(ref g);
+    if (ld64(&g) != 78) return 2;
+
+    // 2
+    H h = new H();
+    bump(ref h.n);
+    if (h.n != 6) return 3;
+    setit(out h.n);
+    if (h.n != 7) return 4;
+
+    // 3
+    i64 r = 40;
+    mid(ref r);
+    if (r != 41) return 5;
+
+    // 4, 5, 6
+    if (h.shadow() != 12) return 6;
+    if (h.captured() != 22) return 7;
+    if (h.fnptr() != 8) return 8;
+
+    // the field and the global stayed apart the whole way
+    if (n != 100) return 9;
+    return 0;
+}
