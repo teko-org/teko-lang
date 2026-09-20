@@ -5937,8 +5937,40 @@ of type f64`), `string_interp_no_include.tk` (`` teko: string interpolation need
 `docs/reference/not-yet.md`'s `$"..."` half of its row, replaced by the three rows still
 open (alignment, format specifier, no formatter); `docs/reference/runtime.md`'s string
 library table, three new functions; `docs/reference/diagnostics.md`, a new "String
-interpolation" section, all eight literal messages. **Not landed, out of this crumb's own
+interpolation" section, all ELEVEN literal messages (the count this entry first recorded, eight, was the draft's: the review counted them). **Not landed, out of this crumb's own
 boundary:** a single-pass `tk_str_interp` (§ 9's decision 5's own upgrade path, left for a
 crumb that needs the O(N²) piece-count ceiling measured rather than guessed at); the four
 refused `ToString` types' own `rt_alloc` leak (§ 9's decision 4, unresolved by design, not
 this crumb's boundary to widen).
+**Amended 2026-09-20, after the merge, by the review this head answered late.** Two defects
+and four records, all found by Copilot on PR #754 and PR #751 after their squashes, and
+fixed together in `fix/interp-null-and-slice`:
+
+1. **A hole of `TY_UPTR` dereferenced whatever it held.** `str`, `ptr`, `uptr` and the
+   `null` literal are ONE type (D33), and `new string(str)` measures with `tk_str_len`, so
+   `$"{null}"` read address zero. The `null` LITERAL is the one member this pass can tell
+   apart (`tk_is_null_lit`, teko_struct.tk) and is refused where it is written, `teko: an
+   interpolation hole holds no null` (`tests/refuse/string_interp_null.tk`); a `str`
+   VARIABLE that happens to hold 0 is the constructor's own guard instead -- `new
+   string(p)` with a null `p` is the EMPTY string, not a fault. A non-null address that is
+   not text stays undefined, as every other `str` road in this language is.
+2. **`ByteOf` could walk past the allocation** on a string whose tail is a TRUNCATED UTF-8
+   sequence -- which `new string(raw)` explicitly allows, since it copies bytes and counts
+   lead bytes -- so `Substring(0)` and `Substring(0, Length)` sliced out of bounds (D89's
+   own ceiling, one step further than `tk_string_cp_decode`'s). It clamps to `nbytes` now,
+   and both shapes are pinned in `tests/surface_string_interp.tk`.
+3. `docs/reference/runtime.md` said `/` and `%` are unsigned when BOTH operands are: it is
+   the LEFT operand alone (`gen_walk.mc`'s `type_signed(res_type(nd_a(n)))`), the same
+   correction this entry already carries for `lib/string.tk` and `docs/specs/string.md`.
+4. `tk_str_from_i64`'s own comment claimed it receives `u32` and `u64`; the dispatch sends
+   `u32`/`char` to `tk_str_from_char` and `u64`/`usize` to `tk_str_from_u64`.
+5. `docs/reference/runtime.md` carried `tk_string_cp_decode` at its OLD three-argument
+   arity plus a stray call-site row; one correct entry now.
+6. `tests/surface_string_methods.tk`'s section header named `IndexOf(char)`, which D89
+   renamed to `IndexOfChar` because method dispatch resolves by name and arity alone.
+
+**The process failure this exposes, recorded so it does not repeat:** Copilot's review
+fires when a PR is marked ready, and can land AFTER a check that found no open thread.
+Both PRs were squashed in that window. A merge is now gated on re-reading the threads
+immediately before it AND after it, and a late review is answered in a follow-up rather
+than left standing -- which is what this amendment is.

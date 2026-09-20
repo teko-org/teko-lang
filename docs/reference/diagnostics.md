@@ -1938,6 +1938,12 @@ class H {
   The handler pushes the whole `+` chain back through the lexer as **one line**, so a `//`
   would comment out the rest of it. A block comment (`{x /* note */}`) is fine and is
   skipped by the brace scan.
+- `"teko: an interpolation hole holds no null"` — `$"{null}"`. `str`, `ptr`, `uptr` and the
+  `null` literal are ONE type ([types.md](types.md#limits)), and `new string(str)` measures
+  its argument with `tk_str_len`, so a `null` hole would read address zero. The literal is
+  the one member of that family the interpolation pass can tell apart (`tk_is_null_lit`),
+  and it is refused where it is written; a `str` VARIABLE holding 0 is the constructor's
+  own guard instead, which answers the EMPTY string (D92's amendment).
 - `"teko: an interpolation hole holds no ternary, ?? or ?."` — `$"{(a > 0 ? 5 : 6)}"`,
   `$"{x ?? 3}"`, `$"{o?.Name}"`. Each parks as a marker call that `tk_ternary_pass`
   unpacks, and that pass runs *after* the one the hole is typed in, so the hole's type

@@ -498,7 +498,21 @@ i64 tk_interp_fmt(i64 hole, i64 line, uptr fl) {
     if (ty == sty) return hole;
     tk_line = line;
     tk_file = fl;
+    // `TY_UPTR` is ONE type for `str`, `ptr`, `uptr` and the `null` literal
+    // (types.md § Limits), and `new string(str)` measures its argument with
+    // `tk_str_len`. Two things follow, and the review found both:
+    //   * a `null` literal is refused HERE, by name -- it is the one member
+    //     of the family this pass can tell apart (`tk_is_null_lit`), and
+    //     `tk_str_len(0)` would read address zero;
+    //   * a `ptr`/`uptr` that is not a NUL-terminated string cannot be told
+    //     from a `str` by any oracle this language has (one type id, D33),
+    //     so the CONSTRUCTOR carries the guard instead: `new string(p)` with
+    //     a null `p` is the empty string rather than a fault, and a non-null
+    //     address that is not text is the same undefined behaviour every
+    //     other `str` road in this language already has (`not-yet.md`).
     if (ty == TY_UPTR) {
+        if (tk_is_null_lit(hole))
+            err_at(fl, line, "teko: an interpolation hole holds no null");
         i64 args = hole;
         set_nd_next(args, 0);
         uptr fn = tk_new_pick(si, sr_name_at(si), &args, 1, line, fl);
