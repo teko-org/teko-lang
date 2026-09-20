@@ -35,7 +35,7 @@ argument types, symbol, result type)` — a position may carry a late type NAME 
 | `TK_PMPROP` | `x.Name` | `t.Days` |
 | `TK_PMFUN` | `x.Name(args)` | `t.CompareTo(u)` |
 | `TK_PMCTOR` | `new Type(args)` | `new DateTime(2024, 2, 29)` |
-| `TK_PMSOON` | `Type.Name`, refused by name | `DateTime.Now` |
+| `TK_PMSOON` | `Type.Name`, refused by name | `Guid.NewGuid` |
 
 **The parameter list is a count and a HEAD into a pool of positions**, one column per
 argument. It was a count and ONE type until N2c, because every row took its arguments in a
@@ -57,9 +57,11 @@ DateTime(...)` is five rows (1, 2, 3, 6 and 7 arguments) and the site picks by h
 wrote; a count no row has is `teko: wrong number of arguments for new`.
 
 **A `TK_PMSOON` row names a member the type HAS and this version does not teach.**
-`DateTime.Now`, `UtcNow` and `Today` need a wall clock, which is `mc`'s to give
-([the spec](../specs/datetime.md) § 8), and the row is what makes the site say
-`teko: DateTime.Now is not taught yet` instead of reading as an unknown member.
+`Guid.NewGuid` needs an entropy source, teko's own `extern` to give
+([not-yet.md](../reference/not-yet.md)), and the row is what makes the site say
+`teko: Guid.NewGuid is not taught yet` instead of reading as an unknown member.
+`DateTime.Now`/`UtcNow`/`Today` used to be `TK_PMSOON` rows too, for the same reason
+(a wall clock, also teko's own); C6 (D90) moved them to ordinary `TK_PMSVAL` rows.
 
 An **operator row** is `(token, arity, left type, right type, symbol, result type, swap)`.
 `swap` is C#'s reversed declaration — `n * t` and `t * n` are one function, called with the
