@@ -365,8 +365,11 @@ raw eight (or sixteen) bytes with the compiler's own cast on the way in (`tk_pri
 on the way out, which is D40/D41's rule and D42's precedent, so `tk_prim_cast_check` never
 mistakes either for a cast a source wrote.
 
-`.ToString()` on a nullable is **deferred**: no type in teko converts to text yet — that is
-N2b's and N7's shared crumb — and a `T?` will get it when its `T` has it.
+`.ToString()` on a nullable itself is **refused**, `teko: unknown member of i64?: ToString`:
+the box is not the value. `x.Value.ToString()` is the form, and since D98 it works for every
+core scalar (`i8`..`u64`, `usize`, `char`), as it already did for `string`, an `enum`,
+`decimal`, `DateTimeOffset`, `Guid`, `i128` and `u128`. A `T` whose own `.ToString()` is
+still unwritten refuses under its OWN name there, not the nullable's.
 
 ---
 
@@ -517,7 +520,7 @@ Each row is a `not-yet.md` entry the crumb that lands it owes.
 | `x.GetValueOrDefault(fallback)` (C#'s one-argument overload) | `teko: unknown member of i64?: GetValueOrDefault` at that arity — `x ?? fallback` is the form |
 | `x.Value = e`, `ref x.Value` | `teko: .Value is not a slot` |
 | `x is null`, `case null:` | there is no `is`, and a switch takes no nullable subject |
-| `x.ToString()` on a nullable | deferred with all text (N2b, N7/N8) |
+| `x.ToString()` on a nullable | `` teko: unknown member of i64?: ToString `` — `x.Value.ToString()` is the form, built for every core scalar since D98 |
 | flow narrowing (`if (c != null) { c.v }` reading `c` as a `Cell`) | not taught: C# 8's flow analysis is a dominator-based pass this design does not buy. `c.Value.v` is the form |
 
 ---

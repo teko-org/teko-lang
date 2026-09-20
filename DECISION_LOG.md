@@ -11207,7 +11207,7 @@ keeps `teko: f64 has no members: ToString` until a real float formatter lands.
 
 **Also refused, each with a fixture**: `str`/`ptr`/`uptr` (one type id — no oracle can tell
 text from a raw address; `new string(p)` is the spelling that carries the guard), a `T?`
-(read through `.Value` first) and a user class that declares no `ToString` of its own — no
+(read through `.Value` first: `x.Value.ToString()` works, and `tests/surface_prim_tostring.tk` pins it) and a user class that declares no `ToString` of its own — no
 default is given to a user type by this crumb.
 
 **What this does not reach.** No format string, no `IFormattable`, no `object.ToString()`
