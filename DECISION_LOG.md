@@ -11277,9 +11277,12 @@ the rule every other slot in the language lives by — `null` needs a slot decla
 ([arrays.md](docs/reference/arrays.md), the store `ops[0] = null` refusal on a plain `Op[]`
 element is the same rule reached from the array side). **Follow C# (the fork protocol's
 default, no form in `mc`'s own market for a jagged array)**: the spelling is `T[][]`, a row
-starts `null`, and dereferencing a null row faults like any other null does today — the same
-unguarded SIGSEGV a global reference field/global gives before it is built
-(`not-yet.md`'s own "definite assignment" table). The alternative measured and rejected is
+starts `null`. **Amendment, measured when D100 built this ruling:** indexing INTO a null row
+is NOT unguarded. `lib/rt.tk`'s element guard answers `if (a == 0) panic("index into a null
+array")`, so `G[0][0]` on an unassigned global jagged exits 70 with
+`teko: index into a null array`. The unguarded SIGSEGV this sentence first claimed belongs
+to a null OBJECT reference read through a field or a global
+(`not-yet.md`'s own "definite assignment" table), which is a different road. The alternative measured and rejected is
 `T[]?[]`, a row slot explicitly typed nullable so the zeroed-on-allocation state is a real,
 declared `null` rather than a bare handle pretending to be one: it loses because it is not
 what `new T[n][]` writes in C# (a plain `T[][]`, not a `T[]?[]`), and it would make the two
@@ -11320,8 +11323,12 @@ is a LOOP now: each `[]` answers `tk_ha_row(row)` over the row the previous one 
 dispatches the chain once per type position, which is why the whole suffix chain — the `?`
 of Q1a included — has to be read here: `T[]?[]` is an array of nullable rows, `T[][]?` a
 nullable array of rows, and both fall out of the same loop rather than out of a rule of
-their own. D99 ruled the shape (following C#, a row starts `null` and a null row faults like
-every other unbuilt reference); this is that ruling built.
+their own. D99 ruled the shape, following C#: a row starts `null`. D99's own
+sentence about the deref does not survive the measurement, though -- an index INTO a null
+row is guarded at `lib/rt.tk:257` (`if (a == 0) panic("index into a null array")`), so
+`G[0][0]` on an unassigned global jagged exits 70 with
+`teko: index into a null array`, not a fault. The unguarded case is a null OBJECT reference
+read through a field, which is a different road.
 
 **The machinery that needed NO change, re-measured on `444fb242`.** `tk_ty_mangle_name`
 (`teko_struct.tk`) already recursed on a row (`arr_` + the element's own mangle), so
@@ -11383,6 +11390,11 @@ refused as expected, 0 failed`. `FIXPOINT OK`, docs gate green, and `--dump-ast`
 `444fb242` over every one of the 138 fixtures accepted by both compilers: an EMPTY diff —
 this crumb only widens what is accepted.
 
-**Still open, on purpose.** `new T[n][]` (the allocator, the next crumb), a null row's deref
-(unguarded, D99's own ruling, `docs/reference/not-yet.md`), and a FIXED array of arrays
+**Still open, on purpose.** `new T[n][]` (the allocator, the next crumb), the unprefixed core
+message on a nullable-row WRITE (`i64[]?[] m; m[0][0] = 1;` still answers the core's own
+`left side of assignment must be a name`, because `tk_bracket` defers only an `N_IDENT` or
+`N_INDEX` base and a local's inner index is neither; the READ of the same expression
+answers ``teko: `[` needs an array``, and the same core message comes out of
+`i64[]? f(); f()[0] = 1;` on the base, so this crumb widens no defect, it only makes one
+more spelling reach an old one), and a FIXED array of arrays
 (`i64[] xs[2]`), which stays where D99 left the fixed road.
