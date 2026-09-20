@@ -34,7 +34,9 @@ if [ -z "$mc" ] || [ -z "$config" ]; then
     echo "usage: check-limits.sh MC CONFIG" >&2
     exit 1
 fi
-if ! command -v "$mc" >/dev/null 2>&1 && [ ! -x "$mc" ]; then
+if command -v "$mc" >/dev/null 2>&1; then
+    mc=$(command -v "$mc")
+elif [ ! -x "$mc" ]; then
     echo "FAIL: compiler '$mc' not found or not executable"
     exit 1
 fi
@@ -44,7 +46,7 @@ if [ ! -f "$config" ]; then
 fi
 
 rm -rf build
-out=$(mc limits . --config "$config" 2>&1)
+out=$("$mc" limits . --config "$config" 2>&1)
 rc=$?
 
 # Each block starts at a `limits <name>` line and ends at the `tolerance ...,
