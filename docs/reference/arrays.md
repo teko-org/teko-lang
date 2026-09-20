@@ -313,7 +313,9 @@ i64 main() {
 
 #### `new T[n][expr]` is an index
 
-Only a `[` whose very next character is `]` is read as a rank. `new i64[3][0]`,
+Only a `[` that holds nothing is read as a rank. The lookahead asks for the first character
+the lexer would not skip, so a blank, a newline and a comment between the brackets change
+nothing: `new i64[3][ ]` and `new i64[3][/* rank */]` are ranks too. `new i64[3][0]`,
 `new i64[3][1 + 1]` and `new i64[3][i]` are what they always were: an index into an array
 that was just allocated, and the value they read is the element's zero.
 

@@ -12,7 +12,8 @@
 //      allocator's spelling of `i64[]?[]` (D100's nullable row).
 //   3. `index` -- the collision: `new i64[3][0]`, `new i64[3][1+1]` and
 //      `new i64[3][i]` are INDEXES into a fresh array, not ranks. Only a `[`
-//      whose next character is `]` is read as a rank.
+//      that holds nothing is read as a rank -- the lookahead skips blanks and comments,
+//      so `new i64[3][ ]` is a rank too (section 9).
 //   4. `counted` -- `Cell[][]` and `str[][]`, and the memory table: a row
 //      allocated and never filled, filled, overwritten, nulled, one row shared
 //      by two slots (freed exactly once), and the whole array returned from a
@@ -175,6 +176,29 @@ i64 str_rows() {
     return 0;
 }
 
+// ---- 9. the rank's lookahead skips blanks and comments ----
+//
+// `tk_next_ch` answers the first character the LEXER WOULD NOT SKIP, not the byte that
+// literally follows the `[`. So trivia between the brackets does not turn a rank into an
+// index, and none of these four is a compile error.
+
+i64 trivia() {
+    i64[][] a = new i64[3] [];
+    if (a.Length != 3) return 90;
+    i64[][] b = new i64[3][ ];
+    if (b.Length != 3) return 91;
+    i64[][] c = new i64[3][/* the rank */];
+    if (c.Length != 3) return 92;
+    i64[][] d = new i64[3][    // the rank, past a line comment
+    ];
+    if (d.Length != 3) return 93;
+    if (a[0] != null) return 94;                 // still a rank, so the rows are null
+    // and the index road is untouched by the same trivia
+    if (new i64[3][ 0 ] != 0) return 95;
+    if (new i64[3][/* an index */ 0] != 0) return 96;
+    return 0;
+}
+
 i64 main() {
     i64 base = rt_live();
     i64 d = dtors;
@@ -214,6 +238,14 @@ i64 main() {
 
     rc = str_rows();
     if (rc != 0) return rc;
+
+    // measured against the count right here, not against `base`: `kept` above is still in
+    // scope and holds an outer array, a row and a Cell, so main's floor has risen by three
+    // by this point. (Measured: `str_rows` itself leaves nothing live, twice in a row.)
+    i64 before_trivia = rt_live();
+    rc = trivia();
+    if (rc != 0) return rc;
+    if (rt_live() != before_trivia) return 82;
 
     return 0;
 }

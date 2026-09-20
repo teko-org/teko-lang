@@ -11439,8 +11439,11 @@ array. The previous crumb refused the rank by recognizing the allocator's own ca
 inside `tk_ha_index`; that recognition is gone, and with it the refusal
 ``teko: `new T[n][]` is not taught yet`` and its fixture `tests/refuse/array_new_jagged.tk`.
 What parts them now is one character of lookahead — `tk_next_ch` (`teko_access.tk`), the
-reader `tk_bracket_follows` already uses — asked while the `[` is still the current token:
-a `[` whose next character is `]` is a rank, anything else is left untouched for the postfix
+reader `tk_bracket_follows` already uses — asked while the `[` is still the current token.
+That reader answers the first character the LEXER WOULD NOT SKIP (`teko_access.tk`'s own
+header), not the byte that literally follows, so a blank, a newline and a comment between
+the brackets are skipped: `new i64[3][ ]` and `new i64[3][/* rank */]` are ranks as much as
+`new i64[3][]` is. A `[` that holds nothing is a rank, anything else is left untouched for the postfix
 loop, `tk_bracket` → `tk_ha_index`. So `new i64[3][0]`, `new i64[3][1 + 1]` and
 `new i64[3][i]` are the indexes they always were, and the index door never sees an empty
 `[]` again.
@@ -11473,8 +11476,14 @@ per-slot `rt_release_array` pass when the element is counted, and a `T[]` row IS
 
 **Gate.** `139 passed, 182 refused as expected, 0 failed` at `300b91e2` → `140 passed, 183
 refused as expected, 0 failed`. `FIXPOINT OK`, docs gate green, and `--dump-ast` against
-`300b91e2` over all 139 fixtures accepted by both compilers: an empty diff, this crumb only
-widens what is accepted.
+`300b91e2`: an empty diff, this crumb only widens what is accepted. **Read the dump gate
+narrowly, though.** `--dump-ast` takes no `--config`, so `[include] paths` never reaches it
+and every fixture spelling `#include "rt.tk"` dumps NOTHING — 47 of the 139 do, and an empty
+diff over those is no evidence at all. Copied under `lib/` on both sides, 138 fixtures dump
+non-empty on both and 0 of them differ; the 139th, `tests/surface_string_interp.tk`, dumps
+nothing either way because its `internal` rule reads the path it was opened from. That is
+the real measurement, and it holds. `CLAUDE.md`'s refactor proof is worth re-reading with
+this in mind: it is vacuous for a third of the suite unless the copy is done.
 
 **Still open, on purpose.** There is no spelling that fills the rows for you — the rows come
 from a store, one at a time, and `new i64[3][4]` is an index, not a second length. The
