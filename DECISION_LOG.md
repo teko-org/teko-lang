@@ -11039,8 +11039,12 @@ still not refused: the walk pushes scope vars as it passes them, so the name is 
 at the site. A marked base inside a subtree `tk_pend` walks after this pass's own visit has
 passed it is not re-judged.
 
-**Gate.** `135 passed, 154 refused as expected, 0 failed` before; `136 passed, 159 refused as
-expected, 0 failed` after — five refuse fixtures and one positive. `--dump-ast` compared
+**Gate.** `135 passed, 154 refused as expected, 0 failed` before; `136 passed, 162 refused as
+expected, 0 failed` after — eight refuse fixtures and one positive. The three write-side ones
+(`index_param_shadow_write.tk`, `index_param_shadow_heap_write.tk`,
+`index_member_below_write.tk`, the last two covering the compound form and the member
+binding) were added on the review's own finding: the two WRITE resolvers are separate changed
+paths and nothing pinned them. `--dump-ast` compared
 against `63951cb0` over every one of the 136 accepted fixtures: an EMPTY diff, the new
 positive fixture included (it is a legal program on both compilers). `FIXPOINT OK`, docs gate
 green.
