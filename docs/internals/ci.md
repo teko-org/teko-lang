@@ -9,7 +9,7 @@ Six workflows and three composite actions. Everything a change has to pass runs 
 |---|---|---|
 | `ngen (<os>/<arch>)` | 5 | the taught compiler builds on that pair, `tests/*.tk` compiles **and runs** there with the right exit code, and `tests/refuse/*.tk` is refused with the right message and line (`scripts/fixtures.sh`, D52) |
 | `fixpoint (<os>/<arch>)` | 5 | the ladder closes on the same five pairs ([bootstrap.md](bootstrap.md)) |
-| `docs` | 1 | `sh scripts/check-docs.sh`, on one pair — it proves a documentation tree, not a platform |
+| `docs` | 1 | `sh scripts/check-docs.sh` and `sh scripts/check-limits.sh`, on one pair — both prove a tree, not a platform |
 | `mc build ngen && run` | 1 | the aggregator: green only when every one of the five legs is |
 
 The five pairs are linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64 and
@@ -68,6 +68,31 @@ compile, judged by a two-line header —
 wrong as one with the wrong words). A `.tk` under either directory missing its header(s)
 fails the run instead of being silently skipped. `docs/reference/diagnostics.md` lists every
 message either kind can hit; D33 first named the gap a refusal fixture had no harness for.
+
+## The decision numbering, and the limits budget (D94)
+
+`docs` carries two checks that read `sh scripts/check-docs.sh`'s own output but measure
+something neither the fixtures nor the samples do.
+
+`scripts/check-docs.sh`'s **seventh check** reads `DECISION_LOG.md`'s own numbering:
+every `### D<n>` header unique, the set dense from D1 to the highest with no gap except a
+number a docs/ page explicitly reserves (`docs/specs/tekoc-tool.md`'s own draft, D73 today
+— read from that page, never hardcoded), and every `D<n>` cited under `docs/` or in a root
+`*.tk` module resolving to a header. `433b18d3` carried thirty-one entries (D57-D86) out of
+the file and five merges passed with a green docs gate, because none of the first six checks
+read the log's own numbering (D93); this closes that gap.
+
+`sh scripts/check-limits.sh "$MC" teko.toml` runs `mc limits . --config teko.toml` (`rm -rf
+build` first, so the measurement is clean rather than incremental) and fails if the
+**compiler** table (`[compiler]`, `build/teko.mc` -> `build/teko`) answers `grow` on any
+row. `teko.toml` already targets linux/x86_64 — the same pair `docs` runs on — so no derived
+config is needed. It does NOT gate the second table `mc limits` prints, the **entry**
+(`[project]`, `tests/hello.tk` built by the taught compiler): measured at head that table
+already answers `grow` (`passes`, `syntax`, `alias`, `types`, at `[limits] tolerance = 1.0`),
+and gating on it would either fail on the first run or need its cap raised to pass — exactly
+the silent weakening this check exists to refuse. It is printed and left as a debt
+([debts.md](debts.md)). `heap` is never read as pass/fail on either table: it is `mc
+limits`'s own estimate, not a hand-set budget.
 
 ## The composite actions
 

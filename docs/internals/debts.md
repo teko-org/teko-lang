@@ -78,5 +78,21 @@ retiring it, is a ruleset decision rather than a workflow edit.
 
 `[limits] tolerance = 1.0` in [`../../teko.toml`](../../teko.toml) is a starting point taken
 from a much smaller project, and the static estimate `mc limits` computes is a function of
-source bytes. It has not been re-derived for a compiler this size; `mc limits . --config
-<config>` is what says whether it still holds, and it is run rather than assumed.
+source bytes. It has not been re-derived for a compiler this size.
+
+Since D94, `sh scripts/check-limits.sh` (`docs` job, [ci.md](ci.md)) runs `mc limits .
+--config teko.toml` rather than leaving the claim assumed — but only HALF of what it prints
+is gated. Measured at head, clean (`rm -rf build` first, never incremental):
+
+* the **compiler** table (`[compiler]`, `build/teko.mc` -> `build/teko`) is clean at this
+  tolerance — every row `ok`, `ins` the tightest at 244874 used of 379800 reserved (64%) —
+  and the check fails the `docs` job the day a row on this table answers `grow`.
+* the **entry** table (`[project]`, `tests/hello.tk` compiled BY the taught compiler) is
+  NOT clean: `passes`, `syntax`, `alias` and `types` already answer `grow` at tolerance
+  1.0. This table is printed by the check and left ungated — gating on it today would
+  either fail the first run or need `tolerance` raised to pass, and this check does not
+  raise a cap to make itself green. Re-deriving `tolerance` for this table, or sizing it as
+  its own row set, is owed and not yet scheduled.
+
+`heap` is never cited as a pass/fail signal on either table: it is `mc limits`'s own
+estimate, not a hand-set budget.
