@@ -140,7 +140,7 @@ so the array is released at the end of the statement that built it.
 | on a method or a constructor | ``teko: `params` is taught on a free function only`` |
 | on an `extern` | ``teko: an `extern` symbol takes no `params` list`` |
 | an argument that does not convert | the existing element-conversion message |
-| `params i64[][] xs` | the existing "an array of arrays is not taught yet" |
+| `params i64[][] xs` | accepted since D100: a jagged list, the shape that builds a `T[][]` today |
 
 ## Deliberately outside this design
 
@@ -148,7 +148,7 @@ so the array is released at the end of the statement that built it.
 signature are a different piece of work. Today the virtual path is quietly wrong; refusing it
 trades a silent hole for a message, which is the right trade while the rest lands.
 
-**A generic `params`, `T[][]`, a lambda as an element, and a default plus expansion in the
+**A generic `params`, a lambda as an element, and a default plus expansion in the
 same call.** None is refused on principle; none is part of this design.
 
 **Implicit numeric conversion of an element.** C# has it; teko does not, here or anywhere

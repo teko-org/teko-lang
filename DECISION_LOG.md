@@ -11277,9 +11277,12 @@ the rule every other slot in the language lives by — `null` needs a slot decla
 ([arrays.md](docs/reference/arrays.md), the store `ops[0] = null` refusal on a plain `Op[]`
 element is the same rule reached from the array side). **Follow C# (the fork protocol's
 default, no form in `mc`'s own market for a jagged array)**: the spelling is `T[][]`, a row
-starts `null`, and dereferencing a null row faults like any other null does today — the same
-unguarded SIGSEGV a global reference field/global gives before it is built
-(`not-yet.md`'s own "definite assignment" table). The alternative measured and rejected is
+starts `null`. **Amendment, measured when D100 built this ruling:** indexing INTO a null row
+is NOT unguarded. `lib/rt.tk`'s element guard answers `if (a == 0) panic("index into a null
+array")`, so `G[0][0]` on an unassigned global jagged exits 70 with
+`teko: index into a null array`. The unguarded SIGSEGV this sentence first claimed belongs
+to a null OBJECT reference read through a field or a global
+(`not-yet.md`'s own "definite assignment" table), which is a different road. The alternative measured and rejected is
 `T[]?[]`, a row slot explicitly typed nullable so the zeroed-on-allocation state is a real,
 declared `null` rather than a bare handle pretending to be one: it loses because it is not
 what `new T[n][]` writes in C# (a plain `T[][]`, not a `T[]?[]`), and it would make the two
@@ -11309,3 +11312,89 @@ rising by exactly the two added. `FIXPOINT OK`, docs gate green, and `--dump-ast
 `2d27f6dd` over every one of the 138 fixtures accepted by both compilers: an EMPTY diff (this
 crumb refuses only what the core already refused on the two new spellings; nothing accepted
 moves).
+
+### D100 · `T[][]` is the row of a row: the type position reads every `[]` it is given,
+and the machinery under it needed no change (2026-09-20)
+
+**What landed.** `tk_ha_type` (`teko_heaparr.tk`), the `syntax_type` handler this port owns,
+used to read ONE `[]` and refuse a second, `teko: an array of arrays is not taught yet`. It
+is a LOOP now: each `[]` answers `tk_ha_row(row)` over the row the previous one built, so
+`i64[][]` is `(i64[])[]` and `i64[][][]` is one rank further. `take_type` (mc's own)
+dispatches the chain once per type position, which is why the whole suffix chain — the `?`
+of Q1a included — has to be read here: `T[]?[]` is an array of nullable rows, `T[][]?` a
+nullable array of rows, and both fall out of the same loop rather than out of a rule of
+their own. D99 ruled the shape, following C#: a row starts `null`. D99's own
+sentence about the deref does not survive the measurement, though -- an index INTO a null
+row is guarded at `lib/rt.tk:257` (`if (a == 0) panic("index into a null array")`), so
+`G[0][0]` on an unassigned global jagged exits 70 with
+`teko: index into a null array`, not a fault. The unguarded case is a null OBJECT reference
+read through a field, which is a different road.
+
+**The machinery that needed NO change, re-measured on `444fb242`.** `tk_ty_mangle_name`
+(`teko_struct.tk`) already recursed on a row (`arr_` + the element's own mangle), so
+`tkarr_new_arr_i64` and `tkarr_release_arr_i64` are the symbols a jagged row gets, and the
+four name builders in `teko_heaparr.tk` inherit it. `tk_ha_release_fn` emits the per-slot
+`rt_release_array` pass iff the element is counted, and a `T[]` row IS counted, so a jagged
+array releases its rows with no new branch; `rt_release_array` (`lib/rt.tk`) is
+element-type-agnostic, and `tk_arr_at` is layout-driven and already right for a pointer
+element. `tk_ha_row` is memoized per element type, so `i64[][]` spelled in ten positions is
+one row. The diff in the type position is the loop and nothing else.
+
+**Two gaps inside the crumb, found by measuring and fixed here.** The GLOBAL road matches by
+NAME: `tk_array_maybe_rewrite_index` (`teko_array.tk`) reads `nd_a(n)` and looks the name up
+in the two global tables. The walk is children-first, so on `G[i][j]` the INNER index is
+already the typed row LOAD by the time the outer one is read — its base is no longer an
+`N_IDENT` and no table can answer for it — and the outer index survived raw into
+`tk_pm_check_index`, refused ``teko: `[` needs an array`` for a read the compiler knows how
+to build. `tk_hg_rewrite_nested` answers it from the row the inner load registered
+(`tk_struct_of_expr`), the same question `tk_bracket` asks at parse time for the local, field
+and parameter forms, which need no pass at all. The WRITE half was worse: `G[i][j] = v`
+reached the CORE's own `left side of assignment must be a name`, no `teko:` prefix and in no
+catalogue (the defect class D99 fixed on the declaration side). `tk_bracket` defers a write
+whose base is an `N_INDEX` too now, `tk_gd_walk_reads` walks the parked BASE so the inner
+read is rewritten first, and `tk_hg_resolve_nested_write` mirrors `tk_hg_resolve_write` over
+the row instead of the name. A base that types as no array at all takes the refusal the read
+of the same expression already gives.
+
+**One refusal added: `new T[n][]`.** The jagged ALLOCATOR is not taught, and it cannot be
+reached from `tk_new_array` — `i64[]` is a lexeme the lexer cannot form, so the element word
+after `new` can never itself name a row. The trailing `[]` therefore arrives at the INDEX
+door, where it used to reach the core's own `expression expected`. `tk_ha_index` refuses it
+now, ``teko: `new T[n][]` is not taught yet``, recognized by the callee's own name
+(`tk_ha_allocname(ety)`) so that an empty `[]` after anything else keeps the reading it has
+today and `new i64[3][0]` — an index over a fresh array — still runs. Until that crumb, the
+rows of a jagged array come from a STORE: `params T[][]` is the shape that builds one out of
+rows the caller already holds, and `rows[0] = r` fills a slot.
+
+**The rc measurement.** `tests/surface_array_jagged.tk`: a `Cell[][]` built out of two
+`Cell[]` rows, one row overwritten in place (`rows[0] = fresh`), read back through
+`rows[i][j].val()`. `rt_live()` is back to its floor once the builder returns and all three
+`Cell` destructors have run — the jagged array released its rows, each row released its
+element, and the overwritten row was released at the store. The `i64` half is measured the
+same way: `rt_live()` back to the value it had before the whole section. Nothing here is new
+code; it is the existing release road reached one level deeper.
+
+**Fixtures.** `tests/surface_array_jagged.tk` (a `params i64[][]` list, `.Length` on both
+ranks, a row read into an `i64[]` local and passed on, `rows[i][j]` read/written/compound,
+`i64[][]` as a return type, a plain parameter, a local, an `i64[][]?`, a class FIELD, a
+GLOBAL with the two chained forms above, the counted `Cell[][]` floor, a third rank
+`i64[][][]`, and `i64[]?[]` -- an array of NULLABLE rows, where a slot holds `null`, is
+tested against it, and releases the row it held when `null` is stored over it) and
+`tests/refuse/array_new_jagged.tk` (`new i64[3][]`, line 15). The stale status of `T[][]`
+was corrected wherever the repository published it: `docs/guide/99-what-is-not-there-yet.md`,
+`CONTRIBUTING.md`, `docs/specs/nullable.md` and `docs/specs/params-typed.md`'s own
+out-of-scope list (Copilot on this crumb).
+
+**Gate.** `138 passed, 181 refused as expected, 0 failed` at `444fb242` → `139 passed, 182
+refused as expected, 0 failed`. `FIXPOINT OK`, docs gate green, and `--dump-ast` against
+`444fb242` over every one of the 138 fixtures accepted by both compilers: an EMPTY diff —
+this crumb only widens what is accepted.
+
+**Still open, on purpose.** `new T[n][]` (the allocator, the next crumb), the unprefixed core
+message on a nullable-row WRITE (`i64[]?[] m; m[0][0] = 1;` still answers the core's own
+`left side of assignment must be a name`, because `tk_bracket` defers only an `N_IDENT` or
+`N_INDEX` base and a local's inner index is neither; the READ of the same expression
+answers ``teko: `[` needs an array``, and the same core message comes out of
+`i64[]? f(); f()[0] = 1;` on the base, so this crumb widens no defect, it only makes one
+more spelling reach an old one), and a FIXED array of arrays
+(`i64[] xs[2]`), which stays where D99 left the fixed road.

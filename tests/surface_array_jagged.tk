@@ -1,0 +1,236 @@
+// surface_array_jagged.tk -- `T[][]`, C#'s jagged array (D100). The TYPE
+// POSITION reads the second `[]` and answers with the row of the row:
+// `i64[][]` is `(i64[])[]`, an array whose element is itself a counted
+// `i64[]`, so every road the element type already had -- the mangled
+// allocator/release pair, the per-slot release, the guarded element address --
+// carries it with no new machinery.
+//
+// What each helper proves, in order:
+//
+//   1. `total` / `first_of` -- a `params i64[][]` list, `.Length` on it and on
+//      a row, a row read out into an `i64[]` local, `rows[i][j]` read and
+//      written, and a row passed on to a plain `i64[]` parameter.
+//   2. `pack` / `widest` -- `i64[][]` as a RETURN type and as a plain
+//      (non-`params`) parameter, as a local, and `i64[][]?` -- a second `[]`
+//      and a `?` are suffixes of the SAME type position, read in one pass.
+//   3. `Grid` -- `i64[][]` as a class FIELD, read and written through a
+//      method, and the whole thing released with the object.
+//   4. `G` -- `i64[][]` as a GLOBAL: `G[i]`, `G[i][j]`, `G[i][j] = v`,
+//      `G[i][j] += v` and a whole ROW stored into a slot. The chained forms
+//      are the two the global road had no answer for before D100: the walk
+//      that rewrites a global's index matches by NAME, and the base of the
+//      OUTER index is the inner LOAD, which no name table holds.
+//   5. `cellcheck` -- `Cell[][]`, the counted case: the jagged array owns a
+//      reference to every row, a row owns one to every element, overwriting a
+//      row releases the old row (and with it its elements), and `rt_live()`
+//      is back to its floor once the whole thing goes out of scope.
+//   6. `cube` -- `i64[][][]`: the recursion has no depth of its own, a third
+//      rank is the row of a row of a row.
+//   7. `nullrows` -- `i64[]?[]`, an array of NULLABLE rows: the `?` is a
+//      suffix of the same type position, so a row slot can be declared
+//      nullable, hold `null`, be tested against it and be emptied -- and
+//      storing `null` over a row releases the row that was there.
+//
+// `new i64[3][]` is still refused (`tests/refuse/array_new_jagged.tk`): the
+// rows of a jagged array come from a store today, not from an allocator.
+
+#include "../lib/rt.tk"
+
+// expect-exit: 0
+
+i64 dtors;
+
+// ---- 1. a `params i64[][]` list ----
+
+i64 first_of(i64[] row) { return row[0]; }
+
+i64 total(params i64[][] rows) {
+    i64 t = 0;
+    i64 i = 0;
+    loop {
+        if (i >= rows.Length) break;
+        i64[] r = rows[i];                       // a row read out into a local
+        i64 j = 0;
+        loop {
+            if (j >= r.Length) break;
+            t = t + rows[i][j];                  // ...and the chained read
+            j = j + 1;
+        }
+        t = t + first_of(r);                     // a row as a plain `i64[]` argument
+        i = i + 1;
+    }
+    return t;
+}
+
+// ---- 2. `i64[][]` as a return type, a parameter and a local ----
+
+i64[][] pack(params i64[][] rows) { return rows; }
+
+i64 widest(i64[][] rows) {
+    i64 w = 0;
+    i64 i = 0;
+    loop {
+        if (i >= rows.Length) break;
+        if (rows[i].Length > w) w = rows[i].Length;
+        i = i + 1;
+    }
+    return w;
+}
+
+// ---- 3. `i64[][]` as a class field ----
+
+class Grid {
+    i64[][] rows;
+
+    public Grid(i64[][] rows) { this.rows = rows; }
+
+    public i64 at(i64 i, i64 j) { return rows[i][j]; }
+    public void put(i64 i, i64 j, i64 v) { rows[i][j] = v; }
+    public i64 height() { return rows.Length; }
+}
+
+// ---- 4. `i64[][]` as a global ----
+
+i64[][] G;
+
+// ---- 5. the counted element ----
+
+class Cell {
+    i64 v;
+
+    public Cell(i64 v) { this.v = v; }
+    public i64 val() { return v; }
+    ~Cell() { dtors = dtors + 1; }
+}
+
+i64 cellrows(params Cell[][] rows) {
+    Cell[] fresh = new Cell[1];
+    fresh[0] = new Cell(7);
+    rows[0] = fresh;                             // the OLD row, and its element, released
+    return rows[0][0].val() + rows[1][0].val();
+}
+
+i64 cellcheck() {
+    Cell[] a = new Cell[1];
+    a[0] = new Cell(1);
+    Cell[] b = new Cell[1];
+    b[0] = new Cell(2);
+    if (cellrows(a, b) != 9) return 41;
+    return 0;
+}
+
+// ---- 6. a third rank ----
+
+i64 cube(params i64[][][] c) { return c.Length + c[0].Length + c[0][1].Length; }
+
+// ---- 7. an array of nullable rows ----
+
+i64[]?[] nrows(params i64[]?[] rows) { return rows; }
+
+i64 nullrows() {
+    i64[] a = new i64[2];
+    a[0] = 4;
+    i64[]?[] rs = nrows(a, null);
+    if (rs.Length != 2) return 51;
+    if (rs[1] != null) return 52;
+    if (rs[0] == null) return 53;
+    i64[]? r = rs[0];
+    if (r == null) return 54;
+
+    i64[]?[] own = nrows(new i64[2], null);      // this row is owned by `own` alone
+    i64 live = rt_live();
+    own[0] = null;                               // ...and released by the store
+    if (rt_live() != live - 1) return 55;
+    return 0;
+}
+
+// sections 1, 2, 3 and 6, in a scope of their own: every array they build is
+// a local, so `rt_live()` is back to where it started once this returns.
+i64 run() {
+    i64[] a = new i64[2];
+    a[0] = 1;
+    a[1] = 2;
+    i64[] b = new i64[3];
+    b[0] = 3;
+    b[1] = 4;
+    b[2] = 5;
+
+    // 1: 1+2 + 3+4+5 = 15, plus `first_of` on each row (1 and 3)
+    if (total(a, b) != 19) return 11;
+    if (total() != 0) return 12;
+
+    // 2
+    i64[][] p = pack(a, b);
+    if (p.Length != 2) return 21;
+    if (widest(p) != 3) return 22;
+    if (p[1][2] != 5) return 23;
+    p[1][2] = 9;
+    if (p[1][2] != 9) return 24;
+    p[1][2] += 1;
+    if (b[2] != 10) return 25;                   // the row is shared, not copied
+
+    // 2b: `T[][]?`, the suffix chain read in ONE pass -- a second `[]` and a
+    // `?` are both suffixes of the same type position (D100)
+    i64[][]? maybe = null;
+    if (maybe != null) return 26;
+    maybe = p;
+    if (maybe == null) return 27;
+
+    // 3
+    Grid g = new Grid(pack(b, a));
+    if (g.height() != 2) return 31;
+    if (g.at(1, 0) != 1) return 32;
+    g.put(1, 0, 6);
+    if (a[0] != 6) return 33;
+
+    // 6
+    i64[][] q = pack(b);
+    if (cube(p, q) != 7) return 61;              // 2 ranks + 2 rows + 3 elements
+    return 0;
+}
+
+// 4: the GLOBAL keeps what it was given after the locals that built it are
+// gone -- the jagged array holds a reference to each row of its own.
+i64 gsec() {
+    i64[] a = new i64[2];
+    a[0] = 1;
+    a[1] = 2;
+    i64[] b = new i64[3];
+    b[0] = 3;
+    b[1] = 4;
+    b[2] = 5;
+    G = pack(a, b);
+    if (G[0].Length != 2) return 34;
+    if (G[1][0] != 3) return 35;
+    G[1][0] = 8;
+    if (b[0] != 8) return 36;
+    G[1][0] += 2;
+    if (G[1][0] != 10) return 37;
+    G[0] = b;                                    // a whole row stored into a slot
+    if (G[0][2] != 5) return 38;
+    return 0;
+}
+
+i64 main() {
+    i64 base = rt_live();
+    i64 rc = run();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 71;
+
+    i64 nullbase = rt_live();
+    rc = nullrows();
+    if (rc != 0) return rc;
+    if (rt_live() != nullbase) return 56;
+
+    i64 cellbase = rt_live();
+    rc = cellcheck();
+    if (rc != 0) return rc;
+    if (rt_live() != cellbase) return 42;
+    if (dtors != 3) return 43;
+
+    rc = gsec();
+    if (rc != 0) return rc;
+    if (G[0][0] != 10) return 39;                // the rows outlived the locals
+    if (G[1][2] != 5) return 40;
+    return 0;
+}
