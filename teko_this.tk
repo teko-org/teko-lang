@@ -475,10 +475,76 @@ void tk_this_iface_prop(i64 n, i64 wantset) {
 void tk_this_iface_fix(i64 n, i64 k) {
     if (k == N_IDENT)  { tk_this_iface_prop(n, 0); return; }
     if (k == N_ASSIGN) { tk_this_iface_prop(n, 1); return; }
+    // D97, the third site with the same gap: `&Prop` inside a DEFAULT body. The
+    // only member of an interface a bare name can reach is a property, and it is
+    // reached through the itab -- there is no slot for an address to name at all,
+    // so this one is a refusal by nature rather than a deferred teaching. The
+    // judge is the METHOD body's own, unchanged: `tk_pass_class` is the interface
+    // here and `tk_addr_is_member` asks the deep interface question itself.
+    // Measured on `55cdf69e`: `ld64(&Label)` in a default body, over a global
+    // `Label = 100` and an implementing `Label` worth 5, answered 100.
+    if (k == N_ADDR)   { tk_this_addr_reject(n);   return; }
     if (k == N_CALL)     tk_this_iface_call(n);
 }
 
-// the three shapes an unqualified member takes, asked of every node of a
+// `&n` / `ref n` / `out n` on a BARE member name (D97). Every other use of such
+// a name is rewritten here -- the read (`tk_this_ident`), the write
+// (`tk_this_assign`), the call (`tk_this_call`) -- but the ADDRESS road was not
+// among the kinds dispatched below, so the name under `&` was left to the core's
+// own resolver, which finds the same-named GLOBAL. One name then carried two
+// bindings in one method with no diagnostic at all: measured on `55cdf69e`,
+// `bump(ref n); return this.n;` over a field `n = 5` and a global `n = 100`
+// answered 5 while the GLOBAL went to 101, and `setit(out n)` on a static wrote
+// the global and left the static at 5. `&n` read the global's address outright.
+//
+// Refused rather than taught: taking the address of a counted field opens
+// teko_rc.tk's lifetime question, and `out` on a member opens definite
+// assignment (D46) on a member. Neither is a crumb, and NO spelling of a
+// member's address works today to point at instead -- `ref this.n` is refused
+// (`this` is no `T_IDENT` for `tk_ref_addr`), `&this.n` builds the address of the
+// receiver SLOT plus the offset, and `&H.n` is the core's own `& expects a
+// name`. So the message says "not taught yet" rather than naming a qualified
+// form the way ``an array field is reached through `this.` `` can.
+//
+// The order is `tk_this_ident`'s: a local or a parameter binds nearer than any
+// member (C#'s rule, and what makes the repassed-`ref`-parameter road of
+// teko_ref.tk untouched by this), then a field -- a base class's and a static
+// alike -- then a member const, then a property.
+// the one wording, written once: a lambda's own walk (`tk_lam_addr_reject`,
+// teko_deleg.tk) has the same gap over the same name and reads the same
+// sentence by construction, the way D70 factored `tk_lam_not_captured`
+void tk_addr_of_member(i64 n, uptr nm) {
+    err_at2(nd_file(n), nd_line(n), "teko: the address of a member is not taught yet", nm);
+}
+
+// 1 when `nm`, bare in a body belonging to `cls`, names a member of it: a field
+// -- a base's and a static alike -- a member const, or a property. A local, a
+// parameter or a lambda capture is NOT this function's business and is judged by
+// the caller, which knows its own scope table.
+i64 tk_addr_is_member(i64 cls, uptr nm) {
+    if (cls < 0) return 0;
+    if (tk_field_find(cls, nm) >= 0) return 1;
+    if (tk_mconst_find(cls, nm) >= 0) return 1;
+    if (tk_prop_find(cls, nm) >= 0) return 1;
+    // an interface property a BASE interface declares: `tk_prop_find` answers
+    // the interface's OWN property and stops there, which is why the read road
+    // has `tk_ifprop_find_deep` (`tk_this_iface_prop`) and why the address road
+    // needs it too. Measured on `55cdf69e` AND on this crumb's first commit:
+    // `ld64(&Label)` inside a lambda in `interface I2 : I1`'s default body, over
+    // `I1`'s own `Label`, still answered the global 100 with only the shallow
+    // question asked (found by the Copilot review).
+    if (!tk_is_iface(cls)) return 0;
+    uptr pdecl = xalloc(8);
+    return tk_ifprop_find_deep(cls, nm, pdecl) != 0;
+}
+
+void tk_this_addr_reject(i64 n) {
+    uptr nm = nd_name(n);
+    if (tk_ty_scope_find(nm) >= 0) return;
+    if (tk_addr_is_member(tk_pass_class, nm)) tk_addr_of_member(n, nm);
+}
+
+// the four shapes an unqualified member takes, asked of every node of a
 // method's body -- and of nothing else, because outside a method there is no
 // `this` for a name to belong to
 void tk_this_fix(i64 n) {
@@ -491,5 +557,6 @@ void tk_this_fix(i64 n) {
     }
     if (k == N_IDENT)  { tk_this_ident(n);  return; }
     if (k == N_ASSIGN) { tk_this_assign(n); return; }
+    if (k == N_ADDR)   { tk_this_addr_reject(n); return; }
     if (k == N_CALL)     tk_this_call(n);
 }
