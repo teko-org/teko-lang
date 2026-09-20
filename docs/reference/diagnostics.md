@@ -1372,9 +1372,6 @@ words (*a value of type i64 does not convert to Op*) used to answer for it.
 - ``"teko: `new T[]` needs a length; write `new T[n]`"`` — the length is an expression, and
   it is required.
 - `"teko: an array has no member"` — a `T[]` has `Length` and nothing else.
-- ``"teko: `new T[n][]` is not taught yet"`` — the `[]` right after a fresh `new T[n]`.
-  The jagged TYPE is read (D100); the allocator that would fill its rows is not taught, so
-  a row comes from a store. `new T[n][0]` — an index over a fresh array — is unaffected.
 - `"teko: an array of objects is not taught yet; use a field array or wait for T[]"` — a
   **fixed** array of a class or struct type. Use `T[]`.
 - `"teko: an array of type void"` — an element has a type.

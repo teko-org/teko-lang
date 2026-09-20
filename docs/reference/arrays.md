@@ -284,9 +284,41 @@ further. A row is an element of counted type like any other: the jagged array ho
 reference to each row it was given, storing over a slot releases the row that was there, and
 releasing the jagged array releases every row still in it.
 
-The rows come from a **store**, not from an allocator: `new T[n][]` is not taught
-([limits](#limits) below), so a jagged array is built where one already exists — a
-`params T[][]` list is the shape that builds one out of rows the caller holds.
+The outer array comes from **`new T[n][]`** (D101): an empty `[]` after the length is a
+*rank*, not an index, so `new i64[3][]` allocates three row slots and every one of them
+starts `null`. A rank repeats (`new i64[2][][]` is `i64[][][]`) and may carry the `?` of a
+nullable row: `new i64[2][]?` is an `i64[]?[]`. The ROWS themselves still come from a
+**store**, one at a time — there is no allocator that fills them for you, since
+`new i64[3][4]` is an index into the fresh array (just below) and not a second rank. A `params T[][]` list builds one out of rows the caller already holds.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+i64 main() {
+    {
+        i64[][] m = new i64[3][];
+        if (m.Length != 3) return 1;
+        if (m[0] != null) return 2;              // every row starts null
+
+        m[0] = new i64[2];                       // a row, supplied by a store
+        m[0][1] = 41;
+        m[0][1] += 1;
+        if (m[0][1] != 42) return 3;
+    }
+    if (rt_live() != 0) return 4;                // the array, and the row it owned
+    return 42;
+}
+```
+
+#### `new T[n][expr]` is an index
+
+Only a `[` that holds nothing is read as a rank. The lookahead asks for the first character
+the lexer would not skip, so a blank, a newline and a comment between the brackets change
+nothing: `new i64[3][ ]` and `new i64[3][/* rank */]` are ranks too. `new i64[3][0]`,
+`new i64[3][1 + 1]` and `new i64[3][i]` are what they always were: an index into an array
+that was just allocated, and the value they read is the element's zero.
+
 
 ```teko
 // expect-exit: 42
@@ -342,7 +374,8 @@ an inline array field; the element type may widen, never narrow. A **global** `T
 
 | limit | value |
 |---|---|
-| `new T[n][]`, the jagged allocator | not taught (``teko: `new T[n][]` is not taught yet``); the TYPE `T[][]` is taught (D100) and its rows are supplied by a store |
+| the ROWS of a jagged array | supplied one at a time by a store; `new T[n][]` (D101) allocates the outer array with every row `null`, and no spelling fills them all at once |
+| a chained write through an array of NULLABLE rows (`T[]?[] m; m[0][0] = v;`) | not taught: the core answers `left side of assignment must be a name`; store the row whole (`m[0] = r;`) |
 | a fixed array of a class or struct type | not taught; use `T[]` |
 | reading a `ref T[]` / `out T[]` **inside the callee** | not taught: the parameter carries the caller's slot, so `xs[i]` and `xs.Length` there are refused (`expression with no codegen`) |
 | `.Length` on a **global fixed** array | not taught; a local fixed array and any `T[]` answer |

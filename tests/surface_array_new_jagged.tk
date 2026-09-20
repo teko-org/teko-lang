@@ -1,0 +1,251 @@
+// surface_array_new_jagged.tk -- `new T[n][]`, the ALLOCATOR half of a jagged
+// array (D101). D100 taught the TYPE `T[][]`; what it left open was the one
+// way to make the outer array without a `params` list. An empty `[]` after
+// the length raises the ELEMENT to the row `T[]`, so `new i64[3][]` allocates
+// three row slots, each one null, and a store is what fills them.
+//
+// What each section proves, in order:
+//
+//   1. `plain` -- `new i64[3][]`: the length, the null rows, a row stored,
+//      read back, and the chained `m[i][j]` read and write.
+//   2. `ranks` -- `new i64[2][][]`, a third rank, and `new i64[2][]?`, the
+//      allocator's spelling of `i64[]?[]` (D100's nullable row).
+//   3. `index` -- the collision: `new i64[3][0]`, `new i64[3][1+1]` and
+//      `new i64[3][i]` are INDEXES into a fresh array, not ranks. Only a `[`
+//      that holds nothing is read as a rank -- the lookahead skips blanks and comments,
+//      so `new i64[3][ ]` is a rank too (section 9).
+//   4. `counted` -- `Cell[][]` and `str[][]`, and the memory table: a row
+//      allocated and never filled, filled, overwritten, nulled, one row shared
+//      by two slots (freed exactly once), and the whole array returned from a
+//      function and scoped out. Every step is a measured `rt_live()` delta and
+//      a destructor count.
+//
+// `new T[n]` with a rank is the only new spelling: a jagged array's rows still
+// come from a store, one at a time -- there is no `new i64[3][4]` that would
+// fill the rows for you, because that spelling is an index (section 3).
+
+#include "../lib/rt.tk"
+
+// expect-exit: 0
+
+i64 dtors;
+
+class Cell {
+    i64 v;
+
+    public Cell(i64 v) { this.v = v; }
+    public i64 val() { return v; }
+    ~Cell() { dtors = dtors + 1; }
+}
+
+// ---- 1. the plain allocation ----
+
+i64 plain() {
+    i64[][] m = new i64[3][];
+    if (m.Length != 3) return 11;
+    if (m[0] != null) return 12;                 // every row starts null
+    if (m[2] != null) return 13;
+
+    m[0] = new i64[2];
+    m[0][1] = 7;
+    if (m[0][1] != 7) return 14;
+    m[0][1] += 3;
+    if (m[0][1] != 10) return 15;
+
+    i64[] row = m[0];                            // a row read out into a local
+    if (row.Length != 2) return 16;
+    if (row[1] != 10) return 17;
+    return 0;
+}
+
+// ---- 2. three ranks, and a nullable row ----
+
+i64 ranks() {
+    i64[][][] c = new i64[2][][];
+    if (c.Length != 2) return 21;
+    if (c[0] != null) return 22;
+    c[0] = new i64[1][];                         // a rank-2 array as an element
+    if (c[0].Length != 1) return 23;
+    if (c[0][0] != null) return 24;
+    c[0][0] = new i64[1];
+    c[0][0][0] = 5;
+    if (c[0][0][0] != 5) return 25;
+
+    // `new i64[2][]?` is `i64[]?[]`: the `?` binds to the rank just read, the
+    // element, exactly as it does in the type position and in `new Cell?[n]`.
+    i64[]?[] nr = new i64[2][]?;
+    if (nr.Length != 2) return 26;
+    if (nr[0] != null) return 27;
+    nr[0] = new i64[1];
+    if (nr[0] == null) return 28;
+    nr[0] = null;                                // a nullable row can be emptied
+    if (nr[0] != null) return 29;
+    return 0;
+}
+
+// ---- 3. `new T[n][expr]` is still an INDEX ----
+
+i64 index() {
+    if (new i64[3][0] != 0) return 31;
+    if (new i64[3][1 + 1] != 0) return 32;
+    i64 i = 2;
+    if (new i64[3][i] != 0) return 33;
+    Cell[] fresh = new Cell[1];
+    fresh[0] = new Cell(4);
+    if (fresh[0].val() != 4) return 34;
+    return 0;
+}
+
+// ---- 4. the counted element, and the memory table ----
+
+Cell[][] make() {
+    Cell[][] m = new Cell[2][];                  // returned, so it outlives this frame
+    m[0] = new Cell[1];
+    m[0][0] = new Cell(1);
+    return m;
+}
+
+i64 counted() {
+    i64 f = rt_live();
+    i64 d = dtors;
+
+    // allocated and never filled: ONE live object, the outer array
+    Cell[][] m = new Cell[3][];
+    if (rt_live() != f + 1) return 41;
+
+    // filled: a row, then an element of it
+    m[0] = new Cell[1];
+    if (rt_live() != f + 2) return 42;
+    m[0][0] = new Cell(1);
+    if (rt_live() != f + 3) return 43;
+    if (m[0][0].val() != 1) return 44;
+
+    // a row OVERWRITTEN: the old row goes, and its element with it
+    m[0] = new Cell[1];
+    if (rt_live() != f + 2) return 45;
+    if (dtors != d + 1) return 46;
+
+    // one row SHARED by two slots: two references, so it is freed exactly once
+    Cell[] shared = new Cell[1];
+    shared[0] = new Cell(2);
+    m[1] = shared;
+    m[2] = shared;
+    if (rt_live() != f + 4) return 47;           // outer, m[0], shared, its Cell
+    m[1] = new Cell[0];                          // one reference given back, row alive
+    if (rt_live() != f + 5) return 48;
+    if (dtors != d + 1) return 49;
+    if (m[2][0].val() != 2) return 50;
+    m[1] = shared;                               // shared again, and left that way:
+    if (rt_live() != f + 4) return 51;           // the scope end below releases the
+    return 0;                                    // row TWICE and frees it once -- a
+}                                                // third would trip rc_dec's own
+                                                 // "reference count below zero"
+
+// one row, built whole, so the array is the only owner of it once stored --
+// a chained `m[0][0] = ...` on an array of NULLABLE rows is still the core's
+// own `left side of assignment must be a name` (D100's open list, unchanged
+// by this crumb: `tk_bracket` defers only an `N_IDENT` or `N_INDEX` base).
+Cell[] onecell(i64 v) {
+    Cell[] r = new Cell[1];
+    r[0] = new Cell(v);
+    return r;
+}
+
+// the same array with NULLABLE rows, so a row can be nulled by a store
+i64 nulled() {
+    i64 f = rt_live();
+    Cell[]?[] m = new Cell[2][]?;
+    m[0] = onecell(3);
+    if (rt_live() != f + 3) return 55;
+    i64 d = dtors;
+    m[0] = null;                                 // the store releases the row
+    if (rt_live() != f + 1) return 56;
+    if (dtors != d + 1) return 57;
+    if (m[0] != null) return 58;
+    return 0;
+}
+
+i64 str_rows() {
+    str[][] s = new str[2][];
+    s[0] = new str[2];
+    s[0][0] = "hi";
+    s[0][1] = "there";
+    if (s[0][0] != "hi") return 61;
+    if (s[0][1] != "there") return 62;
+    if (s[1] != null) return 63;
+    return 0;
+}
+
+// ---- 9. the rank's lookahead skips blanks and comments ----
+//
+// `tk_next_ch` answers the first character the LEXER WOULD NOT SKIP, not the byte that
+// literally follows the `[`. So trivia between the brackets does not turn a rank into an
+// index, and none of these four is a compile error.
+
+i64 trivia() {
+    i64[][] a = new i64[3] [];
+    if (a.Length != 3) return 90;
+    i64[][] b = new i64[3][ ];
+    if (b.Length != 3) return 91;
+    i64[][] c = new i64[3][/* the rank */];
+    if (c.Length != 3) return 92;
+    i64[][] d = new i64[3][    // the rank, past a line comment
+    ];
+    if (d.Length != 3) return 93;
+    if (a[0] != null) return 94;                 // still a rank, so the rows are null
+    // and the index road is untouched by the same trivia
+    if (new i64[3][ 0 ] != 0) return 95;
+    if (new i64[3][/* an index */ 0] != 0) return 96;
+    return 0;
+}
+
+i64 main() {
+    i64 base = rt_live();
+    i64 d = dtors;
+
+    i64 rc = plain();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 71;
+
+    rc = ranks();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 72;
+
+    rc = index();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 73;
+
+    d = dtors;
+    rc = counted();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 74;            // every row released with the array
+    if (dtors != d + 2) return 75;               // the overwritten Cell, and the shared row's
+
+    d = dtors;
+    rc = nulled();
+    if (rc != 0) return rc;
+    if (rt_live() != base) return 76;
+    if (dtors != d + 1) return 77;
+
+    // returned from a function and scoped out here
+    d = dtors;
+    Cell[][] kept = make();
+    if (rt_live() != base + 3) return 78;        // outer, its row, the row's Cell
+    if (kept[0][0].val() != 1) return 79;
+    kept = make();                               // the first one released whole
+    if (rt_live() != base + 3) return 80;
+    if (dtors != d + 1) return 81;
+
+    rc = str_rows();
+    if (rc != 0) return rc;
+
+    // measured against the count right here, not against `base`: `kept` above is still in
+    // scope and holds an outer array, a row and a Cell, so main's floor has risen by three
+    // by this point. (Measured: `str_rows` itself leaves nothing live, twice in a row.)
+    i64 before_trivia = rt_live();
+    rc = trivia();
+    if (rc != 0) return rc;
+    if (rt_live() != before_trivia) return 82;
+
+    return 0;
+}
