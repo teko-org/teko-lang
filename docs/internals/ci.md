@@ -161,15 +161,19 @@ standard library, which mc counts as part of the recipe, so a `std` job runs
 the registry.
 
 Three properties the branch has on purpose: it **accumulates**, one file per mc version, and
-is never force-pushed (mc polls one file for up to 90 minutes, and a file must not vanish
-under a reader); the workflow holds a single `concurrency` group so two runs cannot race the
-same push; and a dispatch naming a `version` explicitly rewrites a verdict already there,
-which is how a re-run corrects itself.
+is never force-pushed (mc reads one file and it must not vanish under a reader); the workflow
+holds a single `concurrency` group so two runs cannot race the same push; and a dispatch
+naming a `version` explicitly rewrites a verdict already there, which is how a re-run
+corrects itself.
 
-The 15 minutes are mc's number, not a preference: its `promote` budgets a quarter of an hour
-for this schedule to notice inside its 90-minute poll. Cron is GitHub's least punctual
-trigger and the schedule is disabled after 60 days with no push to `main`, so the manual road
-— `gh workflow run mc-canary.yml -f version=0.17.0` — is the one that removes the wait.
+The 15 minutes were mc's number, not a preference: its `promote` budgeted a quarter of an
+hour for this schedule to notice inside a 90-minute poll — the contract until 2026-09-20,
+when `promote-pending.yml` took the deadline away. The cron stays because it is still the
+road a verdict travels by default. Cron is GitHub's least punctual trigger and the schedule
+is disabled after 60 days with no push to `main` — measured on 2026-09-19/20, `*/15`
+delivered about one run every two hours, and mc v1.1.0 (tagged 03:42Z) fell in a
+three-and-a-half-hour gap — so the manual road, `gh workflow run mc-canary.yml -f
+version=1.1.0`, is the one that removes the wait.
 
 `canary` must be **pushable by `GITHUB_TOKEN`**: the `All Green` ruleset covers `~ALL` and
 requires a pull request, so `refs/heads/canary` needs to sit in its exclude list beside
