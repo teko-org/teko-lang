@@ -155,7 +155,7 @@ i64 main() {
     i64 cast = (i64) a;           // teko: a DateTime does not cast; `.Ticks` reads it
     TimeSpan t = b - 1;           // teko: a value of type i64 does not convert to DateTime
     i64 y = a.Yearr;              // teko: unknown member of DateTime
-    i64 n = DateTime.Now();       // teko: DateTime.Now is not taught yet
+    i64 n = DateTime.Now();       // ~~teko: DateTime.Now is not taught yet~~ -- landed, C6, D90: this line now compiles (`DateTime.Now` answers a `DateTime`, not an `i64`, so `i64 n = ...` is its own, unrelated refusal today)
     return 0;
 }
 ```
@@ -168,7 +168,7 @@ i64 main() {
 | an integer in a `DateTime`/`TimeSpan` slot | `teko: a value of type i64 does not convert to DateTime` |
 | `(i64) dt`, `(DateTime) n` written by hand | ``teko: a DateTime does not cast; `.Ticks` reads it and `new DateTime(...)` builds it`` |
 | an unknown member | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` |
-| `DateTime.Now`, `UtcNow`, `Today` | `teko: DateTime.Now is not taught yet` (§ 8) |
+| ~~`DateTime.Now`, `UtcNow`, `Today`~~ | **landed**, C6, D90 (§ 8, § 12): no longer refused. See [datetime.md § `Now`](../reference/datetime.md) for what they answer today |
 | `extern` with a `DateTime` parameter | none: a `DateTime` is eight bytes and passes as one, so an `extern` takes it |
 | a `DateTime` field, array element, `ref`/`out`, generic argument | none: eight bytes with an alignment, like every other scalar |
 

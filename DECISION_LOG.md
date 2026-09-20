@@ -5448,13 +5448,18 @@ for this — mask and keep the `Kind`), same `Kind` as `Now`.
 same way: `tk_dto_now_utc()`/`tk_dto_now()` both wrap `tk_dt_now_utc()` at offset `+0`.
 
 **Ruling 5, determinism.** `tests/surface_datetime_now.tk` asserts what a wall clock leaves
-stable across one run rather than a literal: the year `>= 2026`; two reads of `UtcNow`
-never go backwards (not "never equal" — two reads can land in the same 100 ns tick on a
-fast host); `UtcNow.Kind == DateTimeKind.Utc`; `Now.Kind == DateTimeKind.Local`; `Today`'s
-time of day is exactly zero and its date matches `Now`'s; `DateTimeOffset.UtcNow.Offset ==
-TimeSpan.Zero` and `DateTimeOffset.Now.Offset == TimeSpan.Zero`; the round trip through
-`DateTimeOffset.UtcNow.UtcDateTime` and back to a fresh `DateTime.UtcNow` never goes
-backwards either. Each assertion's own comment states why it is the stable one.
+stable across one run rather than a literal: the year `>= 2026` on every one of the four
+reads; `UtcNow.Kind == DateTimeKind.Utc`; `Now.Kind == DateTimeKind.Local`; `Today`'s time
+of day is exactly zero and its `.Date` is itself (already at midnight);
+`DateTimeOffset.UtcNow.Offset == TimeSpan.Zero` and `DateTimeOffset.Now.Offset ==
+TimeSpan.Zero`. The first draft also compared two SEPARATE reads against one another
+(`UtcNow` read twice, `Now` against `UtcNow`, the round trip) asserting the later one never
+went backwards — Copilot's review on #752 caught the real risk: `clock_gettime`/
+`GetSystemTimePreciseAsFileTime` read the WALL clock, not a monotonic one, and an NTP
+correction or an administrator setting the time between two reads can move either one
+backwards on a real host, CI included. Every assertion now reads its own value once and
+asks only what that ONE value must answer; each assertion's own comment states why it is
+the stable one.
 
 **The mechanism `[include].paths` forced, not the one the design page assumed.**
 `.github/workflows/ngen.yml`'s own comment states `[include]` "can never drift" across the
