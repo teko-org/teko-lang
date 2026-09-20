@@ -140,7 +140,7 @@ so the array is released at the end of the statement that built it.
 | on a method or a constructor | ``teko: `params` is taught on a free function only`` |
 | on an `extern` | ``teko: an `extern` symbol takes no `params` list`` |
 | an argument that does not convert | the existing element-conversion message |
-| `params i64[][] xs` | the existing "an array of arrays is not taught yet" |
+| `params i64[][] xs` | accepted since D100: a jagged list, the shape that builds a `T[][]` today |
 
 ## Deliberately outside this design
 

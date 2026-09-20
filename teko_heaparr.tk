@@ -15,8 +15,9 @@
 // (`p_type()`, a local, a global, a cast, an `extern`, a parameter of a free
 // function or of a member). `tk_ha_row` (teko_struct.tk, the row identity
 // `tk_is_counted` already shares) is memoized per element, so `i64[]` spelled
-// twice is one row; `T[][]` is refused where the SECOND `[]` is read, because
-// nothing here lowers a nested one.
+// twice is one row; a SECOND `[]` is the row of that row (D100), read by the
+// same loop, so `T[][]` and `T[][][]` need no lowering of their own -- what a
+// jagged array still lacks is its ALLOCATOR, `new T[n][]`.
 //
 // LAYOUT (the object `new T[n]` allocates):
 //
@@ -311,6 +312,15 @@ i64 tk_ha_deleg_call(i64 addr, i64 ety, i64 di, i64 line, uptr fl) {
 // (teko_params.tk's own `tk_bracket`).
 i64 tk_ha_index(i64 left, i64 si) {
     i64 ety = ha_ety_at(si);
+    // `new T[n][]` (D100): the `[]` right after a FRESH allocation is not an
+    // index at all -- it is the second rank of the type, and the jagged
+    // allocator that would fill those rows is not taught yet. Recognized by
+    // the callee's own name, so an empty `[]` after anything else keeps the
+    // reading it has today.
+    if (p_id() == K_RBRACK)
+        if (nd_kind(left) == N_CALL)
+            if (str_eq(nd_name(left), tk_ha_allocname(ety)))
+                err_at(p_file(), p_line(), "teko: `new T[n][]` is not taught yet");
     i64 line = p_line();
     uptr fl = p_file();
     i64 idx = parse_expr(0);
@@ -396,26 +406,36 @@ i64 tk_new_array(i64 ety, i64 line, uptr fl) {
 // module owns, `[]`, answers with `tk_ha_row`'s own memoized id; anything
 // else stands. `take_type` (mc's own) dispatches this ONCE per type
 // position, so a SECOND `[]` right after the first (`T[][]`) is not another
-// call here -- it is refused right where it stands, with a message of this
-// module's own, rather than left for the core to stumble into later.
+// call here -- the suffix chain is read by the LOOP below, which is the whole
+// of jagged support (D100): the row of a row is a row like any other, and
+// every road an element type already had (the mangled allocator/release pair,
+// `tk_ha_release_fn`'s per-slot pass over a counted element, `tk_arr_at`'s
+// guarded address) carries it unchanged. The `?` of Q1a is a suffix of the
+// same position, so it is read inside the loop too: `T[]?[]` is an array of
+// nullable rows, `T[][]?` a nullable array of rows.
 i64 tk_ha_type(i64 ty) {
     if (ty == TY_VOID) return 0;
     if (p_id() != K_LBRACK) return 0;
-    p_next();
-    p_expect(K_RBRACK, "expected ] after the element type");
-    i64 line = p_line();
-    uptr fl = p_file();
-    if (p_id() == K_LBRACK) err_at(fl, line, "teko: an array of arrays is not taught yet");
-    i64 row = tk_ha_row(ty);
-    // Q1a: `Cell[]?`, a NULLABLE array. `take_type` dispatches the chain once
-    // per type position, so the `?` that follows `[]` has to be read here --
-    // this is the array half of the two-line cooperation teko_null.tk's own
-    // `tk_nl_type` makes from the other side (`Cell?[]`).
-    if (p_id() != tk_nl_quest) return row;
-    p_next();
-    if (p_id() == tk_nl_quest) err_at(fl, line, "teko: a nullable of a nullable is not taught");
-    if (p_id() == K_LBRACK) err_at(fl, line, "teko: an array of arrays is not taught yet");
-    return tk_nl_row(row);
+    i64 row = ty;
+    loop {
+        if (p_id() != K_LBRACK) break;
+        p_next();
+        p_expect(K_RBRACK, "expected ] after the element type");
+        row = tk_ha_row(row);
+        // Q1a: `Cell[]?`, a NULLABLE array. `take_type` dispatches the chain
+        // once per type position, so the `?` that follows `[]` has to be read
+        // here -- this is the array half of the two-line cooperation
+        // teko_null.tk's own `tk_nl_type` makes from the other side
+        // (`Cell?[]`).
+        if (p_id() == tk_nl_quest) {
+            i64 line = p_line();
+            uptr fl = p_file();
+            p_next();
+            if (p_id() == tk_nl_quest) err_at(fl, line, "teko: a nullable of a nullable is not taught");
+            row = tk_nl_row(row);
+        }
+    }
+    return row;
 }
 
 void tk_ha_init() {

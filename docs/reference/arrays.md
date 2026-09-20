@@ -276,6 +276,50 @@ i64 main() {
 }
 ```
 
+### Jagged arrays, `T[][]`
+
+`T[][]` is an array whose element is itself a `T[]` — C#'s jagged array (D100), spelled with
+one `[]` per rank and read in one pass, so `T[][][]` and `T[][]?` are the same chain read
+further. A row is an element of counted type like any other: the jagged array holds a
+reference to each row it was given, storing over a slot releases the row that was there, and
+releasing the jagged array releases every row still in it.
+
+The rows come from a **store**, not from an allocator: `new T[n][]` is not taught
+([limits](#limits) below), so a jagged array is built where one already exists — a
+`params T[][]` list is the shape that builds one out of rows the caller holds.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+i64[][] pack(params i64[][] rows) {
+    return rows;
+}
+
+i64 main() {
+    {
+        i64[] a = new i64[2];
+        a[0] = 1;
+        a[1] = 2;
+        i64[] b = new i64[1];
+        b[0] = 39;
+
+        i64[][] rows = pack(a, b);
+        if (rows.Length != 2) return 1;
+        if (rows[0].Length != 2) return 2;
+        if (rows[0][1] != 2) return 3;
+
+        rows[0][1] = 3;                          // the row is shared, not copied
+        if (a[1] != 3) return 4;
+
+        rows[1] = a;                             // the old row is released here
+        if (rows[1][0] != 1) return 5;
+    }
+    if (rt_live() != 0) return 6;                // every row, and the array of rows
+    return 42;
+}
+```
+
 ### A global `T[]`
 
 `i64[] g;` at top level declares the reference with no length; `g = new i64[n];` fills it
@@ -298,7 +342,7 @@ an inline array field; the element type may widen, never narrow. A **global** `T
 
 | limit | value |
 |---|---|
-| `T[][]`, or any multidimensional array | not taught (`an array of arrays is not taught yet`) |
+| `new T[n][]`, the jagged allocator | not taught (``teko: `new T[n][]` is not taught yet``); the TYPE `T[][]` is taught (D100) and its rows are supplied by a store |
 | a fixed array of a class or struct type | not taught; use `T[]` |
 | reading a `ref T[]` / `out T[]` **inside the callee** | not taught: the parameter carries the caller's slot, so `xs[i]` and `xs.Length` there are refused (`expression with no codegen`) |
 | `.Length` on a **global fixed** array | not taught; a local fixed array and any `T[]` answer |

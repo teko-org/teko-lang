@@ -658,7 +658,7 @@ void tk_array_walk_reads(i64 n) {
 // for `params`' own walk (teko_params.tk) to find right after this pass runs.
 void tk_array_maybe_rewrite_index(i64 n) {
     i64 base = nd_a(n);
-    if (nd_kind(base) != N_IDENT) return;
+    if (nd_kind(base) != N_IDENT) { tk_hg_rewrite_nested(n); return; }
     i64 gi = tk_garr_find(nd_name(base));
     if (gi < 0) { tk_hg_rewrite_index(n); return; }
     i64 ety = gv_ty_at(gi);
@@ -679,6 +679,25 @@ void tk_array_maybe_rewrite_index(i64 n) {
     // through it too, and they are not elements of anything.
     tk_xt_put(n, tk_struct_by_ty(ety), ety, 1, TK_BORROWED);
 }
+
+// `g[i][j]` on a global `T[][]` (D100): this walk is children-first, so the
+// INNER index is ALREADY the typed row load by the time the OUTER one is
+// read -- its base is no longer an `N_IDENT`, and the two tables, which match
+// by NAME alone, can never answer for it. The row the inner load registered
+// answers instead (`tk_struct_of_expr`, teko_struct.tk, the same question
+// `tk_bracket` asks at parse time for the local and parameter forms, which
+// need no pass at all). A base that types as anything else is left
+// untouched, for `tk_pm_check_index` (teko_params.tk) to refuse.
+void tk_hg_rewrite_nested(i64 n) {
+    i64 base = nd_a(n);
+    i64 si = tk_struct_of_expr(base);
+    if (!tk_is_ha(si)) return;
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+    i64 r = tk_ha_load(base, ha_ety_at(si), nd_b(n));
+    tk_node_replace(n, r);
+    tk_xt_move(r, n);                            // the tag follows the value into the
+}                                                // node the tree keeps, as above
 
 // `g[i]` on a global `T[]` (G1): unlike a FIXED array's own rewrite above,
 // there is no compile-time bound to check against -- the element count is
@@ -716,6 +735,11 @@ void tk_array_resolve_write(i64 i) {
     i64 base = gd_base_at(i);
     i64 line = gd_line_at(i);
     uptr fl = gd_file_at(i);
+    // a base that is not a NAME is no table's row (D100): it is the inner
+    // index of `g[i][j] = v`, rewritten into its own typed load by the read
+    // walk just above, and the row it registered is what says where the store
+    // goes.
+    if (nd_kind(base) != N_IDENT) { tk_hg_resolve_nested_write(i); return; }
     i64 gi = tk_garr_find(nd_name(base));
     if (gi < 0) { tk_hg_resolve_write(i); return; }
     i64 ety = gv_ty_at(gi);
@@ -772,6 +796,33 @@ void tk_hg_resolve_write(i64 i) {
     tk_deleg_late_move(r, n);         // MOVED onto the node the tree keeps
 }
 
+// the write half of `g[i][j]` on a global `T[][]` (D100), the mirror of
+// `tk_hg_rewrite_nested`'s read: the base is the inner load, already typed by
+// the read walk, so the row answers where the name tables cannot. A base that
+// types as no array at all is the same refusal `tk_pm_check_index`
+// (teko_params.tk) gives the read of the same expression.
+void tk_hg_resolve_nested_write(i64 i) {
+    i64 base = gd_base_at(i);
+    i64 line = gd_line_at(i);
+    uptr fl = gd_file_at(i);
+    i64 si = tk_struct_of_expr(base);
+    if (!tk_is_ha(si)) err_at(fl, line, "teko: `[` needs an array");
+    i64 ety = ha_ety_at(si);
+    tk_line = line;
+    tk_file = fl;
+    i64 r = 0;
+    tk_deleg_defer_all_set(1);                   // the same scope-free store the
+    if (gd_form_at(i) == TK_ASTORE)              // named road above makes
+        r = tk_ha_store(base, ety, gd_idx_at(i), gd_val_at(i));
+    else
+        r = tk_ha_compound(base, ety, gd_idx_at(i), gd_op_at(i), gd_val_at(i));
+    tk_deleg_defer_all_set(0);
+    i64 n = gd_node_at(i);
+    tk_node_replace(n, r);
+    tk_os_move(r, n);
+    tk_deleg_late_move(r, n);
+}
+
 // the subtrees a deferred write PARKED are not in the tree the walk above
 // reads: `gd_val`/`gd_idx` hold expressions the parser handed to `tk_gd_add`,
 // and only `tk_array_resolve_write` splices them back -- after every rewrite
@@ -786,7 +837,8 @@ void tk_gd_walk_reads() {
     i64 i = 0;
     loop {
         if (i >= tk_ngd) break;
-        tk_array_walk_reads(gd_val_at(i));
+        tk_array_walk_reads(gd_base_at(i));   // D100: the BASE is parked too, and
+        tk_array_walk_reads(gd_val_at(i));    // `g[i][j] = v` parks an index in it
         tk_array_walk_reads(gd_idx_at(i));
         i = i + 1;
     }
