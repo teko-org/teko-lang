@@ -322,6 +322,7 @@ here:
 |---|---|
 | `s.IndexOf(c)` where `c` is a `char` (a second `IndexOf` overload beside `.IndexOf(string)`) | `teko: ambiguous overload; two signatures take this many arguments: IndexOf` — write `s.IndexOfChar(c)` instead (N8, D89); a class method has no argument-type-based dispatch, only a free function does (`teko_over.tk`) |
 | `this[i]` on a user-declared class | `` teko: `[` needs an array `` — N8's own `string`-receiver row in `tk_bracket` is targeted, not a general indexer (`docs/specs/string.md` § 6/§ 10); a user `operator[]`/indexer is a fork of its own, undesigned |
+| `"hi"[0]` — a LITERAL indexed directly | `` teko: `[` needs an array `` — the index hook reads the receiver's own type through `tk_struct_of_expr`, which answers for a local, a field chain and a call's return, never for a literal the interning has not placed yet. `string s = "hi"; s[0]` is the spelling (D89) |
 
 Two gaps N7b's own interning does not reach, both measured directly, neither one of D33's
 nine slots:

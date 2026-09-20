@@ -89,8 +89,14 @@ i64 tk_string_utf8_width(i64 b0) {
     return 4;
 }
 
-// the code point `width` bytes starting at `data + boff` decode to
-i64 tk_string_cp_decode(uptr data, i64 boff, i64 width) {
+// the code point `width` bytes starting at `data + boff` decode to, reading
+// nothing past `nbytes`: `new string(raw)` copies whatever bytes it is given
+// and counts LEAD bytes, so a truncated sequence at the tail -- a `raw` that
+// is not valid UTF-8 -- would otherwise be decoded past the allocation. A
+// sequence that runs off the end answers U+FFFD, the replacement character
+// every decoder gives a truncated one (D89, the review's own finding).
+i64 tk_string_cp_decode(uptr data, i64 boff, i64 width, i64 nbytes) {
+    if (boff + width > nbytes) return 65533;
     i64 b0 = ld8(data + boff);
     if (width == 1) return b0;
     if (width == 2) return ((b0 & 31) << 6) | (ld8(data + boff + 1) & 63);
@@ -116,7 +122,7 @@ i64 tk_string_at(string s, i64 i) {
     i64 ci = 0;
     loop {
         i64 w = tk_string_utf8_width(ld8(data + boff));
-        if (ci == i) return tk_string_cp_decode(data, boff, w);
+        if (ci == i) return tk_string_cp_decode(data, boff, w, nbytes);
         boff = boff + w;
         ci = ci + 1;
     }
@@ -423,7 +429,7 @@ public class string {
         loop {
             if (i >= nchars) return 0 - 1;
             i64 w = tk_string_utf8_width(ld8(data + boff));
-            if (tk_string_cp_decode(data, boff, w) == c) return i;
+            if (tk_string_cp_decode(data, boff, w, nbytes) == c) return i;
             boff = boff + w;
             i = i + 1;
         }
@@ -585,7 +591,7 @@ public class string {
         loop {
             if (boff >= nbytes) break;
             i64 w = tk_string_utf8_width(ld8(data + boff));
-            if (tk_string_cp_decode(data, boff, w) == sep) n = n + 1;
+            if (tk_string_cp_decode(data, boff, w, nbytes) == sep) n = n + 1;
             boff = boff + w;
         }
         string[] parts = new string[n];
@@ -595,7 +601,7 @@ public class string {
         loop {
             if (boff >= nbytes) break;
             i64 w = tk_string_utf8_width(ld8(data + boff));
-            if (tk_string_cp_decode(data, boff, w) == sep) {
+            if (tk_string_cp_decode(data, boff, w, nbytes) == sep) {
                 parts[k] = SliceBytes(start, boff - start);
                 k = k + 1;
                 start = boff + w;

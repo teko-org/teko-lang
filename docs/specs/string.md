@@ -250,7 +250,7 @@ Split across two crumbs; § 12 says which is which.
 | static | instance — N7 | instance — N8 |
 |---|---|---|
 | `string.Empty`, `new string()` (the same value) | `.Length`, `.Utf8Length` | `.Substring(i64)`, `.Substring(i64, i64)` |
-| `string.Concat(string, string)` | `.ToString()` — identity | `.IndexOf(string)`, `.IndexOf(char)`, `.LastIndexOf(string)` |
+| `string.Concat(string, string)` | `.ToString()` — identity | `.IndexOf(string)`, `.IndexOfChar(char)` (§ 15: method dispatch resolves by name and arity, so the two cannot share a name), `.LastIndexOf(string)` |
 | `string.IsNullOrEmpty(string?)` | `.Equals(string)`, `.CompareTo(string)` | `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` |
 | `string.Join(string, string[])` | `.GetHashCode()` | `.Trim()`, `.TrimStart()`, `.TrimEnd()` |
 | | | `.ToUpper()`, `.ToLower()` — **ASCII only**, § 10 |

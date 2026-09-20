@@ -5313,7 +5313,7 @@ mistake "not known" for "is a `string`" — measured, not assumed.
 
 **`tk_string_at` is a top-level function, not a method, and that is load-bearing.** It
 reads `nbytes`/`nchars`/`data` through the FIXED byte offsets § 1's own layout diagram
-publishes (`STRING_NBYTES`/`STRING_NCHARS`/`STRING_DATA` = 16/24/32), reached through
+publishes (`TK_STRAT_NBYTES`/`TK_STRAT_NCHARS`/`TK_STRAT_DATA` = 16/24/32), reached through
 `(uptr) s` — an ordinary CAST, general to every reference type and already exercised by
 `tests/surface_string_intern.tk`'s own `(uptr) a != (uptr) b` — never through `this`, and
 never through D33's nine conversion slots: `tk_str_borrow` only fires at those, never at a
@@ -5359,6 +5359,17 @@ default taken: keep the search, drop the collision — `.IndexOf(char)` is spell
 silently matching C#'s surface. Recorded here rather than halted on, because the fork
 protocol's own default applies (follow C# where it fits, and note the one place it does
 not, D89 being the note).
+
+**The constructor's bytes, and the review's own finding.** `new string(raw)` copies whatever
+`raw` points at and counts LEAD bytes for `nchars`, so a `raw` that is not valid UTF-8 -- a
+sequence truncated at the tail, which only program-built bytes can produce, never a literal
+-- used to let `s[i]` decode past the allocation (measured by the verifier: `C3 A9 F0 00`
+read three bytes past a four-byte buffer). `tk_string_cp_decode` takes `nbytes` now and
+answers **U+FFFD** for a sequence that runs off the end, the replacement character every
+decoder gives a truncated one, so `s[i]`, `IndexOfChar` and `Split` are total and bounded
+over any byte string. The constructor still does not VALIDATE: ill-formed bytes in the
+middle decode to whatever they encode, exactly as C#'s own `string(sbyte*)` does with an
+invalid page, and `.Utf8Length` always answers the bytes actually held.
 
 **Fixtures (D52).** `tests/surface_string_index.tk` (`42`): ASCII, a 2-byte code point
 (π), a 3-byte one (中), a 4-byte one (😀), `s[0]`, `s[s.Length - 1]`, a loop summing every
