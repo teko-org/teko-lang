@@ -11230,14 +11230,14 @@ declaration reaches the core's own diagnostic instead of teko's (2026-09-20)
 
 **Roadmap correction.** `docs/specs/roadmap-1.0.md`'s own list of what v1.0.0 owes named "an
 array of objects" as still outstanding. It is not: `Cell[] cs = new Cell[2]; cs[0] =
-new Cell(7); cs[0].v` runs and answers 7, the same road already carries `string`, an `enum`
+new Cell(7); cs[0].v` runs and answers 7, the same road already carries `str`, an `enum`
 and a delegate, as a local, a field and a global, and the rc floor is proven — an array of
 `Circle` and an array of `string` both reach `rt_live() == 0` on scope exit. The row is
 removed from the roadmap's owed list.
 
 **The FIXED road stays refused, restated as a decision.** `Cell cs[2]; i64? xs[2]; P ps[2];`
 are each still refused at the declaration, `teko: an array of objects is not taught yet;
-use a field array or wait for T[]` (`teko_array.tk:217-225` — `tk_arr_on_stmt`, called
+use a field array or wait for T[]` (`teko_array.tk` — `tk_arr_on_stmt`, called
 `tk_arr_add`'s own judge). "Wait for T[]" now reads "use T[]": the heap road serves every
 case a FIXED array of objects would have. The refusal itself is not lifted, on purpose: D50
 (`DECISION_LOG.md:2886`) made "every array element store is reported" a property of the
