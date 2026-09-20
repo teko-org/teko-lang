@@ -1367,6 +1367,13 @@ words (*a value of type i64 does not convert to Op*) used to answer for it.
 - `"teko: the field is not an array"` — the member indexed is a plain field.
 - `"teko: the left side of = is not a place"` — the target of the assignment is not a
   variable, a field or an element.
+- `"teko: a string is immutable"` — `s[i] = c` (N8, `docs/specs/string.md` § 6/§ 10,
+  D89): a `string` receiver's `[` is refused a write outright, ahead of parsing the
+  right-hand side at all — C#'s own rule, and teko's. `s[i]` alone still reads (§ 6),
+  through `tk_string_at`, `lib/string.tk`'s own top-level function.
+- `"teko: string index out of range"` — a RUN-TIME panic, exit 70, written by
+  `tk_string_at` (`lib/string.tk`, not a compiler literal): `s[i]` past `s.Length - 1`,
+  or negative, the same guard every `T[]` index already carries.
 - ``"teko: `[` needs an array"`` — an index on a receiver whose type the parse does not
   know to be one. Bind it to a local of the right type first. The name the base spells is
   appended when it has one, and a name that SHADOWS a global array is the shape that

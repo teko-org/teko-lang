@@ -118,6 +118,13 @@ counted like a class reference.
 Every index is checked: out of range is a panic with exit 70
 (`teko: index past the end of an array`), never a read past the allocation.
 
+A `string`'s own `[` carries the identical guard, exit 70, `teko: string index out of
+range` (N8, `docs/specs/string.md` § 6, D89, [types.md](types.md#string)): `s[i]` is the
+`i`-th CODE POINT, never a byte, and `s[i] = c` is refused outright — `teko: a string is
+immutable` — a `string` has no element to store into. `[` on a `string` receiver is a
+targeted row in `tk_bracket` (`teko_params.tk`), not a general indexer: `this[i]` on a
+user-declared class stays untaught ([not-yet.md](not-yet.md)).
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"

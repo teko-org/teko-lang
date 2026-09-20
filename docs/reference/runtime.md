@@ -497,15 +497,20 @@ to one of them.
 ## The string library
 
 `lib/string.tk` carries [`string`](types.md#string)'s own class: the constructor, the
-destructor, every member and every operator N7a lands, plus two byte-level helpers kept
-here rather than in `lib/rt.tk` — a line added there would move the `--dump-ast` include
-chain of every fixture in the tree, and this file's own gate is that chain staying
-byte-identical. Needs `rt.tk` for `rt_alloc`, `rt_free` and `tk_str_eq`.
+destructor, every member and every operator N7a lands, N8's own index and method
+surface (D89), plus byte-level helpers kept here rather than in `lib/rt.tk` — a line
+added there would move the `--dump-ast` include chain of every fixture in the tree, and
+this file's own gate is that chain staying byte-identical. Needs `rt.tk` for `rt_alloc`,
+`rt_free` and `tk_str_eq`.
 
 | | |
 |---|---|
 | `void tk_string_copy(uptr dst, uptr src, i64 n)` | `n` bytes, no overlap assumed |
 | `i64 tk_string_utf8count(uptr buf, i64 nbytes)` | the number of UTF-8 LEAD bytes in `nbytes` bytes — a one-pass substitute for a full decode, which is what `.Length` needs at construction |
+| `i64 tk_string_is_ws(i64 b)` | ASCII whitespace — space, tab, LF, CR, VT, FF — `.Trim*`'s own byte set (N8) |
+| `i64 tk_string_utf8_width(i64 b0)` | the byte width of the UTF-8 code point whose lead byte is `b0` |
+| `i64 tk_string_cp_decode(uptr data, i64 boff, i64 width)` | the code point `width` bytes at `data + boff` decode to |
+| `i64 tk_string_at(string s, i64 i)` | `s[i]`'s own lowering (`tk_bracket`, `teko_params.tk`, N8, D89) — a PLAIN top-level function, not a method: it reads `s`'s fields through the fixed byte offsets `docs/specs/string.md` § 1's own layout diagram publishes, via `(uptr) s` (a CAST, not one of D33's nine conversion slots — `tk_str_borrow` never fires at a cast), rather than through `this`. `O(1)` on an ASCII string, `O(i)` otherwise; panics `teko: string index out of range`, exit 70, past `Length - 1` or negative |
 
 Every member and every operator of `string` is an ordinary method or a `public static`
 member of the class itself, `new string(raw)` included — there is no lowering table here

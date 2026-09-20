@@ -549,16 +549,36 @@ out of this crumb's own boundary:** the borrowed-pointer lifetime rule in
 [guide/10-values-and-types.md](../guide/10-values-and-types.md) — neither named by this
 crumb's own dispatch, both still true and both N8-adjacent.
 
-### N8 — the methods, and the index (L)
+### N8 — the methods, and the index (L) — landed, D89
 
 `s[i]` in `tk_bracket` (`teko_params.tk`) with its guard; `Substring`, `IndexOf`,
 `LastIndexOf`, `Contains`, `StartsWith`, `EndsWith`, `Trim*`, `Replace`, `Pad*`,
 `ToUpper`/`ToLower`, `Split`, `Join`. Depends on N7a and N7b.
 
+**Landed as designed, with one divergence D89 records.** `s[i]` lowers to a PLAIN
+top-level `tk_string_at(s, i)` (`lib/string.tk`), not a method call, exactly as this
+section already named — a targeted row in `tk_bracket`, and the only compiler change
+this crumb makes. Every other member is an ordinary class method or static, zero
+compiler work. `.IndexOf(char)` is spelled `IndexOfChar` instead of a second `IndexOf`
+overload: a class method is resolved by name-and-ARITY alone (`tk_method_pick`,
+`teko_class.tk`), unlike a free function's `teko_over.tk`, so a second one-argument
+`IndexOf` is genuinely ambiguous today (`teko: ambiguous overload; two signatures take
+this many arguments: IndexOf`, measured) — extending method dispatch to read argument
+types is real machinery this crumb's own module table does not authorize, so the two
+searches keep their own names (D89).
+
 **Gate:** `surface_string_index.tk` and `_methods.tk` at `42`, `_index_oob.tk` at `70`;
-everything N7a/N7b gated on. **Owes:** runtime.md, the index guard in
-[arrays.md](../reference/arrays.md), and the `this[i]` row in
-[not-yet.md](../reference/not-yet.md).
+the write refusal (`tests/refuse/string_index_write.tk`, `teko: a string is immutable`);
+everything N7a/N7b gated on. Proof, mc 1.0.1, macos/aarch64: `mc build . --config
+mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` → **132
+passed, 144 refused as expected, 0 failed**; `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok`; `mc limits`
+`passes`/`syntax`/`alias`/`types`/`on_stmt`/`intrin` unmoved on both the compiler leg and
+the `tests/hello.tk` leg; `--dump-ast --include=lib --include=tests` byte-identical over
+all 257 base fixtures (122 `tests/*.tk` + 135 `tests/refuse/*.tk`) that do not include
+`string.tk`. **Owed:** runtime.md, the index guard in [arrays.md](../reference/arrays.md),
+and the `this[i]` row in [not-yet.md](../reference/not-yet.md) — all landed alongside
+this entry.
 
 ### N10 — interpolation (M, after the pin reaches 0.15.25)
 

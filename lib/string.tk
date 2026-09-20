@@ -58,6 +58,70 @@
 // to every class and not to this one, and not this crumb's compiler code to
 // fix -- reported as an adjacent finding and routed around here by naming.
 
+// ---- N8 (docs/specs/string.md § 6-7, D89): `s[i]`'s own lowering and the
+// instance/static method surface. `s[i]` needs a PLAIN top-level function --
+// `tk_bracket` (teko_params.tk) builds a call to `tk_string_at` by NAME, the
+// same shape every other index lowering already takes (`tk_ha_load`,
+// `tk_arr_load`) -- rather than a method call through `tk_emit_call`'s
+// machinery, so it reads the class's fields through the fixed offsets § 1's
+// own layout diagram already publishes, never through `this`. That is why it
+// stands OUTSIDE `public class string { ... }` below, the one function here
+// that does: everything else is an ordinary member, resolved by the class
+// dispatch that already runs for any type and taught nothing new to reach.
+//
+//     TK_STRAT_NBYTES = 16   TK_STRAT_NCHARS = 24   TK_STRAT_DATA = 32
+//
+// matching the layout comment atop the class, word for word -- a `string`
+// value AT RUNTIME is nothing but the object's own address (every class is),
+// so `(uptr) s` (an ordinary CAST, not one of D33's nine CONVERSION slots:
+// `tk_str_borrow` only fires at those, never at a cast) hands back that
+// address with no help from `teko_string.tk` at all.
+#define TK_STRAT_NBYTES 16
+#define TK_STRAT_NCHARS 24
+#define TK_STRAT_DATA   32
+
+// the byte width of the UTF-8 code point whose LEAD byte is `b0` -- the
+// four-way table every UTF-8 decoder opens with
+i64 tk_string_utf8_width(i64 b0) {
+    if ((b0 & 128) == 0) return 1;
+    if ((b0 & 224) == 192) return 2;
+    if ((b0 & 240) == 224) return 3;
+    return 4;
+}
+
+// the code point `width` bytes starting at `data + boff` decode to
+i64 tk_string_cp_decode(uptr data, i64 boff, i64 width) {
+    i64 b0 = ld8(data + boff);
+    if (width == 1) return b0;
+    if (width == 2) return ((b0 & 31) << 6) | (ld8(data + boff + 1) & 63);
+    if (width == 3)
+        return ((b0 & 15) << 12) | ((ld8(data + boff + 1) & 63) << 6) | (ld8(data + boff + 2) & 63);
+    return ((b0 & 7) << 18) | ((ld8(data + boff + 1) & 63) << 12)
+         | ((ld8(data + boff + 2) & 63) << 6) | (ld8(data + boff + 3) & 63);
+}
+
+// `s[i]`, § 6: the `i`-th CODE POINT, as a `char`. `O(1)` when the string is
+// ASCII (`nbytes == nchars`, one `ld8`); otherwise a walk from byte 0, the
+// same `O(i)` § 6 states rather than hides. Out of range -- negative or past
+// the end -- panics, exit 70, the guard every `T[]` index already carries
+// (docs/reference/arrays.md).
+i64 tk_string_at(string s, i64 i) {
+    uptr obj = (uptr) s;
+    i64 nbytes = ld64(obj + TK_STRAT_NBYTES);
+    i64 nchars = ld64(obj + TK_STRAT_NCHARS);
+    uptr data  = ld64(obj + TK_STRAT_DATA);
+    if (i < 0 || i >= nchars) panic("string index out of range");
+    if (nbytes == nchars) return ld8(data + i);
+    i64 boff = 0;
+    i64 ci = 0;
+    loop {
+        i64 w = tk_string_utf8_width(ld8(data + boff));
+        if (ci == i) return tk_string_cp_decode(data, boff, w);
+        boff = boff + w;
+        ci = ci + 1;
+    }
+}
+
 // ---- two byte-level helpers, kept here rather than in `lib/rt.tk` (the
 // scout's own finding: a line added to `rt.tk` moves the `--dump-ast`
 // include chain of every fixture in the tree, and this crumb's gate is that
@@ -88,6 +152,19 @@ i64 tk_string_utf8count(uptr buf, i64 nbytes) {
         i = i + 1;
     }
     return n;
+}
+
+// N8, § 7: ASCII whitespace -- space, tab, LF, CR, VT, FF -- the byte set
+// `.Trim*` strips (§ 10's own "ASCII only" divergence from C#'s Unicode
+// `char.IsWhiteSpace`)
+i64 tk_string_is_ws(i64 b) {
+    if (b == 32) return 1;
+    if (b == 9) return 1;
+    if (b == 10) return 1;
+    if (b == 13) return 1;
+    if (b == 11) return 1;
+    if (b == 12) return 1;
+    return 0;
 }
 
 public class string {
@@ -223,5 +300,379 @@ public class string {
         if (s == null) return 1;
         if (s.Value.Utf8Length == 0) return 1;
         return 0;
+    }
+
+    // ---- N8 (docs/specs/string.md § 7, D89): the method surface. Every one
+    // is an ORDINARY member -- teko_class.tk/teko_prop.tk taught nothing new
+    // to reach any of them (§ 12), and private-field access across two
+    // instances of the SAME class (`other.data`, already N7a's own `Equals`)
+    // is the mechanism `Join`, `Replace` and the two-operand searches below
+    // all reuse. Ordinal everywhere -- no culture, C#'s own `String.Compare`
+    // with `StringComparison.Ordinal` -- and every one returns a NEW string
+    // or an existing one; nothing mutates (§ 7's own sentence).
+
+    // the byte offset of the `n`-th BYTE range this class owns, at RUN time,
+    // used by every method below that returns a byte-contiguous slice
+    private string SliceBytes(i64 b0, i64 blen) {
+        uptr buf = rt_alloc(blen + 1);
+        tk_string_copy(buf, data + b0, blen);
+        st8(buf + blen, 0);
+        string r = new string(buf);
+        rt_free(buf, blen + 1);
+        return r;
+    }
+
+    // the byte offset of the `ci`-th CODE POINT -- `O(1)` on an ASCII
+    // string (the same fast path `tk_string_at` takes above), `O(ci)`
+    // otherwise. `ci == nchars` is legal and answers `nbytes`, the "one past
+    // the end" address every `Substring` call needs for its own last slice.
+    private i64 ByteOf(i64 ci) {
+        if (nbytes == nchars) return ci;
+        i64 boff = 0;
+        i64 c = 0;
+        loop {
+            if (c >= ci) break;
+            boff = boff + tk_string_utf8_width(ld8(data + boff));
+            c = c + 1;
+        }
+        return boff;
+    }
+
+    // the byte offset of the first occurrence of `needle`'s own bytes at or
+    // after byte `from`, or `-1`. UTF-8 SELF-SYNCHRONIZES: a continuation
+    // byte (`10xxxxxx`) can never open a lead byte's own bit pattern, so a
+    // byte-for-byte match of two valid UTF-8 strings can never land off a
+    // code-point boundary -- a byte search answers the code-point question
+    // with no decode at all. An empty needle matches AT `from` (C#'s own
+    // `IndexOf("")` rule), never past `nbytes`.
+    private i64 ByteFind(uptr needle, i64 nlen, i64 from) {
+        if (nlen == 0) {
+            if (from > nbytes) return 0 - 1;
+            return from;
+        }
+        i64 i = from;
+        loop {
+            if (i + nlen > nbytes) return 0 - 1;
+            i64 j = 0;
+            i64 ok = 1;
+            loop {
+                if (j >= nlen) break;
+                if (ld8(data + i + j) != ld8(needle + j)) { ok = 0; break; }
+                j = j + 1;
+            }
+            if (ok) return i;
+            i = i + 1;
+        }
+    }
+
+    // the CODE-POINT index the byte offset `boff` falls at -- the inverse of
+    // `ByteOf`, walked the same one-pass way
+    private i64 CpIndexOfByte(i64 boff) {
+        if (nbytes == nchars) return boff;
+        i64 c = 0;
+        i64 b = 0;
+        loop {
+            if (b >= boff) break;
+            b = b + tk_string_utf8_width(ld8(data + b));
+            c = c + 1;
+        }
+        return c;
+    }
+
+    // `.Substring(i64)`, `.Substring(i64, i64)` -- indices are CODE POINTS
+    // (D89 ruling 3, matching `.Length`); out of range panics the same
+    // wording `s[i]` does, § 6's own guard extended to a range
+    public string Substring(i64 start) {
+        return Substring(start, nchars - start);
+    }
+
+    public string Substring(i64 start, i64 len) {
+        if (start < 0 || start > nchars) panic("string index out of range");
+        if (len < 0 || start + len > nchars) panic("string index out of range");
+        i64 b0 = ByteOf(start);
+        i64 b1 = ByteOf(start + len);
+        return SliceBytes(b0, b1 - b0);
+    }
+
+    // `.IndexOf(string)` -- `-1` when not found, a CODE-POINT index otherwise
+    public i64 IndexOf(string needle) {
+        i64 b = ByteFind(needle.data, needle.nbytes, 0);
+        if (b < 0) return 0 - 1;
+        return CpIndexOfByte(b);
+    }
+
+    // `IndexOfChar` -- § 7's own `.IndexOf(char)` row, one code point
+    // rather than a `string`, decoded as the walk passes it so no needle is
+    // allocated for a scalar search. NOT spelled `IndexOf(char c)`: a class
+    // METHOD is resolved by name-and-ARITY alone (`tk_method_pick`,
+    // teko_class.tk, its own header -- "-3: two do, and only the argument
+    // TYPES could tell them apart, which is what a module cannot ask the
+    // core about mid-body"), unlike a free function's `teko_over.tk`, which
+    // runs its own later pass over the whole unit's closed declarations
+    // exactly to answer that question. `IndexOf(string)` already claims
+    // arity 1, so a second signature at the same arity is genuinely
+    // ambiguous today (measured: `teko: ambiguous overload; two signatures
+    // take this many arguments: IndexOf`) -- extending method dispatch to
+    // read argument types is real machinery this crumb's own module table
+    // does not list (`teko_class.tk` stays untouched, docs/specs/string.md
+    // § 12), so the two searches keep their own names instead of teaching
+    // the core a new capability to reach one more overload.
+    public i64 IndexOfChar(char c) {
+        i64 i = 0;
+        i64 boff = 0;
+        loop {
+            if (i >= nchars) return 0 - 1;
+            i64 w = tk_string_utf8_width(ld8(data + boff));
+            if (tk_string_cp_decode(data, boff, w) == c) return i;
+            boff = boff + w;
+            i = i + 1;
+        }
+    }
+
+    // `.LastIndexOf(string)` -- the LAST occurrence, found by repeating
+    // `ByteFind` past every hit; there is no C standard-library backward
+    // search over UTF-8 to fall back to, so this is the same forward
+    // primitive walked to exhaustion rather than a second one
+    public i64 LastIndexOf(string needle) {
+        i64 best = 0 - 1;
+        i64 from = 0;
+        loop {
+            i64 b = ByteFind(needle.data, needle.nbytes, from);
+            if (b < 0) break;
+            best = b;
+            from = b + 1;
+        }
+        if (best < 0) return 0 - 1;
+        return CpIndexOfByte(best);
+    }
+
+    public i64 Contains(string needle) {
+        return ByteFind(needle.data, needle.nbytes, 0) >= 0;
+    }
+
+    public i64 StartsWith(string prefix) {
+        if (prefix.nbytes > nbytes) return 0;
+        i64 j = 0;
+        loop {
+            if (j >= prefix.nbytes) break;
+            if (ld8(data + j) != ld8(prefix.data + j)) return 0;
+            j = j + 1;
+        }
+        return 1;
+    }
+
+    public i64 EndsWith(string suffix) {
+        if (suffix.nbytes > nbytes) return 0;
+        i64 off = nbytes - suffix.nbytes;
+        i64 j = 0;
+        loop {
+            if (j >= suffix.nbytes) break;
+            if (ld8(data + off + j) != ld8(suffix.data + j)) return 0;
+            j = j + 1;
+        }
+        return 1;
+    }
+
+    // `.Trim*` -- ASCII whitespace only (space, tab, LF, CR, VT, FF): a
+    // divergence from C#'s Unicode-aware `char.IsWhiteSpace`, stated rather
+    // than hidden (§ 10, the same "ASCII only" C# itself never had to say for
+    // `Trim` but does here alongside `ToUpper`/`ToLower`)
+    public string TrimStart() {
+        i64 i = 0;
+        loop {
+            if (i >= nbytes) break;
+            if (!tk_string_is_ws(ld8(data + i))) break;
+            i = i + 1;
+        }
+        return SliceBytes(i, nbytes - i);
+    }
+
+    public string TrimEnd() {
+        i64 j = nbytes;
+        loop {
+            if (j <= 0) break;
+            if (!tk_string_is_ws(ld8(data + j - 1))) break;
+            j = j - 1;
+        }
+        return SliceBytes(0, j);
+    }
+
+    public string Trim() {
+        return TrimStart().TrimEnd();
+    }
+
+    // `.ToUpper()`, `.ToLower()` -- ASCII only (§ 10): a byte outside
+    // `'A'..'Z'`/`'a'..'z'` passes through unchanged, which is correct for
+    // every ASCII byte and honest about every one that is not
+    public string ToUpper() {
+        uptr buf = rt_alloc(nbytes + 1);
+        i64 i = 0;
+        loop {
+            if (i >= nbytes) break;
+            i64 b = ld8(data + i);
+            if (b >= 'a' && b <= 'z') b = b - 32;
+            st8(buf + i, b);
+            i = i + 1;
+        }
+        st8(buf + nbytes, 0);
+        string r = new string(buf);
+        rt_free(buf, nbytes + 1);
+        return r;
+    }
+
+    public string ToLower() {
+        uptr buf = rt_alloc(nbytes + 1);
+        i64 i = 0;
+        loop {
+            if (i >= nbytes) break;
+            i64 b = ld8(data + i);
+            if (b >= 'A' && b <= 'Z') b = b + 32;
+            st8(buf + i, b);
+            i = i + 1;
+        }
+        st8(buf + nbytes, 0);
+        string r = new string(buf);
+        rt_free(buf, nbytes + 1);
+        return r;
+    }
+
+    // `.Replace(string, string)` -- two passes over the SAME `ByteFind`: the
+    // first sizes the result exactly (this project's allocator has no
+    // resizable tail, § 1), the second builds it. An empty search value
+    // replaces nothing and answers a copy unchanged -- C# throws on it, teko
+    // has no exceptions to throw, and "nothing to replace" is the honest
+    // reading of the same input (stated here rather than silently matching
+    // C#'s `ArgumentException`).
+    public string Replace(string oldS, string newS) {
+        if (oldS.nbytes == 0) return new string(data);
+        i64 count = 0;
+        i64 pos = 0;
+        loop {
+            i64 b = ByteFind(oldS.data, oldS.nbytes, pos);
+            if (b < 0) break;
+            count = count + 1;
+            pos = b + oldS.nbytes;
+        }
+        if (count == 0) return new string(data);
+        i64 outlen = nbytes + count * (newS.nbytes - oldS.nbytes);
+        uptr buf = rt_alloc(outlen + 1);
+        i64 w = 0;
+        pos = 0;
+        loop {
+            i64 b = ByteFind(oldS.data, oldS.nbytes, pos);
+            if (b < 0) break;
+            tk_string_copy(buf + w, data + pos, b - pos);
+            w = w + (b - pos);
+            tk_string_copy(buf + w, newS.data, newS.nbytes);
+            w = w + newS.nbytes;
+            pos = b + oldS.nbytes;
+        }
+        tk_string_copy(buf + w, data + pos, nbytes - pos);
+        w = w + (nbytes - pos);
+        st8(buf + w, 0);
+        string r = new string(buf);
+        rt_free(buf, outlen + 1);
+        return r;
+    }
+
+    // `.Split(char)` -- a `string[]` of counted elements (`T[]` of heap
+    // already releases them, docs/reference/arrays.md); the separator is
+    // decoded per code point, exactly as `IndexOf(char)` above, so a
+    // multi-byte separator splits at the right BYTE boundary too
+    public string[] Split(char sep) {
+        i64 n = 1;
+        i64 boff = 0;
+        loop {
+            if (boff >= nbytes) break;
+            i64 w = tk_string_utf8_width(ld8(data + boff));
+            if (tk_string_cp_decode(data, boff, w) == sep) n = n + 1;
+            boff = boff + w;
+        }
+        string[] parts = new string[n];
+        i64 start = 0;
+        i64 k = 0;
+        boff = 0;
+        loop {
+            if (boff >= nbytes) break;
+            i64 w = tk_string_utf8_width(ld8(data + boff));
+            if (tk_string_cp_decode(data, boff, w) == sep) {
+                parts[k] = SliceBytes(start, boff - start);
+                k = k + 1;
+                start = boff + w;
+            }
+            boff = boff + w;
+        }
+        parts[k] = SliceBytes(start, nbytes - start);
+        return parts;
+    }
+
+    // `.PadLeft(i64)`, `.PadRight(i64)` -- padded with ASCII spaces to
+    // `width` CODE POINTS (matching `.Length`); a string already that long
+    // or longer comes back unchanged
+    public string PadLeft(i64 width) {
+        if (nchars >= width) return new string(data);
+        i64 pad = width - nchars;
+        uptr buf = rt_alloc(nbytes + pad + 1);
+        i64 i = 0;
+        loop {
+            if (i >= pad) break;
+            st8(buf + i, 32);
+            i = i + 1;
+        }
+        tk_string_copy(buf + pad, data, nbytes);
+        st8(buf + pad + nbytes, 0);
+        string r = new string(buf);
+        rt_free(buf, nbytes + pad + 1);
+        return r;
+    }
+
+    public string PadRight(i64 width) {
+        if (nchars >= width) return new string(data);
+        i64 pad = width - nchars;
+        uptr buf = rt_alloc(nbytes + pad + 1);
+        tk_string_copy(buf, data, nbytes);
+        i64 i = 0;
+        loop {
+            if (i >= pad) break;
+            st8(buf + nbytes + i, 32);
+            i = i + 1;
+        }
+        st8(buf + nbytes + pad, 0);
+        string r = new string(buf);
+        rt_free(buf, nbytes + pad + 1);
+        return r;
+    }
+
+    // `string.Join(sep, parts)` -- the static half of § 7's N8 row, over a
+    // `string[]` (`.Length` and `[i]` both the ordinary `T[]` of heap
+    // mechanism, no special case for the element being `string` itself)
+    public static string Join(string sep, string[] parts) {
+        i64 n = parts.Length;
+        if (n == 0) return new string("");
+        i64 total = 0;
+        i64 i = 0;
+        loop {
+            if (i >= n) break;
+            total = total + parts[i].nbytes;
+            if (i > 0) total = total + sep.nbytes;
+            i = i + 1;
+        }
+        uptr buf = rt_alloc(total + 1);
+        i64 w = 0;
+        i = 0;
+        loop {
+            if (i >= n) break;
+            if (i > 0) {
+                tk_string_copy(buf + w, sep.data, sep.nbytes);
+                w = w + sep.nbytes;
+            }
+            tk_string_copy(buf + w, parts[i].data, parts[i].nbytes);
+            w = w + parts[i].nbytes;
+            i = i + 1;
+        }
+        st8(buf + total, 0);
+        string r = new string(buf);
+        rt_free(buf, total + 1);
+        return r;
     }
 }

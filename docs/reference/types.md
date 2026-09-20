@@ -1412,9 +1412,54 @@ A `str` VARIABLE — even one a literal initialized two lines earlier — is sti
 generic way (`teko: a value of type uptr does not convert to string`,
 `tests/refuse/string_str_implicit.tk`): interning reads the SOURCE NODE, not the value, so
 only a literal written directly in the slot converts, and `new string(p)` stays the road
-for everything else. `s[i]`, `Substring`, `IndexOf`, `Contains`, `Trim`, `Replace`, `Split`
-and the rest of the method surface are N8's — the full list, each with its own row, is
-[not-yet.md](not-yet.md) § `string`.
+for everything else.
+
+**N8's own share (D89): `s[i]` and the method surface.** `s[i]` answers the `i`-th CODE
+POINT, as a `char` — `O(1)` on an ASCII string, `O(i)` otherwise — through `tk_string_at`
+(`lib/string.tk`), the one targeted row `tk_bracket` (`teko_params.tk`) gains for a
+`string` receiver; out of range panics `teko: string index out of range`, exit 70. `s[i] =
+c` refuses, `teko: a string is immutable`. Every method returns a NEW string or an
+existing one, ordinal everywhere (no culture):
+
+| member | is |
+|---|---|
+| `.Substring(i)`, `.Substring(i, n)` | code-point indices, matching `.Length` |
+| `.IndexOf(string)`, `.IndexOfChar(char)`, `.LastIndexOf(string)` | `-1` when not found, a code-point index otherwise |
+| `.Contains(string)`, `.StartsWith(string)`, `.EndsWith(string)` | |
+| `.Trim()`, `.TrimStart()`, `.TrimEnd()` | ASCII whitespace only — a divergence from C#'s Unicode-aware `char.IsWhiteSpace` |
+| `.ToUpper()`, `.ToLower()` | ASCII only (§ 10) |
+| `.Replace(old, new)`, `.Split(char)` → `string[]` | an empty `old` replaces nothing (no exception: teko has none to throw) |
+| `.PadLeft(n)`, `.PadRight(n)` | padded with ASCII spaces to `n` code points |
+| `string.Join(sep, string[])` | static |
+
+`.IndexOf(char)` is spelled `IndexOfChar` rather than a second `IndexOf` overload: a class
+method is resolved by name-and-ARITY alone, unlike a free function's overload machinery,
+so a second one-argument `IndexOf` is genuinely ambiguous today
+([not-yet.md](not-yet.md) § `string`).
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "string.tk"
+
+i64 main() {
+    string s = new string("hello, world");
+    if (s[0] != 'h') return 1;
+    if (s.Substring(7) != new string("world")) return 2;
+    if (s.IndexOf(new string("world")) != 7) return 3;
+    if (s.IndexOfChar('w') != 7) return 4;
+    if (s.Contains(new string("wor")) != 1) return 5;
+    if (s.StartsWith(new string("hello")) != 1) return 6;
+    if (s.EndsWith(new string("world")) != 1) return 7;
+    if ((new string("  hi  ")).Trim() != new string("hi")) return 8;
+    if ((new string("MiXeD")).ToUpper() != new string("MIXED")) return 9;
+    if (s.Replace(new string("world"), new string("there")) != new string("hello, there")) return 10;
+    string[] parts = (new string("a,b,c")).Split(',');
+    if (parts.Length != 3) return 11;
+    if (string.Join(new string("-"), parts) != new string("a-b-c")) return 12;
+    return 42;
+}
+```
 
 **The include refusal § 5 names is not built, and not buildable the way the page asks.**
 D48 already measured the identical question for `DateTimeKind`, a type an `#include`d
