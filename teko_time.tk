@@ -81,11 +81,14 @@ i64 tk_ty_dto = 0;
 // is the only wrapper in the tree and wrong the day a second module wraps
 // `lex_set_bundle` after `tk_clock_init()` -- the later wrapper would answer
 // first and `<teko/clock.tk>` would silently stop resolving. A second wrapper
-// has to chain the previous pointer instead. `host_os()`, never `drv_os()`: `ngen.yml`'s five legs are all
-// NATIVE (docs/specs/roadmap-1.0.md, the owner's ruling of 2026-09-04), so
-// the host running this compiler IS the target, and `host_os()` needs no
-// `--config` to answer -- `drv_os()` answers 0 on the bare-CLI path, which
-// would silently pick the wrong host there.
+// has to chain the previous pointer instead. The OS is read `drv_os()` FIRST
+// and `host_os()` only as its fallback: `ngen.yml`'s five legs are all NATIVE
+// (docs/specs/roadmap-1.0.md, the owner's ruling of 2026-09-04) and there the
+// two agree, but a CROSS build -- `mc build --config` with `[target] os =
+// "windows"` on a macOS box -- has to emit the TARGET's wrapper, and only
+// `drv_os()` knows it. `drv_os()` answers 0 on the bare-CLI path (no
+// `[target]`; `src/driver.mc` zero-initialises the record), and there the
+// host is the target, which is what the fallback is for.
 //
 // Each answer is a small, complete function, `tk_dt_raw_utc_ticks()`,
 // returning C#'s own tick count (100 ns, since `0001-01-01`) read off the
@@ -117,8 +120,19 @@ uptr tk_clock_windows_src() {
 // to the resolver `mc_bundle_init()` already installed.
 uptr tk_clock_bundle_open(uptr name, i64 base, uptr pcanon, uptr plen) {
     if (str_eq(name, "teko/clock.tk")) {
+        // the TARGET's clock, not this machine's: `drv_os()` is what
+        // `[target] os` (or `--os`) set, and a cross build -- `--os windows`
+        // on a macOS box, which `docs/internals/bootstrap.md` discusses and
+        // the ladder's own host guard refuses only for the LADDER -- must
+        // emit the target's wrapper or link nothing. `drv_os()` answers 0 on
+        // the bare-CLI path (no `[target]`, `src/driver.mc`'s record is
+        // zero-initialised), and there the host IS the target, so `host_os()`
+        // is the fallback rather than the rule (D90, amended after the
+        // review).
+        uptr os = drv_os();
+        if (os == 0) os = host_os();
         uptr src = tk_clock_posix_src();
-        if (str_eq(host_os(), "windows")) src = tk_clock_windows_src();
+        if (str_eq(os, "windows")) src = tk_clock_windows_src();
         st64(pcanon, "teko/clock.tk");
         st64(plen, cstrlen(src));
         return src;
