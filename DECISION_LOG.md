@@ -10962,3 +10962,85 @@ programs that used to accept (silently wrong) or fail without a `file:line` into
 round moved the guard's placement (the "Where, amended after review" paragraph above): the
 same numbers, unmoved — `--dump-ast` empty diff again, fixtures `135 passed, 154 refused as
 expected, 0 failed`, `FIXPOINT OK`, docs gate green.
+
+### D96 · An index whose base binds nearer than the global it is rewritten against (2026-09-20)
+
+`docs/reference/not-yet.md`'s two rows on a shadowed index, measured live on `origin/main`
+`63951cb0` with the fixture recipe (`--entry-only`, then RUN):
+
+| program | before | after |
+| --- | --- | --- |
+| global `i64 src[3]`; `i64 f(i64 src) { return src[0]; }` | exit 139 | ``teko: `[` needs an array: src`` |
+| the same with a global `i64[] src` | exit 139 | the same refusal |
+| global `i64 src[3]`; a method `go()` above `public i64 src;` | exit 139 | the same refusal |
+| the same with `public const i64 src = 9;` below | exit 139 | the same refusal |
+| the same with a scalar property `src` below | exit 139 | the same refusal |
+| global `i64 src[3]`; `public i64[] src;` below | exit 208 | the same refusal |
+| global `i64[] src`; `public i64[] src;` below | exit 41 (right, by coincidence) | the same refusal |
+| the same `T[]` field below with NO global of that name | ``teko: `[` needs an array`` | unchanged |
+| a field, a member `const` or a property declared ABOVE | already refused | unchanged |
+| a `T[]` field or a `T[]` property declared ABOVE | reads the member | unchanged |
+
+**Root cause, in one sentence.** The index judge in `tk_bracket` (`teko_params.tk`) is a
+PARSE-TIME judge — it refuses a local shadow (`tk_slv_find`) and a member the class has
+ALREADY declared (`tk_field_find(tk_body_class, …)`) — and the two bindings it cannot see
+there, a PARAMETER (in no scope table at parse time, `teko_struct.tk`'s own invariant) and a
+member declared BELOW the reader, fell through to the global road, whose rewriters
+(`tk_array_maybe_rewrite_index` and `tk_hg_rewrite_index`, `teko_array.tk`) match
+`tk_garr_find(nd_name(base))` / `tk_hg_find(…)` BY NAME ALONE out of a walk that carries
+neither scope nor class.
+
+**A correction to the row's own wording.** `not-yet.md` said the index was rewritten into a
+read of the GLOBAL. The base ADDRESS was never the global's: `tk_arr_addr(base, …)` re-uses
+the identifier node, and mc's resolver binds that node to the parameter — so the parameter's
+VALUE was used as an address. Measured: `f(0)` faults at address 8 and `f(7)` at 15, one
+element in from the value passed. Inside a method the same node is rewritten by
+`tk_this_ident` (`teko_this.tk`) into the member's own load, so the member's eight bytes
+became the array's handle. The row is rewritten.
+
+**Where the judge belongs.** Not at the parse-time site, which cannot know the binding, and
+not in the rewriters, which have no context to ask with. The typeof pass walk
+(`tk_ty_pass_walk`, `teko_typeof.tk`) has both halves per function: `tk_ty_scope_params`
+pushes the parameters and `tk_this_enter_fn` enters the type the body belongs to, so a
+parameter answers `tk_ty_scope_find` and a member answers
+`tk_field_find`/`tk_mconst_find`/`tk_prop_find` on `tk_pass_class` whatever the declaration
+order. So the two rewriters — and the two WRITE resolvers beside them, which take the base by
+name the same way — MARK each base identifier they consume (`tk_ib_mark`, a table of node ids,
+`teko_array.tk`), and `tk_ib_check` (`teko_typeof.tk`) judges a marked node at the head of
+`tk_pend_visit`, ahead of the `tk_this_fix` that would consume the name. The node is still
+the untouched `N_IDENT` there, so the site's own line, file and name are read straight off
+it. `tk_nib != 0` joins the two conditions that gate that walk: a plain function with a
+parameter shadowing a global array carries neither a deferred `.` nor a method.
+
+No new pass is registered (`mc limits`' `passes` row does not move) and no new diagnostic
+string is minted for the refusal: it is byte-identical to `teko_params.tk`'s own,
+``teko: `[` needs an array`` with the base's name through `err_at2`. The mark table's
+capacity message, `teko: too many array indexes waiting to be resolved` (4096), is new and
+documented beside its siblings in `docs/reference/diagnostics.md`.
+
+**The judgement call: a `T[]` member declared BELOW is refused, not routed.** A `T[]` field
+or property declared ABOVE its reader is routed to `tk_ha_index` at parse time
+(`teko_params.tk`, Copilot on #698 passes 12-13) and stays legal — the positive fixture
+`tests/index_base_roads.tk` pins both roads. Declared BELOW it is refused with everything
+else, and that refuses no legal program: the identical program with no same-named global is
+ALREADY refused ``teko: `[` needs an array`` today (measured, the eighth row above), so
+routing it would make the presence of an unrelated global the thing that makes a program
+legal. What the ninth row loses is a program that only ever answered right by coincidence —
+the global's element type happening to match the field's; with a fixed global instead it read
+exit 208. Silently reading the global was never on the table. Routing at pass time would mean
+un-doing a rewrite that has already replaced the node, for a shape the parser cannot see; the
+narrower wording of the "array field on a type declared below" row was rejected because that
+row is about a TYPE declared below, not a member.
+
+**What this does NOT cover.** The `&n` / `ref n` / `out n` road on a bare member name, which
+has no member judge at all and is its own row in `not-yet.md` — the mark is only ever laid by
+an index rewrite. A local declared LATER in the same body than the index that names it is
+still not refused: the walk pushes scope vars as it passes them, so the name is not in scope
+at the site. A marked base inside a subtree `tk_pend` walks after this pass's own visit has
+passed it is not re-judged.
+
+**Gate.** `135 passed, 154 refused as expected, 0 failed` before; `136 passed, 159 refused as
+expected, 0 failed` after — five refuse fixtures and one positive. `--dump-ast` compared
+against `63951cb0` over every one of the 136 accepted fixtures: an EMPTY diff, the new
+positive fixture included (it is a legal program on both compilers). `FIXPOINT OK`, docs gate
+green.

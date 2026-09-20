@@ -1392,6 +1392,13 @@ words (*a value of type i64 does not convert to Op*) used to answer for it.
   that IS an array is read as the member instead, index and all: the field through its own
   load, the property through its getter.
 
+  Two bindings the parse cannot see are judged in the typeof pass instead, and answer with
+  the very same sentence (D96): a PARAMETER of the enclosing function, which is in no
+  parse-time scope at all, and a member declared BELOW the method that reads it. A member
+  declared below that IS a `T[]` is refused here too, not read as the member — the parser
+  never saw it, exactly as it never sees it when no same-named global exists. Declare the
+  member above its readers, or rename one of the two names.
+
 ```teko
 // no-run
 i64[] src;                    // a GLOBAL array...
@@ -1440,6 +1447,19 @@ class L {
         ys[0] = 8;            // ...while a `T[]` PROPERTY is read by its getter
         return ys[0];
     }
+}
+
+// D96, the two bindings the parse cannot see
+i64 p(i64 src) {
+    return src[0];            // teko: `[` needs an array: src -- a PARAMETER
+}
+
+class M {
+    public i64 g() {
+        return src[0];        // teko: `[` needs an array: src -- declared BELOW
+    }
+
+    public i64 src;
 }
 ```
 
@@ -2026,6 +2046,7 @@ truncation; the fix is to split the unit.
 | ``"teko: too many global `T[]` of heap"`` | 32 in one source |
 | `"teko: too many globals"` | 2048 global slots in one source — every global that holds one value, which is what the oracle answers for by name |
 | `"teko: too many array writes waiting to be resolved"` | 512 |
+| `"teko: too many array indexes waiting to be resolved"` | 4096 index bases a global-array rewrite consumed and left for the typeof pass to judge the binding of (D96) — one per `g[i]` on a global array, read or write |
 | `"teko: too many array-field accesses"` | 128 |
 | ``"teko: too many `T[]` parameters in one declaration"`` | 32 |
 | `"teko: too many locals in one unit"` | 8192 |
