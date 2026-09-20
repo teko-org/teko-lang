@@ -449,9 +449,14 @@ a function nothing calls, so its `extern` still has to link). The mechanism used
 the one `minicompiler/mc` already ships for exactly this shape of problem —
 `#include <mc/host>`, whose bundle resolver answers differently per host with no change to
 the two include lines a generated compiler carries. `teko_time.tk` wraps that SAME resolver
-(`lex_set_bundle`) for one more name, `<teko/clock.tk>`, answered by `host_os()` and falling
-through to `host_bundle_open` for everything else; `lib/time.tk` includes it unconditionally,
-and the text it expands to differs by host. Zero mc changes, zero new intrinsics: the
+(`lex_set_bundle`) for one more name, `<teko/clock.tk>`, answered by the TARGET's operating
+system — `drv_os()`, what `[target] os` or `--os` set, falling back to `host_os()` only when
+that answers 0 (no `[target]`, where the host IS the target) — and falling through to
+`host_bundle_open` for everything else; `lib/time.tk` includes it unconditionally, and the
+text it expands to differs by target. Reading the host alone was the first draft's mistake:
+a cross build (`--os windows` on a macOS box) would have put the POSIX wrapper in a COFF
+object, an undefined `clock_gettime` no Windows link can resolve (D90's own amendment
+carries the measurement). Zero mc changes, zero new intrinsics: the
 generated text is ordinary `extern`/function surface, parsed the same way any other include
 is.
 
