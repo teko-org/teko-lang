@@ -67,6 +67,23 @@ compiler_verdict=$(printf '%s\n' "$verdicts" | sed -n '1p')
 entry_name=$(printf '%s\n' "$names" | sed -n '2p')
 entry_verdict=$(printf '%s\n' "$verdicts" | sed -n '2p')
 
+# Measured on this project's own tables, `mc limits`'s exit code is 3 when
+# the entry table's own known state (its `grow` plus `intrin` sitting at
+# `tight`) is present and 1 on a config it refuses outright (no table at
+# all, e.g. an out-of-range `[limits] tolerance`) -- 0-3 is the range this
+# script has actually seen and accounted for. `nblocks < 2` above already
+# catches the "refused before printing anything" case; this catches the
+# other one: `mc limits` prints two tables that both parse `ok`/`grew` fine
+# but STILL exits somewhere this script has never seen, which is not a
+# verdict on a row -- more likely an internal error or a misuse of the
+# command -- and is a hard failure on its own rather than silently passing
+# just because the tables it did print happened to read clean.
+if [ "$rc" -gt 3 ]; then
+    echo "FAIL limits: mc limits exited $rc, outside the range this check has measured -- not a verdict it can read"
+    printf '%s\n' "$out"
+    exit 1
+fi
+
 fails=0
 if [ "$compiler_verdict" = "ok" ]; then
     echo "ok limits: compiler ($compiler_name) verdict ok, tolerance holds"
@@ -76,12 +93,5 @@ else
     fails=1
 fi
 echo "owed limits: entry ($entry_name) verdict $entry_verdict (not gated, docs/internals/debts.md)"
-
-if [ "$rc" -gt 1 ] && [ "$fails" = 0 ]; then
-    # `mc limits` itself exits non-zero on a `grow`/`tight` verdict anywhere;
-    # the entry table's own known-grown state is the expected source of that
-    # here, already accounted for above -- nothing further to report.
-    :
-fi
 
 exit "$fails"

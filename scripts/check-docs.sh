@@ -401,7 +401,7 @@ uniq -d "$tmp/dec_headers" > "$tmp/dec_dupes"
 # `## D<n> — draft, not yet in the log` is the reservation marker
 # `docs/specs/tekoc-tool.md` carries for D73; read every page under docs/ for
 # it rather than trusting one path, and rather than trusting the number.
-grep -hoE '^## D[0-9]+ — draft, not yet in the log' docs -r 2>/dev/null \
+grep -rhoE '^## D[0-9]+ — draft, not yet in the log' docs 2>/dev/null \
     | sed -E 's/^## D//; s/ .*//' | sort -nu > "$tmp/dec_reserved"
 
 : > "$tmp/dec_gap"
@@ -414,7 +414,7 @@ while [ "$n" -le "$highest" ]; do
 done
 
 : > "$tmp/dec_bad_citations"
-{ grep -rhoE '\bD[0-9]+\b' docs --include='*.md' 2>/dev/null; grep -hoE '\bD[0-9]+\b' ./*.tk 2>/dev/null; } \
+{ grep -rhoE --include='*.md' '\bD[0-9]+\b' docs 2>/dev/null; grep -hoE '\bD[0-9]+\b' ./*.tk 2>/dev/null; } \
     | sed 's/^D//' | sort -nu > "$tmp/dec_cited"
 while IFS= read -r n; do
     [ -n "$n" ] || continue
