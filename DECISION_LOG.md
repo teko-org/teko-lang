@@ -10747,3 +10747,73 @@ from `1898beeb`'s own entry (defect (a), its fix, the audit of every synthesized
 the surviving tail of the rewrite that followed the verifier's rejection of defect (b).
 D73 is the one number with no entry, and that is deliberate: it is reserved for `tekoc` and
 still a draft at `docs/specs/tekoc-tool.md`. Every other number from D1 to D93 resolves.
+
+### D94 · Two checks the gate owed: the decision numbering, and `mc limits` never run (2026-09-20)
+
+**What this closes.** D93 named a seventh check `scripts/check-docs.sh` owed and did not
+add: the decision log's own numbering. And a second gap, unrelated to the loss but the same
+shape — every crumb's "the six tables are unmoved" claim has been hand-copied prose since,
+never re-measured, because nothing in CI runs `mc limits`. Both land in one crumb, `ci:
+gate-decisions-and-limits`, because both are checks the gate owed and both are small.
+
+**Check one — the decision numbering, `scripts/check-docs.sh`'s seventh check.** Every
+`### D<n>` header in `DECISION_LOG.md` is unique, and the set is dense from D1 to the
+highest, with no gap except a number a docs/ page explicitly reserves: today exactly D73,
+`docs/specs/tekoc-tool.md`'s own `## D73 — draft, not yet in the log` marker, read by grep
+from that page rather than hardcoded, so a reservation that disappears while its gap remains
+fails the check instead of passing silently. Every `D<n>` cited anywhere under `docs/` or in
+a root `*.tk` module, at or below the highest header, has to resolve to a header — the
+citation a `D57`-`D86` loss would have tripped.
+
+One thing the first draft of this check got wrong and a second pass caught: the header
+pattern has to match `### D<n>` at a word boundary, not `### D<n> ·` literally.
+`### D80 (D79 is C5's, on its own branch) · a postfix after a parenthesized...` carries a
+parenthetical BETWEEN the number and the title separator, and a check that requires the
+` ·` right after the digits silently misses it — which would have reported a phantom gap at
+D80 on a file that has none. Citations beyond the highest header (`D131`, `D224`, `D210`,
+even the UTF-16 surrogate range literal `D800` in `docs/specs/string.md`) are not checked at
+all: several root `*.tk` modules cite the RETIRED standalone compiler's own frozen decision
+log by number in comments (`docs/history/README.md`'s "its decision log (D1-D210)"), a
+different file with different numbering, and a citation the current log could not possibly
+own is not this check's business.
+
+**What it does not cover.** A header whose NUMBER is right but whose TEXT drifted from what
+actually shipped is invisible to a check that reads numbering alone; D93's own restoration
+proved that only a `git show` of the pre-damage commit and a manual read caught the mismatch
+between D87's header and its grafted body. This check catches disappearance, not corruption.
+
+**Check two — `mc limits` in `docs`, `scripts/check-limits.sh`.** `teko.toml`'s own
+`[target]` is linux/x86_64, the same pair the `docs` job already runs on, so no config is
+derived: the step is `sh scripts/check-limits.sh "$MC" teko.toml`, which runs `mc limits .
+--config teko.toml` after `rm -rf build` (an incremental measurement is not the same claim
+as a clean one) and fails the job when the **compiler** table (`[compiler]`, `build/teko.mc`
+-> `build/teko`) answers `grow` on any row.
+
+Measured at head, clean, on macOS/aarch64 (the pair this crumb built on; `docs` itself runs
+linux/x86_64, and the row SHAPE — which tables are `ok` and which are not, at
+`[limits] tolerance = 1.0` — is what this check rests on, not the exact byte counts, which
+are architecture-dependent): the compiler table is clean, every row `ok`, `ins` the
+tightest at 244874 used of a 379800 reservation (64%). The **entry** table (`[project]`,
+`tests/hello.tk` built BY the taught compiler) is not: `passes`, `syntax`, `alias` and
+`types` already answer `grow` at this same tolerance. The check prints that table and does
+not gate it — gating it today would fail the very first run this check makes, and raising a
+cap to make a new check pass is the silent weakening this crumb exists to refuse. The row
+set left ungated is recorded, with the measurement, in `docs/internals/debts.md`.
+
+**What it does not cover.** `heap` is never read as pass/fail on either table — it is `mc
+limits`'s own estimate of a heap ceiling, not a budget a row here reserves by hand, and
+citing it as though it were is D21's own "no new intrinsics" argument turned into a metric
+that means nothing. And the check runs on ONE pair (linux/x86_64, the `docs` job's own
+runner): `mc limits`'s counts are mostly platform-INDEPENDENT (`ins`, `nodes`, `funcs` do
+not move with pointer width) but `heap` and a handful of others are, so a row that grows
+only on a pair `docs` does not run on would not be caught here — the same argument that
+already keeps `docs` off the five-way matrix, taken the other way.
+
+**Proof, on mc 1.0.1.** Deleting a `### D80 ·` header in a scratch copy of `DECISION_LOG.md`
+makes check one refuse with `gap in DECISION_LOG.md's numbering`, naming `D80`. Citing a
+`D99` that has no header (added to a scratch `docs/` page) makes check one refuse with
+`D<n> cited under docs/ or a root *.tk module with no header`, naming `D99`. Lowering
+`[limits] tolerance` in a scratch `teko.toml` to `0.2` moves the compiler table's own `ins`
+row into `grow` (244874 used against a 227880 reservation at that tolerance) and check two
+refuses with `compiler (build/teko.mc) verdict grew -- a budget row moved`. All three
+restored before the crumb's own commits.
