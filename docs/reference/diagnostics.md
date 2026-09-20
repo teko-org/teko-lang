@@ -997,6 +997,14 @@ runtime's `panic` (D82):
 - `` "teko: `" `` — completed by *`X` is a binary operator; it names two operands*, by
   *`X` is a unary operator; it names one operand*, or, for a generic, by *`X` takes N
   arguments*.
+- `` "teko: `%` takes no float operand" `` — D95: over a pair the CORE would own (neither
+  side declares its own operator — a type that names `operator%` is unaffected, and still
+  resolves the usual way against the rows it declares), `%` is not one of the promoted
+  operators (this backend has no float remainder instruction), and either side being an
+  `f32`/`f64` reached it exactly as written. `7 % 2.5` used to compile clean and read the
+  float's bits as an integer's; `2.5 % 7` and `f64 % f64` already failed, but at the mc
+  level (`mc: no float remainder`, no `file:line`). All three now refuse here instead,
+  symmetrically on either operand, with one pinnable message.
 
 ## Integer division
 

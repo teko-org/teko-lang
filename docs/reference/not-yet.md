@@ -37,9 +37,14 @@ An integer converts to a float in every slot that has one, `f32` converts to `f6
 same way, and nothing narrows back — an `f64` into an `f32` slot is refused rather than run
 raw (D78, [types.md](types.md#f32-and-f64)). What is still missing around it:
 
+A `%` with a float operand is not "not yet" any more (D95): this backend has no float
+remainder instruction at all, so C# §12.4.5's promotion is not applied for it — instead
+`7 % 2.5`, `2.5 % 7` and `f64 % f64` are all refused, `` teko: `%` takes no float operand ``
+([diagnostics.md](diagnostics.md#operators)), rather than silently reading the float's bits
+as an integer's (what `7 % 2.5` used to do, exiting `7` where C# gives `2.0`).
+
 | written | what happens |
 |---|---|
-| `7 % 2.5` | the remainder is not promoted — the integer operand stays one, and the float's bit pattern is read as an integer. `2.5 % 7` is `mc: no float remainder`, the backend having no float remainder instruction at all |
 | `2.5 << 1`, `2.5 & 1` | a shift and the bitwise operators take no float in C# and are not promoted here either |
 | `(i64) p.w` on a field | `teko: i64 has no members: w` — the cast binds tighter than the `.`, so it reads as `((i64) p).w`. Write the load into a local first, `f64 v = p.w;` |
 
