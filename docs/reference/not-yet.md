@@ -306,15 +306,23 @@ refusal § 5 names. One crumb still owes the rest of the design.
 | a `class string` the PROGRAM declares | an ordinary user class: neither the interning nor either conversion fires on it, and `string s = "hi";` refuses with `teko: a value of type uptr does not convert to string`. The row is `lib/string.tk`'s only — provenance plus layout, `tk_str_class_si` (D88) |
 | `string` named with no `#include "string.tk"` | a plain parse error, `expected ; after expression` — and it stays that way: D48 already measured the identical question for `DateTimeKind`, a type an `#include`d library file declares, and ruled the friendly hint IMPOSSIBLE without making `class string { ... }` refuse its own name (`tk_newname`, `teko: the name is already a type`) the moment `lib/string.tk` is parsed. A library type is told apart by the library, D48's own sentence and D88's re-measurement of it for a class rather than an `enum` |
 
-**N8** owes § 6-7's index and method surface, all of it over the class N7a already
-declares:
+**N8 landed (D89)**: `s[i]` (`tk_string_at`, `teko_params.tk`'s own row in `tk_bracket`),
+`s[i] = c` (`teko: a string is immutable`), and every instance/static method § 7 names —
+`Substring`, `IndexOf`, `LastIndexOf`, `Contains`, `StartsWith`, `EndsWith`,
+`Trim`/`TrimStart`/`TrimEnd`, `ToUpper`/`ToLower`, `Replace`, `Split`, `PadLeft`/`PadRight`,
+`string.Join`. One divergence: `.IndexOf(char)` is spelled `IndexOfChar` rather than a
+second `IndexOf` overload — a class method is resolved by name-and-ARITY alone
+(`tk_method_pick`, `teko_class.tk`), unlike a free function's `teko_over.tk`, so two
+one-argument `IndexOf` signatures are genuinely ambiguous (`teko: ambiguous overload; two
+signatures take this many arguments: IndexOf`, measured); extending method dispatch to
+read argument types is real machinery outside this crumb's own boundary and stays a row
+here:
 
 | written | what happens today |
 |---|---|
-| `s[i]` | `` teko: `[` needs an array `` — `tk_bracket` (`teko_params.tk`, not `teko_array.tk`: the spec's own citation is corrected in this crumb) gains no `string`-receiver row until N8 |
-| `s[i] = c` | the same, ahead of N8's own `teko: a string is immutable` |
-| `.Substring`, `.IndexOf`, `.LastIndexOf`, `.Contains`, `.StartsWith`, `.EndsWith`, `.Trim`/`.TrimStart`/`.TrimEnd`, `.ToUpper`/`.ToLower`, `.Replace`, `.Split`, `.PadLeft`/`.PadRight` | `teko: unknown member of string: <name>` — N8's own method surface |
-| `string.Join(string, string[])` | `teko: unknown member: Join` (a static's wording carries no type) — a static N8 owes beside the instance methods |
+| `s.IndexOf(c)` where `c` is a `char` (a second `IndexOf` overload beside `.IndexOf(string)`) | `teko: ambiguous overload; two signatures take this many arguments: IndexOf` — write `s.IndexOfChar(c)` instead (N8, D89); a class method has no argument-type-based dispatch, only a free function does (`teko_over.tk`) |
+| `this[i]` on a user-declared class | `` teko: `[` needs an array `` — N8's own `string`-receiver row in `tk_bracket` is targeted, not a general indexer (`docs/specs/string.md` § 6/§ 10); a user `operator[]`/indexer is a fork of its own, undesigned |
+| `"hi"[0]` — a LITERAL indexed directly | `` teko: `[` needs an array `` — the index hook reads the receiver's own type through `tk_struct_of_expr`, which answers for a local, a field chain and a call's return, never for a literal the interning has not placed yet. `string s = "hi"; s[0]` is the spelling (D89) |
 
 Two gaps N7b's own interning does not reach, both measured directly, neither one of D33's
 nine slots:

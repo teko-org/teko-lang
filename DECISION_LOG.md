@@ -5294,3 +5294,117 @@ mc.macos.toml --limits` after `rm -rf build` — `build/teko.mc` verdict `ok`, a
 `on_stmt`(4), every row equal to the base's own measurement of the same leg;
 `--dump-ast --include=lib --include=tests`, base vs head, over all **125** pre-existing
 `tests/*.tk` fixtures — byte-identical, all 125.
+
+### D89 · `string`, the methods and the index (N8, 2026-09-20)
+`docs/specs/string.md` §§ 6-7 and § 15's N8 row, over the class N7a landed (D86) and the
+interning/conversions N7b landed (D88). Depends on N7a and N7b, and on nothing else.
+
+**`s[i]` is the one construct that needs a compiler row, and it is the ONLY compiler
+change this crumb makes.** `tk_bracket` (`teko_params.tk`) already asks
+`tk_struct_of_expr(left)` for a receiver's own row — a local, a field chain, a call's own
+return — to answer the `T[]` case (`tk_is_ha`); one more line asks the same answer
+against `tk_str_class_si()` (`teko_string.tk`, D88) and, on a match, calls
+`tk_string_index(left)`. A write refuses outright, ahead of parsing any right-hand side —
+`teko: a string is immutable`, C#'s own rule and teko's; a read lowers to a PLAIN
+top-level call, `tk_call2("tk_string_at", left, idx)`, the identical shape `tk_ha_load`
+already is. `hi >= 0` guards the comparison: `tk_str_class_si()` answers `-1` when no
+program in the unit ever wrote `#include "string.tk"`, and `-1 == -1` would otherwise
+mistake "not known" for "is a `string`" — measured, not assumed.
+
+**`tk_string_at` is a top-level function, not a method, and that is load-bearing.** It
+reads `nbytes`/`nchars`/`data` through the FIXED byte offsets § 1's own layout diagram
+publishes (`TK_STRAT_NBYTES`/`TK_STRAT_NCHARS`/`TK_STRAT_DATA` = 16/24/32), reached through
+`(uptr) s` — an ordinary CAST, general to every reference type and already exercised by
+`tests/surface_string_intern.tk`'s own `(uptr) a != (uptr) b` — never through `this`, and
+never through D33's nine conversion slots: `tk_str_borrow` only fires at those, never at a
+cast, so `(uptr) s` hands back the object's own identity address with no help from
+`teko_string.tk` at all. A method call through `tk_emit_call` was the alternative and was
+rejected: it buys nothing (private-field access across two instances of the SAME class
+already works, N7a's own `Equals` proves it) and it is machinery this crumb's own module
+table does not authorize (`teko_class.tk` stays untouched, § 12). The two byte-level
+decode helpers (`tk_string_utf8_width`, `tk_string_cp_decode`) live beside it for the same
+reason `tk_string_copy`/`tk_string_utf8count` already do (N7a's own header): a line added
+to `lib/rt.tk` would move the `--dump-ast` include chain of every fixture in the tree.
+
+**Every other member is an ORDINARY class method or static — zero compiler work,
+exactly as § 12's own table says.** `Substring(i)`/`Substring(i,n)`, `IndexOf(string)`,
+`LastIndexOf(string)`, `Contains`, `StartsWith`, `EndsWith`, `Trim`/`TrimStart`/`TrimEnd`,
+`ToUpper`/`ToLower`, `Replace`, `Split(char)` → `string[]`, `PadLeft`/`PadRight`, and the
+static `string.Join(sep, string[])`. Indices are CODE POINTS everywhere, matching
+`.Length` (ruling 3). Two divergences from C#, stated rather than hidden (ruling 2):
+`Trim*` strips ASCII whitespace only (space/tab/LF/CR/VT/FF), not C#'s Unicode
+`char.IsWhiteSpace`; `Replace` with an empty search value answers a copy unchanged rather
+than throwing (teko has no exceptions to throw, and "nothing to replace" is the honest
+reading of the same input). Every method allocates a NEW string or returns an existing
+one; a byte search (`ByteFind`, private) relies on UTF-8 SELF-SYNCHRONIZATION — a
+continuation byte can never open a lead byte's own bit pattern, so a byte-for-byte match
+of two valid UTF-8 strings can never land off a code-point boundary — to answer a
+code-point question with no decode at all. `Replace` and `Join` size their result in a
+FIRST pass and build it in a second, this project's allocator having no resizable tail
+(§ 1's own reason for the class's two-allocation shape).
+
+**One divergence from § 7's own table, forced by a real compiler limit.** `.IndexOf(char)`
+beside `.IndexOf(string)` is a SECOND one-argument overload of an instance method, and
+`tk_method_pick` (`teko_class.tk`) resolves a method by name-and-ARITY alone — its own
+header already names the gap ("-3: two do, and only the argument TYPES could tell them
+apart, which is what a module cannot ask the core about mid-body"), unlike a free
+function's `teko_over.tk`, which runs its own LATER pass over the whole unit's closed
+declarations exactly to answer that question. Measured: `teko: ambiguous overload; two
+signatures take this many arguments: IndexOf`. Extending method dispatch to read argument
+types is real machinery — this crumb's own module table does not list `teko_class.tk` as
+touched, and D2/D21's own spirit (zero mc-core changes, zero new intrinsics) reads the
+same way about a home-grown compiler extension nobody asked this crumb to build. The
+default taken: keep the search, drop the collision — `.IndexOf(char)` is spelled
+`IndexOfChar(char)` instead, and `not-yet.md` carries the gap as its own row rather than
+silently matching C#'s surface. Recorded here rather than halted on, because the fork
+protocol's own default applies (follow C# where it fits, and note the one place it does
+not, D89 being the note).
+
+**The constructor's bytes, and the review's own finding.** `new string(raw)` copies whatever
+`raw` points at and counts LEAD bytes for `nchars`, so a `raw` that is not valid UTF-8 -- a
+sequence truncated at the tail, which only program-built bytes can produce, never a literal
+-- used to let `s[i]` decode past the allocation (measured by the verifier: `C3 A9 F0 00`
+read three bytes past a four-byte buffer). `tk_string_cp_decode` takes `nbytes` now and
+answers **U+FFFD** for a sequence that runs off the end, the replacement character every
+decoder gives a truncated one, so `s[i]`, `IndexOfChar` and `Split` are total and bounded
+over any byte string. The constructor still does not VALIDATE: ill-formed bytes in the
+middle decode to whatever they encode, exactly as C#'s own `string(sbyte*)` does with an
+invalid page, and `.Utf8Length` always answers the bytes actually held.
+
+**Fixtures (D52).** `tests/surface_string_index.tk` (`42`): ASCII, a 2-byte code point
+(π), a 3-byte one (中), a 4-byte one (😀), `s[0]`, `s[s.Length - 1]`, a loop summing every
+code point. `tests/surface_string_index_oob.tk` (`70`): `s[s.Length]` panics `teko: string
+index out of range`. `tests/surface_string_methods.tk` (`42`): every method, an empty
+string, an empty needle, a needle longer than the haystack, a prefix/suffix at both ends,
+an all-space `Trim`, `Replace` with no match and with an empty search value, `Join` of
+zero/one/many. `tests/refuse/string_index_write.tk`: `s[0] = 'H'` refuses `teko: a string
+is immutable` at the line written.
+
+**Proof, mc 1.0.1, macos/aarch64, head against `origin/main` `1f18de36` (D88 merged in).**
+`mc build . --config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko
+mc.macos.toml` → **132 passed, 144 refused as expected, 0 failed** (base: 129 passed, 144
+refused — exactly the three new fixtures); `sh scripts/bootstrap.sh --os macos --arch
+aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 703 links, 78 fragments,
+413 diagnostics, 144 refusals, 154 samples, manifest listed`.
+
+`mc limits build/teko.mc` (`rm -rf build` first, both legs), base vs head. `passes` 0/8,
+`syntax` 0/16, `alias` 0/16 (used 1/1), `types` 0/8 (used 1/1), `on_stmt` 0/8, `intrin`
+0/8 — every one identical on both, **all six UNMOVED**. Only the compiler leg's own
+surface-code rows move, by the one new function (`tk_string_index`): `nodes` 175127 ->
+175186, `funcs`/`lowered` 3443/3424 -> 3444/3425, `strings` 2440 -> 2442, `symbols` 6884 ->
+6887, `ins` 242505 -> 242597 (`heap`, never cited). `mc limits .` (the `tests/hello.tk`
+leg, the fixed sample this crumb never touches) is likewise unmoved on every named row.
+
+**`--dump-ast --include=lib --include=tests`, base vs head, over all 257 base fixtures**
+(122 `tests/*.tk` + 135 `tests/refuse/*.tk`, every one that does not `#include
+"string.tk"`) — byte-identical, all 257, run with `./build/teko` IN PLACE (base and head
+each next to their own `build/lib/mc/v1.0.1/`, the same shape D88's own proof needed).
+
+**Adjacent findings, not this crumb's to fix:** the method-overload-by-type gap above
+(`tk_method_pick`, `teko_class.tk`) is general to every class, not to `string`, and is
+worth its own crumb should a second same-arity method overload ever become load-bearing
+elsewhere. The `#define` collision measured while naming `STRING_NBYTES`/`STRING_NCHARS`/
+`STRING_DATA` in `lib/string.tk` — `mc`'s own preprocessor reported `duplicate #define` at
+an unrelated line before any such macro existed elsewhere in the tree — was routed around
+by naming the three `TK_STRAT_*` instead rather than chased to a root cause; a minimal
+pure-mc reproducer was not built and none is owed here unless the collision recurs.

@@ -104,6 +104,28 @@ void set_pmd_over_at(i64 i, i64 v)   { st64(pmd_over + i * 8, v); }
 // no pass rewrote is refused by `tk_pm_check_index` below instead of reaching
 // a lowering that has nothing to do with it.
 //
+// `s[i]` -- N8 (docs/specs/string.md § 6, D89). A write is refused outright:
+// C#'s `string` is immutable and so is teko's (§ 10), so `tk_arr_write_follows`
+// is asked once, ahead of parsing any right-hand side, rather than building a
+// store this class has no member to take. A read lowers to a plain call, the
+// same shape `tk_ha_load` already is: `tk_call2` carries the receiver and the
+// index straight through, no method-dispatch machinery, because
+// `tk_string_at` (`lib/string.tk`, N8) is a top-level function and not a
+// member (its own header explains why).
+i64 tk_string_index(i64 left) {
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 idx = parse_expr(0);
+    p_expect(K_RBRACK, "expected ] after the index");
+    tk_line = line;
+    tk_file = fl;
+    if (tk_arr_write_follows())
+        err_at(fl, line, "teko: a string is immutable");
+    i64 r = tk_call2("tk_string_at", left, idx);
+    set_nd_type(r, TY_U32);
+    return r;
+}
+
 i64 tk_bracket(i64 left) {
     i64 base = tk_unary_base(left);
     // D80: a `(` right before the `- ! ~` (teko_prefix.tk's tk_unary_parened,
@@ -127,6 +149,15 @@ i64 tk_bracket(i64 left) {
     }
     i64 hi = tk_struct_of_expr(left);             // a `T[]` of heap (K3): a local, a field, a call
     if (tk_is_ha(hi)) return tk_ha_index(left, hi);
+    // N8 (docs/specs/string.md § 6, D89): a receiver typed `string` -- same
+    // three sources `tk_struct_of_expr` already answers for (a local, a
+    // field chain, a call's own return) -- lowers to `tk_string_at(s, i)`, a
+    // targeted addition beside the array cases above and NOT a general
+    // indexer (`this[i]` on a user class stays untaught, docs/specs/string.md
+    // § 10). `hi >= 0` first: `tk_str_class_si()` answers -1 when no program
+    // in the unit ever wrote `#include "string.tk"`, and -1 == -1 would
+    // otherwise mistake "not known" for "is a string".
+    if (hi >= 0 && hi == tk_str_class_si()) return tk_string_index(left);
     // ...and a name the parser has ALREADY SEEN DECLARED as a local of this
     // scope indexes nothing: every array shape a local can have was answered
     // above (a fixed one by `tk_arr_find`, a `T[]` by `tk_struct_of_expr`),
