@@ -197,7 +197,22 @@ public class string {
         owned = 1;
     }
 
+    // A NULL `raw` is the EMPTY string, not a fault: `str`, `ptr`, `uptr` and
+    // `null` are one type to mc (types.md § Limits), so no caller -- this
+    // class, an interpolation hole (D92), a program's own code -- can prove
+    // its argument is text before handing it over, and `tk_str_len(0)` would
+    // read address zero. A non-null address that is not NUL-terminated text
+    // stays what it is everywhere else in this language: undefined, and named
+    // in `not-yet.md` rather than guarded here.
     public string(str raw) {
+        if (((uptr) raw) == 0) {
+            nbytes = 0;
+            data = rt_alloc(1);
+            st8(data, 0);
+            nchars = 0;
+            owned = 1;
+            return;
+        }
         nbytes = tk_str_len(raw);
         data = rt_alloc(nbytes + 1);
         tk_string_copy(data, raw, nbytes);
@@ -332,13 +347,21 @@ public class string {
     // string (the same fast path `tk_string_at` takes above), `O(ci)`
     // otherwise. `ci == nchars` is legal and answers `nbytes`, the "one past
     // the end" address every `Substring` call needs for its own last slice.
+    // ...and it never walks past `nbytes`: `new string(raw)` copies whatever
+    // bytes it is given and counts LEAD bytes, so a sequence truncated at the
+    // tail (only program-built bytes can make one, never a literal) has a
+    // width wider than what is left. Clamping here is what keeps every caller
+    // -- `Substring`, `SliceBytes`, the searches -- inside the allocation;
+    // the same ceiling `tk_string_cp_decode` answers U+FFFD for (D89).
     private i64 ByteOf(i64 ci) {
         if (nbytes == nchars) return ci;
         i64 boff = 0;
         i64 c = 0;
         loop {
             if (c >= ci) break;
+            if (boff >= nbytes) return nbytes;
             boff = boff + tk_string_utf8_width(ld8(data + boff));
+            if (boff > nbytes) return nbytes;
             c = c + 1;
         }
         return boff;
@@ -712,8 +735,10 @@ i64 tk_string_cp_encode(uptr buf, i64 cp) {
     return 4;
 }
 
-// an `i64` hole (and, through the call-argument widening every other
-// integer already gets, `u8`/`i8`/`u16`/`i16`/`u32`/`u64` too): the decimal
+// an `i64` hole, and `u8`/`i8`/`u16`/`i16`/`i32` through the call-argument
+// widening every narrower integer already gets -- NOT `u32` (which is
+// `char`'s own id and goes to `tk_str_from_char`) and NOT `u64`/`usize`
+// (which go to `tk_str_from_u64`, whose peel is unsigned): the decimal
 // text `tk_i64_to_dec` (`lib/rt.tk`) already writes, on the STACK -- no
 // `rt_alloc`, so no free for this one to forget (§ 9's decision 4).
 string tk_str_from_i64(i64 v) {
