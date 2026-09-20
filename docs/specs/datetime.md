@@ -155,7 +155,7 @@ i64 main() {
     i64 cast = (i64) a;           // teko: a DateTime does not cast; `.Ticks` reads it
     TimeSpan t = b - 1;           // teko: a value of type i64 does not convert to DateTime
     i64 y = a.Yearr;              // teko: unknown member of DateTime
-    i64 n = DateTime.Now();       // teko: DateTime.Now is not taught yet
+    i64 n = DateTime.Now();       // teko: the member is a property; it is not called: Now (landed, C6, D90 -- `Now` is no longer UNKNOWN, but it is still a property, so the () refuses)
     return 0;
 }
 ```
@@ -168,7 +168,7 @@ i64 main() {
 | an integer in a `DateTime`/`TimeSpan` slot | `teko: a value of type i64 does not convert to DateTime` |
 | `(i64) dt`, `(DateTime) n` written by hand | ``teko: a DateTime does not cast; `.Ticks` reads it and `new DateTime(...)` builds it`` |
 | an unknown member | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` |
-| `DateTime.Now`, `UtcNow`, `Today` | `teko: DateTime.Now is not taught yet` (§ 8) |
+| ~~`DateTime.Now`, `UtcNow`, `Today`~~ | **landed**, C6, D90 (§ 8, § 12): no longer refused. See [datetime.md § `Now`](../reference/datetime.md) for what they answer today |
 | `extern` with a `DateTime` parameter | none: a `DateTime` is eight bytes and passes as one, so an `extern` takes it |
 | a `DateTime` field, array element, `ref`/`out`, generic argument | none: eight bytes with an alignment, like every other scalar |
 
@@ -276,21 +276,21 @@ that is stated in the reference the crumb owes, not hidden.
 
 ## 8. What stays out, and `Now`
 
-**`DateTime.Now`, `DateTime.UtcNow` and `DateTime.Today` are C6, teko's own.** They need a
-wall clock, one symbol whose name differs per host: `clock_gettime` on Linux and macOS,
-`GetSystemTimePreciseAsFileTime` on Windows. The owner's ruling (2026-09-08): teko declares
-the `extern` itself, and the taught compiler picks the one for the target host at compile
-time — `mc` gives `extern`, the target's name, and the sysroot teko already writes; nothing
-is asked of it. Until C6 lands `DateTime.Now` is refused by name and the rest of this page
-lands without it. Everything else here — every component, every operator, every
-format — needs no clock and no `mc` change at all.
+**`DateTime.Now`, `DateTime.UtcNow` and `DateTime.Today` are C6, teko's own -- landed, D90.**
+They needed a wall clock, one symbol whose name differs per host: `clock_gettime` on Linux
+and macOS, `GetSystemTimePreciseAsFileTime` on Windows. The owner's ruling (2026-09-08):
+teko declares the `extern` itself, never asking `mc`. `DateTime.Now`'s VALUE is the same
+clock read `UtcNow` answers, carrying `DateTimeKind.Local` for C#'s own spelling alone --
+teko has no time-zone database, so there is no host offset to apply, and that divergence
+from C# is documented rather than faked (D90). Everything else here — every component,
+every operator, every format — needed no clock and no `mc` change at all.
 
 Also deliberately outside:
 
 | left out | why |
 |---|---|
 | `ToLocalTime`, `ToUniversalTime` | a time-zone database is not a language feature |
-| `DateTimeOffset` | designed in [datetime-extras.md](datetime-extras.md) (N5) -- no time-zone database needed, `.LocalDateTime` reads the offset the value carries -- and queued behind C3, the sixteen-byte machine it needs |
+| `DateTimeOffset` | designed in [datetime-extras.md](datetime-extras.md) (N5) -- no time-zone database needed, `.LocalDateTime` reads the offset the value carries -- **landed**, D76; its own `Now`/`UtcNow` landed with C6 too (D90) |
 | ~~`enum DateTimeKind`~~ | **landed** (N2c, D48): teko had no `enum` when this page was written, so C2 shipped a `type_alias` over `i32` plus three constants — the same surface, and `enum` a crumb of its own. It is now an ordinary `enum` declared in `lib/time.tk`, and the two registrations are gone |
 | culture, `ParseExact`, custom format strings | the market's answer is a formatting library, not a primitive |
 | `TimeSpan * f64`, `DateTime` in a `switch` pattern | neither is refused on principle; neither is in this design |
@@ -354,7 +354,8 @@ fixtures under the `surface_*` family the repository uses — `tests/surface_tim
 (42), `tests/surface_timespan_overflow.tk` (70), `tests/surface_datetime.tk` (42, 106
 assertions) and `tests/surface_datetime_panic.tk` (70) — and N2c added
 `tests/surface_datetime_kind.tk` (42) and `tests/surface_datetime_kind_panic.tk` (70)
-beside them (D41 § 6, D48). Read every
+beside them (D41 § 6, D48), and C6 added `tests/surface_datetime_now.tk` (42) for `Now`,
+`UtcNow`, `Today` and their `DateTimeOffset` siblings (D90). Read every
 `tests/primitives_*` name on this page as the `surface_*` one that carries it.
 
 Every one of them is a whole program with `#include "../lib/time.tk"`, returns `42` on
@@ -430,13 +431,40 @@ plus a `not-yet.md` row for `Now` and one for the time zone. **Owes:** the `Date
 section of types.md, diagnostics.md, runtime.md, and
 [guide/10-values-and-types.md](../guide/10-values-and-types.md).
 
-### C6 — `Now` and `UtcNow` (S)
+### C6 — `Now` and `UtcNow` (S) — **landed**, D90
 
-One static row per name, one call into `lib/time.tk`, one fixture that asserts
-`UtcNow > UnixEpoch` and `Now.Kind == DateTimeKind.Local`. The wall-clock `extern` per host
-(§ 8: `clock_gettime` on Linux and macOS, `GetSystemTimePreciseAsFileTime` on Windows) is
-part of the crumb; it is numbered C6 because it lands after `decimal`'s crumbs, and it
-needs nothing from them and nothing outside this repository.
+One static row per name (`DateTime` and, following `docs/specs/datetime-extras.md`'s own
+N5 row, `DateTimeOffset`), one call into `lib/time.tk`, one fixture,
+`tests/surface_datetime_now.tk`, asserting what a wall clock leaves stable across a run
+rather than a literal value (D90 § "determinism"). The wall-clock `extern` per host (§ 8:
+`clock_gettime` on Linux and macOS, `GetSystemTimePreciseAsFileTime` on Windows) is the
+crumb's own; it needs nothing from `decimal`'s crumbs and nothing outside this repository.
+
+**What landed differently from the design above.** `[include].paths` cannot vary by host —
+`.github/workflows/ngen.yml`'s own five-leg config generator states it "can never drift"
+between the five legs — so a quoted `#include` naming a per-host FILE was never going to
+work, and declaring both hosts' wrappers unconditionally in one file left an unresolved
+`extern` wherever the other host's symbol does not exist (measured: `mc` does not dead-strip
+a function nothing calls, so its `extern` still has to link). The mechanism used instead is
+the one `minicompiler/mc` already ships for exactly this shape of problem —
+`#include <mc/host>`, whose bundle resolver answers differently per host with no change to
+the two include lines a generated compiler carries. `teko_time.tk` wraps that SAME resolver
+(`lex_set_bundle`) for one more name, `<teko/clock.tk>`, answered by the TARGET's operating
+system — `drv_os()`, what `[target] os` or `--os` set, falling back to `host_os()` only when
+that answers 0 (no `[target]`, where the host IS the target) — and falling through to
+`host_bundle_open` for everything else; `lib/time.tk` includes it unconditionally, and the
+text it expands to differs by target. Reading the host alone was the first draft's mistake:
+a cross build (`--os windows` on a macOS box) would have put the POSIX wrapper in a COFF
+object, an undefined `clock_gettime` no Windows link can resolve (D90's own amendment
+carries the measurement). Zero mc changes, zero new intrinsics: the
+generated text is ordinary `extern`/function surface, parsed the same way any other include
+is.
+
+`Now` and `UtcNow` read the SAME clock (D90 § "resolution and source per host", § "`Now` vs
+`UtcNow`"): teko has no time-zone database, so `Now`'s `DateTimeKind.Local` is C#'s own
+spelling over a value that is not actually converted — a recorded divergence, not a silent
+one. `DateTimeOffset.Now`/`UtcNow` (`datetime-extras.md`'s own N5 row) landed the same way,
+offset `+0` for both, for the same reason.
 
 ## 13. Risks and law tensions
 
@@ -446,13 +474,12 @@ needs nothing from them and nothing outside this repository.
 | **A member table is a second way to declare a member.** A class declares members in one place, a primitive in another. | Accepted, and it is the mc mechanism's own consequence: `type_new` gives primitives, not aggregates. The table is data in one module, listed in the reference beside the class members, and no third way is opened. |
 | **The include.** `#include "time.tk"` is a build-time step C# does not have. | Refuse the type word with the include in the message, and leave the flip to `lib/rt.tk` open for the owner: it is a one-line change either way. |
 | **`types 10/14` in `mc limits`.** Three primitives spend three of a program's type ids before the program declares one. | P0 measures it. If the heaviest fixture goes over, the fix is `[limits] tolerance`, not fewer types — and `tolerance` is already 1.0, so the row would be a `grew` verdict rather than an error. |
-| **`Now` invites a workaround.** A per-host include, or a `[libs]`/`[externs]` mapping in the leg config, would make it work today. | Refuse it. The rule is `docs/specs/surface.md`'s: a construct `mc` cannot express is reported, never worked around here. `DateTime.Now` is refused by name and the ask is filed. |
 | **`ToString()` leaks into the arena.** A `str` is not counted. | Ship the `fmt` half in the same crumb and document both, exactly as `mc`'s `<float_rt>` does. A counted string type is a separate decision. |
+| **`[include].paths` cannot vary by host, so a per-host FILE cannot be picked by a quoted include (C6, D90).** | Wrap the bundle resolver ANGLE includes already use (`lex_set_bundle`), the same mechanism `#include <mc/host>` relies on for a generated compiler to be portable. `<teko/clock.tk>` is teko's own name; every other one still reaches `host_bundle_open` unchanged. |
 
 ## 14. What the `mc` channel is asked
 
-1. **A wall clock in `<sys>`** — one name on the three hosts (§ 8). Blocks `Now`, `UtcNow`
-   and `Today`, and nothing else on this page.
-
-Nothing else here needs `mc` to change: `type_new`, `type_alias`, `syntax_expr` and the
-existing passes are all released mechanisms on the pinned `0.15.18`.
+**Nothing.** The wall clock (C6, D90) is teko's own `extern`, chosen per host by
+`teko_time.tk`'s own bundle wrapper — never an `mc` hook, per the owner's ruling of
+2026-09-08. `type_new`, `type_alias`, `syntax_expr`, `lex_set_bundle` and the existing
+passes are all released mechanisms on the pinned version this repository builds against.

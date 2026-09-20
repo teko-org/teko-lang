@@ -418,10 +418,11 @@ messages reuse the wordings a declared type already gets; only a handful are its
   Each clause carries its VERB as well as its spelling, because the pair is not the same
   sentence for every type: a `Guid` is not constructed at all, so its own reads
   ``teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it``.
-- `"teko: "` — completed by *`DateTime.Now` is not taught yet*, and by `UtcNow` and
-  `Today`: the three need a wall clock, which is one symbol per operating system and `mc`'s
-  to give ([the spec](../specs/datetime.md) § 8). The member is named by the table so that
-  the site says so, instead of reading as a member nobody declared.
+- `"teko: the wall clock is not available"` — `DateTime.Now`/`UtcNow`/`Today` and
+  `DateTimeOffset.Now`/`UtcNow` (C6, D90), exit 70. `clock_gettime` is the only one of the
+  wall clock's two host answers that documents a failure at all (a bad clock id or an
+  unmapped buffer, neither reachable through this call); `GetSystemTimePreciseAsFileTime`,
+  Windows' own, cannot fail by its own contract, so it has no panic to raise.
 ### `DateTimeKind`, since it became an `enum`
 
 `DateTimeKind` is an ordinary `enum` declared in `lib/time.tk` (N2c), not a compiler
@@ -840,9 +841,6 @@ refusal beyond the shared ones, and three run-time panics.
   `(i64) o` and `(DateTimeOffset) n` written by hand. Sixteen bytes are no number, and unlike
   `decimal` this type teaches both a reader and a builder already, so the refusal names them
   (`tk_prim_cast_check`, D75's own mechanism).
-- ``"teko: DateTimeOffset.Now is not taught yet"`` — a `TK_PMSOON` row, blocked on the same
-  wall clock `DateTime.Now` already is ([datetime.md](datetime.md) § 8). `UtcNow` is the same
-  row under the other name.
 - ``"teko: a value of type i64 does not convert to DateTime"`` — the `new DateTimeOffset(i64
   ticks, TimeSpan)` overload C# has is **not taught** (`docs/reference/not-yet.md`); the one
   row this table carries is `new DateTimeOffset(DateTime, TimeSpan)`, and `tk_prim_pick`

@@ -189,7 +189,6 @@ i64 main() {
 | an hour, minute, second or millisecond out of range | `teko: an hour is out of range` and its three siblings, exit 70 — **as landed** (N4b): `DateTime`'s own four wordings, because `new TimeOnly(h, mi, s[, ms])` panics on the very function `new DateTime(y, m, d, h, mi, s)` does |
 | a raw tick count outside `0 .. 863999999999` (`new TimeOnly(ticks)`, `TimeOnly.FromTimeSpan(ts)`) | `teko: a time of day is out of range`, exit 70 — **as landed** (N4b): the one wording this crumb adds, since none of `lib/time.tk`'s existing panics reads honestly for an interval that starts at zero |
 | an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
-| `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `datetime.md` § 8 is blocked on |
 
 ## 3. Operators
 
@@ -240,7 +239,7 @@ keeps it rather than inventing an operator C# does not have.
 | `new DateTimeOffset(i64 ticks, TimeSpan)` — **not taught** (D76): `tk_prim_pick` chooses a `"new"` row by argument count alone, so a second row of arity 2 was never going to be told apart from the row above; write `new DateTimeOffset(new DateTime(t), ts)` | `.Year` … `.Millisecond`, of the **local** reading |
 | `DateTimeOffset.FromUnixTimeSeconds(i64)`, `FromUnixTimeMilliseconds(i64)` | `.ToUnixTimeSeconds()`, `.ToUnixTimeMilliseconds()` |
 | `DateTimeOffset.Parse(str)`, `TryParse(str, out DateTimeOffset)` | `.ToOffset(TimeSpan)`, `.CompareTo`, `.Equals`, `.ToString()` |
-| `DateTimeOffset.Now`, `UtcNow` — **blocked** | |
+| `DateTimeOffset.Now`, `UtcNow` — **landed** (C6, D90): the same wall clock `DateTime.UtcNow` reads, offset `+0` for both, since teko has no time-zone database | |
 
 `.LocalDateTime` is `.DateTime` under another name here: teko has no time-zone database
 (`datetime.md` § 8), so "local" means "the offset this value carries" and nothing more. It
@@ -346,21 +345,23 @@ gated on, and eight fixtures under `tests/refuse/dto_*.tk`.
 **Owes, all landed with D76:** the section in [types.md](../reference/types.md), the
 refusals in [diagnostics.md](../reference/diagnostics.md) (including the stale
 `TK_MAXPRIMM`/`TK_MAXPRIMO` numbers that table had carried since before D74), the functions
-in [runtime.md](../reference/runtime.md), the `Now`/`UtcNow` row, the ticks-constructor row
-and the `new T()` row in [not-yet.md](../reference/not-yet.md), and the removal of the row
-that named `DateTimeOffset` as still open in that same page.
+in [runtime.md](../reference/runtime.md), the ticks-constructor row and the `new T()` row in
+[not-yet.md](../reference/not-yet.md), and the removal of the row that named
+`DateTimeOffset` as still open in that same page. The `Now`/`UtcNow` row itself moved to C6
+(D90, below), which is what actually taught the two members.
 
 ## 9. Risks and law tensions
 
 | tension | recommended resolution |
 |---|---|
 | **`DateTimeOffset` needs sixteen bytes and `datetime.md` promised its two types needed no machine.** | It does not break that promise, it inherits another page's: `teko_wide.tk` exists for `decimal` and already carries `Guid` by the time this lands, so N5 adds no machine work at all. It is also why N5 is a separate crumb from N4 — `DateOnly` and `TimeOnly` are free of that dependency and should not wait behind it. |
-| **`.LocalDateTime` without a time-zone database.** | It means "the offset this value carries", it is documented as exactly that, and `DateTimeOffset.Now` — the one member that would need the host's zone — is refused by name and blocked on the same wall clock `datetime.md` § 8 asks for. Refusing the whole member would refuse something that has an honest meaning. |
+| **`.LocalDateTime` without a time-zone database.** | It means "the offset this value carries", it is documented as exactly that, and `DateTimeOffset.Now` (C6, D90) reads the same instant `UtcNow` does, offset `+0`, rather than consulting a host zone teko does not have — a recorded divergence from C#, not a silent one. |
 | **`d + t` reads like it should work.** A `DateOnly` plus a `TimeOnly` is a `DateTime` to every reader. | C# has no such operator and `d.ToDateTime(t)` is its form, so the refusal is C#'s own, with the method named in the neighbouring row of the table. Adding the operator would be teko inventing surface, which D3 does not allow. |
 | **Three more type words taken from every program.** `DateOnly`, `TimeOnly`, `DateTimeOffset`. | The same cost every `type_new` has, checked over the whole tree in each crumb's gate. They are C#'s spellings and long enough that a collision is unlikely; a collision found in the gate is the finding, not a reason to rename. |
 | **This page and `datetime.md` will conflict** when both branches merge. | It is written as a standalone file for exactly that reason, it restates nothing that page owns, and folding it in as `datetime.md` § 15 and deleting this file is a mechanical step on whichever branch merges second. |
 
 ## 10. What the `mc` channel is asked
 
-**Nothing new.** `DateTimeOffset.Now` and `UtcNow` are blocked on the wall clock
-`datetime.md` § 14 already asks for, and nothing else on this page needs `mc` to change.
+**Nothing.** `DateTimeOffset.Now` and `UtcNow` landed with C6 (D90): the wall clock is
+teko's own `extern` per target host, never an `mc` hook (the owner's ruling, 2026-09-08).
+Nothing on this page ever needed `mc` to change.

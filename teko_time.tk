@@ -31,17 +31,119 @@
 //
 // WHAT IS NOT HERE, and why: `.ToString()`/`Parse` are text, which lands with
 // the `enum` text crumb's own machinery (docs/reference/not-yet.md);
-// `DateTime.Now`/`UtcNow`/`Today` need a wall clock, one symbol per host, and
-// are refused BY NAME (a `TK_PMSOON` row) until `mc`'s `<sys>` carries one
-// (docs/specs/datetime.md § 8); `TimeSpan * f64`, `TimeSpan / TimeSpan`,
-// `DateTime.SpecifyKind` and `.Subtract` are C# members the spec's § 4/§ 6
-// leave out of these two crumbs.
+// `TimeSpan * f64`, `TimeSpan / TimeSpan`, `DateTime.SpecifyKind` and
+// `.Subtract` are C# members the spec's § 4/§ 6 leave out of these crumbs.
+//
+// `DateTime.Now`/`UtcNow`/`Today` and `DateTimeOffset.Now`/`UtcNow` DID need
+// a wall clock, one symbol per host -- crumb C6, D90, below, landed it: the
+// owner's ruling of 2026-09-08 is that the clock is teko's OWN `extern`, not
+// an `mc` hook, so nothing there was ever actually blocked on `mc`. The stale
+// claim otherwise, once in this file and once in `teko_prim.tk`'s own
+// comment above `TK_PMSOON`, is what this crumb corrects.
 
 i64 tk_ty_timespan = 0;
 i64 tk_ty_datetime = 0;
 i64 tk_ty_dateonly = 0;
 i64 tk_ty_timeonly = 0;
 i64 tk_ty_dto = 0;
+
+// ============================================================================
+// the wall clock (crumb C6, D90)
+// ============================================================================
+//
+// `DateTime.Now`/`UtcNow`/`Today` and `DateTimeOffset.Now`/`UtcNow` need one
+// wall-clock symbol per host: `clock_gettime` on Linux and macOS,
+// `GetSystemTimePreciseAsFileTime` on Windows. `.github/workflows/ngen.yml`
+// derives its five legs' configs from the SAME `teko.toml`, and its own
+// comment states `[include]` "can never drift" between them -- so a quoted
+// `#include "clock.tk"` cannot pick a different FILE per host, and declaring
+// both wrappers unconditionally in `lib/time.tk` would leave an unresolved
+// `extern` on whichever host does not own it: measured (a scratch `mc build`
+// with a `call` to an undefined extern INSIDE a function nothing ever calls)
+// -- `mc` does not dead-strip an unreachable function, so an unused wrapper's
+// `extern` still has to resolve. WHERE it bites is the platform's: on
+// macos/aarch64 the link itself succeeds (exit 0) and `dyld` binds eagerly,
+// so the binary dies at process START, exit 134, `Symbol not found` --
+// re-measured by the independent verifier, and worse than a link error, not
+// better, since nothing in the build says a word about it.
+//
+// The mechanism that already solves "the same source, a different answer per
+// host" is `#include <mc/host>` (`minicompiler/mc` src/core_bundle.mc): the
+// bundle resolver behind every `#include <name>` is ONE function pointer
+// (`lex_set_bundle`), and `host_bundle_open` -- what `core_teko.mc`'s own
+// `mc_bundle_init()` installs -- already special-cases that one name to
+// `host_include()`'s own answer, so a generated compiler is portable with no
+// change to its two include lines. This wraps that SAME pointer for one more
+// name, `<teko/clock.tk>`, and falls through to `host_bundle_open` for every
+// other one, so `<sys>`, `<prelude>` and the rest of the bundle are
+// untouched. That fallthrough calls `host_bundle_open` BY NAME rather than
+// the pointer that was installed before this one, which is right while this
+// is the only wrapper in the tree and wrong the day a second module wraps
+// `lex_set_bundle` after `tk_clock_init()` -- the later wrapper would answer
+// first and `<teko/clock.tk>` would silently stop resolving. A second wrapper
+// has to chain the previous pointer instead. The OS is read `drv_os()` FIRST
+// and `host_os()` only as its fallback: `ngen.yml`'s five legs are all NATIVE
+// (docs/specs/roadmap-1.0.md, the owner's ruling of 2026-09-04) and there the
+// two agree, but a CROSS build -- `mc build --config` with `[target] os =
+// "windows"` on a macOS box -- has to emit the TARGET's wrapper, and only
+// `drv_os()` knows it. `drv_os()` answers 0 on the bare-CLI path (no
+// `[target]`; `src/driver.mc` zero-initialises the record), and there the
+// host is the target, which is what the fallback is for.
+//
+// Each answer is a small, complete function, `tk_dt_raw_utc_ticks()`,
+// returning C#'s own tick count (100 ns, since `0001-01-01`) read off the
+// host clock -- `lib/time.tk`'s `Now`/`UtcNow` call nothing else. `rt_alloc`,
+// `panic`, `ld64`, `UNIX_EPOCH_TICKS` and `TICKS_PER_SECOND` all read from
+// `lib/time.tk`'s own scope at the point `#include <teko/clock.tk>` appears
+// there, textually after `lib/rt.tk`'s include and the tick constants.
+// CLOCK_REALTIME is 0 on both Linux and macOS. A negative return is the one
+// failure `clock_gettime` documents (a bad clock id or an unmapped buffer,
+// neither reachable through this call) -- panics rather than answering a
+// wrong instant, exit 70, the road every other wall-clock read of this
+// crumb takes.
+uptr tk_clock_posix_src() {
+    return "extern i32 clock_gettime(i32 clk, uptr tp);\ni64 tk_dt_raw_utc_ticks() {\n    uptr tp = rt_alloc(16);\n    i32 rc = clock_gettime(0, tp);\n    if (rc != 0) panic(\"the wall clock is not available\");\n    i64 sec = ld64(tp);\n    i64 nsec = ld64(tp + 8);\n    rt_free(tp, 16);\n    return UNIX_EPOCH_TICKS + sec * TICKS_PER_SECOND + nsec / 100;\n}\n";
+}
+
+// FILETIME: a 64-bit little-endian count of 100 ns ticks since `1601-01-01`,
+// written as two 32-bit halves that `ld64` reads back as one -- the same
+// trick every Windows program that aliases `FILETIME` to `ULARGE_INTEGER`
+// relies on. The MSDN contract is that this call cannot fail, unlike the
+// POSIX one. `FILETIME_EPOCH_DIFF_TICKS` is .NET's own constant, the tick
+// count between `0001-01-01` and `1601-01-01`.
+uptr tk_clock_windows_src() {
+    return "extern void GetSystemTimePreciseAsFileTime(uptr tp);\nconst i64 FILETIME_EPOCH_DIFF_TICKS = 504911232000000000;\ni64 tk_dt_raw_utc_ticks() {\n    uptr tp = rt_alloc(8);\n    GetSystemTimePreciseAsFileTime(tp);\n    i64 ft = ld64(tp);\n    rt_free(tp, 8);\n    return ft + FILETIME_EPOCH_DIFF_TICKS;\n}\n";
+}
+
+// the wrapped bundle resolver: `<teko/clock.tk>` answered here, by host; every
+// other name -- `<sys>`, `<prelude>`, `<mc/host>` itself -- handed straight
+// to the resolver `mc_bundle_init()` already installed.
+uptr tk_clock_bundle_open(uptr name, i64 base, uptr pcanon, uptr plen) {
+    if (str_eq(name, "teko/clock.tk")) {
+        // the TARGET's clock, not this machine's: `drv_os()` is what
+        // `[target] os` (or `--os`) set, and a cross build -- `--os windows`
+        // on a macOS box, which `docs/internals/bootstrap.md` discusses and
+        // the ladder's own host guard refuses only for the LADDER -- must
+        // emit the target's wrapper or link nothing. `drv_os()` answers 0 on
+        // the bare-CLI path (no `[target]`, `src/driver.mc`'s record is
+        // zero-initialised), and there the host IS the target, so `host_os()`
+        // is the fallback rather than the rule (D90, amended after the
+        // review).
+        uptr os = drv_os();
+        if (os == 0) os = host_os();
+        uptr src = tk_clock_posix_src();
+        if (str_eq(os, "windows")) src = tk_clock_windows_src();
+        st64(pcanon, "teko/clock.tk");
+        st64(plen, cstrlen(src));
+        return src;
+    }
+    return host_bundle_open(name, base, pcanon, plen);
+}
+
+// Called once, from `tk_time_init()` below: installs the wrapper AFTER
+// `mc_bundle_init()` (`core_teko.mc`'s `main()`) already ran, so
+// `host_bundle_open` -- the pointer this wrapper falls through to -- exists.
+void tk_clock_init() { lex_set_bundle(&tk_clock_bundle_open); }
 
 // the include the lowering symbols live in, named in the refusal a program
 // that forgot it gets (docs/specs/datetime.md § 9). BARE, since D76: the
@@ -139,11 +241,16 @@ void tk_dt_statics() {
     tk_prim_member(dt, "UnixEpoch", TK_PMSVAL, 0 - 1, "tk_dt_epoch", dt);
     tk_prim_member(dt, "IsLeapYear", TK_PMSFUN, TY_I64, "tk_dt_is_leap", TY_I64);
     tk_prim_membern(dt, "DaysInMonth", TK_PMSFUN, 2, TY_I64, "tk_dt_days_in_month", TY_I64);
-    // § 8: blocked on a wall clock in `mc`'s `<sys>`, refused by name until it
-    // lands. C# spells all three as static properties, and so does the row.
-    tk_prim_member(dt, "Now",    TK_PMSOON, 0 - 1, 0, dt);
-    tk_prim_member(dt, "UtcNow", TK_PMSOON, 0 - 1, 0, dt);
-    tk_prim_member(dt, "Today",  TK_PMSOON, 0 - 1, 0, dt);
+    // C6, D90: the wall clock, `<teko/clock.tk>`'s own `tk_dt_raw_utc_ticks()`
+    // read through three rows. `Now` carries `DateTimeKind.Local` -- C#'s own
+    // spelling -- but teko has no time-zone database (§ 8, unmoved), so its
+    // VALUE is the same clock read as `UtcNow`: an honest `Kind` on an
+    // instant that is not actually converted, which is D90's own ruling and
+    // is documented as exactly that, never silently. `Today` is `Now`
+    // truncated to midnight, the same `Kind`.
+    tk_prim_member(dt, "Now",    TK_PMSVAL, 0 - 1, "tk_dt_now_local", dt);
+    tk_prim_member(dt, "UtcNow", TK_PMSVAL, 0 - 1, "tk_dt_now_utc",   dt);
+    tk_prim_member(dt, "Today",  TK_PMSVAL, 0 - 1, "tk_dt_today",     dt);
 }
 
 // The five constructors C# has that need no calendar the surface cannot
@@ -422,11 +529,13 @@ void tk_dto_statics() {
     // registered all the same, so an instance access answers "static; reach
     // it through its type" rather than "unknown member".
     tk_prim_membern(o, "TryParse", TK_PMSFUN, 2, TY_UPTR, "tk_dto_tryparse", TY_I64);
-    // Ruling 7: blocked on the same wall clock `DateTime.Now` is
-    // (docs/specs/datetime.md § 8) -- teko has no time-zone database either,
-    // so "now" needs a host clock before it needs a zone.
-    tk_prim_member(o, "Now",    TK_PMSOON, 0 - 1, 0, o);
-    tk_prim_member(o, "UtcNow", TK_PMSOON, 0 - 1, 0, o);
+    // C6, D90: the same clock `DateTime.Now`/`UtcNow` read. Offset `+0`,
+    // C#'s own for `DateTimeOffset.UtcNow`; `Now`'s offset is ALSO `+0` here
+    // -- teko has no time-zone database (Ruling 7, § 8, unmoved), so the two
+    // are the one instant under two names, exactly as `DateTime.Now`/`UtcNow`
+    // now are, and for the same documented reason.
+    tk_prim_member(o, "Now",    TK_PMSVAL, 0 - 1, "tk_dto_now",     o);
+    tk_prim_member(o, "UtcNow", TK_PMSVAL, 0 - 1, "tk_dto_now_utc", o);
 }
 
 // Ruling 1: ONE two-argument constructor, `new DateTimeOffset(DateTime,
@@ -529,6 +638,8 @@ i64 tk_dto_expr() {
 // `Add*` rows name `ty_f64`, the id `<float>`'s own registration returns, so
 // the float library has to be wired before this table is written.
 void tk_time_init() {
+    tk_clock_init();
+
     tk_ty_timespan = type_new("TimeSpan", 8, 8, TK_SINT);
     syntax_expr("TimeSpan", &tk_prim_expr);
     syntax_stmt("TimeSpan", &tk_prim_stmt);

@@ -102,8 +102,9 @@ DateTime next = leap.AddDays(1);               // 2024-03-01
 TimeSpan gap  = next - leap;                   // one day, 864000000000 ticks
 ```
 
-`DateTime.Now` is not taught: a wall clock is one symbol per operating system and belongs
-to `mc`. [`timespan.md`](../reference/timespan.md) and
+`DateTime.Now`/`UtcNow`/`Today` read the host wall clock, teko's own `extern` per target
+host (C6, D90) -- `Now` carries `DateTimeKind.Local` but reads the same instant `UtcNow`
+does, since teko has no time-zone database. [`timespan.md`](../reference/timespan.md) and
 [`datetime.md`](../reference/datetime.md) are the two reference pages.
 
 ## `null`, and the slot that may hold it

@@ -1,0 +1,67 @@
+// surface_datetime_now.tk -- `DateTime.Now`/`UtcNow`/`Today` and
+// `DateTimeOffset.Now`/`UtcNow` (docs/specs/datetime.md § 8, crumb C6;
+// docs/specs/datetime-extras.md's own N5 rows; D90). A wall clock cannot be
+// asserted against a literal value -- what is asserted here is what STAYS
+// TRUE regardless of the instant the fixture happens to run at, and each
+// assertion says why it is the stable one. NONE of them compares two
+// SEPARATE reads against one another: a wall clock (`clock_gettime`,
+// `GetSystemTimePreciseAsFileTime`) is not a monotonic clock, and an NTP
+// correction or an administrator setting the time between two reads can move
+// either one backwards -- a real risk on a CI runner, not a theoretical one
+// (Copilot review on #752). Every check below reads its OWN value once and
+// asks only what that one value must answer, regardless of what the clock
+// did a moment before or after:
+//
+//   the year is >= 2026        this file cannot run before it was written
+//   `UtcNow.Kind`               `DateTimeKind.Utc`, C#'s own, always
+//   `Now.Kind`                  `DateTimeKind.Local`, C#'s own spelling --
+//                               D90's ruling is that its VALUE is the same
+//                               clock read `UtcNow` answers, teko having no
+//                               time-zone database, so `Now` and `UtcNow`
+//                               read the SAME instant under two `Kind`s
+//   `Today`'s time of day       always zero: `Today` is `Now` truncated to
+//                               midnight, whatever the wall clock answers
+//   `Today.Kind`                `DateTimeKind.Local`, `Now`'s own
+//   `Today.Date`                already at midnight, so truncating again is
+//                               a no-op -- true of `Today`'s OWN value alone
+//   `DateTimeOffset.UtcNow.Offset`   always `TimeSpan.Zero`: the `+0` half
+//                               of a `DateTimeOffset` is always UTC
+//   `DateTimeOffset.Now.Offset`      also `TimeSpan.Zero` here, D90's same
+//                               ruling carried to the wide type
+//
+// expect-exit: 42
+
+#include "../lib/time.tk"
+
+i64 main() {
+    // ---- `DateTime.UtcNow` ----
+    DateTime u1 = DateTime.UtcNow;
+    if (u1.Year < 2026) return 1;
+    if (u1.Kind != DateTimeKind.Utc) return 2;
+
+    // ---- `DateTime.Now` ----
+    DateTime n1 = DateTime.Now;
+    if (n1.Year < 2026) return 3;
+    if (n1.Kind != DateTimeKind.Local) return 4;
+
+    // ---- `DateTime.Today` ----
+    DateTime t = DateTime.Today;
+    if (t.Year < 2026) return 5;
+    if (t.Kind != DateTimeKind.Local) return 6;
+    if (t.TimeOfDay.Ticks != 0) return 7;             // truncated to midnight
+    if (t.Date != t) return 8;                        // already at midnight
+
+    // ---- `DateTimeOffset.UtcNow` ----
+    DateTimeOffset o1 = DateTimeOffset.UtcNow;
+    if (o1.Offset != TimeSpan.Zero) return 9;          // the `+0` half is always UTC
+    if (o1.TotalOffsetMinutes != 0) return 10;
+    if (o1.UtcDateTime.Kind != DateTimeKind.Utc) return 11;
+    if (o1.UtcDateTime.Year < 2026) return 12;
+
+    // ---- `DateTimeOffset.Now` ----
+    DateTimeOffset o2 = DateTimeOffset.Now;
+    if (o2.Offset != TimeSpan.Zero) return 13;         // D90: no time-zone database
+    if (o2.UtcDateTime.Year < 2026) return 14;
+
+    return 42;
+}

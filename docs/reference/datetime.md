@@ -20,10 +20,13 @@ A program that names `DateTime` without it is refused where the type word is use
 `teko: DateTime needs #include "time.tk" before it is used` — rather than at the link.
 [`TimeSpan`](timespan.md) is the other half of the same page and the same include.
 
-`DateTime.Now`, `UtcNow` and `Today` are **not** taught: they need a wall clock, which is
-one symbol per operating system and `mc`'s to give ([the spec](../specs/datetime.md) § 8).
-Each is refused by name. So are the text members (`ToString`, `Parse`) and everything
-about time zones ([not-yet.md](not-yet.md)).
+`DateTime.UtcNow` reads the host wall clock (C6, D90): `clock_gettime` on Linux and macOS,
+`GetSystemTimePreciseAsFileTime` on Windows, teko's own `extern` per target host, never an
+`mc` hook. `DateTime.Now` reads the SAME instant and carries `DateTimeKind.Local`, C#'s own
+spelling, but teko has no time-zone database, so its value does not actually convert to a
+local time -- a recorded divergence from C#, documented rather than faked. `DateTime.Today`
+is `Now` truncated to midnight, the same `Kind`. The text members (`ToString`, `Parse`) and
+everything about time zones are still not taught ([not-yet.md](not-yet.md)).
 
 ---
 
@@ -39,6 +42,9 @@ about time zones ([not-yet.md](not-yet.md)).
 | `new DateTime()` | `DateTime.MinValue`, C#'s parameterless value constructor |
 | `DateTime.MinValue` `MaxValue` | the two ends of the range |
 | `DateTime.UnixEpoch` | `1970-01-01 00:00:00` Utc, `621355968000000000` ticks |
+| `DateTime.UtcNow` | the host wall clock, `Kind` `Utc` (C6, D90) |
+| `DateTime.Now` | the SAME clock read as `UtcNow`, `Kind` `Local` -- teko has no time-zone database, so this is a divergence from C#, not a real local time |
+| `DateTime.Today` | `Now` truncated to midnight, `Kind` `Local` |
 
 Every field is checked where the date is built, and a date that does not exist **panics**
 (exit 70, [memory.md](memory.md)): `new DateTime(2023, 2, 29)` is
@@ -242,7 +248,6 @@ i64 main() {
     DateTime e = (DateTime) 5; // the same refusal, the other way
     i64 y = d.Yearr;           // teko: unknown member of DateTime: Yearr
     i64 z = DateTime.Epoch;    // teko: unknown static member of DateTime: Epoch
-    DateTime f = DateTime.Now; // teko: DateTime.Now is not taught yet
     i64 w = DateTime.Year;     // teko: DateTime.Year is an instance member; reach it through an object
     i64 v = d.MinValue;        // teko: DateTime.MinValue is static; reach it through its type
     d.Year = 5;                // teko: a member of DateTime is read-only: Year
