@@ -32,9 +32,11 @@
 #                    out only what is listed (v0.13.0 was refused for a missing row).
 #   7. decisions    DECISION_LOG.md's own numbering (D93/D94): every `### D<n>` header is
 #                    unique, the set is dense from D1 to the highest with no gap except a
-#                    number a docs/ page explicitly reserves, and every `D<n>` cited under
-#                    docs/ or in a root `*.tk` module resolves to a header. `433b18d3` lost
-#                    D57-D86 and five merges passed with none of checks 1-6 noticing.
+#                    number a docs/ page explicitly reserves, every `D<n>` cited under
+#                    docs/, in a root `*.tk` module or in scripts/.github resolves to a
+#                    header, and -- the floor -- no header that existed at the BASE commit
+#                    is gone here. `433b18d3` lost D57-D86 by TRUNCATING THE TOP, which
+#                    density and citations alone cannot see; only the floor refuses it.
 mc="${1:-mc}"
 
 if command -v "$mc" >/dev/null 2>&1; then
@@ -376,16 +378,31 @@ if [ "$missing" = 0 ]; then echo "manifest ok: every module and lib file is in [
 echo "ok samples: $nblocks fenced teko blocks ($pass run, $noruns no-run)"
 
 # --------------------------------------------------------------- 7. decisions
-# DECISION_LOG.md's own numbering (D93). `433b18d3` carried D57-D86 (31
+# DECISION_LOG.md's own numbering (D93/D94). `433b18d3` carried D57-D86 (31
 # rulings) out of the file and five merges passed with a green docs gate,
 # because none of the six checks above reads the log's own numbering. This
 # one does: every `### D<n>` header is unique and the set is dense from D1 to
 # the highest, with no gap except a number a page RESERVES (today exactly
 # D73, `docs/specs/tekoc-tool.md`'s own draft -- read from that page, never
 # hardcoded, so a reservation that disappears while its gap remains fails
-# here); and every `D<n>` cited under docs/ or in a root `*.tk` module, at or
-# below the highest header, resolves to a header (a citation to a reserved,
-# headerless number is not a failure -- that is what "reserved" means).
+# here); and every `D<n>` cited under docs/, in a root `*.tk` module, or in
+# `scripts/`/`.github/`, at or below the highest header, resolves to a header
+# (a citation to a reserved, headerless number is not a failure -- that is
+# what "reserved" means).
+#
+# THE FLOOR. Density and citations read only the file under test, and anything
+# that reads only the file under test is satisfied by deleting more of it:
+# `433b18d3` did not punch a hole, it TRUNCATED THE TOP (D1..D86 -> D1..D56),
+# which lowers the ceiling, leaves a dense list, and exempts from the citation
+# rule the very citations that would have tripped it. So the check takes a
+# SECOND source it cannot edit: the header set of the same file at the BASE
+# commit, read with `git show`. Any `### D<n>` that existed there and is gone
+# here fails -- a truncation, a hole, and a hole dressed up with a reservation
+# marker are all the same shape to a set difference, while a new entry only
+# adds. The base is the merge-base with `origin/main` (the PR's own base), or
+# `HEAD~1` when that resolves to HEAD itself (a push to `main`, or a detached
+# head at the very commit under test). The `docs` job checks out with
+# `fetch-depth: 0` so `origin/main` is there.
 #
 # A header format note: `### D80 (D79 is C5's, on its own branch) · ...`
 # carries a parenthetical BETWEEN the number and the ` · ` title separator,
@@ -414,7 +431,9 @@ while [ "$n" -le "$highest" ]; do
 done
 
 : > "$tmp/dec_bad_citations"
-{ grep -rhoE --include='*.md' '\bD[0-9]+\b' docs 2>/dev/null; grep -hoE '\bD[0-9]+\b' ./*.tk 2>/dev/null; } \
+{ grep -rhoE --include='*.md' '\bD[0-9]+\b' docs 2>/dev/null
+  grep -hoE '\bD[0-9]+\b' ./*.tk 2>/dev/null
+  grep -rhoE '\bD[0-9]+\b' scripts .github 2>/dev/null; } \
     | sed 's/^D//' | sort -nu > "$tmp/dec_cited"
 while IFS= read -r n; do
     [ -n "$n" ] || continue
@@ -424,7 +443,44 @@ while IFS= read -r n; do
     echo "D$n" >> "$tmp/dec_bad_citations"
 done < "$tmp/dec_cited"
 
+# The floor: the header set at the base commit. `comm -23` is every number
+# that had a header there and has none here -- the shape of every loss.
+: > "$tmp/dec_lost"
+dec_base=""
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    if git rev-parse --verify -q origin/main >/dev/null; then
+        dec_base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+    fi
+    # origin/main absent, or it IS this commit: the previous commit is the base.
+    if [ -z "$dec_base" ] || [ "$dec_base" = "$(git rev-parse HEAD)" ]; then
+        dec_base=$(git rev-parse --verify -q HEAD~1 || true)
+    fi
+fi
+if [ -n "$dec_base" ] && git show "$dec_base:DECISION_LOG.md" >"$tmp/dec_base_log" 2>/dev/null; then
+    # `comm` compares LEXICALLY, so both sides are `sort -u`, not `sort -nu`;
+    # the numeric order is put back on the way out.
+    grep -oE '^### D[0-9]+\b' "$tmp/dec_base_log" | sed -E 's/^### D//' | sort -u > "$tmp/dec_base_headers"
+    sort -u "$tmp/dec_headers" > "$tmp/dec_headers_u"
+    comm -23 "$tmp/dec_base_headers" "$tmp/dec_headers_u" | sort -n > "$tmp/dec_lost"
+    dec_floor="floor $(git rev-parse --short "$dec_base"), $(grep -c . "$tmp/dec_base_headers") entries"
+else
+    dec_floor=""
+fi
+
 dec_ok=1
+# A missing base is a FAILURE, never a silent skip: the floor is the only part
+# of check 7 that does not read the file under test, and a shallow checkout
+# that quietly drops it puts the gate back where `433b18d3` found it.
+if [ -z "$dec_floor" ]; then
+    fail "no base commit to floor DECISION_LOG.md against" \
+        "needs origin/main or HEAD~1 (the docs job checks out with fetch-depth: 0)"
+    dec_ok=0
+fi
+if [ -s "$tmp/dec_lost" ]; then
+    fail "### D<n> headers present at the base commit and gone from DECISION_LOG.md ($dec_floor)" \
+        "$(sed 's/^/D/' "$tmp/dec_lost" | paste -sd, -)"
+    dec_ok=0
+fi
 if [ -s "$tmp/dec_dupes" ]; then
     fail "duplicate ### D<n> headers in DECISION_LOG.md" "$(sed 's/^/D/' "$tmp/dec_dupes")"
     dec_ok=0
@@ -441,7 +497,7 @@ fi
 if [ "$dec_ok" = 1 ]; then
     reserved_list=$(sed 's/^/D/' "$tmp/dec_reserved" | paste -sd, - 2>/dev/null)
     [ -n "$reserved_list" ] || reserved_list="none"
-    echo "ok decisions: $ndecisions entries, D1..D$highest, $reserved_list reserved"
+    echo "ok decisions: $ndecisions entries, D1..D$highest, $reserved_list reserved, $dec_floor"
 fi
 
 # ------------------------------------------------------------------- verdict
