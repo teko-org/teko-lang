@@ -1,0 +1,135 @@
+// surface_string_interp.tk -- N10 of docs/specs/string.md § 9: `$"..."`
+// string interpolation, end to end. Every hole type this crumb teaches
+// (`string`, `str`/`ptr`/`uptr`, `char`, every integer width), a hole at the
+// very start and the very end of the literal, an expression hole
+// (`a + b`, `o.Name`, `f(1)`), adjacent holes, `{{`/`}}`, `$""` and
+// `$"plain"` -- and `rt_live()` back at its floor once a block's own
+// interpolated strings drop, the exact assertion `surface_string_rc.tk`
+// already proves for `+`.
+
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+class Named { public string Name; public Named(string n) { Name = n; } }
+
+i64 add1(i64 x) { return x + 1; }
+
+i64 main() {
+    i64 floor = rt_live();
+
+    // ---- every formatter type this crumb teaches ----
+    {
+        string sv = new string("abc");
+        string a = $"{sv}";
+        if (a.Length != 3) return 1;
+
+        str raw = "raw";
+        string b = $"{raw}";
+        if (b.Length != 3) return 2;
+
+        char c = 'Q';
+        string cs = $"{c}";
+        if (cs.Length != 1) return 3;
+
+        i8 i8v = 0 - 5;
+        string d = $"{i8v}";
+        if (d.Length != 2) return 4;
+
+        u8 u8v = 200;
+        string e = $"{u8v}";
+        if (e.Length != 3) return 5;
+
+        i16 i16v = 0 - 100;
+        string f = $"{i16v}";
+        if (f.Length != 4) return 6;
+
+        u16 u16v = 40000;
+        string g = $"{u16v}";
+        if (g.Length != 5) return 7;
+
+        i32 i32v = 0 - 1;
+        string h = $"{i32v}";
+        if (h.Length != 2) return 8;
+
+        // `u32` and `char` are the SAME core type id (`type_alias("char",
+        // TY_U32)`, teko_type.tk) -- true type erasure, D92's own second
+        // finding. A `u32` hole gets the same UTF-8 encode a `char` hole
+        // does (65 = 'A', one character), not a decimal -- the one
+        // observable consequence of the alias, recorded rather than
+        // worked around.
+        u32 u32v = 65;
+        string k = $"{u32v}";
+        if (k.Length != 1) return 9;
+
+        i64 i64v = 0 - 9000000000;
+        string l = $"{i64v}";
+        if (l.Length != 11) return 10;
+
+        u64 u64v = 9000000000;
+        string m = $"{u64v}";
+        if (m.Length != 10) return 11;
+    }
+    if (rt_live() != floor) return 12;
+
+    // ---- a hole at the very start, and at the very end ----
+    {
+        i64 n = 7;
+        string a = $"{n} end";
+        if (a.Length != 5) return 13;
+        string b = $"start {n}";
+        if (b.Length != 7) return 14;
+    }
+    if (rt_live() != floor) return 15;
+
+    // ---- an expression hole: `a + b`, `o.Name`, `f(1)` ----
+    {
+        i64 x = 3;
+        i64 y = 4;
+        string a = $"{x + y}";
+        if (a.Length != 1) return 16;
+
+        Named o = new Named("Ada");
+        string b = $"{o.Name}!";
+        if (b.Length != 4) return 17;
+
+        string c = $"{add1(41)}";
+        if (c.Length != 2) return 18;
+    }
+    if (rt_live() != floor) return 19;
+
+    // ---- adjacent holes, no literal text between ----
+    {
+        i64 x = 1;
+        i64 y = 2;
+        string a = $"{x}{y}";
+        if (a.Length != 2) return 20;
+    }
+    if (rt_live() != floor) return 21;
+
+    // ---- `{{`/`}}`, `$""`, `$"plain"` ----
+    {
+        i64 n = 5;
+        string a = $"{{n}} is {n}";
+        if (a.Length != 8) return 22;
+        string b = $"";
+        if (b.Length != 0) return 23;
+        string c = $"plain text";
+        if (c.Length != 10) return 24;
+    }
+    if (rt_live() != floor) return 25;
+
+    // ---- a churned loop, the reproducer's failure mode at scale ----
+    i64 i = 0;
+    loop {
+        if (i >= 50) break;
+        i64 n = i;
+        string a = $"item {n} of 50";
+        if (a.Length < 1) return 26;
+        i = i + 1;
+    }
+    if (rt_live() != floor) return 27;
+
+    return 42;
+}
