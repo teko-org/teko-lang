@@ -155,7 +155,7 @@ i64 main() {
     i64 cast = (i64) a;           // teko: a DateTime does not cast; `.Ticks` reads it
     TimeSpan t = b - 1;           // teko: a value of type i64 does not convert to DateTime
     i64 y = a.Yearr;              // teko: unknown member of DateTime
-    i64 n = DateTime.Now();       // ~~teko: DateTime.Now is not taught yet~~ -- landed, C6, D90: this line now compiles (`DateTime.Now` answers a `DateTime`, not an `i64`, so `i64 n = ...` is its own, unrelated refusal today)
+    i64 n = DateTime.Now();       // teko: the member is a property; it is not called: Now (landed, C6, D90 -- `Now` is no longer UNKNOWN, but it is still a property, so the () refuses)
     return 0;
 }
 ```
