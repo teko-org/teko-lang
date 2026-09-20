@@ -216,6 +216,8 @@ not the identity cast `TimeSpan.Ticks` is:
 | `i64 tk_dt_hour(i64)` `tk_dt_minute(i64)` `tk_dt_second(i64)` `tk_dt_ms(i64)` | the time of day |
 | `i64 tk_dt_date(i64)` `i64 tk_dt_tod(i64)` | `.Date` and `.TimeOfDay` |
 | `i64 tk_dt_min()` `tk_dt_max()` `tk_dt_epoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
+| `i64 tk_dt_raw_utc_ticks()` | C6, D90: the host wall clock, one function per host answered by `#include <teko/clock>` (`teko_time.tk`'s bundle wrapper); `tk_dt_now_utc`/`_local` are the only callers |
+| `i64 tk_dt_now_utc()` `tk_dt_now_local()` `tk_dt_today()` | `UtcNow`, `Now` (same clock read, `DateTimeKind.Local`), `Today` (`Now` at midnight) |
 | `i64 tk_dt_from_ticks(i64)` `i64 tk_dt_from_ticks_kind(i64, i64)` | the two raw constructors |
 | `i64 tk_dt_ymd(i64, i64, i64)` `tk_dt_ymdhms(...)` `tk_dt_ymdhmsms(...)` | the three calendar constructors |
 | `i64 tk_dt_add_ticks(i64, i64)` | `.AddTicks`, and what every other `Add*` ends in |
@@ -320,6 +322,7 @@ the LOCAL reading (the instant plus the offset, an ordinary Unspecified tick cou
 | `i64 tk_dto_check_offset(i64 ts)` | the offset validator: a whole minute, `-14:00 .. +14:00`; panics `teko: that UTC offset does not exist` otherwise |
 | `DateTimeOffset tk_dto_make(i64 instant, i64 offmin)` | the one constructor every value passes; panics `teko: the local time of that DateTimeOffset is out of range` when instant + offset leaves the `DateTime` range |
 | `DateTimeOffset tk_dto_min()` `tk_dto_max()` `tk_dto_unixepoch()` | `MinValue`, `MaxValue`, `UnixEpoch` |
+| `DateTimeOffset tk_dto_now_utc()` `tk_dto_now()` | `UtcNow`, `Now` (C6, D90): the same `tk_dt_now_utc()` read, offset `+0` |
 | `DateTimeOffset tk_dto_new(i64 dt, i64 ts)` | `new DateTimeOffset(DateTime, TimeSpan)`: the `DateTime` read as a LOCAL reading at `ts`'s offset, the instant that minus the offset |
 | `DateTimeOffset tk_dto_from_unix_seconds(i64)` `tk_dto_from_unix_ms(i64)` | the two `FromUnixTime*` builders, range-checked before the multiply |
 | `i64 tk_dto_to_unix_seconds(DateTimeOffset)` `tk_dto_to_unix_ms(DateTimeOffset)` | their inverse |

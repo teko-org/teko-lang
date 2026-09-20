@@ -56,7 +56,7 @@ fixes the order.
 | 16a | ~~**N7a** `string`, the class and its members~~ **landed**, D86 | string.md | L | — |
 | 16b | ~~**N7b** `string`, literal interning, the two implicit conversions, the `#include` refusal~~ **landed**, D88 | string.md | L | N7a |
 | 17 | ~~**N8** `string`, the methods and the index~~ **landed**, D89 | string.md | L | N7a, N7b |
-| 18 | **C6** `DateTime.Now`, `UtcNow`, `Today` | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |
+| 18 | ~~**C6** `DateTime.Now`, `UtcNow`, `Today`~~ **landed**, D90 | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |
 | 19 | **N9** `Guid.NewGuid` | guid.md | S | N3 — an entropy `extern` per target host and a `bcrypt.def` in teko's Windows sysroot, teko's own |
 | 20 | **N10** `$"..."` interpolation | string.md | M | N8, and a pin at `mc` ≥ 0.15.25, where `$` before `"` is a token a module claims with `syntax_expr("$", …)` |
 | 21 | **C7** the native wide instructions (optional, speed only) | `docs/specs/decimal.md` | S | C4 |

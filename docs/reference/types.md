@@ -770,9 +770,14 @@ i64 main() {
 
 `DateTimeKind` is an [`enum`](#enum) with three values, declared in `lib/time.tk`, so
 `d.Kind` answers it and no bare integer lands in it. A date that does not exist panics
-where it is built (`new DateTime(2023, 2, 29)` is `teko: a date does not exist`, exit 70),
-and `DateTime.Now` is refused by name until `mc`'s `<sys>` carries a wall clock.
-[datetime.md](datetime.md) is the whole type.
+where it is built (`new DateTime(2023, 2, 29)` is `teko: a date does not exist`, exit 70).
+
+`DateTime.UtcNow` reads the host wall clock (C6, D90): `clock_gettime` on Linux and macOS,
+`GetSystemTimePreciseAsFileTime` on Windows, teko's own `extern` per target -- never an `mc`
+hook. `DateTime.Now` reads the SAME instant and carries `DateTimeKind.Local`, C#'s own
+spelling, but teko has no time-zone database, so its value does not actually convert to a
+local time; that divergence from C# is documented, not hidden. `DateTime.Today` is `Now`
+truncated to midnight, the same `Kind`. [datetime.md](datetime.md) is the whole type.
 
 ---
 
@@ -1144,7 +1149,11 @@ C#'s own rule.
 | `new DateTimeOffset(DateTime, TimeSpan)` | `.UtcDateTime`, `.LocalDateTime`, `.DateTime` → `DateTime` |
 | `DateTimeOffset.FromUnixTimeSeconds(i64)`, `FromUnixTimeMilliseconds(i64)` | `.Year` … `.Millisecond`, of the local reading |
 | `DateTimeOffset.Parse(str)`, `TryParse(str, out DateTimeOffset)` | `.ToUnixTimeSeconds()`, `.ToUnixTimeMilliseconds()` |
-| `DateTimeOffset.Now`, `UtcNow` — **not taught** ([not-yet.md](not-yet.md)) | `.ToOffset(TimeSpan)`, `.CompareTo`, `.Equals`, `.ToString()`, `.ToString(str)` |
+| `DateTimeOffset.Now`, `UtcNow` (C6, D90) | `.ToOffset(TimeSpan)`, `.CompareTo`, `.Equals`, `.ToString()`, `.ToString(str)` |
+
+`DateTimeOffset.UtcNow` reads the same host wall clock `DateTime.UtcNow` does, offset `+0`.
+`DateTimeOffset.Now` is the same instant under the same offset -- a recorded divergence from
+C#, not a gap: teko has no time-zone database, so there is no local offset to carry.
 
 C#'s `new DateTimeOffset(i64 ticks, TimeSpan)` overload is **not taught**: the one `new` row
 this table carries takes a `DateTime`, and `new DateTimeOffset(new DateTime(t), ts)` is the
@@ -1172,7 +1181,6 @@ offset zero, since teko has no time-zone database to read a bare wall-clock stri
 | `extern i64 f(DateTimeOffset o);` | ``teko: an `extern` takes no DateTimeOffset`` |
 | an offset outside `-14:00 .. +14:00`, or not a whole minute | `teko: that UTC offset does not exist`, exit 70 |
 | a value whose LOCAL clock (instant + offset) leaves the `DateTime` range (`MaxValue.ToOffset(+01:00)`) | `teko: the local time of that DateTimeOffset is out of range`, exit 70 — refused where the value is built (`tk_dto_make`), as C# does at construction |
-| `DateTimeOffset.Now`, `UtcNow` | `teko: DateTimeOffset.Now is not taught yet` — the same wall clock `DateTime.Now` is blocked on |
 
 ---
 

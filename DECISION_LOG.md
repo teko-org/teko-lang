@@ -5408,3 +5408,118 @@ elsewhere. The `#define` collision measured while naming `STRING_NBYTES`/`STRING
 an unrelated line before any such macro existed elsewhere in the tree — was routed around
 by naming the three `TK_STRAT_*` instead rather than chased to a root cause; a minimal
 pure-mc reproducer was not built and none is owed here unless the collision recurs.
+
+### D90 · `DateTime.Now`/`UtcNow`/`Today` and `DateTimeOffset.Now`/`UtcNow` (C6, 2026-09-20)
+`docs/specs/datetime.md` §§ 8, 12 (C6), over the `DateTime` C2 landed (D41) and the
+`DateTimeOffset` N5 landed (D76); `docs/specs/datetime-extras.md`'s own N5 `Now`/`UtcNow`
+row moves here, since this is the crumb that actually taught the two members. Depends on
+C2, and on nothing else — the owner's ruling of 2026-09-08 is that the wall clock is
+teko's own `extern` per target host, never an `mc` ask, so nothing here was ever blocked
+on the mc channel.
+
+**Ruling 1, resolution and source per host.** `clock_gettime(CLOCK_REALTIME, &tp)` on Linux
+and macOS (`CLOCK_REALTIME` is `0` on both, and `struct timespec` is sixteen bytes on both
+64-bit ABIs — two `i64` fields, no padding), nanoseconds divided to teko's own 100 ns tick;
+`GetSystemTimePreciseAsFileTime` on Windows, a FILETIME already in 100 ns ticks since
+`1601-01-01`, its two `DWORD` halves read back as one `i64` through `ld64` — the same
+alias every Windows program that reads a `FILETIME` as a `ULARGE_INTEGER` relies on.
+`FILETIME_EPOCH_DIFF_TICKS = 504911232000000000`, .NET's own constant, is the tick count
+from `0001-01-01` to `1601-01-01`. On failure: `clock_gettime`'s one documented failure
+(a bad clock id or an unmapped buffer, neither reachable through this call) panics
+`teko: the wall clock is not available`, exit 70 — the road every other wall-clock read in
+this crumb takes; `GetSystemTimePreciseAsFileTime` has no failure to report by its own
+contract, so it has no panic to raise.
+
+**Ruling 2, `Now` vs `UtcNow`.** Measured before ruling: `localtime_r`/`GetTimeZoneInformation`
+would add a second host-specific `extern` pair and a DST table neither libc exposes for
+free, well past this crumb's own "S" size and past what `DateTime`'s own design page (§ 8)
+ever asked C6 to carry. The ruling taken is the one § 8 states as acceptable on its own:
+`Now` reads the SAME clock `UtcNow` does and carries `DateTimeKind.Local`, C#'s own
+spelling, over a value that is NOT actually converted — a recorded divergence from C#,
+documented in three places (`docs/specs/datetime.md` § 8, `docs/reference/types.md`,
+`docs/reference/not-yet.md`), never faked as a real local time. `DateTimeOffset.Now`
+carries the same ruling: offset `+0` for both `Now` and `UtcNow`, since there is no local
+offset to apply.
+
+**Ruling 3, `Today`.** `DateTime.Now` truncated to midnight (`tk_dt_date`, already exact
+for this — mask and keep the `Kind`), same `Kind` as `Now`.
+
+**Ruling 4, `DateTimeOffset.Now`/`UtcNow`.** `datetime-extras.md`'s own N5 row, landed the
+same way: `tk_dto_now_utc()`/`tk_dto_now()` both wrap `tk_dt_now_utc()` at offset `+0`.
+
+**Ruling 5, determinism.** `tests/surface_datetime_now.tk` asserts what a wall clock leaves
+stable across one run rather than a literal: the year `>= 2026`; two reads of `UtcNow`
+never go backwards (not "never equal" — two reads can land in the same 100 ns tick on a
+fast host); `UtcNow.Kind == DateTimeKind.Utc`; `Now.Kind == DateTimeKind.Local`; `Today`'s
+time of day is exactly zero and its date matches `Now`'s; `DateTimeOffset.UtcNow.Offset ==
+TimeSpan.Zero` and `DateTimeOffset.Now.Offset == TimeSpan.Zero`; the round trip through
+`DateTimeOffset.UtcNow.UtcDateTime` and back to a fresh `DateTime.UtcNow` never goes
+backwards either. Each assertion's own comment states why it is the stable one.
+
+**The mechanism `[include].paths` forced, not the one the design page assumed.**
+`.github/workflows/ngen.yml`'s own comment states `[include]` "can never drift" across the
+five CI legs' derived configs, so a quoted `#include` naming a per-host FILE (the design
+page's own assumption, § 9) was never going to work — measured directly: a scratch `mc
+build` linking a function NOTHING CALLS, whose body references an undefined `extern`,
+still refuses to link (`mc` does not dead-strip an unreachable function), so declaring
+both hosts' wrappers unconditionally in one `lib/time.tk` would leave the OTHER host's
+symbol unresolved on every leg but its own. The mechanism used instead is the one
+`minicompiler/mc` already ships for exactly "the same source, a different answer per
+host": `#include <mc/host>`, whose bundle resolver (`lex_set_bundle`, one function
+pointer) already special-cases that one name to `host_include()`'s own per-host answer,
+which is what makes a GENERATED compiler portable with no change to its two include
+lines (`minicompiler/mc` `src/core_bundle.mc`). `teko_time.tk` wraps that SAME pointer
+for one more name, `<teko/clock>` — answered by `host_os()`, never `drv_os()` (the five
+CI legs are all NATIVE, so host and target are the same machine, and `host_os()` needs no
+`--config` to answer where `drv_os()` reads `0` on the bare-CLI path) — and falls through
+to `host_bundle_open` for every other name, so `<sys>`/`<prelude>`/`<mc/host>` itself stay
+untouched. `lib/time.tk` includes `<teko/clock>` unconditionally; the TEXT it expands to
+differs by host, and only ONE host's wrapper is ever compiled into a given build. Zero mc
+changes (`lex_set_bundle` is `src/lex.mc`'s own exposed hook, already called once by
+`mc_bundle_init()`), zero new intrinsics: the generated text is ordinary `extern`/function
+surface, parsed the same as any other include.
+
+**`TK_PMSOON` → `TK_PMSVAL`, five rows.** `DateTime.Now`/`UtcNow`/`Today` and
+`DateTimeOffset.Now`/`UtcNow` move from the "named, refused by name" row `Guid.NewGuid`
+still carries to ordinary static-value rows naming `tk_dt_now_local`/`tk_dt_now_utc`/
+`tk_dt_today`/`tk_dto_now`/`tk_dto_now_utc`. The two stale comments that called
+`DateTime.Now` "blocked on a wall clock in `mc`'s `<sys>`" (`teko_time.tk`'s own header,
+`teko_prim.tk`'s comment above `TK_PMSOON`) were never true after the owner's ruling of
+2026-09-08 — the wall clock was always teko's own to give — and are corrected to name
+`Guid.NewGuid`, the one row `TK_PMSOON` still carries, instead.
+
+**Fixture (D52).** `tests/surface_datetime_now.tk` (`42`), replacing `tests/refuse/
+dto_now.tk` (`teko: DateTimeOffset.Now is not taught yet`), which this crumb makes legal
+and therefore removes rather than leaves failing.
+
+**Proof, mc 1.0.1, macos/aarch64, head against `origin/main` `1b0d14dd`.** `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**133 passed, 143 refused as expected, 0 failed** (base: 132 passed, 144 refused — the one
+new fixture and the one refusal this crumb removes); `sh scripts/bootstrap.sh --os macos
+--arch aarch64` → `FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 702 links,
+79 fragments, 413 diagnostics, 143 refusals, 155 samples, manifest listed`.
+
+`mc limits build/teko.mc` (`rm -rf build` first, both legs), base vs head. `passes` 15/15,
+`syntax` 20/20, `alias` 25/25, `types` 18/18, `intrin` 8/8, `on_stmt` 4/4 — every one
+identical on both, **all six UNMOVED**, on the `tests/hello.tk` leg (the fixed sample this
+crumb never touches, byte-identical top to bottom) and on the compiler's own leg alike.
+Only the compiler leg's own surface-code rows move, by the new module code: `nodes`
+207117->207652, `funcs`/`lowered` 4207/4207->4214/4214 (declared) and 3444/3425->3448/3429
+(used), `strings` 3071->3080, `symbols` 8680->8698, `ins` 242597->242701 (`heap`, never
+cited).
+
+**`--dump-ast --include=lib --include=tests`, base vs head, over all 275 base fixtures**
+(132 `tests/*.tk` + 143 `tests/refuse/*.tk`, everything but the one fixture added and the
+one refusal removed) — byte-identical on 255 of them; the 20 that `#include`
+`lib/time.tk` (directly or through a chain) each gained the SAME 66 lines, a pure append
+after every pre-existing node (`diff` measured zero removed lines on every one of the
+twenty) — the new `<teko/clock>` extern-and-function pair plus `tk_dt_now_utc`/`_local`/
+`tk_dt_today`/`tk_dto_now`/`tk_dto_now_utc`, the accepted surface this crumb adds. No
+pre-existing node moved.
+
+**Adjacent findings, not this crumb's to fix:** `docs/specs/datetime.md`'s own § 8 still
+listed `DateTimeOffset` as "queued behind C3" and `datetime-extras.md`'s § 2 sample
+mixing `DateOnly`/`TimeOnly`/`DateTimeOffset` is still marked `// no-run` — both stale
+since N5 landed (D76), before this crumb, and corrected here in passing since this crumb
+was already touching the same paragraphs; the sample's `// no-run` marker itself is left
+as found, since making it run is N5's own gate, not C6's.
