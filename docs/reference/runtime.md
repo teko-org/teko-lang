@@ -517,6 +517,9 @@ this file's own gate is that chain staying byte-identical. Needs `rt.tk` for `rt
 | `i64 tk_string_cp_decode(uptr data, i64 boff, i64 width)` | the code point `width` bytes at `data + boff` decode to |
 | `i64 tk_string_at(string s, i64 i)` | `s[i]`'s own lowering (`tk_bracket`, `teko_params.tk`, N8, D89) — a PLAIN top-level function, not a method: it reads `s`'s fields through the fixed byte offsets `docs/specs/string.md` § 1's own layout diagram publishes, via `(uptr) s` (a CAST, not one of D33's nine conversion slots — `tk_str_borrow` never fires at a cast), rather than through `this`. `O(1)` on an ASCII string, `O(i)` otherwise; panics `teko: string index out of range`, exit 70, past `Length - 1` or negative |
 | `tk_string_cp_decode(data, boff, width, nbytes)` | the code point at a byte offset, reading nothing past `nbytes`: a sequence truncated at the tail (only program-built bytes can make one, never a literal) answers **U+FFFD** rather than reading past the allocation — the constructor copies bytes and counts lead bytes, it does not validate (D89) |
+| `string tk_str_from_i64(i64 v)` | N10, D92: an interpolation hole of any integer width — the decimal text `tk_i64_to_dec` (`lib/rt.tk`) already writes, on the STACK (no `rt_alloc`, so no free to forget) |
+| `i64 tk_string_cp_encode(uptr buf, i64 cp)` | N10, D92: the inverse of `tk_string_cp_decode` — one code point's UTF-8 bytes into `buf` (needs 4), returns the width written |
+| `string tk_str_from_char(char c)` | N10, D92: an interpolation hole of type `char` (and, by the same core type id, `u32` — `type_alias("char", TY_U32)` is not a distinct `type_new`) — `tk_string_cp_encode` onto the stack, NUL-terminated for the class's own `str` constructor |
 
 Every member and every operator of `string` is an ordinary method or a `public static`
 member of the class itself, `new string(raw)` included — there is no lowering table here

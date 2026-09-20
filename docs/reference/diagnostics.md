@@ -1921,6 +1921,36 @@ class H {
 }
 ```
 
+## String interpolation (`$"…"`)
+
+- `"teko: $ needs a string literal for interpolation"` — `$` is claimed program-wide the
+  moment `#include "string.tk"` is not even required to read this one: `$` followed by
+  anything but a string literal (`$1`, `${1}`, the `#rule` forms) is not this crumb's own
+  syntax. Write `$"…"`.
+- `"teko: string interpolation needs #include \"string.tk\" before it is used"` — `$"…"`
+  lowers into the `string` class's own `operator+`, which only exists once the class does.
+  Add the include.
+- `"teko: an interpolated string needs }} for a literal }"` — a bare `}` with no matching
+  `{` is not this page's own escape; double it, `}}`, C#'s own answer for the same byte.
+- `"teko: unterminated interpolation hole"` — a `{` opened a hole and no matching `}`
+  closed it before the string literal itself ended.
+- `"teko: an interpolation hole needs an expression"` — `{}` is empty; write one.
+- `"teko: an interpolation hole holds one expression, no alignment or format specifier"` —
+  a top-level `,` (C#'s alignment, `{x,10}`) or `:` (its format specifier, `{x:N2}`) inside
+  a hole. Neither is taught ([string.md](../specs/string.md) § 9); format the value first
+  and write the result into the hole.
+- `"teko: malformed literal text in an interpolated string"` — the literal text between two
+  holes did not parse back into a single string literal (an internal invariant of the
+  handler's own re-lexing; not reachable from source a person writes by hand).
+- `"teko: no interpolation of a value of type "` — completed by the type's name. Only
+  `string`, `str`/`ptr`/`uptr`, `char` and the integers have a formatter
+  ([string.md](../specs/string.md) § 9's own table); everything else — `f64`/`f32`,
+  `decimal`, `DateTime`, `TimeSpan`, `Guid`, an `enum` — needs its value turned into a
+  `string` first (`.ToString()` where the type has one) and concatenated with `+`.
+- `"teko: the type of this value is not known here"` — a hole whose static type the
+  compiler cannot determine at all, the same "not known here" every other deferred site
+  gives.
+
 ## Capacity
 
 Every table the compiler keeps has a ceiling. Hitting one is a diagnostic, not a silent

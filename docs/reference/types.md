@@ -1487,6 +1487,49 @@ moment it is parsed (`teko: the name is already a type`, measured). `string` nam
 `docs/specs/string.md` § 5/§ 9's own row is corrected to say so — a library type is told
 apart by the library, D48's own sentence (D88).
 
+**N10's own share (D92): `$"..."` interpolation.** `syntax_expr("$", …)` claims the token
+(`teko_interp.tk`, new module); `$"a{x}b"` lowers into a `+` chain of the literal pieces and
+one formatter call per hole, chosen by the hole's STATIC type:
+
+| the hole's type | the formatter |
+|---|---|
+| `string` | itself |
+| `str`, `ptr`, `uptr` | the class's own `str` constructor |
+| `char` | a UTF-8 encode |
+| every integer width | the decimal text `tk_i64_to_dec` already writes |
+
+`u32` and `char` are the SAME core type id (`type_alias("char", TY_U32)`, no distinct
+`type_new`), so a `u32` hole gets the UTF-8 encode too — `65` reads `"A"`, one character,
+not the digits `"65"` — the one observable consequence of the alias. `f64`/`f32`/
+`decimal`/`DateTime`/`TimeSpan`/`Guid`/an `enum` are refused by name
+(`teko: no interpolation of a value of type Foo`, [not-yet.md](not-yet.md)); so is C#'s
+alignment/format specifier, `{x,10}`/`{x:N2}` (`teko: an interpolation hole holds one
+expression, no alignment or format specifier`). `$` with no `#include "string.tk"` reads
+`teko: string interpolation needs #include "string.tk" before it is used`.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "string.tk"
+
+class Point { public i64 X; public i64 Y; public Point(i64 x, i64 y) { X = x; Y = y; } }
+
+i64 main() {
+    i64 n = 7;
+    string a = $"n={n}";
+    if (a.Length != 3) return 1;
+
+    Point p = new Point(3, 4);
+    string b = $"({p.X}, {p.Y})";
+    if (b.Length != 6) return 2;
+
+    string c = $"{{literal braces}} and {n}";
+    if (c.Length != 22) return 3;
+
+    return 42;
+}
+```
+
 ---
 
 ## Members

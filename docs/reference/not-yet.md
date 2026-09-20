@@ -336,9 +336,18 @@ nine slots:
 | `pick("hi")` against an OVERLOADED `string pick(string)`/`pick(i64)` | `teko: no overload of pick matches these arguments` — overload SELECTION (`tk_ov_args_fit`, `teko_over.tk`) is a different question from the nine slots' own conversion, asked before any declaration is chosen; a name declared ONCE still interns (`greet("world")` in `docs/specs/string.md` § 5's own sample), and `string pick(string s) { return s; }` alone, called the same way, works |
 | `c ? "yes" : s` (a literal ternary arm beside a `string`) | `` teko: the two arms of ?: have different types `` — `tk_tern_lower` (`teko_ternary.tk`) requires its two arms' types to already be EQUAL and converts neither one, for any type, string included (`cond ? 1 : 2.5` refuses the identical way); `??` is `string`'s own gap this crumb closed (`teko_null.tk`), `?:` is a different mechanism with no conversion of its own to extend |
 
-`$"..."` (N10) and `"n=" + 5` (needing a universal `ToString`/`object`, § 11) are neither
-N7a's nor N7b's nor N8's; both stay exactly where
-[the specification](../specs/string.md) § 9-11 leaves them.
+`$"..."` **landed, N10, D92** — [the type reference](types.md#string) and
+[the specification](../specs/string.md) § 9 have it. What § 9 itself still names as not
+taught, over a hole:
+
+| written | what happens today, and why |
+|---|---|
+| `$"{x,10}"` — C#'s alignment | `teko: an interpolation hole holds one expression, no alignment or format specifier` — a hole holds one expression, nothing else (§ 9's own decision) |
+| `$"{x:N2}"` — C#'s format specifier | the same message |
+| `$"{x}"` where `x` is `f64`/`f32`/`decimal`/`DateTime`/`TimeSpan`/`Guid`/an `enum` | `` teko: no interpolation of a value of type Foo `` — each one's own `.ToString()` (where it has one) hands back an `rt_alloc`-owned `str` this crumb cannot free with the right size from outside the module that sized it; write the value into a `string` first and concatenate with `+` |
+
+`"n=" + 5` (needing a universal `ToString`/`object`, § 11) is neither N7a's, N7b's, N8's
+nor N10's; it stays exactly where [the specification](../specs/string.md) § 11 leaves it.
 
 ## The rest of `docs/specs/guid.md`
 
