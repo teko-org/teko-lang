@@ -332,8 +332,9 @@ static type** — which is what keeps it inside D4:
 `tk_i64_to_dec` peels its digits with SIGNED `/` and `%`, so every `u64` at or above 2^63
 came out as its negative twin: `u64 v = 9223372036854775808; $"{v}"` read
 `-9223372036854775808` where C# reads `9223372036854775808`. `mc`'s own `/` and `%` are
-unsigned when both operands are (measured on the pin: `18446744073709551615 / 10` is
-`1844674407370955161`), so `tk_str_from_u64` is one peel loop on a `u64` parameter, with
+unsigned when the LEFT operand is — `gen_walk.mc` dispatches on
+`type_signed(res_type(nd_a(n)))`, the left side alone (measured on the pin:
+`18446744073709551615 / 10` is `1844674407370955161`, and its right operand is signed), so `tk_str_from_u64` is one peel loop on a `u64` parameter, with
 no cast down to `i64` anywhere in it and no change to `tk_i64_to_dec`, which every signed
 caller still wants as it is. `u8` and `u16` are unsigned too but widen into `i64` with
 room to spare, so they keep the signed formatter. The fixture pins every width by its

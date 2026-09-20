@@ -5861,8 +5861,12 @@ crumb.
 value.** Every `tk_is_int_ty` hole went to `tk_str_from_i64`, which formats through the
 SIGNED `tk_i64_to_dec` (`lib/rt.tk`): `u64 v = 9223372036854775808; $"{v}"` read
 `-9223372036854775808` where C# reads `9223372036854775808`. `mc`'s own `/` and `%` are
-unsigned when BOTH operands are (measured: `18446744073709551615 / 10` is
-`1844674407370955161`), so the fix is `tk_str_from_u64`, one peel loop on a `u64`
+unsigned when the LEFT operand is — mc's `gen_walk.mc` dispatches on
+`type_signed(res_type(nd_a(n)))`, the left side alone, which is what `tk_str_from_u64`'s
+own `v / 10` and `v % 10` rest on (measured: `18446744073709551615 / 10` is
+`1844674407370955161`, with a SIGNED right operand — the re-verification's own correction
+of this entry's first wording, which said BOTH and cited an example that does not satisfy
+it), so the fix is `tk_str_from_u64`, one peel loop on a `u64`
 parameter, dispatched on `ty == TY_U64` ahead of the signed row. `u8`/`u16` widen into
 `i64` with room to spare and keep the signed formatter; `u32` is `char`'s own id and keeps
 the UTF-8 encode. `tk_i64_to_dec` is unchanged -- every signed caller still wants it as it
