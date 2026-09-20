@@ -5508,6 +5508,20 @@ still carries to ordinary static-value rows naming `tk_dt_now_local`/`tk_dt_now_
 2026-09-08 — the wall clock was always teko's own to give — and are corrected to name
 `Guid.NewGuid`, the one row `TK_PMSOON` still carries, instead.
 
+**Amended after the review (2026-09-20): the clock follows the TARGET, not the machine that
+compiles.** The first draft read `host_os()` alone, arguing that `ngen.yml`'s five legs are
+native and that `drv_os()` answers 0 on the bare-CLI path. Both halves are true and the
+conclusion was still wrong: a CROSS build — `mc build --config` with `[target] os =
+"windows"` on a macOS box, which `docs/internals/bootstrap.md` discusses and which the
+ladder's host guard refuses only for the LADDER, not for an ordinary build — emitted the
+POSIX wrapper into a COFF object, an undefined `clock_gettime` no Windows link can resolve.
+`tk_clock_bundle_open` reads `drv_os()` first and falls back to `host_os()` only when it
+answers 0 (no `[target]`, where the host IS the target). Measured on macos/aarch64: the same
+program built with `os = "macos"` runs and exits 42; built with `os = "windows", arch =
+"x86_64"` the COFF object carries `GetSystemTimePreciseAsFileTime`, and its link fails on
+this machine for the ordinary reason — `cc` does not link COFF — which is the linker's
+business and not the selection's.
+
 **Fixture (D52).** `tests/surface_datetime_now.tk` (`42`), replacing `tests/refuse/
 dto_now.tk` (`teko: DateTimeOffset.Now is not taught yet`), which this crumb makes legal
 and therefore removes rather than leaves failing.
