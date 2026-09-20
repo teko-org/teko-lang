@@ -16,8 +16,8 @@
 // function or of a member). `tk_ha_row` (teko_struct.tk, the row identity
 // `tk_is_counted` already shares) is memoized per element, so `i64[]` spelled
 // twice is one row; a SECOND `[]` is the row of that row (D100), read by the
-// same loop, so `T[][]` and `T[][][]` need no lowering of their own -- what a
-// jagged array still lacks is its ALLOCATOR, `new T[n][]`.
+// same loop, so `T[][]` and `T[][][]` need no lowering of their own; its
+// ALLOCATOR is `new T[n][]`, the rank loop in `tk_new_array` (D101).
 //
 // LAYOUT (the object `new T[n]` allocates):
 //
@@ -312,15 +312,9 @@ i64 tk_ha_deleg_call(i64 addr, i64 ety, i64 di, i64 line, uptr fl) {
 // (teko_params.tk's own `tk_bracket`).
 i64 tk_ha_index(i64 left, i64 si) {
     i64 ety = ha_ety_at(si);
-    // `new T[n][]` (D100): the `[]` right after a FRESH allocation is not an
-    // index at all -- it is the second rank of the type, and the jagged
-    // allocator that would fill those rows is not taught yet. Recognized by
-    // the callee's own name, so an empty `[]` after anything else keeps the
-    // reading it has today.
-    if (p_id() == K_RBRACK)
-        if (nd_kind(left) == N_CALL)
-            if (str_eq(nd_name(left), tk_ha_allocname(ety)))
-                err_at(p_file(), p_line(), "teko: `new T[n][]` is not taught yet");
+    // D101: an empty `[]` right after a fresh `new T[n]` never reaches here
+    // any more -- `tk_new_array` reads it as the second RANK before the
+    // postfix loop ever runs -- so every `[` this door sees carries an index.
     i64 line = p_line();
     uptr fl = p_file();
     i64 idx = parse_expr(0);
@@ -384,15 +378,38 @@ i64 tk_ha_member_of(i64 left, i64 si, uptr m, i64 line, uptr fl) {
 // Op(fn)`/`new Point`/`new Box<...>`. `ety` can never itself be a `T[]` row
 // here: its own reserved word (`i64[]`) is a lexeme the lexer cannot form, so
 // no source text can name it as the word right after `new`. `T[][]` is a type
-// this module READS (D100, `tk_ha_type` below), but the jagged ALLOCATOR is
-// not taught: the trailing `[]` of `new T[n][]` reaches the index door, where
-// `tk_ha_index` refuses it, and a jagged array's rows come from a store.
+// this module READS (D100, `tk_ha_type` below), and the JAGGED ALLOCATOR is
+// the loop below (D101): an EMPTY `[]` after the length raises the element to
+// the row `T[]`, so `new T[n][]` allocates the outer array of `T[][]` with
+// its `n` rows null, and a store is what fills them. It cannot be a recursion
+// in the type reader, because `ety` can never itself be a `T[]` row here.
+//
+// `new T[n][0]` is the collision, and the lookahead is what parts them: a
+// `[` whose very next character is `]` is a RANK, anything else is an INDEX
+// into the fresh array and is left to the postfix loop, `tk_bracket` ->
+// `tk_ha_index`, untouched.
 i64 tk_new_array(i64 ety, i64 line, uptr fl) {
     if (ety == TY_VOID) err_at(fl, line, "teko: an array of type void");
     p_next();                                     // the '['
     if (p_id() == K_RBRACK) err_at(fl, line, "teko: `new T[]` needs a length; write `new T[n]`");
     i64 n = parse_expr(0);
     p_expect(K_RBRACK, "expected ] after the array length");
+    loop {
+        if (p_id() != K_LBRACK) break;
+        if (tk_next_ch() != ']') break;           // an index, not a rank
+        p_next();                                 // the `[`
+        p_expect(K_RBRACK, "expected ] after the rank of a jagged array");
+        ety = tk_ha_row(ety);
+        // `new T[n][]?`, the allocator's spelling of `T[]?[]`: the `?` binds
+        // to the rank just read, i.e. to the ELEMENT, the same way it does
+        // inside `tk_ha_type`'s own loop below and the same way `new Cell?[n]`
+        // (teko_expr.tk) writes a nullable element of a plain word.
+        if (p_id() == tk_nl_quest) {
+            p_next();
+            if (p_id() == tk_nl_quest) err_at(fl, line, "teko: a nullable of a nullable is not taught");
+            ety = tk_nl_row(ety);
+        }
+    }
     tk_line = line;
     tk_file = fl;
     i64 ty = tk_ha_row(ety);
