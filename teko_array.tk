@@ -69,6 +69,7 @@
 #define TK_MAXGDEF  512                // deferred writes into a possibly-global array
 #define TK_MAXHG    32                 // global `T[]` of heap declared in one source
 #define TK_MAXGSLOT 2048               // global SLOTS declared in one source (521 in the compiler's own unit)
+#define TK_MAXIBASE 4096               // index bases a global-array rewrite consumed (D96)
 
 #define TK_ASTORE    0                 // a[i] = e
 #define TK_ACOMPOUND 1                 // a[i] += e / -= e / ++ / --
@@ -135,6 +136,18 @@ i64  gd_line[TK_MAXGDEF];
 uptr gd_file[TK_MAXGDEF];
 i64  tk_ngd = 0;
 
+// ---- D96: the base identifier a global-array rewrite consumed ----
+// Both rewrites below match a base by NAME ALONE, out of a walk that carries
+// no scope and no class: `tk_garr_find(nd_name(base))` / `tk_hg_find(...)`.
+// The name may bind NEARER than the global they matched -- to a PARAMETER,
+// which is in no parse-time scope table (teko_struct.tk's own invariant), or
+// to a member the parser had not read yet when `tk_bracket` judged the site
+// (teko_params.tk). Each base a rewrite consumes is recorded here, and the
+// typeof pass -- the first walk that has both the function's parameters and
+// the method's own class -- judges the binding at the site (`tk_ib_check`).
+i64  ib_node[TK_MAXIBASE];
+i64  tk_nib = 0;
+
 // ---- table accessors (no raw ld64/st64 outside this section) ----
 uptr av_name_at(i64 i) { return ld64(av_name + i * 8); }
 i64  av_ty_at(i64 i)   { return ld64(av_ty + i * 8); }
@@ -159,6 +172,9 @@ uptr gs_name_at(i64 i) { return ld64(gs_name + i * 8); }
 i64  gs_ty_at(i64 i)   { return ld64(gs_ty + i * 8); }
 void set_gs_name_at(i64 i, uptr v) { st64(gs_name + i * 8, v); }
 void set_gs_ty_at(i64 i, i64 v)    { st64(gs_ty + i * 8, v); }
+
+i64  ib_node_at(i64 i) { return ld64(ib_node + i * 8); }
+void set_ib_node_at(i64 i, i64 v)  { st64(ib_node + i * 8, v); }
 
 i64  gd_node_at(i64 i) { return ld64(gd_node + i * 8); }
 i64  gd_base_at(i64 i) { return ld64(gd_base + i * 8); }
@@ -556,6 +572,29 @@ i64 tk_arr_write_follows() {
     return 0;
 }
 
+// D96: a base this module's rewrite is about to consume by NAME. The node is
+// kept, not the name: it is still the untouched `N_IDENT` when the typeof
+// pass reaches it (`tk_this_ident` rewrites a member's bare name in that very
+// walk, and nothing rewrites a parameter's at all), so the site's own line,
+// file and name are read off it there.
+void tk_ib_mark(i64 base) {
+    if (nd_kind(base) != N_IDENT) return;
+    if (tk_nib == TK_MAXIBASE)
+        err_at2(nd_file(base), nd_line(base), "teko: too many array indexes waiting to be resolved", nd_name(base));
+    set_ib_node_at(tk_nib, base);
+    tk_nib = tk_nib + 1;
+}
+
+i64 tk_ib_marked(i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nib) break;
+        if (ib_node_at(i) == n) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
 void tk_gd_add(i64 n, i64 base, i64 idx, i64 form, i64 op, i64 val, i64 line, uptr fl) {
     if (tk_ngd == TK_MAXGDEF) err_at(fl, line, "teko: too many array writes waiting to be resolved");
     set_gd_node_at(tk_ngd, n);
@@ -630,6 +669,7 @@ void tk_array_maybe_rewrite_index(i64 n) {
     tk_line = line;
     tk_file = fl;
     i64 idx = tk_arr_bounds(nd_b(n), nel, nm, line, fl);
+    tk_ib_mark(base);                            // D96: the binding is judged in the typeof pass
     i64 r = tk_arr_load(ety, tk_arr_addr(base, ety, idx));
     tk_node_replace(n, r);
     // the same tag the heap load below carries, for the same reason: this node
@@ -654,6 +694,7 @@ void tk_hg_rewrite_index(i64 n) {
     i64 ety = tk_hg_ety_at(hi);
     tk_line = nd_line(n);
     tk_file = nd_file(n);
+    tk_ib_mark(base);                            // D96, same as the fixed-array read above
     i64 r = tk_ha_load(base, ety, nd_b(n));
     tk_node_replace(n, r);
     // the registration follows the VALUE into the node the tree holds:
@@ -683,6 +724,7 @@ void tk_array_resolve_write(i64 i) {
     tk_line = line;
     tk_file = fl;
     i64 idx = tk_arr_bounds(gd_idx_at(i), nel, nm, line, fl);
+    tk_ib_mark(base);                            // D96: a WRITE takes the base by name too
     i64 r = 0;
     if (gd_form_at(i) == TK_ASTORE) {
         i64 at = tk_arr_addr(base, ety, idx);
@@ -715,6 +757,7 @@ void tk_hg_resolve_write(i64 i) {
     tk_line = line;
     tk_file = fl;
     i64 idx = gd_idx_at(i);
+    tk_ib_mark(base);                            // D96, same as the fixed-array write above
     i64 r = 0;
     // no scope stands around this store: every judgement over its value --
     // the coercion, the type, the escape -- belongs to the walk that will

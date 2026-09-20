@@ -1638,11 +1638,56 @@ void tk_pend_do(i64 pi) {
     if (rty >= 0) tk_xt_put(n, tk_struct_by_ty(rty), rty, pure, own);
 }
 
-// One walk, two rewrites: the deferred `.` this file owns, and the unqualified
-// member teko_this.tk owns. They share the walk because they share what it
+// ---- D96: an index whose base binds NEARER than the global it was rewritten
+// against ----
+//
+// `tk_bracket`'s index judge (teko_params.tk) is a PARSE-TIME judge: it refuses
+// a LOCAL shadow and a member the class has ALREADY declared, and it has no
+// answer for the two bindings parse time cannot see -- a PARAMETER, which is in
+// no scope table at parse time at all (teko_struct.tk's invariant), and a member
+// declared BELOW the method reading it. Both then took the global road in
+// teko_array.tk, which matches by NAME ALONE, and the program compiled wrong:
+// the base identifier under the rewrite still resolved to the parameter or to
+// the member, so the parameter's VALUE was used as the array's address and the
+// member's own bytes as its handle (measured, exit 139 in every shape).
+//
+// This walk is where the binding is knowable: `tk_ty_pass_walk` pushes each
+// function's parameters (`tk_ty_scope_params`) and enters the type its body
+// belongs to (`tk_this_enter_fn`), so a parameter answers `tk_ty_scope_find` and
+// a member answers `tk_field_find`/`tk_mconst_find`/`tk_prop_find` on
+// `tk_pass_class` WHATEVER the declaration order. The refusal is the one the
+// parse-time judge already gives the same program -- byte-identical to
+// teko_params.tk's, and at the site's own line.
+//
+// A member declared below that IS itself a `T[]` is refused here too, with that
+// same wording, rather than routed to `tk_ha_index` as the declared-ABOVE one is
+// (teko_params.tk): the identical program with no same-named global is ALREADY
+// refused ``teko: `[` needs an array`` today, so routing it would make the
+// presence of an unrelated global the thing that makes the program legal. What
+// is lost is a program that only ever answered right by coincidence -- the
+// global's element type happening to match the field's.
+void tk_ib_check(i64 n) {
+    if (tk_nib == 0) return;
+    if (nd_kind(n) != N_IDENT) return;
+    if (!tk_ib_marked(n)) return;
+    uptr nm = nd_name(n);
+    if (tk_ty_scope_find(nm) >= 0)               // a parameter, or a local of this scope
+        err_at2(nd_file(n), nd_line(n), "teko: `[` needs an array", nm);
+    if (tk_pass_class < 0) return;
+    if (tk_field_find(tk_pass_class, nm) >= 0)   // `tk_this_ident`'s own order:
+        err_at2(nd_file(n), nd_line(n), "teko: `[` needs an array", nm);
+    if (tk_mconst_find(tk_pass_class, nm) >= 0)  // field, then member const,
+        err_at2(nd_file(n), nd_line(n), "teko: `[` needs an array", nm);
+    if (tk_prop_find(tk_pass_class, nm) >= 0)    // then property
+        err_at2(nd_file(n), nd_line(n), "teko: `[` needs an array", nm);
+}
+
+// One walk, three rewrites: the deferred `.` this file owns, the unqualified
+// member teko_this.tk owns, and the index binding D96 judges above. They share the walk because they share what it
 // carries -- the scope that says whether a name is a local, and the position in
 // the tree where a node may be replaced by what it stood for.
 void tk_pend_visit(i64 n) {
+    tk_ib_check(n);                              // D96, ahead of the rewrite that consumes the name
     i64 pi = tk_pend_at(n);
     if (pi >= 0) {
         tk_pend_do(pi);
@@ -1825,7 +1870,11 @@ i64 tk_typeof_pass(i64 root) {
     // answers a call to an overloaded name out of that table, and every
     // consumer of the oracle is this pass or a later one.
     tk_ov_prepare(root);
-    if (tk_npend != 0 || tk_nmethod != 0) {
+    // D96: `tk_nib` joins the two conditions, because a marked index base is
+    // judged by this very walk and a unit may carry one with no deferred `.`
+    // and no method at all -- a plain function with a parameter that shadows a
+    // global array is exactly that unit.
+    if (tk_npend != 0 || tk_nmethod != 0 || tk_nib != 0) {
         tk_ty_pass_walk(root, &tk_pend_visit);
         tk_pend_check();
     }

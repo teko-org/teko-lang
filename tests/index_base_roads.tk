@@ -1,0 +1,57 @@
+// index_base_roads.tk -- D96's other half: the roads that must still work
+// after an index's base binding is judged in the typeof pass.
+//
+// The judge (`tk_ib_check`, teko_typeof.tk) only ever fires on a base a
+// GLOBAL-array rewrite consumed by name, so every road below has to be
+// untouched by it:
+//
+//   - a `T[]` FIELD declared ABOVE its reader, reached by its bare name:
+//     `tk_bracket` routes it to `tk_ha_index` at parse time (teko_params.tk,
+//     Copilot on #698 pass 12), so no global rewrite happens and the base is
+//     never marked -- even though a global `i64[] xs` of the same name exists;
+//   - a `T[]` PROPERTY declared ABOVE its reader, the same road through the
+//     getter's call (pass 13);
+//   - a plain index into a GLOBAL array, fixed and heap, from a function whose
+//     scope and whose class declare nothing of that name: marked, judged,
+//     accepted;
+//   - a plain PARAMETER that shadows nothing, indexed as the `T[]` it is;
+//   - a global array read from inside a METHOD of a class that declares no
+//     member of that name -- the case `tk_pass_class >= 0` must not refuse.
+//
+// expect-exit: 42
+#include "../lib/rt.tk"
+
+i64   fixed[3];
+i64[] xs;
+i64[] ys;
+
+class H {
+    public i64[] xs;                          // shadows the global `i64[] xs`
+    public i64[] ys { get { return yheld; } } // ...and a property shadows `ys`
+    public i64[] yheld;
+    public H() {
+        xs = new i64[2];
+        xs[0] = 10;
+        yheld = new i64[2];
+        yheld[0] = 20;
+    }
+    public i64 fromField()  { return xs[0]; }     // -> tk_ha_index, the field
+    public i64 fromProp()   { return ys[0]; }     // -> tk_ha_index, the getter
+    public i64 fromGlobal() { return fixed[1]; }  // -> the global road, in a method
+}
+
+i64 sum(i64[] a) { return a[0] + a[1]; }          // a parameter shadowing nothing
+
+i64 main() {
+    fixed[1] = 7;
+    xs = new i64[2];
+    xs[0] = 1;
+    xs[1] = 2;
+    H h = new H();
+    i64 r = h.fromField();      // 10, the FIELD's own array
+    r = r + h.fromProp();       // 20, the PROPERTY's own array
+    r = r + h.fromGlobal();     // 7,  the global `fixed`
+    r = r + sum(xs);            // 3,  the parameter's own array
+    r = r + fixed[1] - 5;       // 7 - 5 = 2, a plain global index
+    return r;                   // 10 + 20 + 7 + 3 + 2 = 42
+}
