@@ -11398,3 +11398,88 @@ answers ``teko: `[` needs an array``, and the same core message comes out of
 `i64[]? f(); f()[0] = 1;` on the base, so this crumb widens no defect, it only makes one
 more spelling reach an old one), and a FIXED array of arrays
 (`i64[] xs[2]`), which stays where D99 left the fixed road.
+
+### D101 · `new T[n][]`: an empty `[]` after the length is a RANK, and one character of
+lookahead is what tells it from an index (2026-09-20)
+
+**What landed.** D100 taught the jagged TYPE and left the ALLOCATOR out, on a blocker its
+own header recorded: `ety` can never be a `T[]` row inside `tk_new_array`, because `i64[]`
+is a lexeme the lexer cannot form, so no recursion in the type reader could ever reach it.
+The fix is where the header said it had to be — `tk_new_array` (`teko_heaparr.tk`) reads
+the trailing `[]` ITSELF, after the length, and builds the row type from it:
+
+```
+loop {
+    if (p_id() != K_LBRACK) break;
+    if (tk_next_ch() != ']') break;           // an index, not a rank
+    p_next();                                 // the `[`
+    p_expect(K_RBRACK, "expected ] after the rank of a jagged array");
+    ety = tk_ha_row(ety);
+    if (p_id() == tk_nl_quest) { ... ety = tk_nl_row(ety); }
+}
+```
+
+Six lines, then the SIX that were already there: `tk_ha_row(ety)`, `tk_struct_by_ty`,
+`tk_ha_ensure_gen`, the mangled `tkarr_new_*` call and its `tk_xt_add`. Raising the element
+is the whole of the lowering, because a row of rows is a row like any other (D100) and the
+allocator it needs is generated per element type from the same three builders.
+
+**What `new` now accepts.** `new i64[3][]` is `i64[][]`: three row slots, every one `null`
+(`rt_alloc` zeroes), the outer array counted like any other. A rank REPEATS with no cap —
+`new i64[2][][]` is `i64[][][]`, and nothing in the loop knows its own depth, so a cap
+would have been a rule invented for the occasion. A rank may carry the `?` of Q1a:
+`new i64[2][]?` is an `i64[]?[]`, an array of NULLABLE rows, the `?` binding to the rank
+just read exactly as it does inside `tk_ha_type`'s own loop and as `new Cell?[n]` binds it
+over a plain word. A second `?` is `teko: a nullable of a nullable is not taught`, the
+message the type position already gives (written with a blank, `[]? ?`: `??` on its own is
+D45's null-coalescing token).
+
+**The collision, and how it is parted.** `new i64[3][0]` has to stay an INDEX into a fresh
+array. The previous crumb refused the rank by recognizing the allocator's own callee NAME
+inside `tk_ha_index`; that recognition is gone, and with it the refusal
+``teko: `new T[n][]` is not taught yet`` and its fixture `tests/refuse/array_new_jagged.tk`.
+What parts them now is one character of lookahead — `tk_next_ch` (`teko_access.tk`), the
+reader `tk_bracket_follows` already uses — asked while the `[` is still the current token:
+a `[` whose next character is `]` is a rank, anything else is left untouched for the postfix
+loop, `tk_bracket` → `tk_ha_index`. So `new i64[3][0]`, `new i64[3][1 + 1]` and
+`new i64[3][i]` are the indexes they always were, and the index door never sees an empty
+`[]` again.
+
+**Memory, measured.** `tests/surface_array_new_jagged.tk`, every line an `rt_live()` delta
+against the floor of its own scope plus a destructor count:
+
+| case | measured |
+|---|---|
+| allocated, never filled (`new Cell[3][]`) | `+1` — the outer array alone; rows are `null` |
+| a row stored, then an element of that row | `+2`, then `+3` |
+| a row OVERWRITTEN | back to `+2`, and the old row's `Cell` destructed (`dtors + 1`) |
+| a row NULLED (`Cell[]?[] m; m[0] = null;`) | `-2` from `+3`, `dtors + 1` |
+| one row in TWO slots | `+4` (outer, other row, shared row, its `Cell`); dropping one slot leaves the row alive |
+| two slots still sharing at scope end | freed exactly once — a third `rc_dec` would trip `reference count below zero` |
+| returned from a function, then scoped out | `+3` held, then back to the floor |
+| every scope above, on exit | `rt_live()` back to the floor it started from |
+
+No leak and no double release, with no machinery added: `tk_ha_release_fn` already emits the
+per-slot `rt_release_array` pass when the element is counted, and a `T[]` row IS counted.
+
+**Fixtures and docs.** `tests/surface_array_new_jagged.tk` (the four sections above, plus
+`str[][]` and `i64[][][]`); `tests/refuse/array_new_jagged_nolen.tk` (`new i64[][]`, line 10
+— a rank is not a length) and `tests/refuse/array_new_jagged_quest2.tk` (line 11).
+`tests/refuse/array_new_jagged.tk` is deleted: its message no longer exists.
+`docs/reference/arrays.md` gains a runnable sample and the rank/index note,
+`docs/reference/not-yet.md` trades the ALLOCATOR row for the two that remain,
+`docs/reference/diagnostics.md` loses the entry, and
+`docs/guide/99-what-is-not-there-yet.md` no longer names it.
+
+**Gate.** `139 passed, 182 refused as expected, 0 failed` at `300b91e2` → `140 passed, 183
+refused as expected, 0 failed`. `FIXPOINT OK`, docs gate green, and `--dump-ast` against
+`300b91e2` over all 139 fixtures accepted by both compilers: an empty diff, this crumb only
+widens what is accepted.
+
+**Still open, on purpose.** There is no spelling that fills the rows for you — the rows come
+from a store, one at a time, and `new i64[3][4]` is an index, not a second length. The
+unprefixed core message on a nullable-row WRITE stands exactly where D100 left it:
+`Cell[]?[] m; m[0][0] = v;` still answers `left side of assignment must be a name`, because
+`tk_bracket` defers only an `N_IDENT` or `N_INDEX` base; this crumb makes one more spelling
+reach it (`m` can now be allocated with `new`) and widens no defect — store the row whole.
+A FIXED array of arrays (`i64[] xs[2]`) stays where D99 left the fixed road.
