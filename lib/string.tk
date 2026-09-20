@@ -730,3 +730,35 @@ string tk_str_from_char(char c) {
     st8(buf + n, 0);
     return new string(buf);
 }
+
+// a `u64` hole. `tk_i64_to_dec` (`lib/rt.tk`) peels its digits with SIGNED
+// `/` and `%`, so every value at or above 2^63 comes out as its negative
+// twin -- `$"{(u64) 9223372036854775808}"` answered `-9223372036854775808`
+// where C# answers `9223372036854775808`. mc's own `/` and `%` are unsigned
+// when BOTH operands are (measured on the pin: `18446744073709551615 / 10`
+// is `1844674407370955161`), so the fix is one peel loop of its own on a
+// `u64` parameter -- no cast back down to `i64` anywhere in it, and no
+// change to `tk_i64_to_dec`, which every signed caller still wants as it is.
+// `u8`/`u16` are unsigned too but widen into `i64` with room to spare, so
+// they keep the signed formatter; `u32` is `char`'s own id (D92's type
+// erasure) and goes to `tk_str_from_char` instead. On the stack, so no
+// `rt_alloc` and no free to forget (§ 9's decision 4).
+string tk_str_from_u64(u64 v) {
+    u8 tmp[24];
+    u8 buf[24];
+    i64 i = 24;
+    loop {
+        i = i - 1;
+        st8(tmp + i, '0' + v % 10);
+        v = v / 10;
+        if (v == 0) break;
+    }
+    i64 n = 0;
+    while (i < 24) {
+        st8(buf + n, ld8(tmp + i));
+        n = n + 1;
+        i = i + 1;
+    }
+    st8(buf + n, 0);
+    return new string(buf);
+}

@@ -1,9 +1,20 @@
 // teko_interp.tk -- N10 of docs/specs/string.md § 9: `$"..."` string
-// interpolation. The ONE row `mc limits`' `syntax` table grows for this
-// crumb (D91's own table's next line): `syntax_expr("$", &tk_interp_expr)`,
-// which is what turns `$` from an unclaimed lexeme (`invalid hole` outside a
-// `#rule`, hooks.md § syntax_expr) into an ordinary punctuation token a
-// module owns. D92 records why this claim sits in ITS OWN module rather than
+// interpolation. `syntax_expr("$", &tk_interp_expr)` is what turns `$` from
+// an unclaimed lexeme (`invalid hole` outside a `#rule`, hooks.md §
+// syntax_expr) into an ordinary punctuation token a module owns.
+//
+// It costs ONE row of `syntax_expr`'s own table and NOTHING in `mc limits`'
+// report, which is not a contradiction: `T_SYNTAX` is a single high-water
+// mark shared by FOUR independent tables (`mc`'s `src/hooks.mc`, four
+// `grow(T_SYNTAX, ...)` calls -- `syntax`, `syntax_stmt`, `syntax_expr` and
+// the literal hook -- with `src/arena.mc`'s `lim_note` keeping the MAXIMUM).
+// In this tree `syntax_stmt`'s table is the tallest at 20, `syntax_expr`'s
+// stands at 19 with `$` in it (18 without), so this crumb's own row sits
+// under a taller neighbour. Measured on mc 1.0.1, one dummy registration at
+// a time: `+1 syntax_stmt` -> 21/42/21, `+1 syntax_expr` -> 20/40/20, `+1
+// syntax` -> 20/40/20, `+5 syntax_expr` -> 24/48/24. The next `syntax_stmt`
+// added here moves the reported row; so does the SECOND `syntax_expr` after
+// this one. D92 records why this claim sits in ITS OWN module rather than
 // in `teko_string.tk`: that file's own header states, in so many words, that
 // it registers no `syntax_expr` of its own, and rests D88's whole proof
 // ("no base fixture includes `lib/string.tk`, so none of their dumps could
@@ -82,11 +93,32 @@ uptr tk_interp_frame(uptr fl, i64 line) {
 // reason -- a `}` inside `"{"` must not close the hole), and every other
 // `{`/`}` nests the depth. Returns 0, the position no valid hole ever
 // reaches, when `end` arrives before depth does.
+// just past a `/* ... */` starting at `p`, or 0 when `p` does not open one.
+// Only the BLOCK form: a `//` inside a hole would comment out the rest of the
+// ONE-line buffer this file pushes (the whole `+` chain and its terminator),
+// so it is refused by name in `tk_interp_hole_check` instead of skipped here.
+// An unclosed `/*` runs to `end`, where the caller's own
+// `unterminated interpolation hole` then answers.
+uptr tk_interp_skip_block(uptr p, uptr end) {
+    if (p + 1 >= end) return 0;
+    if (ld8(p) != '/' || ld8(p + 1) != '*') return 0;
+    uptr q = p + 2;
+    loop {
+        if (q + 1 >= end) return end;
+        if (ld8(q) == '*' && ld8(q + 1) == '/') return q + 2;
+        q = q + 1;
+    }
+}
+
 uptr tk_interp_hole_end(uptr p, uptr end) {
     i64 depth = 1;
     loop {
         if (p >= end) return 0;
         i64 c = ld8(p);
+        if (c == '/') {
+            uptr after = tk_interp_skip_block(p, end);
+            if (after != 0) { p = after; continue; }
+        }
         if (c == '"' || c == '\'') { p = tk_fwd_skip_quoted(p + 1, end, c); continue; }
         if (c == '{') { depth = depth + 1; p = p + 1; continue; }
         if (c == '}') {
@@ -147,6 +179,12 @@ void tk_interp_hole_check(uptr p, i64 n, i64 line, uptr fl) {
     loop {
         if (q >= end) break;
         i64 c = ld8(q);
+        if (c == '/' && q + 1 < end && ld8(q + 1) == '/')
+            err_at(fl, line, "teko: a line comment does not fit in an interpolation hole");
+        if (c == '/') {
+            uptr after = tk_interp_skip_block(q, end);
+            if (after != 0) { q = after; continue; }
+        }
         if (c == '"' || c == '\'') { q = tk_fwd_skip_quoted(q + 1, end, c); continue; }
         if (c == '(' || c == '[') { depth = depth + 1; q = q + 1; continue; }
         if (c == ')' || c == ']') { depth = depth - 1; q = q + 1; continue; }
@@ -295,16 +333,38 @@ i64 tk_interp_scan(uptr inner, i64 ilen, i64 line, uptr fl) {
         else w = tk_interp_write_hole(buf, w, p, n);
         k = k + 1;
     }
-    // the trailing NUL is a safety pad ONE BYTE PAST the counted region, not
-    // itself part of `len` -- `p_push_source`'s own convention (the proven
-    // `tk_interp_piece` this file used to have never counted it either: it
-    // wrote the NUL at `buf + w` but never did `w = w + 1` afterward).
+    // ---- the terminator, and why the chain cannot be parsed without one ----
+    // `parse_expr` always fetches ONE more token to check for a continuing
+    // operator, and a frame pops ITSELF the moment its buffer is exhausted:
+    // with the last `+` operand as the buffer's last token, that fetch pops
+    // back into the OUTER file and `parse_expr` carries straight on parsing
+    // whatever real source followed the whole `$"..."`. Every infix operator
+    // and every `.` after an interpolated string went that way -- `$"a{n}" +
+    // x`, `$"c" == s`, `$"a{n}".Length`, all legal C#, all answered
+    // `teko: malformed literal text in an interpolated string` by the
+    // walk-apart guard below, because the root it was handed was the OUTER
+    // expression and not the chain that was pushed.
+    //
+    // One `;` written into the buffer ends it: `parse_expr` stops there (a
+    // `;` continues no expression), so the chain it returns is exactly the
+    // `nseg`-long one this function built and nothing of the outer file was
+    // read. The single `p_next()` afterwards spends that `;` -- the buffer
+    // is exhausted by it, the frame pops, and the token the handler is left
+    // SITTING ON is the outer file's own next one, the same position the
+    // frame's own drain used to leave behind. The trailing NUL is a safety
+    // pad ONE BYTE PAST the counted region, not itself part of `len`
+    // (`p_push_source`'s own convention).
+    st8(buf + w, ';');
+    w = w + 1;
     st8(buf + w, 0);
 
     i64 d0 = p_depth();
     tk_push_source(tk_interp_frame(fl, line), buf, w);
     p_next();
     i64 root = parse_expr(0);
+    if (p_id() != K_SEMI || p_depth() != d0 + 1)
+        err_at(fl, line, "teko: malformed literal text in an interpolated string");
+    p_next();
     if (p_depth() != d0)
         err_at(fl, line, "teko: malformed literal text in an interpolated string");
 
@@ -374,8 +434,6 @@ i64 tk_interp_scan(uptr inner, i64 ilen, i64 line, uptr fl) {
 i64 tk_interp_expr() {
     i64 line = p_line();
     uptr fl = p_file();
-    if (tk_str_class_si() < 0)
-        err_at(fl, line, "teko: string interpolation needs #include \"string.tk\" before it is used");
     // The RAW span, and it has to be read this way round: `p_start()` on a
     // `T_STR` points into the ARENA, at mc's own escape-PROCESSED copy, not
     // at the source (hooks.md § "Record and replay"), so a length measured
@@ -389,6 +447,11 @@ i64 tk_interp_expr() {
     p_next();                                    // the `$`
     if (p_id() != T_STR)
         err_at(fl, line, "teko: $ needs a string literal for interpolation");
+    // AFTER the `T_STR` check, not before it: a `$` that is not an
+    // interpolation at all (`${1}`, `$ 1`, `$(1)`) is not a missing
+    // `#include`, and reporting one for it named the wrong cause.
+    if (tk_str_class_si() < 0)
+        err_at(fl, line, "teko: string interpolation needs #include \"string.tk\" before it is used");
     uptr qend = p_cp();                           // just past its closing quote
     // NOT `p_next()` here: `p_push_source`'s own lookahead contract
     // (hooks.md § Record and replay) discards whatever token is CURRENT the
@@ -445,10 +508,32 @@ i64 tk_interp_fmt(i64 hole, i64 line, uptr fl) {
         set_nd_next(hole, 0);
         return tk_call("tk_str_from_char", hole);
     }
+    // `u64` (and `usize`, its alias) BEFORE the signed formatter: every
+    // value at or above 2^63 comes out as its negative twin through
+    // `tk_i64_to_dec`. `u8`/`u16` widen into `i64` with room to spare and
+    // keep the signed one; `u32` never reaches here (it is `char`'s own id,
+    // taken by the row above).
+    if (ty == TY_U64) {
+        set_nd_next(hole, 0);
+        return tk_call("tk_str_from_u64", hole);
+    }
     if (tk_is_int_ty(ty)) {
         set_nd_next(hole, 0);
         return tk_call("tk_str_from_i64", hole);
     }
+    // `?`, `??` and `?.` park as a CALL of their own marker
+    // (`teko_ternary.tk`'s `tk_ternary`/`tk_coalesce`/`tk_qdot`) and are
+    // unpacked by `tk_ternary_pass`, which runs AFTER the pass this walk
+    // rides -- so `tk_ty_of` cannot answer for one here, and the generic
+    // `the type of this value is not known here` was all a parenthesised
+    // ternary hole (`$"{(a > 0 ? 5 : 6)}"`, C#'s own spelling, since a bare
+    // `:` is a format specifier there too) ever got. Named instead, with its
+    // own `not-yet.md` row: the hole is legal, this crumb does not build it.
+    if (nd_kind(hole) == N_CALL
+        && (str_eq(nd_name(hole), "tk_ternary")
+         || str_eq(nd_name(hole), "tk_coalesce")
+         || str_eq(nd_name(hole), "tk_qdot")))
+        err_at(fl, line, "teko: an interpolation hole holds no ternary, ?? or ?.");
     if (ty < 0)
         err_at(fl, line, "teko: the type of this value is not known here");
     err_at(fl, line, tk_join3("teko: no interpolation of a value of type ", type_name(ty), ""));
@@ -483,7 +568,8 @@ void tk_interp_visit(i64 n) {
     tk_node_replace(n, r);
 }
 
-// ---- registration: ONE row of `mc limits`' `syntax` table (D92's gate) ----
+// ---- registration: one row of `syntax_expr`'s own table, invisible in
+// `mc limits`' shared `syntax` high-water mark (this file's own header) ----
 void tk_interp_init() {
     syntax_expr("$", &tk_interp_expr);
 }
