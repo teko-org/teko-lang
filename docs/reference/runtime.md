@@ -495,7 +495,7 @@ to one of them.
 | `i64 tk_guid_fmt(ptr buf, Guid g, i64 dash)` | the allocation-free half, returning the length. `buf` needs 37 bytes with `dash`, 33 without |
 | `i64 tk_guid_cmp(Guid a, Guid b)` and `tk_guid_eq`…`tk_guid_ge` | the sixteen bytes, UNSIGNED, left to right, stopping at the first difference |
 | `Guid tk_guid_newguid()` | N9, D91: the version-4 layout over sixteen bytes of `tk_entropy_fill`, the version nibble forced to `4` and the variant bits to `10` |
-| `void tk_entropy_fill(uptr buf, i64 n)` | N9, D91: the host's own cryptographic randomness, one function per host answered by `#include <teko/entropy.tk>` (`teko_time.tk`'s bundle wrapper, the SAME one `<teko/clock.tk>` uses); panics `teko: the entropy source is not available` on a short read or a failing call; `tk_guid_newguid` is the only caller |
+| `void tk_entropy_fill(uptr buf, i64 n)` | N9, D91: the host's own cryptographic randomness, one function per host answered by `#include <teko/entropy.tk>` (`teko_time.tk`'s bundle wrapper, the SAME one `<teko/clock.tk>` uses); panics `teko: the entropy source is not available` on a failing or non-progressing call; `tk_guid_newguid` is the only caller |
 
 ---
 

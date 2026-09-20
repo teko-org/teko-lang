@@ -177,7 +177,7 @@ two Windows legs link both import libraries.
 
 A `Guid` built from a counter, a clock or an address would compile and would be a wrong
 answer — two processes would collide — so it is not the fallback. There is no fallback: on
-a failing or short read, `tk_entropy_fill` panics `teko: the entropy source is not
+a failing or non-progressing call, `tk_entropy_fill` panics `teko: the entropy source is not
 available`, exit 70, the same road the wall clock's own failure takes.
 
 ## 6. What stays out

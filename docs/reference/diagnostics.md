@@ -823,7 +823,7 @@ Three more are **run-time panics** of `lib/guid.tk`, all exit 70 and all on stde
   `"N"`. `"B"`, `"P"` and `"X"` are three more spellings of the same sixteen bytes and are
   not taught ([the specification](../specs/guid.md) § 6).
 - `"teko: the entropy source is not available"` — `Guid.NewGuid()` (N9, D91) on a host whose
-  entropy call fails or reads short: `getentropy`'s documented failure, `getrandom` returning
+  entropy call fails or makes no progress: `getentropy`'s documented failure, `getrandom` returning
   negative, or `BCryptGenRandom` answering a nonzero `NTSTATUS`. Not reachable on a healthy
   host; a panic rather than a silently weak fallback, exactly like the wall clock's own
   `"the wall clock is not available"` (C6, D90) — there is no fallback a version-4 `Guid` can

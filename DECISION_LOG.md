@@ -5690,6 +5690,12 @@ never emits) nor any Linux/macOS entropy symbol, confirming `tk_clock_bundle_ope
 `drv_os()`-first read selects the TARGET's entropy source, not the machine's, for the
 second bundle name exactly as it already did for the first (D90).
 
-**Adjacent findings, not this crumb's to fix:** none found — this crumb's own paragraphs
-were the only stale ones (`teko_prim.tk`'s `TK_PMSOON` comment, `docs/reference/not-yet.md`'s
-`Guid.NewGuid` row), and both are corrected here.
+**Adjacent findings:** the independent verifier found one this entry's first draft claimed
+did not exist -- `docs/internals/primitives.md` still listed `Guid.NewGuid` as the example of
+a `TK_PMSOON` row and explained the kind by a message this crumb deletes. Corrected here
+along with the other two (`teko_prim.tk`'s comment, `docs/reference/not-yet.md`'s row): no
+row uses `TK_PMSOON` today, the two that did (C6's clock members, this crumb's `NewGuid`)
+both got what they were waiting for, and the kind stays for the next member that has to
+wait. `sh scripts/check-docs.sh` does not catch prose that contradicts a registration table
+-- only links, English and the diagnostics inventory -- so the sweep is by grep, and the
+grep is `TK_PMSOON` across `docs/` and the modules.
