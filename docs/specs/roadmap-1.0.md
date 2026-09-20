@@ -16,7 +16,7 @@ decision.
 **A surface with no blocking refusal.** Not an empty
 [`not-yet.md`](../reference/not-yet.md) — some entries there are decisions, not gaps. The
 criterion is that nothing on the list stops an ordinary program from being written: a
-multidimensional array, an array of objects, a typed variadic list
+multidimensional array, a typed variadic list
 ([params-typed.md](params-typed.md)), a delegate that is a value in every position. Each
 remaining entry has to be either implemented or restated as a decision with a reason.
 

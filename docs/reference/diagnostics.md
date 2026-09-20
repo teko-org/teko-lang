@@ -1100,8 +1100,11 @@ Two are **run-time panics**, exit 70 and on stderr with no `file:line`
   still the one holding it.
 - ``"teko: a delegate declared below `new` is not taught yet"`` — move the `delegate`
   declaration above the `new` that names it.
-- `"teko: an array of this type is not taught yet"` — a fixed array whose element is a type
-  with no layout of its own here; use `T[]`.
+- `"teko: an array of this type is not taught yet"` — an array whose element is a type with
+  no layout of its own here: a fixed array of such a type, and, since D99, the HEAP spelling
+  of a qualified or generic one (`Geo.Circle[]`, `Box<Circle,2>[]`), which used to fall to
+  the core's own `name expected`. A plain `T[]` of a class, `str`, an enum or a delegate is
+  taught and is not this.
 - `"teko: expected a captured name"` — `use ()` with something that is not a name inside.
 - `"teko: use (...) already captures"` — the same name twice in one `use`.
 - `"teko: the lambda does not match the delegate"` — the parameter count or the types

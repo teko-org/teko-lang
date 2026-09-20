@@ -11224,3 +11224,88 @@ refused rising by exactly the eight added. `FIXPOINT OK`, docs gate green, and `
 against `2b24fc23` over every one of the 137 fixtures accepted by both compilers —
 `tests/surface_string_interp.tk` among them, which is the proof the interpolation refactor
 is a no-op: an EMPTY diff.
+
+### D99 · The heap array road already answers "an array of objects"; a qualified/generic
+declaration reaches the core's own diagnostic instead of teko's (2026-09-20)
+
+**Roadmap correction.** `docs/specs/roadmap-1.0.md`'s own list of what v1.0.0 owes named "an
+array of objects" as still outstanding. It is not: `Cell[] cs = new Cell[2]; cs[0] =
+new Cell(7); cs[0].v` runs and answers 7, the same road already carries `str`, an `enum`
+and a delegate, as a local, a field and a global, and the rc floor is proven — an array of
+`Circle` and an array of `string` both reach `rt_live() == 0` on scope exit. The row is
+removed from the roadmap's owed list.
+
+**The FIXED road stays refused, restated as a decision.** `Cell cs[2]; i64? xs[2]; P ps[2];`
+are each still refused at the declaration, `teko: an array of objects is not taught yet;
+use a field array or wait for T[]` (`teko_array.tk` — `tk_arr_on_stmt`, called
+`tk_arr_add`'s own judge). "Wait for T[]" now reads "use T[]": the heap road serves every
+case a FIXED array of objects would have. The refusal itself is not lifted, on purpose: D50
+(`DECISION_LOG.md:2886`) made "every array element store is reported" a property of the
+store DOOR (`tk_arr_elem_store`) rather than a coincidence of the refusal, and that property
+holds only because no fixed element is counted today. Teaching a counted fixed element would
+have to re-derive it — a crumb of its own, not owed while `T[]` already covers the need.
+`docs/reference/not-yet.md`'s own row is restated with this reason.
+
+**A real refusal for the qualified and generic heap array.** Measured on this head, before
+the fix: `Geo.Circle[] cs = new Geo.Circle[2];` and `Box<Circle,2>[] bs = new Box<Circle,2>[2];`
+both answered `name expected` — the CORE's own diagnostic, no `teko:` prefix, in no
+catalogue. `tk_var_after_type` (teko_ns.tk), the tail both a namespaced declaration and a
+generic one share (`tk_gen_declstmt`, teko_generic.tk, calls it directly), read `p_ident()`
+first and checked for a following `[` only after: the FIXED spelling (`Geo.Circle cs[2]`)
+puts the name before the `[`, so the check landed; the HEAP spelling puts `[` right after
+the type word, before any name, so `p_ident()` itself failed first, on the core's own road.
+The `[` check now runs AHEAD of `p_ident()` too, so both spellings answer the same
+`teko: an array of this type is not taught yet` the FIXED one already gave.
+
+**The plain delegate heap array was measured too, and needed no fix.** `teko_deleg.tk`'s own
+`tk_deleg_var_stmt` reads `p_ident()` before checking `[` in the same shape, which looked
+like the identical bug — but `Op[] fs` never reaches that reader at all: `tk_type_stmt`
+(teko_access.tk) tests `tk_bracket_follows()` right after the type word and routes a
+bracketed delegate declaration straight to the core's own `parse_var`, the same road every
+struct/class heap array already takes (and which `tests/surface_array_heap.tk`'s
+`delegatecheck` already proves runs, `Op[] ops = new Op[2]; ops[0] = add;`). Adding the same
+early check inside `tk_deleg_var_stmt` would be dead code: no program ever reaches it with a
+`[` in hand. Not touched.
+
+**The jagged-row fork, ruled.** `T[][]` is refused today, `teko: an array of arrays is not
+taught yet` (`tk_ha_type`, teko_heaparr.tk) — the SAME message a `T[]?[]` and a `T[][]?`
+suffix chain both give, since `take_type` offers a type position to the handler chain once.
+Nothing in this log or in `docs/specs/` ruled what the taught shape should be once it lands,
+and it has to be ruled now: `new i64[3][]` would allocate three zeroed pointer slots for the
+rows, and a slot typed plain `i64[]` holding a zero (rather than a valid handle) contradicts
+the rule every other slot in the language lives by — `null` needs a slot declared `T?`
+([arrays.md](docs/reference/arrays.md), the store `ops[0] = null` refusal on a plain `Op[]`
+element is the same rule reached from the array side). **Follow C# (the fork protocol's
+default, no form in `mc`'s own market for a jagged array)**: the spelling is `T[][]`, a row
+starts `null`, and dereferencing a null row faults like any other null does today — the same
+unguarded SIGSEGV a global reference field/global gives before it is built
+(`not-yet.md`'s own "definite assignment" table). The alternative measured and rejected is
+`T[]?[]`, a row slot explicitly typed nullable so the zeroed-on-allocation state is a real,
+declared `null` rather than a bare handle pretending to be one: it loses because it is not
+what `new T[n][]` writes in C# (a plain `T[][]`, not a `T[]?[]`), and it would make the two
+crumbs that come next (`new T[n][]`'s own allocator, and the row-index `xs[i][j]`) build a
+second, nullable-flavored row type nothing else in the array surface asks for. This ruling
+unblocks both.
+
+**Recorded, not fixed: an unassigned element of a heap class array faults unguarded.**
+`Cell[] cs = new Cell[2]; return cs[0].v;` exits 139 (SIGSEGV), neither a `teko:` refusal
+nor the exit-70 panic every other array guard gives. `not-yet.md:152` used to say such an
+element is "not judged at all. Three of the four are zeroed by construction", which is the
+wrong reason for a COUNTED element type: a zeroed `i64` is a valid `0`, a zeroed `Cell` slot
+is a null POINTER. `cs[0] == null` already answers `true` correctly — the null is reachable
+and testable — so only the DEREF through it is unguarded, the same gap a global reference
+field/global has before its first build, just reached through an index instead of a name.
+The row's stated reason is corrected; the guard itself is a crumb of its own, not built
+here.
+
+**Fixtures.** `tests/refuse/array_decl_ns_heap.tk` (`Geo.Circle[] cs = new Geo.Circle[2];`,
+line 17) and `tests/refuse/array_decl_generic_heap.tk` (`Box<Circle,2>[] bs = new
+Box<Circle,2>[2];`, line 17), both against the message this fix already teaches — no new
+diagnostic, `docs/reference/diagnostics.md` unchanged.
+
+**Gate.** `138 passed, 179 refused as expected, 0 failed` at `2d27f6dd` → `138 passed, 181
+refused as expected, 0 failed`: two refusals added, no positive fixture touched, refused
+rising by exactly the two added. `FIXPOINT OK`, docs gate green, and `--dump-ast` against
+`2d27f6dd` over every one of the 138 fixtures accepted by both compilers: an EMPTY diff (this
+crumb refuses only what the core already refused on the two new spellings; nothing accepted
+moves).
