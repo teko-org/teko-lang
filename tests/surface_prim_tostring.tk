@@ -1,0 +1,148 @@
+// surface_prim_tostring.tk -- D98: `.ToString()` on a core scalar. Every
+// width this crumb teaches, both signs, `i64`'s minimum (the non-positive
+// peel of `tk_i64_to_dec`, lib/rt.tk), a `u64` at and above 2^63 (the
+// unsigned peel of `tk_str_from_u64`, lib/string.tk), `char`, `bool` both
+// ways -- and every receiver road: a literal, a local, a parameter, a call
+// return, a field load, a global, a cast and a parenthesised expression.
+//
+// The TEXT is pinned, never the length: `surface_string_interp.tk` records
+// why (a `u64` at 2^63 formatted as its negative twin still measured twenty
+// characters). The conversion is the one interpolation makes, so each row
+// here is the same value `$"{x}"` writes.
+
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+class Box { public i64 n; public char c; public Box(i64 v, char ch) { n = v; c = ch; } }
+
+i64 give(i64 x) { return x + 1; }
+u64 giveu(u64 x) { return x + 1; }
+
+// a PARAMETER: in no scope table at parse time at all, so this road is the
+// deferred one (`tk_pend_do`, teko_typeof.tk)
+i64 onparam(i64 p, char c, u64 u) {
+    if (!(p.ToString() == new string("9"))) return 1;
+    if (!(c.ToString() == new string("Z"))) return 2;
+    if (!(u.ToString() == new string("18446744073709551615"))) return 3;
+    return 0;
+}
+
+i64 gl = 0 - 77;
+
+i64 main() {
+    i64 floor = rt_live();
+
+    // ---- every width, both signs ----
+    {
+        i8 i8v = 0 - 5;
+        if (!(i8v.ToString() == new string("-5"))) return 1;
+        i8 i8p = 127;
+        if (!(i8p.ToString() == new string("127"))) return 2;
+
+        u8 u8v = 200;
+        if (!(u8v.ToString() == new string("200"))) return 3;
+
+        i16 i16v = 0 - 100;
+        if (!(i16v.ToString() == new string("-100"))) return 4;
+
+        u16 u16v = 40000;
+        if (!(u16v.ToString() == new string("40000"))) return 5;
+
+        i32 i32v = 0 - 1;
+        if (!(i32v.ToString() == new string("-1"))) return 6;
+
+        i64 i64v = 0 - 9000000000;
+        if (!(i64v.ToString() == new string("-9000000000"))) return 7;
+
+        i64 zero = 0;
+        if (!(zero.ToString() == new string("0"))) return 8;
+
+        // the non-positive peel: `i64`'s minimum has no positive twin, so
+        // `tk_i64_to_dec` peels it without negating it
+        i64 lo = 0 - 9223372036854775807;
+        lo = lo - 1;
+        if (!(lo.ToString() == new string("-9223372036854775808"))) return 9;
+    }
+    if (rt_live() != floor) return 10;
+
+    // ---- `u64`/`usize`: the UNSIGNED peel ----
+    {
+        u64 u64v = 9000000000;
+        if (!(u64v.ToString() == new string("9000000000"))) return 11;
+
+        u64 hi = 9223372036854775808;
+        if (!(hi.ToString() == new string("9223372036854775808"))) return 12;
+
+        u64 max = 18446744073709551615;
+        if (!(max.ToString() == new string("18446744073709551615"))) return 13;
+
+        usize us = 18446744073709551615;
+        if (!(us.ToString() == new string("18446744073709551615"))) return 14;
+    }
+    if (rt_live() != floor) return 15;
+
+    // ---- `char`, and `u32` which is the SAME core type id (teko_type.tk):
+    // both answer the CHARACTER, which is what interpolation answers and what
+    // C# answers for `char`. D98's second fork.
+    {
+        char c = 'Q';
+        if (!(c.ToString() == new string("Q"))) return 16;
+
+        u32 u32v = 65;
+        if (!(u32v.ToString() == new string("A"))) return 17;
+    }
+    if (rt_live() != floor) return 18;
+
+    // ---- `bool` is `u8`'s type id (teko_type.tk), so `.ToString()` answers
+    // `"1"`/`"0"` and not C#'s `"True"`/`"False"`: the same text `$"{true}"`
+    // already writes. D98's first fork.
+    {
+        bool t = true;
+        if (!(t.ToString() == new string("1"))) return 19;
+        bool f = false;
+        if (!(f.ToString() == new string("0"))) return 20;
+    }
+    if (rt_live() != floor) return 21;
+
+    // ---- the receiver roads ----
+    {
+        // a literal
+        if (!(42.ToString() == new string("42"))) return 22;
+        // a local
+        i64 v = 7;
+        if (!(v.ToString() == new string("7"))) return 23;
+        // a call return
+        if (!(give(4).ToString() == new string("5"))) return 24;
+        if (!(giveu(9223372036854775807).ToString() == new string("9223372036854775808"))) return 25;
+        // a field load
+        Box b = new Box(11, 'k');
+        if (!(b.n.ToString() == new string("11"))) return 26;
+        if (!(b.c.ToString() == new string("k"))) return 27;
+        // a global
+        if (!(gl.ToString() == new string("-77"))) return 28;
+        // a cast
+        if (!(((u64) 5).ToString() == new string("5"))) return 29;
+        if (!(((char) 66).ToString() == new string("B"))) return 30;
+        // a parenthesised expression
+        if (!((v + 1).ToString() == new string("8"))) return 31;
+        // a parameter, all three peels
+        if (onparam(9, 'Z', 18446744073709551615) != 0) return 32;
+    }
+    if (rt_live() != floor) return 33;
+
+    // ---- the result is an ordinary `string`: it concatenates, compares and
+    // interpolates like any other, and `$"{x}"` writes the same text.
+    {
+        i64 n = 7;
+        string s = n.ToString() + new string("!");
+        if (!(s == new string("7!"))) return 34;
+        if (!(n.ToString() == $"{n}")) return 35;
+        if (!($"{n.ToString()}" == new string("7"))) return 36;
+        if (n.ToString() != new string("7")) return 37;
+    }
+    if (rt_live() != floor) return 38;
+
+    return 42;
+}

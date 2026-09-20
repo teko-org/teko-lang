@@ -412,6 +412,47 @@ void tk_reject_scalar_member(uptr fl, i64 line, i64 ty, uptr m) {
     err_at2(fl, line, tk_join3("teko: ", type_name(ty), " has no members"), m);
 }
 
+// ---- D98: `.ToString()` on a core scalar ----
+//
+// The conversion is NOT a new formatter: `$"{x}"` already turns exactly this
+// set of types into a `string` (`tk_interp_fmt`, teko_interp.tk), so the two
+// arms that did it move HERE and interpolation calls them too. Three doors
+// share the pair -- the parse-time `.` (teko_expr.tk), the deferred one
+// (`tk_pend_do`, below) and the interpolation hole -- and this file is where
+// they can all see it: teko_expr.tk and teko_interp.tk are both included
+// after it (teko.tk).
+//
+// The slice: `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u64`/`usize`/`char`, on every
+// receiver road. `f32`/`f64`, `str`/`ptr`/`uptr` and `T?` keep the refusal
+// `tk_reject_scalar_member` above already gives them -- there is no float
+// formatter in this tree at all, which is why `$"{3.5}"` refuses too.
+//
+// `.ToString()` on a scalar builds a `string`, so the class has to be
+// declared, exactly as an interpolation hole needs it (teko_interp.tk's own
+// guard). Named here rather than left to the member-name refusal, which
+// would blame `ToString` for a missing `#include`.
+i64 tk_scalar_ts_is(i64 ty, uptr m, i64 line, uptr fl) {
+    if (!str_eq(m, "ToString")) return 0;
+    if (ty != TY_U32 && ty != TY_U64 && !tk_is_int_ty(ty)) return 0;
+    if (tk_str_class_si() < 0)
+        err_at(fl, line, "teko: .ToString() needs #include \"string.tk\" before it is used");
+    return 1;
+}
+
+// the `string` this scalar reads as. `u32` IS `char`'s type id (teko_type.tk,
+// D92's type erasure), so both answer the character; `u64`/`usize` take the
+// UNSIGNED peel, because every value at or above 2^63 comes out of the signed
+// one as its negative twin; every other width widens into `i64` and takes the
+// signed peel. `bool` is `u8`'s id, so it answers `"0"`/`"1"` and not C#'s
+// `"False"`/`"True"` -- D98's own first fork, the one interpolation already
+// took.
+i64 tk_scalar_tostring(i64 recv, i64 ty) {
+    set_nd_next(recv, 0);
+    if (ty == TY_U32) return tk_call("tk_str_from_char", recv);
+    if (ty == TY_U64) return tk_call("tk_str_from_u64", recv);
+    return tk_call("tk_str_from_i64", recv);
+}
+
 // ---- C# §10.2.3, the implicit numeric conversion ----
 
 // the ids a slot of INTEGER type can have. Every integer word teko teaches
@@ -1627,6 +1668,17 @@ void tk_pend_do(i64 pi) {
     // member table existed (the P0 probe measured it:
     // `teko: TimeSpan has no members: Ticks`)
     else if (tk_prim_is(recv_ty)) r = tk_prim_pend(pi, recv_ty, &rty, &pure, &own);
+    // D98: `.ToString()` on a core scalar, the one member a scalar HAS. The
+    // form questions are `tk_prim_pend`'s own, in its order: a store, an index
+    // and a bare read are each refused before the string is built.
+    else if (tk_scalar_ts_is(recv_ty, pd_name_at(pi), tk_line, tk_file)) {
+        if (pd_form_at(pi) != TK_PCALL)
+            err_at2(tk_file, tk_line, "teko: the member is a method; call it with ()", pd_name_at(pi));
+        if (pd_na_at(pi) != 0)
+            err_at(tk_file, tk_line, tk_join("teko: wrong number of arguments for ", pd_name_at(pi)));
+        r = tk_scalar_tostring(recv, recv_ty);
+        rty = sr_ty_at(tk_str_class_si());
+    }
     else if (recv_ty >= 0)  tk_reject_scalar_member(tk_file, tk_line, recv_ty, pd_name_at(pi));
     else                    r = tk_pend_by_name(pi, &rty, &pure, &own);
     i64 n = pd_node_at(pi);

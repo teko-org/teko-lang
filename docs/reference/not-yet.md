@@ -227,13 +227,13 @@ no host offset to apply, and `Now` would otherwise need to fake one. `DateTime.T
 
 | written | what happens |
 |---|---|
-| `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — a crumb of its own; the `enum` page's own N2b landed a PARALLEL mechanism keyed on a struct-table row, not `teko_prim.tk`'s lowering table `TimeSpan`/`DateTime` use, so it does not carry over automatically |
+| `d.ToString()`, `DateTime.Parse(s)`, `TryParse` | `teko: unknown member of DateTime` / `teko: unknown static member of DateTime` — a crumb of its own, but no longer a mechanism question: `teko_prim.tk` carries five `.ToString()` rows already (`decimal`, `DateTimeOffset`, `Guid`, `i128`, `u128`), so what is missing here is the row and the formatter, not the road. The `enum` page's own N2b is a PARALLEL mechanism keyed on a struct-table row and still does not carry over |
 | `DateTime.SpecifyKind(d, k)`, `d.Subtract(x)` | `teko: unknown static member of DateTime: SpecifyKind` / `teko: unknown member of DateTime: Subtract` — neither is registered. A row's parameters may differ in type since N2c (`new DateTime(ticks, kind)` is the first one that does), so `SpecifyKind` is now only a row nobody has written; `Subtract` still needs two overloads of ONE arity, which the mechanism picks by argument COUNT alone. `SpecifyKind(d, k)` is `new DateTime(d.Ticks, k)` and `Subtract` is `-` |
 | `ToLocalTime`, `ToUniversalTime` | not taught: a time-zone database is not a language feature. `DateTimeOffset` (N5, D76, [the type reference](types.md#datetimeoffset)) needs none of it — its `.LocalDateTime` reads the offset the value carries and nothing more — and landed whole; `DateOnly` landed with N4a ([datetime.md](datetime.md#dateonly)) and `TimeOnly` with N4b ([datetime.md](datetime.md#timeonly)) |
-| `d.ToString()`, `DateOnly.Parse(s)`, `TryParse` on a `DateOnly` | `teko: unknown member of DateOnly` / `teko: unknown static member of DateOnly` — the same crumb the `DateTime` row above waits on, for the same reason: no `teko_prim.tk` primitive has a `str` member yet |
-| `t.ToString()`, `TimeOnly.Parse(s)`, `TryParse` on a `TimeOnly` | `teko: unknown member of TimeOnly` / `teko: unknown static member of TimeOnly` — the same crumb, the same reason; `d.ToDateTime(t)` itself IS taught now (N4b, [datetime.md § `TimeOnly`](datetime.md#timeonly)) |
+| `d.ToString()`, `DateOnly.Parse(s)`, `TryParse` on a `DateOnly` | `teko: unknown member of DateOnly` / `teko: unknown static member of DateOnly` — the same crumb the `DateTime` row above waits on, for the same reason: the row and the formatter are unwritten |
+| `t.ToString()`, `TimeOnly.Parse(s)`, `TryParse` on a `TimeOnly` | `teko: unknown member of TimeOnly` / `teko: unknown static member of TimeOnly` — the same crumb, the same unwritten row; `d.ToDateTime(t)` itself IS taught now (N4b, [datetime.md § `TimeOnly`](datetime.md#timeonly)) |
 | `switch` on a `DateTime` | ``teko: no operator `==` takes these operands`` — a `switch` compares its subject against integer case labels, and a date takes no integer operand |
-| `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — a crumb of its own; no `teko_prim.tk` primitive has a `str` member yet, and the `enum` page's own N2b (built) does not carry over, since it is a parallel mechanism keyed on a struct-table row rather than a reuse of this table |
+| `t.ToString()`, `TimeSpan.Parse(s)`, `TryParse` | `teko: unknown member of TimeSpan` / `teko: unknown static member of TimeSpan` — a crumb of its own; `teko_prim.tk`'s five `.ToString()` rows prove the road, so only the row and the formatter are missing. The `enum` page's own N2b (built) does not carry over, since it is a parallel mechanism keyed on a struct-table row rather than a reuse of this table |
 | `t * 1.5`, `t / 1.5` (C#'s `operator *(TimeSpan, double)`) | ``teko: no operator `*` takes these operands`` — the spec's § 4 leaves the float multiply out |
 | `t / t` (C# 7's `operator /(TimeSpan, TimeSpan)` → `double`) | ``teko: no operator `/` takes these operands`` |
 | `new TimeSpan(h, m, s)` and the two longer constructors | `teko: wrong number of arguments for new` — one row, one argument: the tick constructor. Build it from `FromHours(h) + FromMinutes(m) + FromSeconds(s)` |
@@ -359,6 +359,19 @@ taught, over a hole:
 
 `"n=" + 5` (needing a universal `ToString`/`object`, § 11) is neither N7a's, N7b's, N8's
 nor N10's; it stays exactly where [the specification](../specs/string.md) § 11 leaves it.
+
+**D98 landed `.ToString()` on a core scalar** — `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u64`/
+`usize`/`char`, on every receiver road, through the very conversion a hole makes
+(`tk_scalar_tostring`, `teko_typeof.tk`, called by all three doors). What it leaves:
+
+| written | what happens today, and why |
+|---|---|
+| `x.ToString()` where `x` is `f64`/`f32` | `` teko: f64 has no members: ToString `` — there is no float formatter anywhere in this tree, the same gap `$"{3.5}"` reports. Routing it through `(decimal)` was measured and rejected: `((decimal) 1.0e30).ToString()` panics `teko: decimal overflow` (exit 70), so do `NaN` and the infinities, and `1.0/3.0` answers `0.333333333333333`, fifteen digits where C# answers sixteen. A `.ToString()` that panics on `double.MaxValue` is worse than one that refuses |
+| `p.ToString()` where `p` is `str`/`ptr`/`uptr` | `` teko: uptr has no members: ToString `` — one type id for all three (types.md § Limits), so no oracle can tell text from a raw address. `new string(p)` is the spelling that carries the guard |
+| `x.ToString()` where `x` is a `T?` | `` teko: unknown member of i64?: ToString `` — the box is read through `.Value` (Q1b) first |
+| `b.ToString()` on a class that declares none | `` teko: unknown member of Box: ToString `` — no default `ToString` is given to a user type; declare one |
+| `x.ToString("D4")` — C#'s format string | `teko: wrong number of arguments for ToString` — the same decision § 9 makes for a hole's format specifier |
+| `true.ToString()` | `"1"`, not C#'s `"True"` — `bool` is `type_alias("bool", TY_U8)` (`teko_type.tk`), one id with `u8`, so `"True"` would also come out of `((u8) 5).ToString()`. `$"{true}"` already writes `"1"`, and a `.ToString()` disagreeing with interpolation would be the language contradicting itself (D98) |
 
 ## The rest of `docs/specs/guid.md`
 

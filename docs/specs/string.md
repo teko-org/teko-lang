@@ -92,7 +92,7 @@ overloads grow beside them. Nothing is renamed and nothing is removed.
 | `string` | any number | refused: `teko: a value of type string does not convert to i64` | D34, already |
 | any number | `string` | refused: `teko: a value of type i64 does not convert to string` | D34, already |
 | `char` | `string` | `new string(c)` and `new string(c, i64 count)` | C#'s two constructors |
-| `i64`, `f64`, `decimal`, `DateTime`, `Guid`, an `enum` | `string` | `.ToString()`, never implicit | |
+| `i64`, `f64`, `decimal`, `DateTime`, `Guid`, an `enum` | `string` | `.ToString()`, never implicit. **Built** for every core integer width and for `char` (D98), for `decimal`, `DateTimeOffset`, `Guid`, `i128`, `u128` (`teko_prim.tk`'s own rows), for an `enum` (N2b) and for `string` itself (identity); `f64`/`f32` are refused — this tree has no float formatter at all, which is why `$"{3.5}"` refuses too | D98 |
 
 **Rule 3 also converts a `string` into a plain `uptr` slot**, and there is nothing to be
 done about that: `str`, `ptr` and `uptr` are one type, which

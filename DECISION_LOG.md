@@ -11146,3 +11146,81 @@ because a capture answers before the member question.
 refused rising by exactly the nine added. `FIXPOINT OK`, docs gate green, and `--dump-ast`
 against `55cdf69e` over every one of the 136 fixtures accepted by both compilers: an EMPTY
 diff.
+
+### D98 · `.ToString()` on a core scalar (2026-09-20)
+
+**One conversion, three doors.** `$"{x}"` already turned an integer and a `char` into a
+`string` (`tk_interp_fmt`, teko_interp.tk, D92), and `x.ToString()` refused with
+`teko: i64 has no members: ToString`. Those are the same question, so they are now one
+answer: `tk_scalar_tostring(recv, ty)` in teko_typeof.tk, beside
+`tk_reject_scalar_member`, with `tk_scalar_ts_is` as its name-and-slice question. Three
+callers — `tk_interp_fmt` (rewritten to call it, a strict no-op on accepted code),
+`tk_dot`'s parse-time scalar arm (teko_expr.tk) and `tk_pend_do`'s deferred one
+(teko_typeof.tk) — and teko_typeof.tk is where they can all see it: teko_expr.tk and
+teko_interp.tk are both included after it (teko.tk, lines 238/245/246). The lowering is
+what it always was: `char`/`u32` through `tk_str_from_char`, `u64`/`usize` through
+`tk_str_from_u64`, every other width through `tk_str_from_i64` (lib/string.tk, over
+`tk_i64_to_dec` in lib/rt.tk) — all three on the stack, no `rt_alloc`, no free to forget.
+
+**The slice taught**: `i8` `i16` `i32` `i64` `u8` `u16` `u64` `usize` `char`, on every
+receiver road — a literal (`42.ToString()`), a local, a parameter, a call return, a field
+load, a global, a cast and a parenthesised expression. The parse-time door reads its `()`
+the way `tk_prim_dot` (teko_prim.tk) reads a method's; the deferred door asks
+`tk_prim_pend`'s own form questions in `tk_prim_pend`'s own order. `.ToString` without
+`()` is `teko: the member is a method; call it with ()` and `x.ToString("D4")` is
+`teko: wrong number of arguments for ToString`, both reused, C#'s format string being no
+more taught here than it is in a hole (specs/string.md § 9).
+
+**teko_prim.tk's table was deliberately NOT extended.** Registering `TY_I64` there would
+make `tk_prim_is(TY_I64)` true, which `tk_check_scalar_compat` reads for the conversion
+clause and teko_ops.tk for the operator claim (teko_prim.tk:302-305): the blast radius is
+every numeric conversion and every operator in the language, to spell one member. That
+table is for types `type_new` makes; a core scalar is not one.
+
+**One new refusal**, `teko: .ToString() needs #include "string.tk" before it is used`. The
+call BUILDS a `string`, so the class has to be declared, exactly as an interpolation hole
+needs it (teko_interp.tk's own guard). Left to the member-name refusal it would have
+blamed `ToString` for a missing `#include`.
+
+**Fork 1: `bool.ToString()` answers `"1"`, not C#'s `"True"`.** `teko_type.tk:74` aliases
+`bool` to `TY_U8`, so the two are ONE type id: `"True"` would also come out of
+`((u8) 5).ToString()`. `$"{true}"` already writes `"1"` today, and a `.ToString()`
+disagreeing with interpolation would be the language contradicting itself. The divergence
+is recorded rather than faked; a distinct `bool` id is a different crumb entirely.
+
+**Fork 2: `u32` and `char` are one id** (`teko_type.tk:75`), so `.ToString()` on either
+answers the CHARACTER — agreeing with interpolation (D92's own second finding) and with
+C#'s `char`. `((u32) 65).ToString()` is `"A"`, not `"65"`.
+
+**`f64`/`f32` are refused, and the `(decimal)` route was measured and rejected.** There is
+no float formatter anywhere in this tree, which is why `$"{3.5}"` refuses too. Routing a
+float through `decimal` was the obvious shortcut and it is a trap — three measurements on
+this head, so the next crumb does not re-derive them:
+
+* `((decimal) 1.0e30).ToString()` panics `teko: decimal overflow`, exit 70;
+* `NaN` and both infinities panic the same way, `teko: decimal overflow`, exit 70;
+* `((decimal) (1.0 / 3.0)).ToString()` answers `0.333333333333333` — fifteen digits, where
+  C# answers `0.3333333333333333`, sixteen.
+
+A `.ToString()` that panics on `double.MaxValue` is worse than one that refuses, so `f64`
+keeps `teko: f64 has no members: ToString` until a real float formatter lands.
+
+**Also refused, each with a fixture**: `str`/`ptr`/`uptr` (one type id — no oracle can tell
+text from a raw address; `new string(p)` is the spelling that carries the guard), a `T?`
+(read through `.Value` first) and a user class that declares no `ToString` of its own — no
+default is given to a user type by this crumb.
+
+**What this does not reach.** No format string, no `IFormattable`, no `object.ToString()`
+and so still no `"n=" + 5` (specs/string.md § 11's universal `ToString`, untouched).
+`DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly` keep their own unwritten rows — what was
+missing there was never the mechanism (teko_prim.tk carries five `.ToString()` rows
+already: `decimal`, `DateTimeOffset`, `Guid`, `i128`, `u128`), and the four documentation
+rows still claiming "no `teko_prim.tk` primitive has a `str` member yet" were false and are
+corrected here (`not-yet.md`, `datetime-extras.md`, `string.md`).
+
+**Gate.** `137 passed, 171 refused as expected, 0 failed` at `2b24fc23` →
+`138 passed, 179 refused as expected, 0 failed`: one positive fixture and eight refusals,
+refused rising by exactly the eight added. `FIXPOINT OK`, docs gate green, and `--dump-ast`
+against `2b24fc23` over every one of the 137 fixtures accepted by both compilers —
+`tests/surface_string_interp.tk` among them, which is the proof the interpolation refactor
+is a no-op: an EMPTY diff.
