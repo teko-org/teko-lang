@@ -137,7 +137,7 @@ thing that crosses is a URL each side reads anonymously.
 | poll | teko, every 15 min | `repos/minicompiler/mc/releases` — the newest pre-release with no verdict on the `canary` branch yet |
 | judge | teko | `ngen.yml` called with `mc_version` = that candidate: the five legs, the five fixpoint legs, `docs` and the aggregator; plus `teko_std` at its newest tag |
 | publish | teko | `<version>.json` at the root of the `canary` branch, committed with this repository's own `GITHUB_TOKEN` |
-| promote | mc | reads that file every 60 s for 90 minutes: `ok` flips the pre-release to a release, `fail` leaves it a pre-release, and a file that never appears is neither — advisory before mc 1.0.0 |
+| promote | mc | reads that file — contents API first, raw only as a fallback (raw served a stale `fail` for minutes after a push, 2026-09-15) — in two places since 2026-09-20: a short poll inside mc's own release run (~15 min) and a scheduled `promote-pending.yml` of mc's own, every 30 min, which promotes any pre-release whose verdict is green whenever it lands. `ok` flips the pre-release to a release, `fail` leaves it a pre-release, and a file that never appears is neither — no longer a deadline, since the scheduled job picks up a late verdict |
 
 The verdict is one line at a fixed URL:
 
