@@ -16,7 +16,7 @@ looking up a construct must never find a plan described as if it worked.
 | [small-ints.md](small-ints.md) | `i8`, `i16`, `i128` and `u128` — the integers C# has and teko does not, and the `tk_is_int_ty` predicate they change |
 | [enum.md](enum.md) | `enum` with an underlying type, a distinct type of its own, the bitwise operators and a `switch` over the names |
 | [guid.md](guid.md) | `Guid` — sixteen bytes, `Parse`/`ToString`, ordering, and `NewGuid` over teko's own entropy `extern` |
-| [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing, and interpolation over the `$` token `mc` 0.15.25 lets a module claim |
+| [string.md](string.md) | `string` as a counted class beside `str`, the interned literal, value equality, indexing — **all of it built** (N7a/N7b/N8/N10, D86/D88/D89/D92); what is left of the page is § 11's `object`/`Nullable<T>` and § 16's tensions |
 | [nullable.md](nullable.md) | `T?` — one nullable mechanism over any type, reference or value: the handle, the box, `HasValue`/`Value`/`??`/`?.`, definite assignment, and the migration `null` outside a `T?` slot forces — **all of it is built** ([nullable.md](../reference/nullable.md), D43/D44/D45/D46); what is left of the page is the lifted `==` (Q4a) |
 | [datetime-extras.md](datetime-extras.md) | `DateOnly`, `TimeOnly` and `DateTimeOffset` — a proposed section of the `DateTime` page, kept separate so two branches do not conflict — **all three are built** (D54, D58, D76); the page stays open only for the fold into `datetime.md` § 15 |
 | [tekoc-tool.md](tekoc-tool.md) | `tekoc` — the taught compiler as an installable `mc` tool: two packages, the manifest, the library tree the install stages, the permission set, and the crumbs that land it |
@@ -58,7 +58,7 @@ fixes the order.
 | 17 | ~~**N8** `string`, the methods and the index~~ **landed**, D89 | string.md | L | N7a, N7b |
 | 18 | ~~**C6** `DateTime.Now`, `UtcNow`, `Today`~~ **landed**, D90 | `docs/specs/datetime.md` | S | C2 — a wall-clock `extern` per target host, teko's own (the owner's ruling, 2026-09-08) |
 | 19 | ~~**N9** `Guid.NewGuid`~~ **landed**, D91 | guid.md | S | N3 — an entropy `extern` per target host and a `bcrypt.def` in teko's Windows sysroot, teko's own |
-| 20 | **N10** `$"..."` interpolation | string.md | M | N8, and a pin at `mc` ≥ 0.15.25, where `$` before `"` is a token a module claims with `syntax_expr("$", …)` |
+| 20 | ~~**N10** `$"..."` interpolation~~ **landed**, D92 | string.md | M | N8 |
 | 21 | **C7** the native wide instructions (optional, speed only) | `docs/specs/decimal.md` | S | C4 |
 
 **N7 and N8 depend on nothing** and are placed late only because they are the most

@@ -5699,3 +5699,246 @@ both got what they were waiting for, and the kind stays for the next member that
 wait. `sh scripts/check-docs.sh` does not catch prose that contradicts a registration table
 -- only links, English and the diagnostics inventory -- so the sweep is by grep, and the
 grep is `TK_PMSOON` across `docs/` and the modules.
+
+### D92 · `$"..."` string interpolation (N10, 2026-09-20)
+
+**Ruling.** `teko_interp.tk` (new module): `syntax_expr("$", &tk_interp_expr)` claims the
+token, program-wide, the moment `teko_init()` runs -- `docs/specs/string.md` § 9's own
+lowering, one formatter call per hole chosen by its STATIC type. Landed by a dispatch that
+picked up a WIP branch mid-crash (`ngen/n10-interp`, head `ab9e5198` at handoff, fixing the
+raw-span/arena-pointer bug the prior draft found and could not get past) and finished the
+remaining mechanism: a hole desynchronising the parser, a pre-interning bug the fix's own
+proof surfaced, and the docs/fixtures gate.
+
+**Two corrections to entries already on this log, both worth their own paragraph.**
+
+**(a) The `invalid hole` N7b's own D88 measured was never an `mc` defect to report.**
+`hooks.md` § `syntax_expr` documents, in its own words, that an unclaimed `$` before
+anything but a name/digit/`$` is `invalid hole` -- the answer a compiler with no
+`syntax_expr("$", …)` registered gives, by design, not a bug in the lexer. D88 read the
+message as a contradiction of D64's own "the wait is over" and left it for N10 to chase
+with a pure-`mc` reproducer if the contradiction held (D2's own protocol). It never held:
+`invalid hole` is `mc`'s documented answer for an UNTAUGHT compiler, and teaching `$` is
+exactly what registering the handler does. Nothing is owed to `minicompiler/mc`.
+
+**(b) The heap corruption the first draft hit, and the fix.** `p_start()` on a `T_STR`
+token points into the ARENA -- `mc`'s own escape-PROCESSED copy of the literal -- not at
+the source (`hooks.md` § "Record and replay"). The first draft measured the interpolated
+literal's raw span as `qend - qstart` between an arena pointer (`p_start()`) and a source
+cursor (`p_cp()`), handed `p_push_source` that garbage length, and corrupted the
+compiler's own heap -- which surfaced as `EXC_BAD_ACCESS` in whatever unrelated pass
+touched the heap next (`tk_over_pass`, codegen), reading as an unfixable `mc` defect until
+the two pointers were traced to different allocations. The fix reads the RAW span as TWO
+CURSORS into the SAME buffer: `qstart = p_cp()` while the handler is still sitting on the
+`$` (already pointing at the opening quote, since `p_cp()` is the cursor just past the
+CURRENT token), then `p_next()` onto the string literal, then `qend = p_cp()` (now just
+past its closing quote). Both cursors read the source `p_push_source` was always going to
+push a slice of; `p_start()` was never the right function to ask. The next crumb that
+touches `p_push_source` over a `T_STR` token owes itself this paragraph before measuring
+anything as an `mc` bug.
+
+**A hole desynchronising the parser, and why it is not fixed by stacking pushes.**
+`p_push_source`'s own frame pops ITSELF the instant its content is exhausted, and a PIECE
+pushed alone is exhausted the moment its one `T_STR` token is read (`parse_expr` always
+fetches one more token to check for a continuing operator). Parsing pieces and holes one
+push at a time, sequentially -- the shape a straightforward per-segment implementation
+reaches for first -- lets that fetch pop straight past the piece's own frame into the REAL
+outer file, silently discarding whatever real token sat there (the `;` after the whole
+`$"..."`) before the hole that was supposed to come next ever got its own turn to push.
+Pre-pushing every segment's frame up front, in reverse order (tried second, reasoning that
+`p_push_source`'s stack is LIFO so pushing them all before any `p_next()` should be as
+safe as pushing one), does **not** fix it either -- measured directly: two independent
+literal pushes stacked before either is read already dies `unexpected character` on the
+SECOND frame's own first token. More than one frame may sit on the stack only when the
+deeper one was ENTERED (its own `p_next()` spent, at least one real token read from it)
+before the next is pushed -- exactly `#include`'s own nesting, no looser. The fix that
+holds: build ONE buffer holding the WHOLE `+`-joined expression as real teko text -- every
+piece re-quoted, every hole's raw bytes parenthesised -- and push it ONCE. This is the
+exact single-push shape the zero-hole case already proved correct, just with more text in
+it; the CORE's own `+` parses the whole chain in one `parse_expr` call (a left-associative
+`N_BINARY` chain), so there is only ever the one push, the one pop, and the two cursors
+(a) above already trusts. The chain is walked back apart afterward (`nd_b` off the root,
+`nseg - 1` times) so each piece and hole gets exactly the marker/intern treatment it
+always did.
+
+**The pre-interning bug the drain fix's own proof surfaced, never reachable before it.**
+`tk_str_intern`, called from `tk_interp_scan` at PARSE TIME to turn each literal piece into
+its interned global identifier, is the wrong door: every OTHER caller of `tk_str_intern`
+in this tree (`teko_ops.tk`, `teko_rc.tk`, `teko_null.tk`, `teko_params.tk`) calls it from
+a LATER PASS, at the END of resolving whatever construct held the literal -- by which point
+every type-driven decision that construct needed has already been made against the RAW
+`N_STR` node, and the interned identifier is built ONLY for codegen, never queried for its
+type again. Interning a piece at parse time replaces it with an IDENTIFIER before ANY pass
+runs, and an identifier is typed by SCOPE/GLOBAL lookup (`tk_ty_of`'s own `N_IDENT` arm)
+-- never by `tk_hg_collect`'s sweep for this shape, since `tk_str_intern_build`'s own
+global carries `nd_val = nel` (the word count, matching the sweep's OWN array-shape
+row) rather than the `0` a plain scalar global needs to be swept into `gs_*` at all.
+`` teko: the type of the left side of `+` is not known here `` on every hole this crumb
+built, reachable only once the drain fix let a hole reach `tk_ops_pass` at all -- never hit
+by the zero-hole case (no `+` node, nothing to type), never hit by the ORIGINAL sequential
+design (which never got this far). Fixed by leaving a piece a raw `N_STR` operand of the
+`+` chain, exactly what a hand-written `"a" + fmt(x) + "b"` already leaves, and letting
+`tk_ops_pass`'s own end-of-resolution call to `tk_str_intern` do the interning at the
+point every other literal in the language is interned.
+
+**A second bug the SAME proof surfaced, once a hole read a class member.** `$"{o.Name}"`
+resolved its OWN type correctly inside `teko_typeof.tk`'s pass (the sixth, where
+`tk_interp_visit` runs) -- and then answered `-1` the moment `tk_ops_pass` (the eleventh)
+asked the identical question of the identical node. `tk_node_replace(n, r)`, the one door
+every in-place rewrite in this compiler uses (`teko_struct.tk`'s own header), copies `r`'s
+CONTENT into `n`'s slot but leaves everything keyed by NODE INDEX -- `teko_struct.tk`'s
+`xt` table (`tk_xt_put`/`tk_xt_ty`) among them -- still registered under `r`'s ORIGINAL
+index. `tk_interp_visit`'s own `ty == sty` row hands the hole node back UNCHANGED as `r`
+(no formatter needed, it is already a `string`) and then replaces the marker `n` with it;
+a field LOAD's own `xt` row (`tk_field_use`'s own `tk_xt_put`), registered under the hole's
+original index, is now unreachable under `n`'s. Every OTHER caller in this tree that
+replaces a node with a NEW call it built re-registers the row itself
+(`teko_prim.tk:1298`/`1313`'s own `tk_xt_put` right after `tk_node_replace`, the exact
+"moves it after this returns, onto `n`" `tk_node_replace`'s own header names) -- this is
+the one caller that hands `n` a COPY of an EXISTING node instead, and is the one that has
+to copy the `xt` row along with it. Fixed the same way: when `r == hole`, look up `hole`'s
+own `xt` entry (`tk_xt_at`) and, if it has one, re-register it under `n`
+(`tk_xt_put(n, xt_str_at(xi), xt_ty_at(xi), xt_pure_at(xi), xt_own_at(xi))`) before the
+replace.
+
+**A third finding, recorded rather than worked around: `u32` and `char` are the SAME core
+type id.** `teko_type.tk`'s `type_alias("char", TY_U32)` registers no distinct `type_new`
+-- a `u32`-declared local and a `char`-declared one are indistinguishable once parsed,
+by CONSTRUCTION, not by a gap this crumb's own code could close. A `u32` hole therefore
+gets `tk_str_from_char`'s UTF-8 encode, the same road a genuine `char` hole takes, rather
+than a decimal -- `docs/specs/string.md` § 9's own formatter table corrected to say so, and
+`tests/surface_string_interp.tk`'s own `u32` row asserts the ENCODED shape (`65` reads
+`"A"`, one character) rather than the digits a first draft of the fixture assumed.
+
+**Measured: `mc limits`' `syntax` row does not move, and the recorded CAUSE was false.**
+The first writeup of this entry said "`$` already had a `syntax_expr` SLOT the `#rule`
+substitution machinery's own registration reserves". That is FALSE and is corrected here.
+`T_SYNTAX` is **one high-water mark shared by four independent tables**: `mc`'s own
+`src/hooks.mc` calls `grow(T_SYNTAX, ...)` at `:352` (`syntax`), `:363` (`syntax_stmt`),
+`:397` (`syntax_expr`) and `:456` (the literal hook), and `src/arena.mc`'s `lim_note` keeps
+the MAXIMUM of the four, never their sum. In this tree `syntax_stmt`'s table is the tallest
+at **20**; `syntax_expr`'s goes **18 → 19** for this crumb's `$` and stays under it. The
+row this crumb really does add is invisible beneath a taller neighbour, not absent, and
+nothing was ever "reserved" for `$`.
+
+Measured on `mc` 1.0.1, `rm -rf build` first, one dummy registration at a time against this
+head: `+1 syntax_stmt` → `syntax 21 / 42 / 21`; `+1 syntax_expr` → `20 / 40 / 20`; `+1
+syntax` → `20 / 40 / 20`; `+5 syntax_expr` → `24 / 48 / 24` (19 + 5, the arithmetic that
+pins `syntax_expr`'s own table at 19). Base (`origin/main` `477d1b8e`) and head both read
+`syntax 20 / 40 / 20`. **The next `syntax_stmt` this tree adds moves the reported row; so
+does the SECOND `syntax_expr` after this one -- not the first.**
+`passes`/`alias`/`types`/`intrin`/`on_stmt` unmoved either leg, as forecast.
+
+**Proof, mc 1.0.1, macos/aarch64, head against `origin/main` `477d1b8e`.** `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**135 passed, 150 refused as expected, 0 failed** (base 134/143: `surface_string_interp.tk`
+added, seven `tests/refuse/` fixtures added -- alignment, format specifier, an unterminated
+hole, a type with no formatter, the missing `#include`, a line comment in a hole, a ternary
+hole); `sh scripts/bootstrap.sh --os macos --arch aarch64` → `FIXPOINT OK`; `sh
+scripts/check-docs.sh` → `docs ok: 703 links, 80 fragments, 423 diagnostics, 150 refusals,
+156 samples, manifest listed`.
+
+**`--dump-ast --include=lib --include=tests`, base vs head, over all 134 base
+`tests/*.tk` fixtures** (`tests/refuse/*.tk` not compared the same way: a refusal prints
+its one message and stops before any dump would show appended text) -- **124
+byte-identical, 10 moved.** The first writeup of this entry claimed all 134; that is FALSE
+and is corrected here. The ten are exactly the base fixtures that write `#include
+"string.tk"` -- `surface_string_capture`, `_concat`, `_index`, `_index_oob`, `_intern`,
+`_interop`, `_methods`, `_op_str`, `_rc`, `_value` -- and each differs by ONE `diff` hunk,
+`3506a3507,3724`: **218 lines APPENDED, zero deleted, zero changed**, the four functions
+`lib/string.tk` gains (`tk_string_cp_encode`, `tk_str_from_i64`, `tk_str_from_char`,
+`tk_str_from_u64`). A pure append at the end of that file's own dump is exactly what a new
+library function looks like, and it is the additive proof this crumb owes: no node of any
+program that compiled before moved. A second probe, `+=`/`-=`/`++`/`--` over one local
+(`teko_loop.tk`'s own `#rule` use of `$x`/`$e`, the one OTHER place `$` is spelled in this
+tree) IS byte-identical against the base compiler -- the claim changed nothing about
+`#rule` substitution, the concern D64's own wording raised for the pin that unblocked this
+crumb.
+
+**Four defects the review of this head found, each fixed with its own fixture row.**
+
+**(1) A `u64` at or above 2^63 interpolated with the wrong SIGN -- a silently wrong
+value.** Every `tk_is_int_ty` hole went to `tk_str_from_i64`, which formats through the
+SIGNED `tk_i64_to_dec` (`lib/rt.tk`): `u64 v = 9223372036854775808; $"{v}"` read
+`-9223372036854775808` where C# reads `9223372036854775808`. `mc`'s own `/` and `%` are
+unsigned when the LEFT operand is — mc's `gen_walk.mc` dispatches on
+`type_signed(res_type(nd_a(n)))`, the left side alone, which is what `tk_str_from_u64`'s
+own `v / 10` and `v % 10` rest on (measured: `18446744073709551615 / 10` is
+`1844674407370955161`, with a SIGNED right operand — the re-verification's own correction
+of this entry's first wording, which said BOTH and cited an example that does not satisfy
+it), so the fix is `tk_str_from_u64`, one peel loop on a `u64`
+parameter, dispatched on `ty == TY_U64` ahead of the signed row. `u8`/`u16` widen into
+`i64` with room to spare and keep the signed formatter; `u32` is `char`'s own id and keeps
+the UTF-8 encode. `tk_i64_to_dec` is unchanged -- every signed caller still wants it as it
+is. The fixture now pins every width by its TEXT: a length alone let this through, since
+`-9223372036854775808` and `9223372036854775808` are both 20 characters.
+
+**(2) `$"..."` could not be followed by any infix operator.** `$"a{n}" + x`,
+`$"a{n}" + $"b{n}"`, `$"c" == s`, the same inside an `if` -- all legal C#, all refused
+`teko: malformed literal text in an interpolated string`. Root cause: the pushed buffer's
+last token was the chain's last operand, so `parse_expr`'s one-token lookahead exhausted
+the frame, popped back into the OUTER file and carried on parsing the real source after
+the literal; the root handed to the walk-apart loop was the outer expression, and the
+guard fired. Fixed by writing a `;` into the buffer itself: `parse_expr` stops on it
+inside the frame, and the single `p_next()` afterwards spends it, drains the frame and
+leaves the handler on the outer file's own next token -- the same position the drain used
+to leave behind. `docs/reference/diagnostics.md`'s sentence calling that message "not
+reachable from source a person writes by hand" was FALSE at this head and is corrected.
+A `.` directly on a `$"..."` (`$"a{n}".Length`) is still refused, `teko: uptr has no
+members: Length` -- but that is NOT this construct's: `"abc".Length` and `("a" + s).Length`
+are refused identically on `origin/main` with no interpolation anywhere, a `str` literal
+carrying no members. Recorded as a `not-yet.md` row against the string surface, not fixed
+here.
+
+**(3) A comment inside a hole broke the brace scan.** `$"{x /* } */}"` answered
+`teko: an interpolated string needs }} for a literal }`: the scan skipped quoted text but
+not comments. `tk_interp_skip_block` now skips `/* ... */` in `tk_interp_hole_end` and in
+`tk_interp_hole_check`. A LINE comment is refused by name instead,
+`teko: a line comment does not fit in an interpolation hole` -- the buffer this handler
+pushes is ONE line, and a `//` would comment out the rest of the chain.
+
+**(4) The missing-`#include` guard ran before the `T_STR` check**, so a `$` that was no
+interpolation at all could be blamed on a missing include. Reordered. Measured, with and
+without the include, so the record is what each form really answers: `${1}`, `$ 1`, `$(1)`
+→ `teko: $ needs a string literal for interpolation`; `$1` → `mc`'s own
+`expression with no codegen`; `$name` → `mc`'s own `hole $name has no rule binding it`.
+Only the first group ever reaches this file.
+
+**A ternary, `??` or `?.` hole is refused by name rather than by accident.**
+`$"{(a > 0 ? 5 : 6)}"` -- C#'s own spelling, since a bare `:` is a format specifier there
+too -- answered the generic `teko: the type of this value is not known here`. Each of `?`,
+`??` and `?.` parks as a marker call (`tk_ternary`/`tk_coalesce`/`tk_qdot`,
+`teko_ternary.tk`) that `tk_ternary_pass` unpacks, and that pass runs AFTER the walk this
+crumb resolves a hole in, so `tk_ty_of` has nothing to answer with. Named
+(`teko: an interpolation hole holds no ternary, ?? or ?.`) with a `not-yet.md` row; moving
+the hole's own walk behind `tk_ternary_pass` is the upgrade, and it needs a scope walk of
+its own that is not this crumb's to build.
+
+**Fixtures (D52):** `tests/surface_string_interp.tk` at `42` -- every formatter type this
+crumb teaches, EACH PINNED BY ITS TEXT and not by its length (`u64` at `2^63`, at
+`2^64 - 1` and at `0`, `usize`, `i64`'s own minimum, every other width), a hole at the very
+start and the very end of the literal, an expression hole (`a + b`, `o.Name`, a call),
+adjacent holes, `{{`/`}}`, `$""`, `$"plain"`, an infix operator AFTER the literal (`+`,
+`==`, `!=`, and the same inside an `if`), a block comment inside a hole, `rt_live()` back
+at its floor across seven separate blocks and a fifty-iteration churn. Seven
+`tests/refuse/` fixtures, one per named refusal: `string_interp_align.tk`,
+`string_interp_format.tk` (both `` teko: an interpolation hole holds one expression, no
+alignment or format specifier ``), `string_interp_unterminated.tk` (`teko: unterminated
+interpolation hole`), `string_interp_no_formatter.tk` (`teko: no interpolation of a value
+of type f64`), `string_interp_no_include.tk` (`` teko: string interpolation needs
+#include "string.tk" before it is used ``), `string_interp_line_comment.tk`
+(`teko: a line comment does not fit in an interpolation hole`),
+`string_interp_ternary.tk` (`teko: an interpolation hole holds no ternary, ?? or ?.`).
+
+**Owed and landed:** `docs/specs/string.md` § 9 (rewritten, landed rather than blocked),
+§ 10's row, § 12's module table, § 13's `syntax` row corrected, § 14's fixture tables,
+§ 15's N10 entry; `docs/specs/README.md`'s own summary line and roadmap row;
+`docs/reference/types.md`'s own `string` section, a new N10 share with a worked example;
+`docs/reference/not-yet.md`'s `$"..."` half of its row, replaced by the three rows still
+open (alignment, format specifier, no formatter); `docs/reference/runtime.md`'s string
+library table, three new functions; `docs/reference/diagnostics.md`, a new "String
+interpolation" section, all eight literal messages. **Not landed, out of this crumb's own
+boundary:** a single-pass `tk_str_interp` (§ 9's decision 5's own upgrade path, left for a
+crumb that needs the O(N²) piece-count ceiling measured rather than guessed at); the four
+refused `ToString` types' own `rt_alloc` leak (§ 9's decision 4, unresolved by design, not
+this crumb's boundary to widen).

@@ -336,9 +336,24 @@ nine slots:
 | `pick("hi")` against an OVERLOADED `string pick(string)`/`pick(i64)` | `teko: no overload of pick matches these arguments` — overload SELECTION (`tk_ov_args_fit`, `teko_over.tk`) is a different question from the nine slots' own conversion, asked before any declaration is chosen; a name declared ONCE still interns (`greet("world")` in `docs/specs/string.md` § 5's own sample), and `string pick(string s) { return s; }` alone, called the same way, works |
 | `c ? "yes" : s` (a literal ternary arm beside a `string`) | `` teko: the two arms of ?: have different types `` — `tk_tern_lower` (`teko_ternary.tk`) requires its two arms' types to already be EQUAL and converts neither one, for any type, string included (`cond ? 1 : 2.5` refuses the identical way); `??` is `string`'s own gap this crumb closed (`teko_null.tk`), `?:` is a different mechanism with no conversion of its own to extend |
 
-`$"..."` (N10) and `"n=" + 5` (needing a universal `ToString`/`object`, § 11) are neither
-N7a's nor N7b's nor N8's; both stay exactly where
-[the specification](../specs/string.md) § 9-11 leaves them.
+`$"..."` **landed, N10, D92** — [the type reference](types.md#string) and
+[the specification](../specs/string.md) § 9 have it. What § 9 itself still names as not
+taught, over a hole:
+
+| written | what happens today, and why |
+|---|---|
+| `$"{x,10}"` — C#'s alignment | `teko: an interpolation hole holds one expression, no alignment or format specifier` — a hole holds one expression, nothing else (§ 9's own decision) |
+| `$"{x:N2}"` — C#'s format specifier | the same message |
+| `$"{x}"` where `x` is `f64`/`f32`/`decimal`/`DateTime`/`TimeSpan`/`Guid`/an `enum` | `` teko: no interpolation of a value of type Foo `` — each one's own `.ToString()` (where it has one) hands back an `rt_alloc`-owned `str` this crumb cannot free with the right size from outside the module that sized it; write the value into a `string` first and concatenate with `+` |
+| `$"{(a > 0 ? 5 : 6)}"`, `$"{x ?? 3}"`, `$"{o?.Name}"` | `teko: an interpolation hole holds no ternary, ?? or ?.` — each parks as a marker call (`tk_ternary`/`tk_coalesce`/`tk_qdot`, `teko_ternary.tk`) that `tk_ternary_pass` unpacks, and that pass runs AFTER the one this crumb types a hole in, so `tk_ty_of` has nothing to answer with yet. Moving the hole's own walk behind `tk_ternary_pass` is the upgrade; it needs a scope walk of its own and is not this crumb's. Compute into a local, interpolate the local |
+| `cond ? $"a{n}" : $"b"` — an interpolation as a TERNARY ARM, and `$"a" + $"b"` with no hole in either | `teko: a value of type uptr does not convert to string` / `teko: the two arms of ?: have different types` — neither is this crumb's: a hole-less `$"…"` is a plain `str`, and `cond ? "a" + z : z` refuses identically with no interpolation anywhere. The generic row above owns it; named here because the message never says the word interpolation |
+| `char 0` in a hole, and a `u32` above `0x10FFFF` | the empty string, and one garbage byte — pre-existing ceilings of the NUL-terminated `str` and of `tk_string_cp_encode`, not reachable before this crumb and not refused by it (C# gives a one-character string for `'\0'`) |
+| `$"{x // note}"` | `teko: a line comment does not fit in an interpolation hole` — the `+` chain is pushed back through the lexer as ONE line. `$"{x /* note */}"` works |
+| `$"a{n}".Length` — a `.` directly on the literal | `` teko: uptr has no members: Length `` — NOT this construct's: `"abc".Length` and `("a" + s).Length` are refused identically without any interpolation, a `str` literal carrying no members. Bind to a `string` local first |
+| `$"{u}"` where `u` is `u32` | the UTF-8 encoding of the code point, not the decimal — `char` is `type_alias("char", TY_U32)`, the same core id, so the two cannot be told apart (D92). `u8`, `u16`, `i8`, `i16`, `i32`, `i64` and `u64` all give decimal |
+
+`"n=" + 5` (needing a universal `ToString`/`object`, § 11) is neither N7a's, N7b's, N8's
+nor N10's; it stays exactly where [the specification](../specs/string.md) § 11 leaves it.
 
 ## The rest of `docs/specs/guid.md`
 

@@ -1487,6 +1487,60 @@ moment it is parsed (`teko: the name is already a type`, measured). `string` nam
 `docs/specs/string.md` § 5/§ 9's own row is corrected to say so — a library type is told
 apart by the library, D48's own sentence (D88).
 
+**N10's own share (D92): `$"..."` interpolation.** `syntax_expr("$", …)` claims the token
+(`teko_interp.tk`, new module); `$"a{x}b"` lowers into a `+` chain of the literal pieces and
+one formatter call per hole, chosen by the hole's STATIC type:
+
+| the hole's type | the formatter |
+|---|---|
+| `string` | itself |
+| `str`, `ptr`, `uptr` | the class's own `str` constructor |
+| `char`, and `u32` (the same core id) | a UTF-8 encode |
+| `u64`, `usize` | an UNSIGNED decimal peel of its own — `tk_i64_to_dec` is signed, and read every `u64` at or above 2^63 as its negative twin |
+| every other integer width | the decimal text `tk_i64_to_dec` already writes |
+
+`u32` and `char` are the SAME core type id (`type_alias("char", TY_U32)`, no distinct
+`type_new`), so a `u32` hole gets the UTF-8 encode too — `65` reads `"A"`, one character,
+not the digits `"65"` — the one observable consequence of the alias. `f64`/`f32`/
+`decimal`/`DateTime`/`TimeSpan`/`Guid`/an `enum` are refused by name
+(`teko: no interpolation of a value of type Foo`, [not-yet.md](not-yet.md)); so is C#'s
+alignment/format specifier, `{x,10}`/`{x:N2}` (`teko: an interpolation hole holds one
+expression, no alignment or format specifier`), a ternary/`??`/`?.` hole
+(`teko: an interpolation hole holds no ternary, ?? or ?.`) and a line comment inside a hole
+(`teko: a line comment does not fit in an interpolation hole` — a block comment is fine).
+`$` with no `#include "string.tk"` reads `teko: string interpolation needs #include
+"string.tk" before it is used`; that check runs after the string-literal one, so a `$` that
+is not an interpolation at all (`${1}`, `$ 1`, `$(1)` → `teko: $ needs a string literal for
+interpolation`) is never blamed on a missing include.
+
+An interpolated string is an ordinary expression: any infix operator may follow it
+(`$"a{n}" + s`, `$"c" == s`). A `.` directly on it (`$"a{n}".Length`) is refused
+`teko: uptr has no members: Length`, the same answer `"abc".Length` gives with no
+interpolation involved; bind to a `string` local first.
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+#include "string.tk"
+
+class Point { public i64 X; public i64 Y; public Point(i64 x, i64 y) { X = x; Y = y; } }
+
+i64 main() {
+    i64 n = 7;
+    string a = $"n={n}";
+    if (a.Length != 3) return 1;
+
+    Point p = new Point(3, 4);
+    string b = $"({p.X}, {p.Y})";
+    if (b.Length != 6) return 2;
+
+    string c = $"{{literal braces}} and {n}";
+    if (c.Length != 22) return 3;
+
+    return 42;
+}
+```
+
 ---
 
 ## Members

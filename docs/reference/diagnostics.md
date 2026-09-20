@@ -1921,6 +1921,59 @@ class H {
 }
 ```
 
+## String interpolation (`$"…"`)
+
+- `"teko: $ needs a string literal for interpolation"` — `$` is claimed program-wide the
+  moment `teko_init()` runs, so the handler reads every `$` in the program, not only the
+  ones that open an interpolation. It answers this for `$` followed by a token that is not
+  a string literal *and that the handler is the one to see*: `${1}`, `$ 1`, `$(1)`. Two
+  neighbouring forms never reach it and answer with mc's own words instead — `$1` is
+  `expression with no codegen` and `$name` is `hole $name has no rule binding it`, both
+  the core's, both unchanged by this crumb. Write `$"…"`.
+- `"teko: string interpolation needs #include \"string.tk\" before it is used"` — `$"…"`
+  lowers into the `string` class's own `operator+`, which only exists once the class does.
+  Add the include. The check runs *after* the string-literal one above, so a `$` that is
+  not an interpolation at all is never blamed on a missing include.
+- `"teko: a line comment does not fit in an interpolation hole"` — a `//` inside `{…}`.
+  The handler pushes the whole `+` chain back through the lexer as **one line**, so a `//`
+  would comment out the rest of it. A block comment (`{x /* note */}`) is fine and is
+  skipped by the brace scan.
+- `"teko: an interpolation hole holds no ternary, ?? or ?."` — `$"{(a > 0 ? 5 : 6)}"`,
+  `$"{x ?? 3}"`, `$"{o?.Name}"`. Each parks as a marker call that `tk_ternary_pass`
+  unpacks, and that pass runs *after* the one the hole is typed in, so the hole's type
+  cannot be asked for yet ([not-yet.md](not-yet.md)). Compute the value into a local and
+  interpolate the local.
+- `"teko: an interpolated string needs }} for a literal }"` — a bare `}` with no matching
+  `{` is not this page's own escape; double it, `}}`, C#'s own answer for the same byte.
+- `"teko: unterminated interpolation hole"` — a `{` opened a hole and no matching `}`
+  closed it before the string literal itself ended.
+- `"teko: an interpolation hole needs an expression"` — `{}` is empty; write one.
+- `"teko: an interpolation hole holds one expression, no alignment or format specifier"` —
+  a top-level `,` (C#'s alignment, `{x,10}`) or `:` (its format specifier, `{x:N2}`) inside
+  a hole. Neither is taught ([string.md](../specs/string.md) § 9); format the value first
+  and write the result into the hole.
+- `"teko: malformed literal text in an interpolated string"` — the `+` chain the handler
+  builds from the literal's pieces and holes did not parse back into the shape it wrote.
+  The chain is pushed as its own source, terminated by a `;` the handler writes itself, so
+  the parse cannot run past its own frame into the file around it; this message is what is
+  left when the parse still does not come back with that exact chain. It is an invariant of
+  the handler's own re-lexing and no hand-written source is known to reach it — but "known"
+  is the claim, not "impossible": an earlier head reached it from plain C# (`$"a{n}" + x`,
+  `$"c" == s`) because the terminator was missing, and those all compile now.
+- `"teko: no interpolation of a value of type "` — completed by the type's name. Only
+  `string`, `str`/`ptr`/`uptr`, `char` and the integers have a formatter
+  ([string.md](../specs/string.md) § 9's own table); everything else — `f64`/`f32`,
+  `decimal`, `DateTime`, `TimeSpan`, `Guid`, an `enum` — needs its value turned into a
+  `string` first (`.ToString()` where the type has one) and concatenated with `+`.
+- `"teko: the type of this value is not known here"` — a hole whose static type the
+  compiler cannot determine at all, the same "not known here" every other deferred site
+  gives. The ternary, `??` and `?.` cases have their own message above.
+
+A `.` written directly on a `$"…"` (`$"a{n}".Length`) is refused `teko: uptr has no
+members: Length`. That is not this construct's own answer: a plain `"abc".Length` and a
+plain `("a" + s).Length` are refused the same way on `main` today, because a `str` literal
+carries no members. Bind the interpolated string to a `string` local first.
+
 ## Capacity
 
 Every table the compiler keeps has a ceiling. Hitting one is a diagnostic, not a silent

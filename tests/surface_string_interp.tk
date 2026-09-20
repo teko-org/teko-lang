@@ -1,0 +1,177 @@
+// surface_string_interp.tk -- N10 of docs/specs/string.md § 9: `$"..."`
+// string interpolation, end to end. Every hole type this crumb teaches
+// (`string`, `str`/`ptr`/`uptr`, `char`, every integer width, each pinned by
+// its TEXT and not by its length), a hole at the very start and the very end
+// of the literal, an expression hole (`a + b`, `o.Name`, `f(1)`), adjacent
+// holes, `{{`/`}}`, `$""`, `$"plain"`, an infix operator AFTER the literal
+// (`+`, `==`, `!=`, and the same inside an `if`), a block comment inside a
+// hole -- and `rt_live()` back at its floor once a block's own interpolated
+// strings drop, the exact assertion `surface_string_rc.tk` already proves
+// for `+`.
+
+// expect-exit: 42
+
+#include "rt.tk"
+#include "string.tk"
+
+class Named { public string Name; public Named(string n) { Name = n; } }
+
+i64 add1(i64 x) { return x + 1; }
+
+i64 main() {
+    i64 floor = rt_live();
+
+    // ---- every formatter type this crumb teaches, pinned by its TEXT ----
+    // `.Length` alone let a wrong VALUE through: `u64` at 2^63 formatted as
+    // its negative twin and still measured 20 characters. Every row below
+    // compares the whole string.
+    {
+        string sv = new string("abc");
+        if (!($"{sv}" == new string("abc"))) return 1;
+
+        str raw = "raw";
+        if (!($"{raw}" == new string("raw"))) return 2;
+
+        char c = 'Q';
+        if (!($"{c}" == new string("Q"))) return 3;
+
+        i8 i8v = 0 - 5;
+        if (!($"{i8v}" == new string("-5"))) return 4;
+
+        u8 u8v = 200;
+        if (!($"{u8v}" == new string("200"))) return 5;
+
+        i16 i16v = 0 - 100;
+        if (!($"{i16v}" == new string("-100"))) return 6;
+
+        u16 u16v = 40000;
+        if (!($"{u16v}" == new string("40000"))) return 7;
+
+        i32 i32v = 0 - 1;
+        if (!($"{i32v}" == new string("-1"))) return 8;
+
+        // `u32` and `char` are the SAME core type id (`type_alias("char",
+        // TY_U32)`, teko_type.tk) -- true type erasure, D92's own second
+        // finding. A `u32` hole gets the same UTF-8 encode a `char` hole
+        // does (65 = 'A', one character), not a decimal -- the one
+        // observable consequence of the alias, recorded rather than
+        // worked around.
+        u32 u32v = 65;
+        if (!($"{u32v}" == new string("A"))) return 9;
+
+        i64 i64v = 0 - 9000000000;
+        if (!($"{i64v}" == new string("-9000000000"))) return 10;
+
+        i64 lo = 0 - 9223372036854775807;
+        lo = lo - 1;
+        if (!($"{lo}" == new string("-9223372036854775808"))) return 28;
+
+        u64 u64v = 9000000000;
+        if (!($"{u64v}" == new string("9000000000"))) return 11;
+
+        // the whole reason `tk_str_from_u64` exists: a `u64` at or above
+        // 2^63 formatted through the SIGNED `tk_i64_to_dec` came out as its
+        // negative twin, a silently wrong value C# never prints.
+        u64 hi = 9223372036854775808;
+        if (!($"{hi}" == new string("9223372036854775808"))) return 29;
+
+        u64 max = 18446744073709551615;
+        if (!($"{max}" == new string("18446744073709551615"))) return 30;
+
+        u64 zero = 0;
+        if (!($"{zero}" == new string("0"))) return 31;
+
+        usize us = 18446744073709551615;
+        if (!($"{us}" == new string("18446744073709551615"))) return 32;
+    }
+    if (rt_live() != floor) return 12;
+
+    // ---- an interpolated string is an ordinary expression: any infix
+    // operator, and any position, may follow it. The handler writes its own
+    // `;` into the buffer it pushes, so the parse of the `+` chain cannot
+    // run past its own frame into the file around it -- without that, every
+    // one of these was `teko: malformed literal text in an interpolated
+    // string`.
+    {
+        i64 n = 7;
+        string s = new string("x");
+        string a = $"a{n}" + s;
+        if (!(a == new string("a7x"))) return 33;
+        string b = $"a{n}" + $"b{n}";
+        if (!(b == new string("a7b7"))) return 34;
+        if (!($"c" == new string("c"))) return 35;
+        if (n > 0) { if (!($"d{n}" == new string("d7"))) return 36; }
+        if (!($"e{n}" != new string("zz"))) return 37;
+    }
+    if (rt_live() != floor) return 38;
+
+    // ---- a BLOCK comment inside a hole: skipped by the brace scan, so the
+    // `}` inside it does not close the hole (a line comment is refused by
+    // name instead, tests/refuse/string_interp_line_comment.tk).
+    {
+        i64 n = 4;
+        if (!($"{n /* } not a closer */}" == new string("4"))) return 39;
+        if (!($"{/* first */ n}" == new string("4"))) return 40;
+    }
+    if (rt_live() != floor) return 41;
+
+    // ---- a hole at the very start, and at the very end ----
+    {
+        i64 n = 7;
+        string a = $"{n} end";
+        if (a.Length != 5) return 13;
+        string b = $"start {n}";
+        if (b.Length != 7) return 14;
+    }
+    if (rt_live() != floor) return 15;
+
+    // ---- an expression hole: `a + b`, `o.Name`, `f(1)` ----
+    {
+        i64 x = 3;
+        i64 y = 4;
+        string a = $"{x + y}";
+        if (a.Length != 1) return 16;
+
+        Named o = new Named("Ada");
+        string b = $"{o.Name}!";
+        if (b.Length != 4) return 17;
+
+        string c = $"{add1(41)}";
+        if (c.Length != 2) return 18;
+    }
+    if (rt_live() != floor) return 19;
+
+    // ---- adjacent holes, no literal text between ----
+    {
+        i64 x = 1;
+        i64 y = 2;
+        string a = $"{x}{y}";
+        if (a.Length != 2) return 20;
+    }
+    if (rt_live() != floor) return 21;
+
+    // ---- `{{`/`}}`, `$""`, `$"plain"` ----
+    {
+        i64 n = 5;
+        string a = $"{{n}} is {n}";
+        if (a.Length != 8) return 22;
+        string b = $"";
+        if (b.Length != 0) return 23;
+        string c = $"plain text";
+        if (c.Length != 10) return 24;
+    }
+    if (rt_live() != floor) return 25;
+
+    // ---- a churned loop, the reproducer's failure mode at scale ----
+    i64 i = 0;
+    loop {
+        if (i >= 50) break;
+        i64 n = i;
+        string a = $"item {n} of 50";
+        if (a.Length < 1) return 26;
+        i = i + 1;
+    }
+    if (rt_live() != floor) return 27;
+
+    return 42;
+}
