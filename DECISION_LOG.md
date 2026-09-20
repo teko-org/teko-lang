@@ -5524,16 +5524,18 @@ new fixture and the one refusal this crumb removes); `sh scripts/bootstrap.sh --
 identical on both, **all six UNMOVED**, on the `tests/hello.tk` leg (the fixed sample this
 crumb never touches, byte-identical top to bottom) and on the compiler's own leg alike.
 Only the compiler leg's own surface-code rows move, by the new module code: `nodes`
-207117->207654, `funcs`/`lowered` 4207/4207->4214/4214 (declared) and 3444/3425->3448/3429
+207117->207659, `funcs`/`lowered` 4207/4207->4214/4214 (declared) and 3444/3425->3448/3429
 (used), `strings` 3071->3080, `symbols` 8680->8698, `ins` 242597->242701 (`heap`, never
 cited).
 
 **`--dump-ast --include=lib --include=tests`, base vs head, over all 275 base fixtures**
 (132 `tests/*.tk` + 143 `tests/refuse/*.tk`, everything but the one fixture added and the
 one refusal removed) — byte-identical on 255 of them; the 20 that `#include`
-`lib/time.tk` (directly or through a chain) each gained the SAME 66 lines, a pure append
-after every pre-existing node (`diff` measured zero removed lines on every one of the
-twenty) — the new `<teko/clock.tk>` extern-and-function pair plus `tk_dt_now_utc`/`_local`/
+`lib/time.tk` (directly or through a chain) each gained the SAME 70 lines in four
+insertion hunks, none of them removing anything (`diff` measured zero removed lines on
+every one of the twenty; the independent verifier re-measured the same, and corrected this
+entry's first draft, which said 66 lines and called the shape an append -- the hunks land
+where the includes sit, not after the last node) — the new `<teko/clock.tk>` extern-and-function pair plus `tk_dt_now_utc`/`_local`/
 `tk_dt_today`/`tk_dto_now`/`tk_dto_now_utc`, the accepted surface this crumb adds. No
 pre-existing node moved.
 

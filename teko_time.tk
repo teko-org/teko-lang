@@ -61,7 +61,11 @@ i64 tk_ty_dto = 0;
 // `extern` on whichever host does not own it: measured (a scratch `mc build`
 // with a `call` to an undefined extern INSIDE a function nothing ever calls)
 // -- `mc` does not dead-strip an unreachable function, so an unused wrapper's
-// `extern` still has to resolve, and the build refuses to link.
+// `extern` still has to resolve. WHERE it bites is the platform's: on
+// macos/aarch64 the link itself succeeds (exit 0) and `dyld` binds eagerly,
+// so the binary dies at process START, exit 134, `Symbol not found` --
+// re-measured by the independent verifier, and worse than a link error, not
+// better, since nothing in the build says a word about it.
 //
 // The mechanism that already solves "the same source, a different answer per
 // host" is `#include <mc/host>` (`minicompiler/mc` src/core_bundle.mc): the
@@ -72,7 +76,12 @@ i64 tk_ty_dto = 0;
 // change to its two include lines. This wraps that SAME pointer for one more
 // name, `<teko/clock.tk>`, and falls through to `host_bundle_open` for every
 // other one, so `<sys>`, `<prelude>` and the rest of the bundle are
-// untouched. `host_os()`, never `drv_os()`: `ngen.yml`'s five legs are all
+// untouched. That fallthrough calls `host_bundle_open` BY NAME rather than
+// the pointer that was installed before this one, which is right while this
+// is the only wrapper in the tree and wrong the day a second module wraps
+// `lex_set_bundle` after `tk_clock_init()` -- the later wrapper would answer
+// first and `<teko/clock.tk>` would silently stop resolving. A second wrapper
+// has to chain the previous pointer instead. `host_os()`, never `drv_os()`: `ngen.yml`'s five legs are all
 // NATIVE (docs/specs/roadmap-1.0.md, the owner's ruling of 2026-09-04), so
 // the host running this compiler IS the target, and `host_os()` needs no
 // `--config` to answer -- `drv_os()` answers 0 on the bare-CLI path, which
