@@ -1955,6 +1955,25 @@ class H {
 }
 ```
 
+## `.ToString()` on a core scalar (D98)
+
+`.ToString()` on `i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u64`/`usize`/`char` is the very
+conversion an interpolation hole makes (`tk_scalar_tostring`, `teko_typeof.tk`), so the two
+always write the same text. Everything else keeps the refusal it already had:
+`"teko: f64 has no members: ToString"` for a float (there is no float formatter in this
+tree, which is why `$"{3.5}"` refuses too), `"teko: uptr has no members: ToString"` for
+`str`/`ptr`/`uptr` (one type id, so no oracle can tell text from an address),
+`"teko: unknown member of Box: ToString"` for a class that declares none, and
+`"teko: unknown member of i64?: ToString"` for a `T?`, which is read through `.Value`.
+`.ToString` without `()` answers `"teko: the member is a method; call it with ()"` and
+`x.ToString("D4")` answers `"teko: wrong number of arguments for ToString"` — C#'s format
+string is not taught.
+
+- `"teko: .ToString() needs #include \"string.tk\" before it is used"` — the call builds a
+  `string`, so the class has to be declared first, exactly as an interpolation hole needs
+  it. Add the include. Named rather than left to the member-name refusal, which would blame
+  `ToString` for a missing `#include`.
+
 ## String interpolation (`$"…"`)
 
 - `"teko: $ needs a string literal for interpolation"` — `$` is claimed program-wide the

@@ -40,7 +40,7 @@ total across all three crumbs, not one crumb's — N4b's own share of it is `+1`
 
 **Six amendments N5 made**, each marked where it appears: `Parse`/`TryParse`/`ToString` ARE
 taught for `DateTimeOffset` (§ 4, § 5) — the page's own § 2 and § 4 comments
-`` `.DayNumber` reads it `` / "no primitive here has a `str` member yet" describe `DateOnly`
+`` `.DayNumber` reads it `` / "no `str` row is written for it yet" describe `DateOnly`
 and were never meant to bind `DateTimeOffset`, but the wording was easy to misread as a
 blanket claim, so it is narrowed here: text landed with N5, D75's own wide-receiver
 mechanism carrying it, not a fourth crumb of its own; `new DateTimeOffset(i64 ticks,
@@ -218,7 +218,7 @@ keeps it rather than inventing an operator C# does not have.
 | `new DateOnly(y, m, d)` | `.AddDays(i64)` `.AddMonths(i64)` `.AddYears(i64)` |
 | `DateOnly.FromDayNumber(i64)` | `.ToDateTime(TimeOnly)` → `DateTime` — **landed with N4b**, once `TimeOnly` existed |
 | `DateOnly.FromDateTime(DateTime)` | `.CompareTo` `.Equals`; `.ToString()` is **not in N4a** |
-| `DateOnly.Parse(str)`, `TryParse(str, out DateOnly)` — **not in N4a**, no primitive here has a `str` member yet ([not-yet.md](../reference/not-yet.md)) | |
+| `DateOnly.Parse(str)`, `TryParse(str, out DateOnly)` — **not in N4a**, and no `str` row is written for `DateOnly` yet ([not-yet.md](../reference/not-yet.md)) | |
 
 **`TimeOnly`**
 
@@ -228,7 +228,7 @@ keeps it rather than inventing an operator C# does not have.
 | `new TimeOnly(h, mi)`, `new TimeOnly(h, mi, s)`, `new TimeOnly(h, mi, s, ms)` | `.Add(TimeSpan)` `.AddHours(f64)` `.AddMinutes(f64)` — all **wrapping**, C#'s own |
 | `new TimeOnly(i64 ticks)` | `.ToTimeSpan()` → `TimeSpan` |
 | `TimeOnly.FromDateTime(DateTime)`, `FromTimeSpan(TimeSpan)` | `.IsBetween(TimeOnly, TimeOnly)` |
-| `TimeOnly.Parse(str)`, `TryParse(str, out TimeOnly)` — **not in N4b**, no primitive here has a `str` member yet | `.CompareTo` `.Equals`; `.ToString()` is **not in N4b** either |
+| `TimeOnly.Parse(str)`, `TryParse(str, out TimeOnly)` — **not in N4b**, and no `str` row is written for `TimeOnly` yet | `.CompareTo` `.Equals`; `.ToString()` is **not in N4b** either |
 
 **`DateTimeOffset`**
 
