@@ -11370,8 +11370,13 @@ code; it is the existing release road reached one level deeper.
 **Fixtures.** `tests/surface_array_jagged.tk` (a `params i64[][]` list, `.Length` on both
 ranks, a row read into an `i64[]` local and passed on, `rows[i][j]` read/written/compound,
 `i64[][]` as a return type, a plain parameter, a local, an `i64[][]?`, a class FIELD, a
-GLOBAL with the two chained forms above, the counted `Cell[][]` floor, and a third rank
-`i64[][][]`) and `tests/refuse/array_new_jagged.tk` (`new i64[3][]`, line 15).
+GLOBAL with the two chained forms above, the counted `Cell[][]` floor, a third rank
+`i64[][][]`, and `i64[]?[]` -- an array of NULLABLE rows, where a slot holds `null`, is
+tested against it, and releases the row it held when `null` is stored over it) and
+`tests/refuse/array_new_jagged.tk` (`new i64[3][]`, line 15). The stale status of `T[][]`
+was corrected wherever the repository published it: `docs/guide/99-what-is-not-there-yet.md`,
+`CONTRIBUTING.md`, `docs/specs/nullable.md` and `docs/specs/params-typed.md`'s own
+out-of-scope list (Copilot on this crumb).
 
 **Gate.** `138 passed, 181 refused as expected, 0 failed` at `444fb242` → `139 passed, 182
 refused as expected, 0 failed`. `FIXPOINT OK`, docs gate green, and `--dump-ast` against

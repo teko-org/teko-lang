@@ -148,7 +148,7 @@ so the array is released at the end of the statement that built it.
 signature are a different piece of work. Today the virtual path is quietly wrong; refusing it
 trades a silent hole for a message, which is the right trade while the rest lands.
 
-**A generic `params`, `T[][]`, a lambda as an element, and a default plus expansion in the
+**A generic `params`, a lambda as an element, and a default plus expansion in the
 same call.** None is refused on principle; none is part of this design.
 
 **Implicit numeric conversion of an element.** C# has it; teko does not, here or anywhere

@@ -95,7 +95,7 @@ the rest.
 - **Error messages: compiler style.** `file:line:column: "short cause"` (e.g., `teko: unsupported (os,arch)`).
   No lengthy explanations or references to docs.
 - **Refused features carry the `teko:` prefix:** v0.4.0 does not support `Func<>`, `params T[]`,
-  `T[][]`, nested `namespace`, float in `params`, `when` on the last `_` arm. Any of these triggers
+  `new T[n][]`, nested `namespace`, float in `params`, `when` on the last `_` arm. Any of these triggers
   `teko: <short cause>`; the full list is [`docs/reference/not-yet.md`](docs/reference/not-yet.md).
 
 ## Decisions and forks

@@ -26,6 +26,10 @@
 //      is back to its floor once the whole thing goes out of scope.
 //   6. `cube` -- `i64[][][]`: the recursion has no depth of its own, a third
 //      rank is the row of a row of a row.
+//   7. `nullrows` -- `i64[]?[]`, an array of NULLABLE rows: the `?` is a
+//      suffix of the same type position, so a row slot can be declared
+//      nullable, hold `null`, be tested against it and be emptied -- and
+//      storing `null` over a row releases the row that was there.
 //
 // `new i64[3][]` is still refused (`tests/refuse/array_new_jagged.tk`): the
 // rows of a jagged array come from a store today, not from an allocator.
@@ -119,6 +123,27 @@ i64 cellcheck() {
 
 i64 cube(params i64[][][] c) { return c.Length + c[0].Length + c[0][1].Length; }
 
+// ---- 7. an array of nullable rows ----
+
+i64[]?[] nrows(params i64[]?[] rows) { return rows; }
+
+i64 nullrows() {
+    i64[] a = new i64[2];
+    a[0] = 4;
+    i64[]?[] rs = nrows(a, null);
+    if (rs.Length != 2) return 51;
+    if (rs[1] != null) return 52;
+    if (rs[0] == null) return 53;
+    i64[]? r = rs[0];
+    if (r == null) return 54;
+
+    i64[]?[] own = nrows(new i64[2], null);      // this row is owned by `own` alone
+    i64 live = rt_live();
+    own[0] = null;                               // ...and released by the store
+    if (rt_live() != live - 1) return 55;
+    return 0;
+}
+
 // sections 1, 2, 3 and 6, in a scope of their own: every array they build is
 // a local, so `rt_live()` is back to where it started once this returns.
 i64 run() {
@@ -191,6 +216,11 @@ i64 main() {
     i64 rc = run();
     if (rc != 0) return rc;
     if (rt_live() != base) return 71;
+
+    i64 nullbase = rt_live();
+    rc = nullrows();
+    if (rc != 0) return rc;
+    if (rt_live() != nullbase) return 56;
 
     i64 cellbase = rt_live();
     rc = cellcheck();
