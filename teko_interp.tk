@@ -210,10 +210,19 @@ i64 tk_interp_expr() {
     uptr fl = p_file();
     if (tk_str_class_si() < 0)
         err_at(fl, line, "teko: string interpolation needs #include \"string.tk\" before it is used");
+    // The RAW span, and it has to be read this way round: `p_start()` on a
+    // `T_STR` points into the ARENA, at mc's own escape-PROCESSED copy, not
+    // at the source (hooks.md § "Record and replay"), so a length measured
+    // between it and `p_cp()` is the distance between two unrelated
+    // allocations -- which is how the first draft of this handler fed
+    // `p_push_source` a garbage length and corrupted the compiler's heap.
+    // `p_cp()` while still SITTING ON the `$` already points at the opening
+    // quote, and `p_cp()` once the literal is current points just past the
+    // closing one: both are cursors into the same source buffer.
+    uptr qstart = p_cp();                        // the opening quote itself
     p_next();                                    // the `$`
     if (p_id() != T_STR)
         err_at(fl, line, "teko: $ needs a string literal for interpolation");
-    uptr qstart = p_start();                     // the T_STR token's own opening quote
     uptr qend = p_cp();                           // just past its closing quote
     // NOT `p_next()` here: `p_push_source`'s own lookahead contract
     // (hooks.md § Record and replay) discards whatever token is CURRENT the
