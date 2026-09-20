@@ -184,11 +184,22 @@ i64 main() {
     string nsb = $"[{ns}]";              // `.Length` on the literal itself is not-yet.md's own row
     if (nsb.Length != 2) return 62;
 
+    // A FOUR-byte lead with two bytes left: without the clamp the walk
+    // overshoots by two, past `nbytes + 1`. This row pins the VALUES, and it
+    // cannot pin the read itself -- measured, with the clamp reverted, this
+    // fixture still exits 42, because `SliceBytes` re-measures its copy with
+    // `tk_str_len` and stops at the terminator that sits INSIDE the
+    // allocation, so the two bytes read past it never reach an answer. The
+    // clamp removes a real out-of-bounds READ that no fixture in this corpus
+    // can observe (the review asked for a sharper one; this is as sharp as
+    // the language gets without a sanitiser). D92 says the same.
     uptr rawt = rt_alloc(4);
-    st8(rawt, 226); st8(rawt + 1, 130); st8(rawt + 2, 0); st8(rawt + 3, 0);
+    st8(rawt, 240); st8(rawt + 1, 159); st8(rawt + 2, 0); st8(rawt + 3, 0);
     string tr = new string(rawt);
-    if (tr.Substring(0).Utf8Length > tr.Utf8Length) return 63;
-    if (tr.Substring(0, tr.Length).Utf8Length > tr.Utf8Length) return 64;
+    string tr0 = tr.Substring(0);
+    if (tr0.Utf8Length != tr.Utf8Length) return 63;      // EXACTLY 2: a byte more is a read past the allocation
+    string tr1 = tr.Substring(0, tr.Length);
+    if (tr1.Utf8Length != tr.Utf8Length) return 64;
 
     return 42;
 }

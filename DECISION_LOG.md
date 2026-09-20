@@ -5957,8 +5957,15 @@ fixed together in `fix/interp-null-and-slice`:
 2. **`ByteOf` could walk past the allocation** on a string whose tail is a TRUNCATED UTF-8
    sequence -- which `new string(raw)` explicitly allows, since it copies bytes and counts
    lead bytes -- so `Substring(0)` and `Substring(0, Length)` sliced out of bounds (D89's
-   own ceiling, one step further than `tk_string_cp_decode`'s). It clamps to `nbytes` now,
-   and both shapes are pinned in `tests/surface_string_interp.tk`.
+   own ceiling, one step further than `tk_string_cp_decode`'s). It clamps to `nbytes` now.
+   The fixture pins the VALUES both shapes answer; it cannot pin the read, and the review
+   was right to ask: measured with the clamp reverted, `tests/surface_string_interp.tk`
+   still exits 42, because `SliceBytes` re-measures its copy with `tk_str_len` and stops at
+   the terminator INSIDE the allocation, so the bytes read past it never reach an answer.
+   What the clamp removes is a real out-of-bounds read that no fixture in this corpus can
+   observe -- the same shape D89 recorded for `tk_string_cp_decode`, where the arena's own
+   zeroed tail hid it. A sanitiser leg would catch both; this repository has none, and
+   naming the limit is the honest alternative to a fixture that pretends.
 3. `docs/reference/runtime.md` said `/` and `%` are unsigned when BOTH operands are: it is
    the LEFT operand alone (`gen_walk.mc`'s `type_signed(res_type(nd_a(n)))`), the same
    correction this entry already carries for `lib/string.tk` and `docs/specs/string.md`.
