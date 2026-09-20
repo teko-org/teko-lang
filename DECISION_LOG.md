@@ -5559,3 +5559,143 @@ mixing `DateOnly`/`TimeOnly`/`DateTimeOffset` is still marked `// no-run` — bo
 since N5 landed (D76), before this crumb, and corrected here in passing since this crumb
 was already touching the same paragraphs; the sample's `// no-run` marker itself is left
 as found, since making it run is N5's own gate, not C6's.
+
+### D91 · `Guid.NewGuid` (N9, 2026-09-20)
+`docs/specs/guid.md` §§ 5, 6, over the type N3 landed (D75). Depends on N3 and on nothing
+else — the same ruling C6 (D90) already took applies verbatim: the entropy the version-4
+layout needs is teko's own `extern` per target host, never an `mc` ask.
+
+**Ruling 1, the layout.** RFC 4122's version-4 `Guid`: 122 random bits, the version nibble
+forced to `4` in the TOP nibble of `time_hi_and_version` (byte `+6` of § 1's own text-order
+layout), the variant bits forced to `10` in the TOP TWO bits of `clock_seq` (byte `+8`).
+`(b6 & 0x0f) | 0x40` and `(b8 & 0x3f) | 0x80` are the two masks, pinned by
+`tests/primitives_guid_newguid.tk` reading them back through `&g`/`ld8` the same way
+`primitives_guid_bytes.tk` already reads the layout (guid.md § 1's own two masked
+positions).
+
+**Ruling 2, the source per host, measured, not guessed.** `getentropy(uptr buf, i64 n)`
+(macOS, libSystem — `i32`, documents a hard 256-byte ceiling per call, so the answer loops
+in slices of 256); `getrandom(uptr buf, i64 n, u32 flags)` (Linux, glibc >= 2.25 — `i64`,
+CAN return fewer bytes than asked without failing, so the answer loops on its own return
+and never on a fixed slice size); `BCryptGenRandom(uptr h, uptr buf, u32 n, u32 flags)`
+(Windows — `h` 0, `flags` 2, `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, `bcrypt.dll`, not one of the
+kernel32 entry points teko's sysroot already binds). On failure or a call that cannot fill
+the buffer, every host panics `teko: the entropy source is not available`, exit 70 — there
+is no fallback a version-4 `Guid` can take (a counter, a clock or an address would compile
+and two processes would collide), the same road the wall clock's own failure takes.
+
+**Ruling 3, `NewGuid` in a `const` or at file scope.** Unchanged: `Guid.NewGuid()` is a
+CALL, and the constant folder has no 128-bit arithmetic, so `const Guid ID =
+Guid.NewGuid();` still refuses `teko: const requires a constant expression` — the exact
+wording `guid_const.tk` already measures for `Guid.Empty`. Pinned by a fixture of its own,
+`tests/refuse/guid_newguid_const.tk`, rather than left to the reader's assumption that
+landing the call did not open a road around the folder.
+
+**The mechanism is C6's own wrapper, extended, not duplicated.** `[include].paths` cannot
+vary across `ngen.yml`'s five CI legs, and `mc` does not dead-strip an unreachable
+function, so an unused wrapper's `extern` still has to resolve — exactly the measurement
+D90 already made for the wall clock, unchanged for entropy. `teko_time.tk`'s
+`tk_clock_bundle_open` (installed once, by `tk_clock_init()`, itself called from
+`tk_time_init()`) now answers a SECOND bundle name, `<teko/entropy.tk>`, beside
+`<teko/clock.tk>` — the same function, one more `if (str_eq(name, ...))` branch, rather
+than a second `lex_set_bundle` call: D90's own comment already recorded that a second
+wrapper installed later would silently shadow the first (`host_bundle_open` is called BY
+NAME in the fallthrough, not through a chained pointer), so the only road that does not
+reopen that defect is answering more names from the ONE wrapper already installed.
+`lib/guid.tk` includes `<teko/entropy.tk>` unconditionally, right before `tk_guid_newguid()`
+which is its only caller; the TEXT it expands to differs by host, and only one host's
+wrapper is ever compiled into a given build. The bundle name ends `.tk`, D90's own hard
+lesson (`tk_source_claim`, `teko_fwd.tk`, scopes every teko-taught word to a source name
+that passes a bare `.tk`-suffix check) — carried over rather than re-measured, since the
+mechanism is the identical function. Zero mc changes, zero new intrinsics: the generated
+text is ordinary `extern`/function surface, parsed the same as any other include.
+
+**The OS is read `drv_os()` first, `host_os()` only as its fallback — for BOTH names,**
+D90's own amended ruling after its review, applied here without a second measurement: the
+same cross-build risk (`[target] os = "windows"` on a macOS box emitting the wrong host's
+wrapper into a COFF object) applies identically to the entropy branch, so both branches of
+`tk_clock_bundle_open` read the target the same way.
+
+**`TK_PMSFUN`, the last `TK_PMSOON` row moved off it.** `Guid.NewGuid` was the only member
+still on the "named, refused by name" kind after C6 (D90) moved `DateTime`'s and
+`DateTimeOffset`'s five off it; this crumb flips its own row (`teko_guid.tk`) to
+`TK_PMSFUN`, naming `tk_guid_newguid`, `Guid`'s type as both its zero-argument row and its
+return. No row uses `TK_PMSOON` today; both stale comments that pointed at `Guid.NewGuid`
+as the mechanism's one tenant (`teko_prim.tk`, `teko_time.tk`) are corrected to say so.
+
+**The Windows import library.** `BCryptGenRandom` lives in `bcrypt.dll`, not `kernel32.dll`,
+so it is a SECOND import library rather than a `kernel32.def` addition:
+`.github/actions/windows-sysroot/action.yml` writes a one-line `bcrypt.def` (`LIBRARY
+bcrypt.dll` / `EXPORTS BCryptGenRandom`) beside `kernel32.def` and runs `llvm-dlltool -D
+bcrypt.dll` over it into `bcrypt.lib`, exactly the `kernel32.lib` recipe. `ngen.yml`'s two
+Windows legs — the native leg and the fixpoint ladder, both matrix entries each — add
+`"{sysroot}/bcrypt.lib"` to their `[linker] args`, four occurrences total. Each Windows leg
+now: builds the sysroot (four files instead of three), derives its config, builds
+`tests/hello.tk` (unaffected — no `Guid` in it), builds and runs the fixture suite
+(`tests/primitives_guid_newguid.tk` proves the `NewGuid` extern resolves and links on that
+host, `guid_newguid_const.tk` proves the refusal). Not run on this machine — no Windows
+runner locally — proved instead by the cross-build probe below, the same limit D90's own
+entry stated for its own Windows leg.
+
+**Fixture (D52).** `tests/primitives_guid_newguid.tk` (`42`): 64 draws, none `Guid.Empty`,
+the version nibble exactly `4` and the variant nibble one of `8`/`9`/`a`/`b` on every one,
+two consecutive draws never equal, `ToString`/`Parse` (both formats) round-trips the value
+drawn — each assertion stated as what a WRONG build breaks rather than as a claim of
+randomness itself (§ 5 of this entry's own reasoning: a fixture cannot assert entropy, only
+what a version-4 layout guarantees regardless of it). `tests/refuse/guid_newguid_const.tk`
+(ruling 3). `tests/refuse/guid_newguid.tk`, the N3-era refusal `Guid.NewGuid()` earned, is
+REMOVED — this crumb makes it legal, the same road D90 took for `tests/refuse/dto_now.tk`.
+
+**Proof, mc 1.0.1, macos/aarch64, head against `origin/main` `2081c901`.** `mc build .
+--config mc.macos.toml` clean; `sh scripts/fixtures.sh ./build/teko mc.macos.toml` →
+**134 passed, 143 refused as expected, 0 failed** (base: 133 passed, 143 refused — one
+fixture added, one refuse fixture added, one refuse fixture removed, so `refused` is
+unmoved and `passed` is `+1`); `sh scripts/bootstrap.sh --os macos --arch aarch64` →
+`FIXPOINT OK`; `sh scripts/check-docs.sh` → `docs ok: 698 links, 79 fragments,
+413 diagnostics, 143 refusals, 155 samples, manifest listed`.
+
+`mc limits`, base vs head, `rm -rf build` first, both legs (never `heap`, always `grew`
+already on base from `ins`'s own pre-existing headroom, untouched by this crumb). The
+`tests/hello.tk` leg (`mc limits . --config mc.macos.toml`, stock mc against `teko.toml`):
+`passes` 15/30, `syntax` 20/40, `alias` 25/50, `types` 18/36, `intrin` 8/16, `on_stmt` 4/8,
+`syntax_type` 2/8 — every one IDENTICAL on base and head, all seven UNMOVED (`Guid.NewGuid`
+flips an existing row's KIND, `TK_PMSOON` to `TK_PMSFUN`; it registers no new row). The
+compiler's own leg (`mc limits build/teko.mc --config mc.macos.toml`): `nodes` value
+175260->175324 (+64), `funcs`/`lowered` (declared) 4214/4214->4221/4221 (+7) and (used)
+3448/3429->3451/3432 (+3 each), `globals` 1001->1001 (unmoved), `strings` 2450->2455 (+5),
+`symbols` 6899->6907 (+8), `ins` 242712->242811 (+99, `grew` on both base and head — the
+pre-existing headroom this entry does not move). Only the size-of-surface-code rows moved,
+by the new module code (three entropy source builders in `teko_time.tk`, one function in
+`lib/guid.tk`).
+
+**`--dump-ast --include=lib --include=tests`, base vs head, over all 278 base fixtures**
+that still exist at head (279 base `tests/**/*.tk`, minus the one refuse fixture this crumb
+removes) — **274 byte-identical**, including every `tests/refuse/*.tk` whose guid program
+includes `guid.tk`: a refusal prints its one message and stops before the parser's own
+dump would ever show the appended text, so the wording being unchanged is the whole proof
+there. The **4** that run to a full dump and include `guid.tk`
+(`tests/primitives_guid.tk`, `_bytes.tk`, `_parse_bad.tk`, `_tryparse.tk`) each gained the
+SAME 84 lines in ONE insertion hunk, at the point `lib/guid.tk`'s own text ends — `diff`
+measured **zero removed lines** on every one of the four — the `EXTERN` declaration and
+`tk_entropy_fill`/`tk_guid_newguid` bodies this crumb adds. No pre-existing node moved on
+any of the 278.
+
+**The cross-build probe.** A scratch program (`Guid g = Guid.NewGuid(); if (g ==
+Guid.Empty) return 1; return 42;`) built on this macOS/aarch64 machine with `[target] os =
+"windows", arch = "x86_64"`, `--backend=coff-obj-x86_64`, `--entry-only`: the compile
+succeeds and the link fails for the ordinary reason (`cc` does not link COFF, `ld: unknown
+file type`) — the object is left on disk regardless. `strings` on that object shows
+`BCryptGenRandom` and neither `clock_gettime`/`getentropy`/`getrandom` (the wrong wrapper
+never emits) nor any Linux/macOS entropy symbol, confirming `tk_clock_bundle_open`'s
+`drv_os()`-first read selects the TARGET's entropy source, not the machine's, for the
+second bundle name exactly as it already did for the first (D90).
+
+**Adjacent findings:** the independent verifier found one this entry's first draft claimed
+did not exist -- `docs/internals/primitives.md` still listed `Guid.NewGuid` as the example of
+a `TK_PMSOON` row and explained the kind by a message this crumb deletes. Corrected here
+along with the other two (`teko_prim.tk`'s comment, `docs/reference/not-yet.md`'s row): no
+row uses `TK_PMSOON` today, the two that did (C6's clock members, this crumb's `NewGuid`)
+both got what they were waiting for, and the kind stays for the next member that has to
+wait. `sh scripts/check-docs.sh` does not catch prose that contradicts a registration table
+-- only links, English and the diagnostics inventory -- so the sweep is by grep, and the
+grep is `TK_PMSOON` across `docs/` and the modules.

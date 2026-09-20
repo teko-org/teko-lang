@@ -1,0 +1,63 @@
+// primitives_guid_newguid.tk -- N9 of docs/specs/guid.md (§ 5; D91):
+// `Guid.NewGuid()`, the host's own cryptographic randomness under the
+// version-4 layout.
+//
+// A fixture cannot assert randomness itself, so every assertion here is one
+// that a WRONG build (a bad nibble mask, a stuck entropy source, an
+// unshuffled buffer) would actually break, and a right one cannot fail by
+// chance:
+//   - the version nibble is exactly `4` and the variant nibble is exactly
+//     `8`, `9`, `a` or `b` (the top two bits `10`) on MANY draws -- a fixed
+//     position in the text a version-4 value always carries, RFC 4122's own
+//     layout (§ 5, § 1)
+//   - two consecutive draws differ -- true with overwhelming probability
+//     for 122 random bits, and certain to fail loudly (not silently) if the
+//     entropy source were ever stuck returning the same bytes
+//   - `Guid.Empty` is never drawn -- the all-zero value has variant nibble
+//     `0`, which the mask this crumb applies can never produce, so this is
+//     really the same claim as the nibble check, stated the way a caller
+//     would ask it
+//   - `ToString`/`Parse` round-trip a generated value -- `NewGuid` reads
+//     text through the SAME sixteen bytes every other member does, so a
+//     buffer that were somehow uninitialised at the seams would show here
+//     as a parse failure or a mismatch, not as a subtler defect
+//
+// expect-exit: 42
+
+#include "rt.tk"
+#include "guid.tk"
+
+i64 main() {
+    Guid empty = Guid.Empty;
+    Guid prev = Guid.Empty;
+    i64 i = 0;
+    loop {
+        if (i >= 64) break;
+        Guid g = Guid.NewGuid();
+
+        if (g == empty) return 1;                 // never the all-zero value
+
+        // the version nibble: the first hex digit of the third group,
+        // byte +6's own top nibble
+        ptr q = &g;
+        i64 b6 = ld8(q + 6);
+        if (((b6 >> 4) & 15) != 4) return 2;
+
+        // the variant bits: the top two bits of byte +8, `10` in binary --
+        // the nibble is 8, 9, a or b
+        i64 b8 = ld8(q + 8);
+        i64 variant_top2 = (b8 >> 6) & 3;
+        if (variant_top2 != 2) return 3;
+
+        if (i > 0 && g == prev) return 4;          // two consecutive draws differ
+        prev = g;
+
+        // the text round trip, on this very value
+        str s = g.ToString();
+        if (Guid.Parse(s) != g) return 5;
+        if (Guid.Parse(g.ToString("N")) != g) return 6;
+
+        i = i + 1;
+    }
+    return 42;
+}

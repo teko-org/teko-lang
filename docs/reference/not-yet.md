@@ -340,15 +340,17 @@ nine slots:
 N7a's nor N7b's nor N8's; both stay exactly where
 [the specification](../specs/string.md) § 9-11 leaves them.
 
-## `Guid.NewGuid`, and the rest of `docs/specs/guid.md`
+## The rest of `docs/specs/guid.md`
 
 N3 landed the type whole but one member (D75, [the type reference](types.md#guid)): the
-sixteen bytes, `Parse`/`ToString`, `TryParse`, the ordering and `Empty`. What is left is the
-one function that reads the host's entropy.
+sixteen bytes, `Parse`/`ToString`, `TryParse`, the ordering and `Empty`. N9 (D91) landed the
+one function that was left, `Guid.NewGuid()`, over the SAME wrapped bundle resolver C6 (D90)
+installed for the wall clock — `getrandom` on Linux, `getentropy` on macOS,
+`BCryptGenRandom` on Windows, the last needing the `bcrypt.def` this crumb added to teko's
+own Windows sysroot.
 
 | written | what happens |
 |---|---|
-| `Guid.NewGuid()` (N9) | `teko: Guid.NewGuid is not taught yet` — a version-4 `Guid` is sixteen bytes of **cryptographic** randomness, which is one `extern` per operating system: `getrandom` on Linux, `getentropy` on macOS, `BCryptGenRandom` on Windows, the last needing a `bcrypt.def` in teko's own Windows sysroot ([the specification](../specs/guid.md) § 5). A `Guid` built from a counter, a clock or an address would compile and two processes would collide, so there is **no fallback** — there is a refusal until all three land |
 | `g.ToString("B")`, `"P"`, `"X"` | `teko: the Guid format is not taught`, a run-time panic (exit 70) — three more spellings of the same sixteen bytes, and nothing asks for them |
 | `g.ToByteArray()`, `new Guid(byte[])` | `teko: unknown member of Guid` / `teko: this primitive has no constructor` — the byte-order question of § 1 becomes visible the moment either exists, and neither is asked for |
 | version 1, 3, 5 and 7 `Guid`s | not taught: v1 needs a MAC address and a clock, v3/v5 need MD5/SHA-1, v7 needs a clock, and all of them are a library over `NewGuid`'s own primitive |

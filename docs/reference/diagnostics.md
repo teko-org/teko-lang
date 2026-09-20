@@ -792,14 +792,10 @@ sixteen were meant ([the specification](../specs/decimal.md) § 2, last row):
 `Guid` is the second `TK_WIDE` type and the first that is not `decimal`
 ([the specification](../specs/guid.md), D75), so every refusal of the section above that is
 about the sixteen bytes rather than about `decimal` reaches it too — the `extern` one by
-name, the five machine guards as guards. What is its own is short.
+name, the five machine guards as guards. `Guid.NewGuid()` (N9, D91) reads the host's own
+entropy through the same wrapped bundle resolver C6 (D90) gave the wall clock and is no
+longer refused by name. What is its own is short.
 
-- `"teko: "` — completed by *Guid.NewGuid is not taught yet*: a version-4 `Guid` is sixteen
-  bytes of **cryptographic** randomness, which is one `extern` per operating system and
-  teko's own to write (N9, [the specification](../specs/guid.md) § 5,
-  [not-yet.md](not-yet.md)). A `Guid` built from a counter, a clock or an address would
-  compile and two processes would collide, so there is no fallback — there is a `TK_PMSOON`
-  row, and the site says so by name.
 - ``"teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it"`` —
   `(i64) g` and `(Guid) n` written by hand. Sixteen bytes are no number, and unlike
   `decimal` this type teaches both directions already, so the refusal names them.
@@ -816,7 +812,7 @@ name, the five machine guards as guards. What is its own is short.
   fixture until now, since no program had written it — and the shared wording is a strictly
   better answer, naming the static that reads as the type's own zero.
 
-Two more are **run-time panics** of `lib/guid.tk`, both exit 70 and both on stderr with no
+Three more are **run-time panics** of `lib/guid.tk`, all exit 70 and all on stderr with no
 `file:line` — the same abort every other guard in this port takes
 ([runtime.md](runtime.md)):
 
@@ -826,6 +822,12 @@ Two more are **run-time panics** of `lib/guid.tk`, both exit 70 and both on stde
 - `"teko: the Guid format is not taught"` — `g.ToString(fmt)` on a format outside `"D"` and
   `"N"`. `"B"`, `"P"` and `"X"` are three more spellings of the same sixteen bytes and are
   not taught ([the specification](../specs/guid.md) § 6).
+- `"teko: the entropy source is not available"` — `Guid.NewGuid()` (N9, D91) on a host whose
+  entropy call fails or makes no progress: `getentropy`'s documented failure, `getrandom` returning
+  negative, or `BCryptGenRandom` answering a nonzero `NTSTATUS`. Not reachable on a healthy
+  host; a panic rather than a silently weak fallback, exactly like the wall clock's own
+  `"the wall clock is not available"` (C6, D90) — there is no fallback a version-4 `Guid` can
+  take.
 
 ## `DateTimeOffset`
 

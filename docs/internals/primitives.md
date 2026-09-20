@@ -35,7 +35,7 @@ argument types, symbol, result type)` — a position may carry a late type NAME 
 | `TK_PMPROP` | `x.Name` | `t.Days` |
 | `TK_PMFUN` | `x.Name(args)` | `t.CompareTo(u)` |
 | `TK_PMCTOR` | `new Type(args)` | `new DateTime(2024, 2, 29)` |
-| `TK_PMSOON` | `Type.Name`, refused by name | `Guid.NewGuid` |
+| `TK_PMSOON` | `Type.Name`, refused by name | none today — see below |
 
 **The parameter list is a count and a HEAD into a pool of positions**, one column per
 argument. It was a count and ONE type until N2c, because every row took its arguments in a
@@ -56,12 +56,13 @@ one `tk_prim_need_include` refuses for the missing include.
 DateTime(...)` is five rows (1, 2, 3, 6 and 7 arguments) and the site picks by how many it
 wrote; a count no row has is `teko: wrong number of arguments for new`.
 
-**A `TK_PMSOON` row names a member the type HAS and this version does not teach.**
-`Guid.NewGuid` needs an entropy source, teko's own `extern` to give
-([not-yet.md](../reference/not-yet.md)), and the row is what makes the site say
-`teko: Guid.NewGuid is not taught yet` instead of reading as an unknown member.
-`DateTime.Now`/`UtcNow`/`Today` used to be `TK_PMSOON` rows too, for the same reason
-(a wall clock, also teko's own); C6 (D90) moved them to ordinary `TK_PMSVAL` rows.
+**A `TK_PMSOON` row names a member the type HAS and this version does not teach**, so the
+site says `teko: <Type>.<Name> is not taught yet` instead of reading as an unknown member.
+**No row uses the kind today** (`grep` for `TK_PMSOON` finds the `#define` and this page,
+no registration): the two that did both waited on something teko had to give itself and
+both now have it — `DateTime.Now`/`UtcNow`/`Today` on a wall clock (C6, D90) and
+`Guid.NewGuid` on an entropy source (N9, D91), each an `extern` chosen by the target's own
+operating system. The kind stays because the next member that has to wait will want it.
 
 An **operator row** is `(token, arity, left type, right type, symbol, result type, swap)`.
 `swap` is C#'s reversed declaration — `n * t` and `t * n` are one function, called with the

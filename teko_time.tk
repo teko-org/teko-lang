@@ -48,12 +48,18 @@ i64 tk_ty_timeonly = 0;
 i64 tk_ty_dto = 0;
 
 // ============================================================================
-// the wall clock (crumb C6, D90)
+// the wall clock (crumb C6, D90) and the entropy source (crumb N9, D91)
 // ============================================================================
 //
 // `DateTime.Now`/`UtcNow`/`Today` and `DateTimeOffset.Now`/`UtcNow` need one
 // wall-clock symbol per host: `clock_gettime` on Linux and macOS,
-// `GetSystemTimePreciseAsFileTime` on Windows. `.github/workflows/ngen.yml`
+// `GetSystemTimePreciseAsFileTime` on Windows. `Guid.NewGuid()` (N9, D91)
+// needs the same SHAPE of thing -- one symbol per host, `getrandom` on Linux,
+// `getentropy` on macOS, `BCryptGenRandom` on Windows -- so it answers
+// through the SAME wrapper this section installs, under a second bundle
+// name, `<teko/entropy.tk>`, rather than a second `lex_set_bundle` call: the
+// comment below states why a second wrapper would silently shadow this one.
+// `.github/workflows/ngen.yml`
 // derives its five legs' configs from the SAME `teko.toml`, and its own
 // comment states `[include]` "can never drift" between them -- so a quoted
 // `#include "clock.tk"` cannot pick a different FILE per host, and declaring
@@ -73,15 +79,17 @@ i64 tk_ty_dto = 0;
 // (`lex_set_bundle`), and `host_bundle_open` -- what `core_teko.mc`'s own
 // `mc_bundle_init()` installs -- already special-cases that one name to
 // `host_include()`'s own answer, so a generated compiler is portable with no
-// change to its two include lines. This wraps that SAME pointer for one more
-// name, `<teko/clock.tk>`, and falls through to `host_bundle_open` for every
-// other one, so `<sys>`, `<prelude>` and the rest of the bundle are
-// untouched. That fallthrough calls `host_bundle_open` BY NAME rather than
-// the pointer that was installed before this one, which is right while this
-// is the only wrapper in the tree and wrong the day a second module wraps
-// `lex_set_bundle` after `tk_clock_init()` -- the later wrapper would answer
-// first and `<teko/clock.tk>` would silently stop resolving. A second wrapper
-// has to chain the previous pointer instead. The OS is read `drv_os()` FIRST
+// change to its two include lines. This wraps that SAME pointer for two
+// names, `<teko/clock.tk>` and `<teko/entropy.tk>`, and falls through to
+// `host_bundle_open` for every other one, so `<sys>`, `<prelude>` and the
+// rest of the bundle are untouched. That fallthrough calls `host_bundle_open`
+// BY NAME rather than the pointer that was installed before this one, which
+// is right while this is the only wrapper in the tree and wrong the day a
+// second module wraps `lex_set_bundle` after `tk_clock_init()` -- the later
+// wrapper would answer first and both names would silently stop resolving.
+// A second wrapper has to chain the previous pointer instead; `Guid.NewGuid`
+// (N9) answers through THIS wrapper's own second branch rather than
+// installing one, for exactly that reason. The OS is read `drv_os()` FIRST
 // and `host_os()` only as its fallback: `ngen.yml`'s five legs are all NATIVE
 // (docs/specs/roadmap-1.0.md, the owner's ruling of 2026-09-04) and there the
 // two agree, but a CROSS build -- `mc build --config` with `[target] os =
@@ -90,7 +98,7 @@ i64 tk_ty_dto = 0;
 // `[target]`; `src/driver.mc` zero-initialises the record), and there the
 // host is the target, which is what the fallback is for.
 //
-// Each answer is a small, complete function, `tk_dt_raw_utc_ticks()`,
+// Each clock answer is a small, complete function, `tk_dt_raw_utc_ticks()`,
 // returning C#'s own tick count (100 ns, since `0001-01-01`) read off the
 // host clock -- `lib/time.tk`'s `Now`/`UtcNow` call nothing else. `rt_alloc`,
 // `panic`, `ld64`, `UNIX_EPOCH_TICKS` and `TICKS_PER_SECOND` all read from
@@ -101,6 +109,22 @@ i64 tk_ty_dto = 0;
 // neither reachable through this call) -- panics rather than answering a
 // wrong instant, exit 70, the road every other wall-clock read of this
 // crumb takes.
+//
+// Each entropy answer is `tk_entropy_fill(uptr buf, i64 n)`, filling `buf`
+// with `n` bytes of the host's own cryptographic randomness -- `lib/guid.tk`'s
+// `NewGuid` calls nothing else. `rt.tk`'s `panic` is the only other symbol it
+// reads, from `lib/guid.tk`'s own scope at the point `#include
+// <teko/entropy.tk>` appears there. Every host panics rather than answering
+// weak or short randomness: `getentropy` documents a hard 256-byte-per-call
+// ceiling (macOS `man getentropy`), so the POSIX macOS answer LOOPS in
+// slices of 256 and panics on any nonzero return; `getrandom` (Linux, glibc
+// >= 2.25) can return FEWER bytes than asked without failing, so the POSIX
+// Linux answer loops on its own return value and panics on a negative one;
+// `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (flag `2`) fills
+// the whole buffer in one call by its own contract and returns an `NTSTATUS`
+// that is exactly zero on success, so the Windows answer panics on anything
+// else. `panic("the entropy source is not available")` is exit 70 on every
+// host, the same road the wall clock's own failure takes.
 uptr tk_clock_posix_src() {
     return "extern i32 clock_gettime(i32 clk, uptr tp);\ni64 tk_dt_raw_utc_ticks() {\n    uptr tp = rt_alloc(16);\n    i32 rc = clock_gettime(0, tp);\n    if (rc != 0) panic(\"the wall clock is not available\");\n    i64 sec = ld64(tp);\n    i64 nsec = ld64(tp + 8);\n    rt_free(tp, 16);\n    return UNIX_EPOCH_TICKS + sec * TICKS_PER_SECOND + nsec / 100;\n}\n";
 }
@@ -115,25 +139,61 @@ uptr tk_clock_windows_src() {
     return "extern void GetSystemTimePreciseAsFileTime(uptr tp);\nconst i64 FILETIME_EPOCH_DIFF_TICKS = 504911232000000000;\ni64 tk_dt_raw_utc_ticks() {\n    uptr tp = rt_alloc(8);\n    GetSystemTimePreciseAsFileTime(tp);\n    i64 ft = ld64(tp);\n    rt_free(tp, 8);\n    return ft + FILETIME_EPOCH_DIFF_TICKS;\n}\n";
 }
 
-// the wrapped bundle resolver: `<teko/clock.tk>` answered here, by host; every
-// other name -- `<sys>`, `<prelude>`, `<mc/host>` itself -- handed straight
-// to the resolver `mc_bundle_init()` already installed.
+// macOS: `getentropy` fills AT MOST 256 bytes a call and answers `i32` 0 on
+// success, `-1` (with `errno` set) otherwise -- looped in slices of 256 until
+// `n` bytes are written, panicking on the first nonzero return.
+uptr tk_entropy_macos_src() {
+    return "extern i32 getentropy(uptr buf, i64 n);\nvoid tk_entropy_fill(uptr buf, i64 n) {\n    i64 off = 0;\n    loop {\n        if (off >= n) break;\n        i64 chunk = n - off;\n        if (chunk > 256) chunk = 256;\n        i32 rc = getentropy(buf + off, chunk);\n        if (rc != 0) panic(\"the entropy source is not available\");\n        off = off + chunk;\n    }\n}\n";
+}
+
+// Linux (glibc >= 2.25): `getrandom` may answer FEWER bytes than asked
+// without failing (a short read, e.g. on a signal), so the loop advances by
+// its own return and panics on a negative one -- `flags` 0, the blocking
+// default, which only blocks before the kernel's CSPRNG is seeded, once per
+// boot.
+uptr tk_entropy_linux_src() {
+    return "extern i64 getrandom(uptr buf, i64 n, u32 flags);\nvoid tk_entropy_fill(uptr buf, i64 n) {\n    i64 off = 0;\n    loop {\n        if (off >= n) break;\n        i64 rc = getrandom(buf + off, n - off, 0);\n        if (rc <= 0) panic(\"the entropy source is not available\");\n        off = off + rc;\n    }\n}\n";
+}
+
+// Windows: `BCryptGenRandom` with `BCRYPT_USE_SYSTEM_PREFERRED_RNG` (`2`)
+// takes a NULL algorithm handle and fills the whole buffer in one call by its
+// own contract; it returns an `NTSTATUS`, exactly `0` (`STATUS_SUCCESS`) on
+// success. `bcrypt.dll`, not one of the kernel32 entry points teko's sysroot
+// already binds (`.github/actions/windows-sysroot/action.yml`'s own
+// `bcrypt.def`).
+uptr tk_entropy_windows_src() {
+    return "extern u32 BCryptGenRandom(uptr h, uptr buf, u32 n, u32 flags);\nvoid tk_entropy_fill(uptr buf, i64 n) {\n    u32 rc = BCryptGenRandom(0, buf, (u32) n, 2);\n    if (rc != 0) panic(\"the entropy source is not available\");\n}\n";
+}
+
+// the wrapped bundle resolver: `<teko/clock.tk>` and `<teko/entropy.tk>`
+// answered here, by host; every other name -- `<sys>`, `<prelude>`,
+// `<mc/host>` itself -- handed straight to the resolver `mc_bundle_init()`
+// already installed.
 uptr tk_clock_bundle_open(uptr name, i64 base, uptr pcanon, uptr plen) {
+    // the TARGET's host, not this machine's: `drv_os()` is what `[target]
+    // os` (or `--os`) set, and a cross build -- `--os windows` on a macOS
+    // box, which `docs/internals/bootstrap.md` discusses and the ladder's
+    // own host guard refuses only for the LADDER -- must emit the target's
+    // wrapper or link nothing. `drv_os()` answers 0 on the bare-CLI path (no
+    // `[target]`, `src/driver.mc`'s record is zero-initialised), and there
+    // the host IS the target, so `host_os()` is the fallback rather than the
+    // rule (D90, amended after the review; shared by both names, D91).
     if (str_eq(name, "teko/clock.tk")) {
-        // the TARGET's clock, not this machine's: `drv_os()` is what
-        // `[target] os` (or `--os`) set, and a cross build -- `--os windows`
-        // on a macOS box, which `docs/internals/bootstrap.md` discusses and
-        // the ladder's own host guard refuses only for the LADDER -- must
-        // emit the target's wrapper or link nothing. `drv_os()` answers 0 on
-        // the bare-CLI path (no `[target]`, `src/driver.mc`'s record is
-        // zero-initialised), and there the host IS the target, so `host_os()`
-        // is the fallback rather than the rule (D90, amended after the
-        // review).
         uptr os = drv_os();
         if (os == 0) os = host_os();
         uptr src = tk_clock_posix_src();
         if (str_eq(os, "windows")) src = tk_clock_windows_src();
         st64(pcanon, "teko/clock.tk");
+        st64(plen, cstrlen(src));
+        return src;
+    }
+    if (str_eq(name, "teko/entropy.tk")) {
+        uptr os = drv_os();
+        if (os == 0) os = host_os();
+        uptr src = tk_entropy_linux_src();
+        if (str_eq(os, "macos")) src = tk_entropy_macos_src();
+        else if (str_eq(os, "windows")) src = tk_entropy_windows_src();
+        st64(pcanon, "teko/entropy.tk");
         st64(plen, cstrlen(src));
         return src;
     }
