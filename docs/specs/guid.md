@@ -1,12 +1,12 @@
 # `Guid`
 
-**N3 landed** (D75): everything on this page compiles today except `Guid.NewGuid`, which is
-N9 (§ 5) and refused by name. The samples keep their `// no-run` marker because they are
-fragments rather than whole programs; the runnable form is
-[the type reference](../reference/types.md#guid), and
+**N3 and N9 both landed** (D75, D91): everything on this page compiles today, `Guid.NewGuid`
+included. The samples keep their `// no-run` marker because they are fragments rather than
+whole programs; the runnable form is [the type reference](../reference/types.md#guid), and
 `tests/primitives_guid.tk`, `tests/primitives_guid_bytes.tk`,
-`tests/primitives_guid_tryparse.tk` and `tests/primitives_guid_parse_bad.tk` are the
-oracles. What each section owes the build is marked below.
+`tests/primitives_guid_tryparse.tk`, `tests/primitives_guid_parse_bad.tk` and
+`tests/primitives_guid_newguid.tk` are the oracles. What each section owes the build is
+marked below.
 
 `Guid` is C#'s `System.Guid`: a 128-bit identifier, written as
 `f81d4fae-7dec-11d0-a765-00a0c91e6bf6`, compared and ordered by value, with an all-zero
@@ -97,7 +97,7 @@ i64 main() {
     Guid b = 0;                   // teko: a value of type i64 does not convert to Guid
     Guid c = a + a;               // teko: no operator `+` takes these operands
     i64 d = (i64) a;              // teko: a Guid does not cast; `.ToString()` writes it
-    Guid e = Guid.NewGuid();      // teko: Guid.NewGuid is not taught yet
+    const Guid E = Guid.NewGuid();   // teko: const requires a constant expression -- a CALL, still no constant
     return 0;
 }
 ```
@@ -109,9 +109,8 @@ i64 main() {
 | `+ - * / % & \| ^ ~ << >>` | ``teko: no operator `+` takes these operands`` |
 | `(i64) g`, `(Guid) n` written by hand | ``teko: a Guid does not cast; `.ToString()` writes it and `Guid.Parse(s)` reads it`` |
 | an unknown member | `teko: unknown member of Guid`, `teko: unknown static member of Guid`, each completed by the name written |
-| `Guid.NewGuid()` | `teko: Guid.NewGuid is not taught yet` (§ 5) |
 | a `Guid` on an `extern` | ``teko: an `extern` takes no Guid`` — the sixteen-byte convention is teko's own and crosses no C boundary |
-| a `Guid` as a `const` or a `switch` label | `teko: const requires a constant expression` and `teko: a case label must be a constant expression` — **as built**: the folder has no 128-bit arithmetic and those are the wordings it already had, exactly as for `decimal` |
+| a `Guid` as a `const` or a `switch` label, `Guid.NewGuid()` included (§ 5, N9) | `teko: const requires a constant expression` and `teko: a case label must be a constant expression` — **as built**: the folder has no 128-bit arithmetic and those are the wordings it already had, exactly as for `decimal`; a CALL is no constant expression either, § 5's own ruling 3 |
 
 ## 3. Operators
 
@@ -132,7 +131,7 @@ stops at the first difference.
 | `Guid.Empty` | `.ToString()` — the "D" form |
 | `Guid.Parse(str)` | `.ToString(str fmt)` — `"D"` or `"N"` |
 | `Guid.TryParse(str, out Guid)` | `.CompareTo(Guid)`, `.Equals(Guid)` |
-| `Guid.NewGuid()` — N9, § 5 | `.IsEmpty` — an `i64` 0/1 |
+| `Guid.NewGuid()` — N9, § 5, **landed** | `.IsEmpty` — an `i64` 0/1 |
 
 **Text.** `ToString()` writes 36 characters, lowercase, `8-4-4-4-12`, which is C#'s `"D"`
 and C#'s own casing. `ToString("N")` writes the same 32 hex digits with no dashes. `"B"`
@@ -149,7 +148,7 @@ more formats for the same sixteen bytes and nothing asks for them.
 one comparison the caller would otherwise write against a static that costs a load. It is
 the one addition on this page, and it is additive: `g == Guid.Empty` works too.
 
-## 5. `Guid.NewGuid` is teko's own entropy `extern`
+## 5. `Guid.NewGuid` is teko's own entropy `extern` — **landed, N9, D91**
 
 A version-4 `Guid` is sixteen bytes of **cryptographically random** data with the version
 nibble set to `4` and the variant bits to `10`. The nibbles are arithmetic; the randomness
@@ -163,22 +162,28 @@ comes from the host, under one name per operating system:
 
 **These are teko's own** (the owner's ruling of 2026-09-08: the tooling `mc` gives —
 `extern`, the target host the taught compiler knows at compile time, and a sysroot this
-repository writes itself — is enough, and nothing is asked of `mc`). `teko_guid.tk` emits
-the one declaration the target host needs, `lib/guid.tk` loops it into sixteen bytes, and
-teko's `windows-sysroot` action writes a one-line `bcrypt.def` (`EXPORTS BCryptGenRandom`)
-beside its `kernel32.def` and runs `llvm-dlltool` over it, exactly as `kernel32.lib` is made
-(D36 for the site's own precedent of a hand-written piece of infrastructure). Until N9 lands
-`Guid.NewGuid` is refused **by name**, and every other member of this page lands without it.
+repository writes itself — is enough, and nothing is asked of `mc`). The mechanism landed is
+NOT a per-target declaration in `lib/guid.tk` directly (`[include].paths` cannot vary across
+`ngen.yml`'s five CI legs, and `mc` does not dead-strip an unreachable function, so an
+unused wrapper's `extern` would still have to resolve — C6's own measurement, D90): instead
+`lib/guid.tk` includes `<teko/entropy.tk>`, a SECOND name the SAME wrapped bundle resolver
+C6 installed for `<teko/clock.tk>` answers, by host, in `teko_time.tk`. `tk_guid_newguid()`
+calls the one function that text expands to, `tk_entropy_fill(uptr buf, i64 n)`, fills the
+sixteen bytes, and sets the version and variant nibbles by hand. teko's `windows-sysroot`
+action writes a one-line `bcrypt.def` (`EXPORTS BCryptGenRandom`) beside its `kernel32.def`
+and runs `llvm-dlltool` over it into its own `bcrypt.lib`, exactly as `kernel32.lib` is made
+(D36 for the site's own precedent of a hand-written piece of infrastructure); `ngen.yml`'s
+two Windows legs link both import libraries.
 
 A `Guid` built from a counter, a clock or an address would compile and would be a wrong
-answer — two processes would collide — so it is not the fallback. There is no fallback;
-there is a refusal until the `extern` lands.
+answer — two processes would collide — so it is not the fallback. There is no fallback: on
+a failing or short read, `tk_entropy_fill` panics `teko: the entropy source is not
+available`, exit 70, the same road the wall clock's own failure takes.
 
 ## 6. What stays out
 
 | left out | why |
 |---|---|
-| `Guid.NewGuid` | § 5, N9 |
 | version 1, 3, 5 and 7 `Guid`s | v1 needs a MAC address and a clock, v3/v5 need MD5/SHA-1, v7 needs a clock; all of them are a library over `NewGuid`'s own primitive |
 | `ToByteArray`, `new Guid(byte[])` | the byte order question of § 1 becomes visible the moment either exists, and neither is asked for |
 | `"B"`, `"P"`, `"X"` formats | three more spellings of the same bytes |
@@ -191,12 +196,15 @@ there is a refusal until the `extern` lands.
 |---|---|
 | `teko_wide.tk` | **one column**: the machine is general, as this page predicted, but the RETURN BUFFER was one name for the whole program (`tk_dec_retbuf`), so returning a `Guid` asked for `decimal.tk`. It is per type now — a fourth column of the wide set — and every handler that moves the bytes is untouched (D75) |
 | `teko_ref.tk` | **one tag**, and C3's own hole closed with it: a `ref`/`out` parameter's name INSIDE the load or the store the deref pass writes is the ADDRESS, and nothing said so, so `ref decimal`/`out decimal` was refused `teko: a value of type decimal does not convert to uptr` on a line no source wrote. `Guid.TryParse(s, out g)` needs that road, and `tests/primitives_decimal_out.tk` proves it for `decimal` too |
-| **`teko_guid.tk`** (new) | one `type_new`, one `tk_wide_add`, one `syntax_expr`/`syntax_stmt` pair for the type word, the rows of § 3 and § 4 in the primitive-member and primitive-operator tables, and `Guid.TryParse(s, out g)` parsed by hand — `out <name>` is no column those tables have, the same reason `Color.TryParse` is hand-parsed (`teko_enum.tk`) |
+| **`teko_guid.tk`** (new) | one `type_new`, one `tk_wide_add`, one `syntax_expr`/`syntax_stmt` pair for the type word, the rows of § 3 and § 4 in the primitive-member and primitive-operator tables, and `Guid.TryParse(s, out g)` parsed by hand — `out <name>` is no column those tables have, the same reason `Color.TryParse` is hand-parsed (`teko_enum.tk`). N9: `NewGuid`'s own row flips `TK_PMSOON` to `TK_PMSFUN` naming `tk_guid_newguid` |
 | `teko_prim.tk` | **as built, four things** — this page's estimate of "nothing" was wrong (D75). C1's lowering crossed a receiver as `(i64) recv`, wrapped a returning call in a cast and cast an argument, all three of which are `tw_cast` on a sixteen-byte value; a WIDE receiver, argument and result now cross UNCAST. The cast refusal gained a BUILDER clause beside the reader, so a type that is written and read rather than constructed says so (§ 2). And `tk_prim_static_m` splits the member name out of `tk_prim_static`, for the one static this page parses by hand |
 | `teko_typeof.tk` | nothing: the § 5 clause of that page already refuses every conversion |
+| **`teko_time.tk`** | N9: no new registration, but its wrapped bundle resolver (C6, D90) answers a SECOND name, `<teko/entropy.tk>`, by host, rather than installing a second wrapper — three new small source-builder functions, one per host |
 | `teko.tk` | `#include` and one `_init()` call |
-| `lib/guid.tk` (new) | the parser, the formatter, the comparison and `Empty`: about 200 lines of ordinary teko over `ld8`/`st8` through `&g` |
+| `lib/guid.tk` (new) | the parser, the formatter, the comparison and `Empty`: about 200 lines of ordinary teko over `ld8`/`st8` through `&g`. N9: `#include <teko/entropy.tk>` and `tk_guid_newguid()`, the version-4 layout over `tk_entropy_fill` |
 | `lib/rt.tk`, `core_teko.mc`, `user.mc` | nothing |
+| `.github/actions/windows-sysroot/action.yml` | N9: a second import library, `bcrypt.lib`, from a one-line `bcrypt.def` |
+| `.github/workflows/ngen.yml` | N9: `{sysroot}/bcrypt.lib` added to both Windows legs' `[linker] args` |
 
 ## 8. What it costs in `mc limits`
 
@@ -210,6 +218,11 @@ there is a refusal until the `extern` lands.
 The machine module adds no row: `teko_wide.tk` is already derived, and a derived table
 shadows the name it registers rather than consuming a `machines` slot.
 
+**N9 (D91) moves none of these.** `Guid.NewGuid` flips an EXISTING row's kind, `TK_PMSOON`
+to `TK_PMSFUN` — it registers no new `type_new`, no new `syntax_expr`/`syntax_stmt`, no new
+alias. Measured: `passes`, `syntax`, `alias`, `types`, `intrin`, `on_stmt` and `syntax_type`
+identical on base and head, all seven unmoved (D91's own proof).
+
 ## 9. Fixtures
 
 | fixture | asserts | `expect-exit` |
@@ -218,6 +231,8 @@ shadows the name it registers rather than consuming a `machines` slot.
 | `tests/primitives_guid_bytes.tk` | the sixteen bytes read back through `&g` with `ld8` match the documented order for a known text form — the layout has an oracle, not a comment | `42` |
 | `tests/primitives_guid_tryparse.tk` | `TryParse` on a good "D", a good "N", a wrong length, a bad character and a misplaced dash; `Empty` written on every failure | `42` |
 | `tests/primitives_guid_parse_bad.tk` | `Guid.Parse("nope")` | `70` |
+| `tests/primitives_guid_newguid.tk` | 64 draws of `Guid.NewGuid()`: never `Guid.Empty`, the version nibble exactly `4` and the variant nibble one of `8`/`9`/`a`/`b` on every one, two consecutive draws never equal, `ToString`/`Parse` (both formats) round-trips the very value drawn | `42` |
+| `tests/refuse/guid_newguid_const.tk` | `const Guid ID = Guid.NewGuid();` — a CALL is still no constant expression | refuse |
 
 Every one is a whole program with `#include "../lib/guid.tk"`, returning `42` on success and
 a small distinct number per failed assertion.
@@ -248,11 +263,16 @@ section in [types.md](../reference/types.md), the refusals in
 [not-yet.md](../reference/not-yet.md), and the new module in
 [modules.md](../internals/modules.md).
 
-### N9 — `Guid.NewGuid` (S)
+### N9 — `Guid.NewGuid` (S) — **landed, D91**
 
 One static row, one call into `lib/guid.tk`, one fixture asserting that two consecutive
 `NewGuid()` values differ, that the version nibble is `4` and that the variant bits are
-`10`. The entropy `extern` per host and the `bcrypt.def` in teko's Windows sysroot (§ 5) are part of the crumb; it depends on N3 and on nothing outside this repository.
+`10`. The entropy `extern` per host and the `bcrypt.def` in teko's Windows sysroot (§ 5) are
+part of the crumb; it depended on N3 and on nothing outside this repository.
+
+**Gate:** `sh scripts/fixtures.sh` clean, `FIXPOINT OK`, `sh scripts/check-docs.sh` green,
+`mc limits` verdict `ok` with `passes` and `intrin` **not moved**, `--dump-ast` proof over
+every base fixture. See D91 for the full measured numbers.
 
 ## 11. Risks and law tensions
 
@@ -260,6 +280,6 @@ One static row, one call into `lib/guid.tk`, one fixture asserting that two cons
 |---|---|
 | **The ordering diverges from C#.** `a < b` answers by the printed bytes, C# by its fields. | § 1, deliberately, and written into `types.md` beside the type. Matching C# would mean matching its in-memory byte swap, which would make `ToString` a shuffle and `Parse` its inverse, for an ordering C# users are warned about anyway. The fixture pins teko's order with values that only pass under it. |
 | **`Guid` is the second `TK_WIDE` type and the first that is not `decimal`.** If `teko_wide.tk` turned out to be `decimal`-shaped, this is where it shows. | That is a feature of the order, not a risk of it: N3 lands right after C3 and **before** `decimal`'s arithmetic, so the machine module is proved general while it is still small. The `_bytes.tk` fixture reads raw bytes through `&` rather than trusting an arithmetic result, which is `docs/specs/decimal.md` § 13's own technique. |
-| **`NewGuid` on four legs only** — an `extern getentropy` alone would work on four of the five. | Refuse it. Four legs out of five is a silently wrong build on the fifth; N9 lands with all three host `extern`s and the `bcrypt.def`, or not at all. |
-| **`Guid.NewGuid` and `DateTime.Now` need the same kind of thing.** | One `extern` per host each, chosen by the taught compiler for the target; C6 and N9 share the mechanism (`docs/specs/datetime.md` § 8) and land independently. |
+| **`NewGuid` on four legs only** — an `extern getentropy` alone would work on four of the five. | **Resolved, as landed.** All three host `extern`s and the `bcrypt.def` land together, in this one crumb, measured on all five `ngen.yml` legs. |
+| **`Guid.NewGuid` and `DateTime.Now` need the same kind of thing.** | **Resolved, as landed.** N9 reuses C6's own wrapped bundle resolver (`teko_time.tk`) for a second name, `<teko/entropy.tk>`, rather than installing a second `lex_set_bundle` wrapper — the SAME mechanism, not merely the same shape. |
 | **The include.** `#include "guid.tk"` is a build-time step C# does not have. | Same answer as `docs/specs/datetime.md` § 13: refuse the type word with the include named in the message, and leave the flip into `lib/rt.tk` open for the owner — it is a one-line change either way, and it is the same decision for `time.tk`, `decimal.tk`, `guid.tk` and `string.tk`, so it should be taken once for all four. |

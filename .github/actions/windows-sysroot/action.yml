@@ -2,13 +2,15 @@ name: build the Windows sysroot
 description: >
   Everything a Windows link needs that is not the program. Windows has no
   direct-executable backend and no C runtime, so every `mc` link there is
-  `lld-link` against three files -- `winstart.obj`, `mcrt.obj` and
-  `kernel32.lib` -- and none of them is downloaded: the two objects are the
+  `lld-link` against `winstart.obj`, `mcrt.obj`, `kernel32.lib` and
+  `bcrypt.lib` -- and none of them is downloaded: the two objects are the
   system layer and the entry point, compiled out of the bundle inside `mc`
-  itself, and the import library is generated from a list of names
-  (`minicompiler/mc` scripts/sysroot-windows.sh). Both Windows jobs of
-  `ngen.yml` -- the native leg and the fixpoint ladder -- need the same three
-  files, so they are assembled HERE, once.
+  itself, and the two import libraries are each generated from a list of
+  names (`minicompiler/mc` scripts/sysroot-windows.sh for `kernel32.lib`;
+  `bcrypt.lib` is teko's own, one entry point, `BCryptGenRandom`, for
+  `Guid.NewGuid` -- N9, D91). Both Windows jobs of `ngen.yml` -- the native
+  leg and the fixpoint ladder -- need the same four files, so they are
+  assembled HERE, once.
 
   The action also puts LLVM's `lld-link` and `llvm-dlltool` on `$PATH` in
   WINDOWS form, because `mc` spawns the linker through CreateProcessA, and
@@ -99,8 +101,12 @@ runs:
     # plus GetSystemTimePreciseAsFileTime for teko's OWN wall clock
     # (`lib/time.tk`'s `#include <teko/clock.tk>`, C6, D90) -- a name `mc`'s own
     # host layer never calls, so it is NOT in mc's list and does not move with
-    # MC_VERSION; it is this repository's own to keep current.
-    - name: compile winstart.obj, mcrt.obj and kernel32.lib
+    # MC_VERSION; it is this repository's own to keep current. `bcrypt.def` is
+    # a SEPARATE import library rather than a `kernel32.def` addition:
+    # `BCryptGenRandom` lives in `bcrypt.dll`, not `kernel32.dll`, and
+    # `llvm-dlltool`'s `-D` names the one DLL every symbol in a `.def` binds
+    # against.
+    - name: compile winstart.obj, mcrt.obj, kernel32.lib and bcrypt.lib
       id: sysroot
       shell: bash
       env:
@@ -145,5 +151,11 @@ runs:
         WriteFile
         DEF
         llvm-dlltool -m "$machine" -d "$dir/kernel32.def" -D kernel32.dll -l "$dir/kernel32.lib"
+        cat >"$dir/bcrypt.def" <<'DEF'
+        LIBRARY bcrypt.dll
+        EXPORTS
+        BCryptGenRandom
+        DEF
+        llvm-dlltool -m "$machine" -d "$dir/bcrypt.def" -D bcrypt.dll -l "$dir/bcrypt.lib"
         ls -l "$dir"
         echo "dir=$dir" >>"$GITHUB_OUTPUT"

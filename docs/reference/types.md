@@ -1081,7 +1081,7 @@ matching C#'s in-memory byte swap too, and then `ToString` would stop being a st
 | `Guid.Empty` | `.ToString()` — the `"D"` form, lowercase, 36 characters |
 | `Guid.Parse(str)` — `"D"` or `"N"`, either case | `.ToString(str fmt)` — `"D"` or `"N"` |
 | `Guid.TryParse(str, out Guid)` — `1`/`0`, `Empty` on failure | `.CompareTo(Guid)`, `.Equals(Guid)` |
-| | `.IsEmpty` — an `i64` `0`/`1` |
+| `Guid.NewGuid()` | `.IsEmpty` — an `i64` `0`/`1` |
 
 `.IsEmpty` is not a C# member — C# writes `g == Guid.Empty`, which works here too. It is the
 one addition this type makes, and it is additive.
@@ -1091,11 +1091,19 @@ the 36-character hyphenated form nor the 32-character bare one. `ToString` takes
 `"N"` and panics on any other format (`teko: the Guid format is not taught`); `"B"`, `"P"`
 and `"X"` are three more spellings of the same sixteen bytes and are not taught.
 
-**What N3 refuses**, every one of them by name and at the line it was written:
+`Guid.NewGuid()` reads the host's own cryptographic randomness (N9, D91): `getrandom` on
+Linux, `getentropy` on macOS, `BCryptGenRandom` on Windows — teko's own `extern` per target,
+never an `mc` hook, the same mechanism C6 (D90) gave the wall clock. The version-4 layout
+(RFC 4122): the version nibble, the top nibble of `time_hi_and_version` (`+6`), is always
+`4`; the variant bits, the top two bits of `clock_seq` (`+8`), are always `10` — so
+`Guid.NewGuid()` never answers `Guid.Empty`, and two consecutive draws differ with
+overwhelming probability. A `Guid` built from a counter, a clock or an address would compile
+and two processes would collide, so there is no fallback.
+
+**What `Guid` refuses**, every one of them by name and at the line it was written:
 
 | written | message |
 |---|---|
-| `Guid.NewGuid()` | `teko: Guid.NewGuid is not taught yet` — it needs the host's entropy, one `extern` per operating system (N9, [not-yet.md](not-yet.md)) |
 | `a + b`, `~a`, every operator but the six | ``teko: no operator `+` takes these operands`` |
 | `i64 n = g;` | `teko: a value of type Guid does not convert to i64` |
 | `Guid g = 0;` | `teko: a value of type i64 does not convert to Guid` |
