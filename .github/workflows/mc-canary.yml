@@ -32,24 +32,20 @@ name: mc canary
 # `workflow_dispatch` with an explicit `version` is the manual road, and it is
 # the road that removes the 15 minutes.
 
+# Why there is no `repository_dispatch` here, so it is not proposed again:
+# mc publishing straight into this workflow would need a token with write
+# access to this repository sitting in mc's secrets, and the canary is built
+# around the opposite property -- no credential in either direction, in either
+# repository (mc's `docs/specs/M53.md` § 6, the owner's ruling of 2026-09-07).
+# Minting such a token is the owner's call alone. mc covers a late verdict on
+# its own side instead (a scheduled `promote-pending.yml`, every 30 minutes,
+# promoting any pre-release whose verdict is green whenever it lands), which
+# is why a schedule this repository does not control is no longer a deadline:
+# measured 2026-09-19/20, the `*/15` below actually ran about every two hours,
+# and mc v1.1.0 (tagged 03:42Z) fell in a three-and-a-half-hour gap.
 on:
   schedule:
     - cron: '*/15 * * * *'
-  # mc's own release job may ask for a verdict the moment it publishes, instead
-  # of waiting for a schedule GitHub delivers when it feels like it: measured
-  # over 2026-09-19/20, the `*/15` cron above ran roughly every two hours, and
-  # v1.1.0 (tagged 03:42Z) fell in a three-and-a-half-hour gap and timed out its
-  # 90-minute `promote` poll with no verdict at all. A `repository_dispatch`
-  # from the publisher closes that gap without this repository polling harder:
-  #
-  #   gh api repos/teko-org/teko-lang/dispatches -f event_type=mc-release \
-  #     -F 'client_payload[version]=1.1.0'
-  #
-  # `version` is optional and follows the `workflow_dispatch` input's own rule
-  # (no leading `v`; empty means "the newest pre-release with no verdict yet").
-  # A token that can send it is the owner's to mint -- nothing here needs one.
-  repository_dispatch:
-    types: [mc-release]
   workflow_dispatch:
     inputs:
       version:
@@ -86,7 +82,7 @@ jobs:
         id: pick
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ASKED: ${{ inputs.version || github.event.client_payload.version }}
+          ASKED: ${{ inputs.version }}
         run: |
           set -eu
           # A version is three numbers and nothing else, whichever road it
