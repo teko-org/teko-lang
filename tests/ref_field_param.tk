@@ -1,0 +1,96 @@
+// ref_field_param.tk -- D104, the first half: `ref h.n` / `out h.n` where `h`
+// is a PARAMETER. It was refused `teko: not an object of a known type: h` on a
+// legal program, because `tk_ref_addr` (teko_ref.tk) asked `tk_local_find`
+// alone -- a parse-time SCOPE table, and a parameter is in no scope table at
+// all (teko_struct.tk's own invariant). The parameter list already records
+// every parameter's declared type as it reads it, which is the sibling
+// `tk_hp_find` answers for a `T[]` parameter at `tk_dot`; `tk_hp_find_any` is
+// the same row asked for a struct/class one.
+//
+// This is the road the D104 refusal points at, so it has to work for a
+// parameter before that refusal can name it.
+//
+//   1. `ref` on a field of a CLASS parameter -- the caller sees the write,
+//      because the parameter holds the object's own pointer.
+//   2. `out` on the same.
+//   3. a field of a STRUCT parameter. What this fixture pins is what teko
+//      ACTUALLY does: a struct parameter's slot carries the caller's buffer,
+//      not a copy of it, so the write through `ref s.n` is the caller's too.
+//      That is a property of how a struct is passed, measured identically at
+//      `f81e0217` with a plain `s.n = 99;` and no `ref` in sight, and it is
+//      not this decision's to change -- C# copies a struct parameter, and the
+//      gap is reported, not widened here.
+//   4. a BASE CLASS's field through a derived parameter: base-first layout
+//      keeps the offset valid, the same reason `tk_field_find` walks the
+//      chain for a local.
+//   5. a `ref` parameter of the OBJECT itself keeps the old refusal -- its
+//      slot carries an address, not the object, so `h + OFF` would not be the
+//      field. Refused, not silently wrong (`tests/refuse/` has no room for a
+//      shape that only a comment names, so this one is stated, not compiled).
+//
+// expect-exit: 0
+#include "../lib/rt.tk"
+
+struct S { public i64 a; public i64 n; }
+
+class B { public i64 n; public B() { n = 41; } }
+class D : B { public i64 extra; public D() { extra = 9; } }
+
+class H { public i64 n; public H() { n = 41; } }
+
+void bump(ref i64 v) { v = v + 1; }
+void setit(out i64 v) { v = 7; }
+
+// 1
+i64 viaRef(H h) {
+    bump(ref h.n);
+    return h.n;
+}
+
+// 2
+i64 viaOut(H h) {
+    setit(out h.n);
+    return h.n;
+}
+
+// 3
+i64 viaStruct(S s) {
+    bump(ref s.n);
+    return s.n;
+}
+
+// 4
+i64 viaBase(D d) {
+    bump(ref d.n);
+    return d.n;
+}
+
+i64 main() {
+    // 1: the callee's write is the caller's too -- a class parameter is the
+    // object's own pointer
+    H h = new H();
+    if (viaRef(h) != 42) return 1;
+    if (h.n != 42) return 2;
+
+    // 2
+    if (viaOut(h) != 7) return 3;
+    if (h.n != 7) return 4;
+
+    // 3: the struct parameter carries the caller's buffer (see the header),
+    // so both sides read 42; the neighbouring field is untouched, which is
+    // what proves the offset was the right one
+    S s = new S();
+    s.a = 5;
+    s.n = 41;
+    if (viaStruct(s) != 42) return 5;
+    if (s.n != 42) return 6;
+    if (s.a != 5) return 7;
+
+    // 4: a base class's field, reached through a derived parameter
+    D d = new D();
+    if (viaBase(d) != 42) return 8;
+    if (d.n != 42) return 9;
+    if (d.extra != 9) return 10;
+
+    return 0;
+}

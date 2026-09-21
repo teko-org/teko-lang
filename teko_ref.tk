@@ -310,7 +310,22 @@ i64 tk_ref_addr(i64 line, uptr fl, i64 pty) {
     if (p_id() == tk_ref_dot) {
         p_next();
         uptr m = tk_member_name();                // D68
+        // D104: a LOCAL first (`tk_local_find` is the parse-time scope table,
+        // so the innermost declaration still open wins), then a PARAMETER --
+        // which is in no scope table at all, and whose declared type the
+        // parameter list recorded as it was read (`tk_hp_find_any`,
+        // teko_struct.tk). Without the second question a legal program was
+        // refused `teko: not an object of a known type: h` for every
+        // struct/class parameter, which is the sibling `tk_hp_find` already
+        // answers for a `T[]` parameter at `tk_dot` (teko_expr.tk). A
+        // `ref`/`out` parameter keeps the refusal: it has no row in that
+        // table, and its slot carries an address rather than the object, so
+        // `name + OFF` would not be the field.
         i64 si = tk_local_find(name);
+        if (si < 0) {
+            i64 hty = tk_hp_find_any(name);
+            if (hty >= 0) si = tk_struct_by_ty(hty);
+        }
         if (si < 0) err_at2(fl, line, "teko: not an object of a known type", name);
         i64 fi = tk_field_find(si, m);
         if (fi < 0) err_at2(fl, line, "teko: unknown member", m);

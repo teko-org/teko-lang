@@ -2089,7 +2089,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many array writes waiting to be resolved"` | 512 |
 | `"teko: too many array indexes waiting to be resolved"` | 4096 index bases a global-array rewrite consumed and left for the typeof pass to judge the binding of (D96) — one per `g[i]` on a global array, read or write |
 | `"teko: too many array-field accesses"` | 128 |
-| ``"teko: too many `T[]` parameters in one declaration"`` | 32 |
+| `"teko: too many parameters in one declaration"` | 32 rows, one per parameter that is not `ref`/`out`, against mc's own `MAXPARAMS` of 12 — unreachable, and it was unreachable when the table held `T[]` parameters alone (D104 widened what it holds, not its ceiling) |
 | `"teko: too many locals in one unit"` | 8192 |
 | `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |
 | `"teko: too many locals of struct type"` | 256 |
