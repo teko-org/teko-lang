@@ -69,6 +69,19 @@ wrong as one with the wrong words). A `.tk` under either directory missing its h
 fails the run instead of being silently skipped. `docs/reference/diagnostics.md` lists every
 message either kind can hit; D33 first named the gap a refusal fixture had no harness for.
 
+**A dispatch offset sits above the exit code the fixture reports (D107).** A fixture with
+several checks writes `bad = f(); if (bad != 0) return K + bad;` per check, and `K + arm` is a
+real exit code like any other: when it equals the fixture's own `// expect-exit: N`, a failing
+arm reports a pass and the fixture is dead weight. Fifteen tables did exactly that before
+D107. Choose every DISPATCH offset `K` so that no `K + arm` can equal `N`, keep every
+reachable code at or below 255 (an exit code is one byte, and 298 reads 42), and prove a new
+table by forcing one arm and watching the run report something other than `N`. Read that as a
+rule about the dispatch, not about every constant in the file: some two dozen fixtures write a
+helper-internal `return 1 + x;` whose numbers are below `N` and carry no collision at all, and
+a check that simply demanded `K > N` would land red on them. Two shapes evade a naive reading
+of the dispatch and are what hid two of the fifteen: the operands reversed (`return r + 40;`)
+and a bare re-throw (`return bad;`) that hands an inner helper's arm up unchanged.
+
 ## The decision numbering, and the limits budget (D94)
 
 `docs` carries two checks that read `sh scripts/check-docs.sh`'s own output but measure

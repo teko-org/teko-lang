@@ -12383,3 +12383,105 @@ own element, so `foreach (S s in a) { s.n = 9; }` still writes the array where C
 V7 — nothing reclaims a copy, which is the arena row above. Neither is reopened here, and
 § 7 of the spec page still refuses a generated memberwise `==` and still leaves `new S[n]`
 handing out `n` null rows.
+
+### D107 · A fixture's own arithmetic can report SUCCESS: thirteen dispatch tables
+renumbered above the exit code they defend (2026-09-21)
+
+**The shape.** A `tests/*.tk` fixture reports through its exit code, and the table every
+multi-check fixture writes is `bad = f(); if (bad != 0) return K + bad;` — one offset `K` per
+check, the helper's own arm number added to it. Nothing ever held `K + arm` apart from the
+fixture's own `// expect-exit:` code. Twelve tables had an offset of **40** over a helper with
+an arm **2**, one (`surface_nullable_value`) an offset of **30** over an arm **12**, and every
+one of those fixtures declares `// expect-exit: 42`. When that arm fires, `main` returns 42 and
+`scripts/fixtures.sh` reads the code a passing run reports: the fixture **fails silently, as a
+pass**. Nothing about the compiler is wrong here — the oracle collides with itself.
+
+**How the thirteen were re-derived.** Not trusted from the report: re-scanned over the whole
+`tests/*.tk` tree. For every file, `main`'s body was parsed into its return statements, each
+`return K + v;` resolved to the function most recently assigned into `v`, each helper's
+literal arms collected, and the value set propagated to a fixed point through the call graph
+(a helper that itself dispatches contributes `K' + arm'`). A return was flagged when its value
+set contained the file's own `expect-exit`, **taken mod 256** — an exit code is one byte, so a
+code of 298 would read 42 just as surely as 42 does. That scan reported thirteen. **It was wrong, and an
+independent verification that re-derived the list by two other methods found FIFTEEN** — the
+thirteen below, plus `primitives_small_ints` and `surface_globals_calls`, both renumbered
+here too. Two shapes hid them, and both are worth naming because any future scan has to
+carry them:
+
+- **the operands reversed.** `primitives_small_ints:183` writes `return r + 40;`, not
+  `return 40 + r;`, and a pattern that reads only `K + v` never sees it. `convert_check`'s
+  arm 2 made 42.
+- **a bare re-throw.** `surface_globals_calls`'s `thischeck` ends `return bad;`, handing an
+  inner helper's arm up unchanged, and a fixed point that models only `K' + arm'` does not
+  follow it. `Box.unqual`'s arm 2 reached `main`'s `40 + bad` and made 42.
+
+The wraparound half of the original claim does hold: no code anywhere in the tree is
+congruent to its own `expect-exit` mod 256.
+
+| fixture | helper | arm | offset was | exit under force, base | offset now | exit under force, head |
+|---|---|---|---|---|---|---|
+| `struct_copy_local` | `fromcall` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_definite` | `refoutcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_field_store` | `staticcheck` | 2 | 40 | **42 (pass)** | 46 | 48 |
+| `surface_foreach` | `circlecheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_globals` | `paramscheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_globals_rc` | `hasvaluecheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_globals_slot` | `enumcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_globals_struct` | `paramscheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_nullable_ops` | `lazycheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_nullable_ref` | `arrcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_nullable_value` | `widthcheck` | 12 | 30 | **42 (pass)** | 70 | 82 |
+| `surface_params` | `recvcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `surface_refout` | `rcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `primitives_small_ints` | `convert_check` | 2 | 40 (written `r + 40`) | **42 (pass)** | 80 | 82 |
+| `surface_globals_calls` | `Box.unqual` through `thischeck`'s bare re-throw | 2 | 40 | **42 (pass)** | 110 | 112 |
+
+Each row is measured, not derived: the helper was given a `return <arm>;` as its first
+statement, the fixture rebuilt with `--entry-only` and run, the code read, the source restored.
+The base column is why this entry exists — `surface_globals_struct`'s `paramscheck` arm 2 is the
+assertion that `takeref(ref gp)` **still aliases** after D106, the one property the struct-copy
+work claims to preserve, and it could not have been observed failing.
+
+**The fix is renumbering, and nothing else.** No assertion moved, no arm was added or removed,
+no helper changed, no `.tk` module was touched: only the offsets in `main`, and in twelve of the
+thirteen by one constant, **+40**, applied to every exit code that `main` writes as a literal
+(the dispatch offsets and the bare `return <n>;` checks between them) except the success code
+itself. A uniform shift preserves every relation the table already had, so it can introduce no
+new ambiguity between two arms; the three pre-existing ones (`surface_globals`
+dispatches `sibcheck` twice through one offset; `surface_globals_rc` overlaps two DIFFERENT
+helpers, `90 + sourcecheck`'s arms 11-13 against `100 + lambdacheck`'s arms 1-3, both landing
+on 101-103 -- this entry first described that one as one helper twice, which the same
+verification corrected; `surface_lambda` has a bare `return 460;` inside `450 + bad`'s range) are the same before and after, and are
+reported, not widened here.
+
+**The one exception, and the ceiling behind it.** `surface_field_store` carries 27 dispatches
+and its table already ends at 253. A +40 shift would have pushed its codes to 294 — and an exit
+code is one byte, so 294 reads 38 and 298 would read 42: the fix would have written the very
+defect it removes. That file keeps its table and lifts only the four offsets that sat below 42,
+into the free window `43..48` (arm counts 1, 1, 1, 2). The invariant is therefore two-sided:
+**every offset is above the fixture's own `expect-exit`, and every reachable code stays at or
+below 255.**
+
+**The rule that keeps it from coming back.** A dispatch offset is chosen above the success code
+the fixture reports — which is what the four fixtures the struct-copy crumbs added already do,
+their tables starting at 60 against an `expect-exit` of 42. Each of the thirteen now carries the
+rule as a two-line comment at the head of its own `main`, and
+[`docs/internals/ci.md`](docs/internals/ci.md) § "The two fixture kinds, one corridor" states it
+where a fixture author reads the oracle convention.
+
+**Could `scripts/fixtures.sh` check it mechanically? Yes — and not in this crumb.** The precise
+check is the scan above: parse `main`, resolve each dispatch to its helper, collect the arms,
+and fail when any reachable code equals `expect-exit` mod 256. It passes on this head, it is
+worth landing, and it does not belong here — `fixtures.sh` is POSIX `sh` with no such analysis
+today, and the crumb that adds it owns the choice of language and the three findings it will
+raise beyond this one (the arm-vs-arm ambiguities above, and `surface_lambda`'s codes running to
+500 where an exit code holds one byte). The cheap syntactic subset — "every offset is greater
+than `expect-exit`" — is one `awk` away but would land RED against fixtures that have no
+collision at all, since a table starting at 10 is only a latent collision, not an actual one.
+
+**The gate.** `148 passed, 218 refused as expected, 0 failed`, unchanged from the base, which is
+the point: no assertion moved. `FIXPOINT OK`. `--dump-ast --include=lib --include=tests` over all
+148 accepted fixtures: **147 non-empty on both sides** (`surface_string_interp` dumps nothing on
+either, a pre-existing condition), **thirteen moved** — the thirteen renumbered here and no other
+— and every difference in them is an `INT val=` leaf and nothing structural. The other 135 are
+byte-identical.
