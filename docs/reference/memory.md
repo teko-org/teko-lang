@@ -175,6 +175,7 @@ with classes sees a floor above zero rather than a wrong answer.
 |---|---|
 | a `struct` allocation | a struct has no vtable, so there is no release function to reach and no count to keep |
 | a `struct?` | the same: a nullable answers for the row it encloses, and a struct is not counted |
+| **a `struct` COPY** | `S b = a;` allocates a fresh block (D105), and it is a struct allocation like any other: nothing reclaims it. This is the one row that grows with the *running time* of a program rather than with its shape -- the arena is a fixed 4 MiB, so a 16-byte struct copied in a long loop reaches `arena exhausted` where the same loop allocated nothing before. `tests/struct_copy_local.tk` asserts the number (`rt_peak()` rises by one block per copy) instead of implying it. V7 of [struct-value.md](../specs/struct-value.md) § 6 is the crumb that frees a copy at the `}` of the scope that owns it |
 | a `static` field of class type | it holds its reference correctly, and lives for the whole run |
 | a global, and a global `T[]` | a root by construction: the value it holds at the end of the run is never released. An overwritten one IS released, at the store that overwrote it |
 | a Singleton service | a root by design ([di.md](di.md)) |

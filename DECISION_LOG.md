@@ -12043,3 +12043,148 @@ its two call sites in `main`. Every node the base already had is byte-identical,
 fixture and in the other 140. `surface_string_interp` is the one fixture neither binary
 dumps without the project config, and it is excluded rather than counted as an
 empty-vs-empty match.
+
+### D105 · A `struct` is a VALUE type: it cannot contain itself, and it is copied where it
+lands — superseding D56 on the semantics, not on the representation (2026-09-21)
+
+**What D56 recorded, and what this supersedes.** D56 (2026-09-14) built the struct global on
+D5's ruling that a struct value is a POINTER, eight bytes, and wrote one sentence of
+semantics beside it: *"C# copies a struct on assignment; teko does not, because here the
+'struct' IS the pointer (D5) -- there is no sixteen-byte value to copy in the first place"*.
+`docs/reference/types.md:484-486` said the same in the reference's own voice, while
+`not-yet.md`'s newer row (written at `f81e0217`) called the same shape "not judged, and
+silently unlike C#" and owed a design. Two pages of the tree disagreed about one question.
+**The newest ruling wins and C# decides the form** (`CLAUDE.md`, the fork protocol), and
+`not-yet.md`'s own third line -- *no silently wrong result* -- forces the direction: a
+struct is a VALUE type, and a struct value is COPIED where it lands in a storage location.
+
+**The representation is untouched.** D5's pointer stays: `type_new(name, 8, 8, TK_INT)`,
+width 8 for every struct, a slot holding a pointer, storage only from `new` through the
+generated `name_new`. The copy is therefore not a wider slot but a fresh `rt_alloc` plus a
+memberwise copy written AT THE SITE -- which is why every road built on the representation
+keeps working unchanged: D53's assignment corridor, D56's own slot table row, Q1a's `T?`
+over a struct, D104's refusal of `&s.n`, and `tk_is_counted` answering 0 for a struct row.
+The alternative -- `type_new(name, SIZE, 8, TK_OPAQUE)`, the slot BEING the struct -- is a
+fork and was not attempted: mc's own guide is explicit that `type_new` gives **primitives**
+and that "a module that wants structure lowers to `uptr`"
+(`mini_compiler/docs/guide/96-a-new-primitive.md:161-165`), and an inline struct slot needs
+members, `a[i]`, a per-width `MTASK_LOAD`/`MTASK_STORE` and a by-value ABI of arbitrary
+size, every one of them a change in `mc/src/` this repository does not make (D2).
+
+**V1: a struct cannot contain itself.** `struct Node { public Node next; }` compiled, `next`
+being an eight-byte pointer, and so did the mutual pair `struct A { public B b; }
+struct B { public A a; }`. C# refuses both as CS0523, and a memberwise copy of either
+recurses for ever -- in `tk_copy_fn` at compile time and in the body it emits at run time.
+`tk_struct_contains` (teko_struct.tk) walks the field graph from each struct's closing `}`
+over the fields that live IN the object: a `static` field is a global of its own and closes
+no cycle, and an inline array field recurses through its element type. The walk needs no
+visited set and cannot loop, because every cycle is refused at the close of the struct that
+COMPLETES it and the graph it reads is therefore acyclic by induction. A forward-declared
+struct carries no field yet, which is why the mutual case lands at `B`'s declaration and not
+at `A`'s -- the same place C# reports CS0523. Refusal:
+`teko: a struct cannot contain itself`. Two fixtures, `tests/refuse/struct_cycle_self.tk`
+and `tests/refuse/struct_cycle_mutual.tk`, with the D52 two-line oracle each.
+
+**V2: `rt_copy`, `name_copy`, and the first landing.** The copy has three parts and no
+fourth. `rt_copy(d, s, n)` (lib/rt.tk, six lines) moves the whole block a word at a time,
+legal because every `NAME_SIZE` is a multiple of 8 (`tk_size_of`); `rt_retain_array(base, n)`
+beside it is the mirror of the `rt_release_array` a counted inline array field already had.
+`tk_copy_fn` (teko_struct.tk) emits `Name name_copy(uptr s)` next to the existing
+`name_new`, whole-block first and fix-ups after: the bulk copy carries the padding, a
+`u8`/`u32` field's exact width and an inline array of scalars with no per-shape code at all,
+and only two kinds of field get a line -- an `rc_inc` per counted field, and a recursive
+`inner_copy` per struct-typed field. The parameter is `uptr`, the spelling a method's own
+implicit receiver already takes, and the declared return type is the struct's, which is what
+makes the call type exactly as `new S` does. One line is not C#'s shape but this
+representation's: `if (s == 0) return 0;` -- a struct field is a pointer `rt_alloc` zeroed,
+so a struct whose struct-typed field was never built reaches the recursion with 0, and the
+null is copied AS null rather than dereferenced.
+
+`teko_copy.tk` is module 42, registering `pass(&tk_copy_pass)` immediately before
+`pass(&tk_rc_pass)`: behind the oracle (every deferred `.` has a type), behind
+`tk_ref_pass` (a `ref x` argument is already an address and no longer of struct type),
+behind `tk_deleg_pass`/`tk_ops_pass` (a call is a call) and behind `tk_over_pass` (a call
+carries the symbol it keeps, which is what makes the freshness test below stable). **Only
+L1 lands here** -- `S b = <e>;`, the N_VAR of struct type with an initializer. `b = <e>;`,
+`x.f = <e>;`, `a[i] = <e>;`, a by-value argument and `S? b = <e>;` are V3 to V5 of
+`docs/specs/struct-value.md` § 6 and still ALIAS; `tests/surface_globals_struct.tk` proves
+both halves in one file, row 2 the alias a whole-struct store still licenses and row 3 the
+copy the declaration now makes.
+
+**The one exception: `new S` is provably fresh.** An `N_CALL` to the generated `name_new` is
+the `new S` / `new S()` the parser lowered, and the block it hands out is named by nothing
+else yet, so copying it would allocate twice and throw the first away. **Nothing else is
+exempt**: a method may `return f;` on a field, so an ordinary call's result is copied like
+anything else -- `tests/struct_copy_local.tk`'s `frommethod` is that shape, and it is why
+`fromcall` is not an optimisation the pass may make. The exception is a test on the NODE, so
+a `new S` that a hoist has already moved into a temporary (`Vec w = c ? new Vec() : v;`,
+`surface_nullable_ops`) is no longer provably fresh and is copied: one wasted allocation, on
+the safe side of the test, and visible in that fixture's dump.
+
+**What the pass reads, and why it is not the node array.** `slv_node` is a new column on the
+existing `slv` table (teko_struct.tk), written by `tk_on_stmt` and by nothing else -- the
+N_VAR the SOURCE wrote. Every temporary the passes generate (a `foreach` element, a
+ternary's hoisted arm, a nullable's unwrap, a lambda's captured copy) is built straight from
+`tk_var` and never reaches that hook. Walking the node array instead would have copied them
+all, and the `foreach` one is the case that matters: binding a foreach variable to a copy
+would make `foreach (S s in a) { s.n = 9; }` compile and go nowhere, which is the class of
+bug this ruling exists to remove and which V6 refuses outright instead (C#'s CS1654).
+
+**The rc line is not optional, and the fixture proves it by mutation.** A struct's own block
+is uncounted, but its FIELDS are gated by the field's own type (`tk_os_mark`), never by the
+struct's -- `struct S { Cell c; }` and `class H { Cell c; }` give the identical answer on an
+overwriting store, which is what D56 itself measured. `rt_copy` moves pointer bits without
+touching any count, so without an `rc_inc` per counted field two struct blocks name one
+`Cell` with a count of 1 and the first overwriting store frees it under the second: a
+use-after-free, strictly worse than the aliasing it replaces. `tests/struct_copy_local.tk`'s
+`countedcheck` asserts it with exact `rt_live()` numbers rather than an exit code -- the
+overwriting store allocates one block and releases the old `Cell`, so `rt_live()` rises by
+exactly one WITH the `rc_inc` (count 2->1, the `Cell` survives) and does not move at all
+without it (count 1->0, freed). **Measured by mutation:** with `tk_is_counted` forced to 0
+in `tk_copy_fields` the fixture exits **72** (70 + 2, that very assertion); restored, it
+exits **42**. `tk_is_counted` already answers for a class, an interface, a delegate, a `T[]`
+and a `T?` over any of them, so the predicate needed no new arm.
+
+**The arena is the declared debt this adds.** `lib/rt.tk:42` is a fixed 4 MiB, and a copy is
+an allocation nobody reclaims until V7 -- the one debt row that grows with a program's
+RUNNING TIME rather than with its shape, so a 16-byte struct copied in a long loop reaches
+`arena exhausted` where the same loop allocated nothing before.
+`docs/reference/memory.md`'s "What is not reclaimed" gains the row, and
+`tests/struct_copy_local.tk`'s `peakcheck` asserts the number (`rt_peak()` rises by exactly
+`64 * 16` over 64 copies) rather than implying it. `name_copy` is a reserved symbol from
+here on, the same collision rule `point_new` has carried since D48.
+
+**Gate.** `144 passed, 217 refused as expected, 0 failed` (the base is `143 passed, 215
+refused`: `struct_copy_local` and the two cycle fixtures). `FIXPOINT OK`. Docs green.
+`mc limits` on both legs from a CLEAN `build/`: the hello leg moves `passes` **15 -> 16**
+(15/30 -> 16/32, verdict **ok**) and nothing else -- `on_stmt` 4/8, `syntax` 20/40, `alias`
+25/50, `types` 18/36, `intrin` 8/16 all unmoved, `heap` 471920 -> 471936; the compiler leg
+is identical except the same `passes` 15 -> 16 and the size rows the new module costs
+(`nodes` 215334 -> 216416, `funcs` 4298 -> 4314, `strings` 3153 -> 3166, `ins`
+246890 -> 247910, `symbols` 8883 -> 8918).
+
+**`--dump-ast` moves on purpose, and R4 said it would.** 143 accepted fixtures on the base
+and 144 here, 142 and 143 of them non-empty (`surface_string_interp` dumps nothing on either
+side without the project config, and is counted as neither). **Four are byte-identical**
+(`hello`, `primitives_ptr`, `primitives_scalar`, and the empty `surface_string_interp`) and
+**139 move**. In 137 of those the whole movement is `lib/rt.tk` gaining `rt_retain_array`
+and `rt_copy`, which every fixture `#include`s; **20** also gain a `FUNC name=<name>_copy`
+per struct declared and at least one `CALL name=<name>_copy` at an L1 landing
+(`primitives_decimal_value`, `primitives_f32`, `primitives_float`, `primitives_i128`,
+`primitives_small_ints`, `ref_field_param`, `surface_datetime_kind`,
+`surface_default_method`, `surface_definite`, `surface_delegate`, `surface_generics`,
+`surface_globals_struct`, `surface_nullable_ops`, `surface_nullable_ref`,
+`surface_overload_free`, `surface_overload_method`, `surface_prim_call_member`,
+`surface_property`, `surface_typeof_expr`, `types_struct`). Exactly **two** carry a REMOVED
+line: `surface_globals_struct`, whose `localcopycheck` this crumb rewrote to assert the
+copy, and `surface_nullable_ops`, whose hoisted `$g192` gains the `vec_copy` wrapper the
+freshness note above explains. Every other node of every other fixture is byte-identical.
+
+**What stays refused, and what is still owed.** `a == b` on two structs keeps
+``teko: S declares no operator `==` `` -- C# gives a struct memberwise equality for free and
+this ruling does not (§ 7.1 of the spec page). `struct S : I` and `new S(5)` stay refused,
+and each removes a copy site from the design. `return this;` inside a struct keeps D103's
+refusal: `this` is the receiver PARAMETER and a by-value struct parameter is itself still an
+alias until V4. V3 (the store landings), V4 (the call landing), V5 (`S?` and the counted
+field proved end to end), V6 (the `foreach` and capture refusals) and V7 (the reclaim of
+copies) are the remaining crumbs, ordered in § 6 of the spec page.

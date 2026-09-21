@@ -1,0 +1,81 @@
+// teko_copy.tk -- a struct value is COPIED where it lands in a storage
+// location, which is what makes a `struct` a value type rather than an
+// unboxed reference (docs/specs/struct-value.md).
+//
+// D5 gave a struct value a POINTER, eight bytes wide, and that representation
+// is untouched here: the backend moves eight bytes at an assignment and is
+// right to. The copy is therefore written at the SITE, as a fresh allocation
+// plus a memberwise copy -- the generated `name_copy` of `tk_copy_fn`
+// (teko_struct.tk), over `rt_copy` (lib/rt.tk).
+//
+// Copying at the LANDING and nowhere else is what keeps it cheap. `return s;`
+// needs no copy: whatever the caller does with the result is itself a landing.
+// `mk().x` needs none: a field read is not a landing. The landing set is closed
+// and small, and this crumb (V2) builds the FIRST of six:
+//
+//   L1   `S b = <e>;`               an N_VAR of struct type with an initializer
+//   L2   `b = <e>;`                 V3
+//   L3   `x.f = <e>;`               V3
+//   L4   `a[i] = <e>;`              V3
+//   L5   a by-value struct argument V4
+//   L6   `S? b = <e>;`              V5
+//
+// The one exception, at every landing: when `<e>` is PROVABLY FRESH -- an
+// N_CALL to the generated `name_new`, which is the `new S` / `new S()` the
+// parser lowered -- the copy is skipped, there being nothing else that names
+// that block. Nothing ELSE is provably fresh: a method may `return f;` on a
+// field, so an ordinary call's result is copied like anything else.
+//
+// WHY THE PASS IS LAST BUT ONE. `pass(&tk_copy_pass)` is registered immediately
+// before `pass(&tk_rc_pass)`: behind the oracle (`tk_typeof_pass`, so every
+// deferred `.` has a type), behind `tk_ref_pass` (so a `ref x` argument is
+// already an address and is no longer of struct type), behind `tk_deleg_pass`
+// and `tk_ops_pass` (so a call is a call), and behind `tk_over_pass` (so a
+// call carries its own mangled symbol and the freshness test above compares
+// against a name nothing will rename afterwards). The reclaim then runs
+// unchanged: a struct is not counted, so `S b = s_copy(a);` is invisible to it.
+//
+// WHAT THE PASS READS. `slv_node` (teko_struct.tk) is the N_VAR the SOURCE
+// wrote, recorded by `tk_on_stmt` and by nothing else. Every temporary the
+// passes generate -- a foreach element, a ternary's hoisted arm, a nullable's
+// unwrap, a lambda's captured copy -- is built straight from `tk_var` and never
+// reaches that hook, so it is never copied here. That matters beyond tidiness:
+// binding a foreach variable to a copy would make `foreach (S s in a) s.n = 9;`
+// compile and go nowhere, which is the class of bug this design exists to
+// remove, and which V6 refuses outright instead.
+
+// 1 when `e` is the `new S` the parser lowered for the struct row `si`: the
+// block it hands out is named by nothing else yet, so copying it would allocate
+// twice and throw the first away.
+i64 tk_copy_fresh(i64 e, i64 si) {
+    if (nd_kind(e) != N_CALL) return 0;
+    return str_eq(nd_name(e), tk_ctor_name(sr_name_at(si)));
+}
+
+// the single door that wraps one expression at one landing. L2..L6 come through
+// it too, which is why it takes the row rather than re-deriving it.
+i64 tk_copy_here(i64 e, i64 si) {
+    if (tk_copy_fresh(e, si)) return e;
+    return tk_call(tk_copy_name(sr_name_at(si)), e);
+}
+
+// L1: `S b = <e>;`. `nd_val != 0` is `S tbl[4]`, four slots rather than one
+// value, and it never reached `tk_slv_add` at all (`tk_on_stmt`'s own guard).
+void tk_copy_var(i64 n) {
+    i64 e = nd_a(n);
+    if (e == 0) return;                          // `S p;` -- nothing to copy
+    i64 si = tk_struct_by_ty(nd_type(n));
+    if (!tk_is_struct(si)) return;
+    set_nd_a(n, tk_copy_here(e, si));
+}
+
+i64 tk_copy_pass(i64 root) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nslv) break;
+        i64 n = slv_node_at(i);
+        if (n != 0 && nd_kind(n) == N_VAR) tk_copy_var(n);
+        i = i + 1;
+    }
+    return root;
+}

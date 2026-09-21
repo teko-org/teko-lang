@@ -1,8 +1,11 @@
 # `struct` as a value type
 
-**Designed, not built.** Nothing on this page runs at `e3e6aa13`. The reference describes
-what runs; this page describes what a struct is *supposed* to be and the ordered crumbs
-that get it there.
+**Partly built.** Nothing on this page ran at `e3e6aa13`, where it was written. **V1 and V2
+of the crumb table in § 6 have since landed** (D105): a struct cannot contain itself, and
+`S b = <e>;` copies. V3 to V7 are still designed, not built, and every "today" below is the
+measurement at `e3e6aa13` unless a row says otherwise. The reference describes what runs;
+this page describes what a struct is *supposed* to be and the ordered crumbs that get it
+there.
 
 Two rows of [`../reference/not-yet.md`](../reference/not-yet.md) point at each other and
 are one missing piece: a `struct` parameter is not copied, and a `struct` has no copy at
@@ -329,8 +332,8 @@ Ordered, each landable on its own, each with its oracle.
 
 | # | crumb | size | modules it touches | gate | docs it owes | can it run beside an unrelated crumb? |
 |---|---|---|---|---|---|---|
-| **V1** | **A struct cannot contain itself.** The direct case and the mutual case, checked at each struct's closing `}` over the field graph | **S** | `teko_struct.tk` | `tests/refuse/struct_cycle_self.tk` + `tests/refuse/struct_cycle_mutual.tk`, both `expect-refuse: teko: a struct cannot contain itself` with the exact line; the whole fixture suite green; `teko limits` unmoved | `not-yet.md` row; `types.md` § struct one sentence | **no** — `teko_struct.tk` is the busiest file in the tree and D104 touched it two days ago. Must land alone, and **before V2** |
-| **V2** | **`rt_copy`, `name_copy`, and the first landing (L1).** `S b = <e>;` copies; `new S` is the one exception | **M** | `lib/rt.tk`, `teko_struct.tk`, **new** `teko_copy.tk`, `teko.tk` (one `#include`, one `pass`) | `tests/struct_copy_local.tk` **exit 42** — p02/p03/p04/p05/p47 inverted in one program, plus `rt_live()` proving the copy is a *new* block; `teko limits` shows `passes` 16/30, verdict ok; the fixed point closes; the whole suite green | `types.md` § struct (replace the alias paragraph), `memory.md` "What is not reclaimed" (a copy is one more uncounted allocation), `not-yet.md` (delete the assignment row), `DECISION_LOG.md` (supersede D56's one sentence) | **no** — it edits `teko.tk`'s pass list and `teko_struct.tk` |
+| **V1** *(landed, D105)* | **A struct cannot contain itself.** The direct case and the mutual case, checked at each struct's closing `}` over the field graph | **S** | `teko_struct.tk` | `tests/refuse/struct_cycle_self.tk` + `tests/refuse/struct_cycle_mutual.tk`, both `expect-refuse: teko: a struct cannot contain itself` with the exact line; the whole fixture suite green; `teko limits` unmoved | `not-yet.md` row; `types.md` § struct one sentence | **no** — `teko_struct.tk` is the busiest file in the tree and D104 touched it two days ago. Must land alone, and **before V2** |
+| **V2** *(landed, D105)* | **`rt_copy`, `name_copy`, and the first landing (L1).** `S b = <e>;` copies; `new S` is the one exception | **M** | `lib/rt.tk`, `teko_struct.tk`, **new** `teko_copy.tk`, `teko.tk` (one `#include`, one `pass`) | `tests/struct_copy_local.tk` **exit 42** — p02/p03/p04/p05/p47 inverted in one program, plus `rt_live()` proving the copy is a *new* block; `teko limits` shows `passes` 16/30, verdict ok; the fixed point closes; the whole suite green | `types.md` § struct (replace the alias paragraph), `memory.md` "What is not reclaimed" (a copy is one more uncounted allocation), `not-yet.md` (delete the assignment row), `DECISION_LOG.md` (supersede D56's one sentence) | **no** — it edits `teko.tk`'s pass list and `teko_struct.tk` |
 | **V3** | **The store landings (L2, L3, L4).** assignment, field store, `S[]` element store, `params S[]` element | **M** | `teko_copy.tk` only | `tests/struct_copy_store.tk` **exit 42** — p10/p11/p18/p22/p14 inverted; the suite green | `types.md`, `arrays.md` one row each; `not-yet.md` (delete the `params` note if one exists) | **yes** — one file, and nothing else in the tree reads it. Depends on V2 |
 | **V4** | **The call landing (L5).** A by-value struct parameter is copied at the call; `ref`/`out` is not | **M** | `teko_copy.tk` (+ *reads* `teko_ref.tk`, no edit) | `tests/struct_copy_param.tk` **exit 42** — p01/p43 inverted, a method parameter, a delegate parameter, a `params` element, and a `ref`/`out` parameter proving it still aliases; the suite green | `types.md` § struct, `not-yet.md` (delete the parameter row) | **yes**, same file as V3 so **not beside V3**. Depends on V2 |
 | **V5** | **The counted field, proved; and `S?` (L6).** The copy keeps the count of a class-typed field; `S? b = a;` copies | **S** | `teko_copy.tk`, `teko_null.tk` | `tests/struct_copy_counted.tk` **exit 42** with exact `rt_live()` assertions (copy a struct holding a `Cell`, drop one copy's scope, the `Cell` survives; drop both, it dies); `tests/struct_copy_nullable.tk` **exit 42** — p46 inverted | `memory.md` (a struct copy is a new owner of every counted field), `nullable.md` | **yes**. Depends on V2 |
