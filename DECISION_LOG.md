@@ -12402,9 +12402,21 @@ pass**. Nothing about the compiler is wrong here — the oracle collides with it
 literal arms collected, and the value set propagated to a fixed point through the call graph
 (a helper that itself dispatches contributes `K' + arm'`). A return was flagged when its value
 set contained the file's own `expect-exit`, **taken mod 256** — an exit code is one byte, so a
-code of 298 would read 42 just as surely as 42 does. The scan reports **exactly thirteen**,
-the thirteen named below and no other: no fourteenth, none missing, and none through a
-wraparound.
+code of 298 would read 42 just as surely as 42 does. That scan reported thirteen. **It was wrong, and an
+independent verification that re-derived the list by two other methods found FIFTEEN** — the
+thirteen below, plus `primitives_small_ints` and `surface_globals_calls`, both renumbered
+here too. Two shapes hid them, and both are worth naming because any future scan has to
+carry them:
+
+- **the operands reversed.** `primitives_small_ints:183` writes `return r + 40;`, not
+  `return 40 + r;`, and a pattern that reads only `K + v` never sees it. `convert_check`'s
+  arm 2 made 42.
+- **a bare re-throw.** `surface_globals_calls`'s `thischeck` ends `return bad;`, handing an
+  inner helper's arm up unchanged, and a fixed point that models only `K' + arm'` does not
+  follow it. `Box.unqual`'s arm 2 reached `main`'s `40 + bad` and made 42.
+
+The wraparound half of the original claim does hold: no code anywhere in the tree is
+congruent to its own `expect-exit` mod 256.
 
 | fixture | helper | arm | offset was | exit under force, base | offset now | exit under force, head |
 |---|---|---|---|---|---|---|
@@ -12421,6 +12433,8 @@ wraparound.
 | `surface_nullable_value` | `widthcheck` | 12 | 30 | **42 (pass)** | 70 | 82 |
 | `surface_params` | `recvcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
 | `surface_refout` | `rcheck` | 2 | 40 | **42 (pass)** | 80 | 82 |
+| `primitives_small_ints` | `convert_check` | 2 | 40 (written `r + 40`) | **42 (pass)** | 80 | 82 |
+| `surface_globals_calls` | `Box.unqual` through `thischeck`'s bare re-throw | 2 | 40 | **42 (pass)** | 110 | 112 |
 
 Each row is measured, not derived: the helper was given a `return <arm>;` as its first
 statement, the fixture rebuilt with `--entry-only` and run, the code read, the source restored.
@@ -12433,9 +12447,11 @@ no helper changed, no `.tk` module was touched: only the offsets in `main`, and 
 thirteen by one constant, **+40**, applied to every exit code that `main` writes as a literal
 (the dispatch offsets and the bare `return <n>;` checks between them) except the success code
 itself. A uniform shift preserves every relation the table already had, so it can introduce no
-new ambiguity between two arms; the three pre-existing ones (`surface_globals` and
-`surface_globals_rc` each dispatch two calls of one helper through one offset, `surface_lambda`
-has a bare `return 460;` inside `450 + bad`'s range) are the same before and after, and are
+new ambiguity between two arms; the three pre-existing ones (`surface_globals`
+dispatches `sibcheck` twice through one offset; `surface_globals_rc` overlaps two DIFFERENT
+helpers, `90 + sourcecheck`'s arms 11-13 against `100 + lambdacheck`'s arms 1-3, both landing
+on 101-103 -- this entry first described that one as one helper twice, which the same
+verification corrected; `surface_lambda` has a bare `return 460;` inside `450 + bad`'s range) are the same before and after, and are
 reported, not widened here.
 
 **The one exception, and the ceiling behind it.** `surface_field_store` carries 27 dispatches
