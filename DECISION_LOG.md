@@ -11661,8 +11661,12 @@ The guard belongs where D102's kind test already stands, in `tk_this()` (`teko_t
 that function knows `tk_body_class`, and `tk_is_class`/`tk_is_iface` already answer there,
 so the struct case is the `else` of a condition that exists. `tk_is_struct` joins the six kind
 predicates already in `teko_struct.tk` (`tk_is_class`, `tk_is_iface`, `tk_is_deleg`,
-`tk_is_ha`, `tk_is_enum`, `tk_is_nl`) and asks for the row FIRST, because `TK_KSTRUCT` is 0
-and -1 ("no type here") would otherwise read as a struct.
+`tk_is_ha`, `tk_is_enum`, `tk_is_nl`) and asks for the row FIRST. **The reason
+stated when this was written does not survive a verifier's reading**: `&&` short-circuits in
+`mc`, so the row test answers 0 for -1 in either order. What the ordering buys is that
+`sr_kind_at(-1)` is never reached -- an out-of-bounds load, not a wrong answer -- and
+`tk_this()`, the only caller, already refuses a negative `tk_body_class` three lines above
+the question, so even that is unreachable today. The comment in the module says this.
 
 **Why it is not the class's message.** A class carries an object header and a reference
 count, which is what lets `this` be a borrowed value the caller may keep: `tk_rc_return`

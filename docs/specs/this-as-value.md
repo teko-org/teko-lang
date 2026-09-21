@@ -53,7 +53,7 @@ at the line of the construct that consumes the value:
 | ternary arm, `b ? this : o` | `public C M(C o, bool b) { return b ? this : o; }` | `teko: the two arms of ?: have different types` |
 | lambda body, `() => this` | `F f = () => this;` | `teko: this is not captured; add it to use (...)` |
 | `use (this)` on that lambda | `() use (this) => this` | `teko: expected a captured name` |
-| `struct` method, `return this;` | `struct P { public i64 x; public P Self() { return this; } }` | `teko: a value of type uptr does not convert to P` |
+| `struct` method, `return this;` | `struct P { public i64 x; public P Self() { return this; } }` | measured before the build: `teko: a value of type uptr does not convert to P`. **Since D103** (crumb 4) it is ``teko: `this` is not a value in a struct`` |
 | static member | `public static i64 S() { C d = this; ... }` | ``teko: `this` is not there in a static member`` |
 | file scope | `i64 main() { uptr q = this; ... }` | ``teko: `this` is only valid inside the body of a type`` |
 
@@ -62,7 +62,7 @@ D87, and they are the part of the ground truth the log had missed:
 
 | accepted today | what it compiles to | verdict |
 |---|---|---|
-| `public uptr M() { return this; }` — a method DECLARED `uptr` | returns the receiver address as a raw `uptr` | accepted; an escape hatch nobody should write, and it stays legal |
+| `public uptr M() { return this; }` — a method DECLARED `uptr` | returns the receiver address as a raw `uptr` | accepted in a CLASS, and it stays legal there. **Since D103** it is refused in a `struct`, where the same guard answers before the return type is read -- measured working on the base, returning a usable address |
 | `this == o` in a method of `C`, `o` of type `C` | a raw pointer compare | **wrong**: `C a; C b; a == b;` is refused ``teko: C declares no operator `==` `` everywhere else. `this` typing `uptr` is the only reason it slips past `tk_ops_binary` |
 | `this = o;` as a statement | `ASSIGN name=this` over the receiver parameter, with **no** reference counting at all (`tk_rc_assign` sees `TY_UPTR`, which is not counted, and leaves) | **wrong**: C# refuses `this = e;` on a class outright |
 
