@@ -11850,6 +11850,14 @@ were measured before they were fixed:
   its floor is open, and the enclosing rows are exactly what it must still see, so the
   owner is stacked beside the floor. Both roads read one lookup, so the `T[]` sibling is
   answered by the same change. Fixture: `tests/refuse/param_row_outlives_decl.tk`.
+- ...and a stale table is not laundered by BECOMING a floor. `tk_hp_in_owner` answers 1
+  unconditionally while a nested list is open, so a lambda opened inside a parameterless
+  free function trusted the previous declaration's rows for its whole body — the same
+  SIGSEGV one level in. The floor is VALIDATED as it is laid: `tk_hp_push` cuts rows that
+  do not belong to the declaration being parsed, and it is called BEFORE
+  `p_set_decl_name` sets the lambda's gensym, so the question it asks is about the
+  ENCLOSING declaration, the one that owns them. Fixture:
+  `tests/refuse/param_row_outlives_decl_lambda.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11859,13 +11867,17 @@ were measured before they were fixed:
   its body as well — `f81e0217` refuses that too. Items 9 and 10 of
   `tests/ref_field_param.tk`.
 
-**One shape the review raised that is NOT this decision's**, measured identically at
-`f81e0217` and at head: an enclosing LOCAL of another class spelled like a lambda's
-parameter (`Wide h = new Wide(); Take t = new Take((B h) => bump(ref h.n));`) resolves
-through `tk_slv_find`/`tk_local_find` to the OUTER local and writes at its offset. A
-lambda's parameter list is not in either table, and telling the lambda's body scope apart
-from the enclosing one inside `tk_slv_live` is the crumb that fixes it. Reported, not
-widened.
+**Two shapes the review raised that are NOT this decision's**, both measured identically at
+`f81e0217` and at head, so neither is made worse here — the parameter road simply did not
+exist there. An enclosing LOCAL of another class spelled like a lambda's parameter
+(`Wide h = new Wide(); Take t = new Take((B h) => bump(ref h.n));`) resolves through
+`tk_slv_find`/`tk_local_find` to the OUTER local and writes at ITS offset; an enclosing
+FIXED-ARRAY local of the same name (`i64 h[2]; Take t = new Take((H h) => …);`) blocks the
+lambda's own parameter and refuses a legal program. Both are the same missing fact: a
+lambda's parameter list is in neither of those tables, and `tk_slv_live` is cut at `}`
+rather than at a lambda boundary, so nothing says where the enclosing scope stops being
+visible. Marking the body's own scope entry is the crumb that orders them. Reported, and a
+row of `docs/reference/not-yet.md`; not widened.
 
 **Second half: one judge, one point.** All eight wrong shapes are the same deferred row —
 an `N_ADDR` receiver with no ref/out tag — so `tk_addr_recv_reject` (`teko_typeof.tk`) is
@@ -11900,20 +11912,22 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 203
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and thirteen
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 204
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and fourteen
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
 `tests/refuse/lambda_param_shadows_array.tk` for the `T[]` one,
 `tests/refuse/ref_field_array_local.tk` for the fixed-array one and
-`tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration —
-all five found by the review — refused rising by exactly the thirteen added. `tests/addr_not_member.tk` gains its item 7:
+`tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration and
+`tests/refuse/param_row_outlives_decl_lambda.tk` for the same rows laundered through a
+lambda's floor — all six found by the review — refused rising by exactly the fourteen
+added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178053, `ins` 246293 → 246690,
+only the compiler leg's size rows move: `nodes` 177785 → 178060, `ins` 246293 → 246702,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
