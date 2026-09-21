@@ -573,7 +573,8 @@ i64 main() {
 ```
 
 Three limits. `this = e;` is refused — ``teko: `this` is read-only`` — because the receiver
-is a parameter, not a slot; assign to a field instead. `this == o` is a comparison of two
+is a parameter, not a slot; assign to a field instead. The compound spellings of the same
+write (`this += e`, `this++`) earn the same sentence. `this == o` is a comparison of two
 class references and gets the rule every class reference gets, ``teko: C declares no
 operator `==` ``. And `this` inside a `struct` body is not a value
 ([not-yet.md](not-yet.md)), because a `struct` has no copy at assignment yet.

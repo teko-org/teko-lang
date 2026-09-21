@@ -11550,7 +11550,12 @@ exactly the road a method returning a parameter of class type already took. Prov
 counting at all**: the parameter reads `uptr`, which `tk_rc_assign` is not asked to count,
 so the store overwrote the receiver and neither side's count moved (`--dump-ast` showed a
 bare `ASSIGN name=this`). It is now `` teko: `this` is read-only ``, C#'s own rule — the
-receiver is a borrowed parameter, not a slot. And a return typed as an unrelated class now
+receiver is a borrowed parameter, not a slot. **The guard covers the compound spellings
+too.** `this += e`, `this -= e`, `this++` and `this--` are the same write through a
+different word and were measured compiling just as silently; the design page named only
+`=`, and refusing only `=` would have left four siblings wrong. The predicate is
+`tk_arr_write_follows` (`teko_array.tk`), which already answers "does a write follow?" —
+one guard over the set, not one per spelling. And a return typed as an unrelated class now
 names the class: `teko: a value of type D does not convert to U`, where it used to say
 `uptr`.
 
