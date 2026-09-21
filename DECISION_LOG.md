@@ -11735,7 +11735,7 @@ oracle names one):
 |---|---|
 | `&this.n`, the field at offset 16 | **233** |
 | `&this.n`, the same field at offset 32 (two padding fields ahead of it) | **176** |
-| `&this.k` on a field of CLASS type | SIGSEGV, exit 139 |
+| `&this.k` on a field of CLASS type | **233** (an independent verification measured this; it cannot fault -- `ld64` returns the garbage word and `main` returns it as the exit code, nothing dereferences it) |
 | `&h.n` on a LOCAL object | **243** |
 | `&h.n` on a PARAMETER | **233** |
 | `&this.k.n`, a chain | SIGSEGV, exit 139 |
@@ -11748,6 +11748,18 @@ ONE type in the unit declares that member name. Declare a second class with an `
 identical program is refused ``teko: the type of the left side of `.` is not known here:
 n`` instead — `tk_pend_by_name` is a resolution by name, and it refuses an ambiguous one.
 Both shapes now answer the message below.
+
+**Two diagnostics moved with it, neither of them a refusal gained or lost** (found by the
+independent verification, not by this entry's own measurement): `ref hs.n` on a `H[]`
+parameter and `ref x.n` on an interface-typed parameter answered
+`teko: not an object of a known type` before and answer `teko: unknown member: n` now. Both
+still refuse; the new wording names the member rather than the receiver, which is the more
+precise of the two. And one program that was REFUSED becomes accepted, which is a fix
+rather than a regression but is an accepted-code move on the `T[]` door and so belongs
+here: `i64 f(i64[] xs) { Op g = new Op((i64 xs) => xs + 1); return xs[0]; }` was
+``teko: `[` needs an array: xs `` and now answers, because the floor restores the enclosing
+`T[]` row when the lambda's own parameter goes out of scope. It is item 8 of the positive
+fixture.
 
 **First half: the false refusal.** `ref h.n` / `out h.n` where `h` is a PARAMETER was
 refused `teko: not an object of a known type: h` (`teko_ref.tk:316`) on a legal program,
@@ -11905,8 +11917,9 @@ were measured before they were fixed:
   through, so this was the laxer of the two doors: `bump(ref h.secret)` wrote a `private`
   field from OUTSIDE its type where `h.secret` as a plain read is refused, and
   `bump(ref h.tally)` on a STATIC lowered to `h + fd_off` although a static's storage is a
-  symbol of its own (`fd_sym_at`) and not a word inside the object -- SIGSEGV. Both
-  reproduce at `f81e0217` through the LOCAL receiver (42 and exit 139, measured), so the
+  symbol of its own (`fd_sym_at`) and not a word inside the object -- it faults on the
+  STORE, SIGBUS/exit 138 as an independent verification measured, not the SIGSEGV first
+  recorded here. Both reproduce at `f81e0217` through the LOCAL receiver (42 and 138), so the
   gate goes where BOTH receivers pass and the parameter road never inherits them.
   `tk_check_member` then `tk_reject_static_member`, in `tk_member_of`'s own order -- and
   each is given what `tk_member_of` gives it: the field's OWNER for the visibility
