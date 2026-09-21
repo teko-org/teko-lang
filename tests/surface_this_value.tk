@@ -1,0 +1,140 @@
+// surface_this_value.tk -- `this` is a value (D102, docs/specs/this-as-value.md
+// § 5). Every position below refused `teko: a value of type uptr does not
+// convert to C` before the node the parser builds carried the enclosing type.
+//
+// What each part proves, in order:
+//   Acc.Bump        a method returning `this`, typed as its own class
+//   Acc(...)        a constructor storing `this` in a field of the class
+//   Acc.Self        a property `get` whose body is `return this;`
+//   Acc.Mirror      the `set` half of a property, `this` as an argument
+//   Acc.Twin        an argument, `take(this)`
+//   Acc.Copy        an initializer, `Acc d = this;`
+//   Acc.Pick        a ternary arm, `b ? this : o`
+//   Acc.Up          a return typed as the BASE class
+//   Acc.AsI         a return typed as an INTERFACE the class implements
+//   Counter.Me      an interface DEFAULT body, static type = the interface
+//   Vec             D87's own reproducer: a class that DECLARES `operator+`
+//                   and reads a `uptr` field, so the compiler's own
+//                   `this + OFF` must keep answering `uptr`
+//
+// The reference count needed no new machinery: `this` is a parameter, so it is
+// borrowed, and `tk_rc_return` emits the caller's `rc_inc`. `rt_live()` proves
+// it -- a discarded result is swept, a kept one is released at its block's end.
+//
+// expect-exit: 42
+#include "../lib/rt.tk"
+
+interface Counter {
+    i64 Value();
+    // a DEFAULT body: `this` here has the static type of the interface
+    Counter Me() { return this; }
+}
+
+class Base {
+    public i64 v;
+    public Base() { v = 0; }
+}
+
+i64 take(Acc a) { return a.v; }
+
+class Acc : Base, Counter {
+    public Acc twin;
+    public i64 seen;
+
+    public Acc() { v = 0; seen = 0; twin = this; }   // a constructor, `this` stored
+
+    public i64 Value() { return v; }
+
+    public Acc Bump(i64 x) { v = v + x; return this; }   // a method return
+
+    public Acc Self { get { return this; } }             // a property `get`
+
+    public i64 Mirror {
+        get { return seen; }
+        set { seen = take(this); }                       // the `set` half
+    }
+
+    public i64 Twin() { return take(this); }             // an argument
+
+    public i64 Copy() { Acc d = this; return d.v; }      // an initializer
+
+    public Acc Pick(Acc o, bool b) { return b ? this : o; }   // a ternary arm
+
+    public Base Up() { return this; }                    // typed as the BASE
+
+    public Counter AsI() { return this; }                // typed as the INTERFACE
+}
+
+// D87's exact pairing: the class declares its own `operator+` AND reads a
+// `uptr` field. If `this` were retyped in the pass scope, the compiler's
+// `this + OFF` addressing would reach this operator and either refuse a line
+// that writes no `+` or compile a wrong load. Registering the parsed node
+// leaves those generated nodes untouched.
+class Vec {
+    public i64 x;
+    public uptr raw;
+    public Vec() { x = 0; raw = 0; }
+    public static Vec operator+(Vec a, Vec b) { return a; }
+    public Vec Grow() { x = x + 1; return this; }        // no `+` written on `this`
+    public uptr Raw() { return raw; }                    // a `uptr` field read
+}
+
+i64 main() {
+    i64 l0 = rt_live();
+
+    // a method return, chained -- the result of the first two links is
+    // DISCARDED, and swept by tk_rc_exprstmt
+    Acc a = new Acc();
+    a.Bump(1).Bump(2).Bump(3);
+    if (a.v != 6) return 10;
+
+    // a kept result: an owning local, released at the end of this block
+    Acc k = a.Bump(4);
+    if (k.v != 10) return 11;
+
+    // the constructor stored `this` in `twin`: a self-reference, and a cycle a
+    // plain count never collects -- docs/reference/memory.md says so
+    if (a.twin.v != 10) return 12;
+
+    // a property `get`
+    if (a.Self.v != 10) return 13;
+
+    // the `set` half of a property, and the argument road it uses
+    a.Mirror = 0;
+    if (a.Mirror != 10) return 14;
+
+    // an argument and an initializer
+    if (a.Twin() != 10) return 15;
+    if (a.Copy() != 10) return 16;
+
+    // a ternary arm, both ways
+    Acc o = new Acc();
+    o.Bump(99);
+    if (a.Pick(o, true).v != 10) return 17;
+    if (a.Pick(o, false).v != 99) return 18;
+
+    // typed as the BASE class
+    Base b = a.Up();
+    if (b.v != 10) return 19;
+
+    // typed as the INTERFACE, and the interface's own DEFAULT body
+    Counter c = a.AsI();
+    if (c.Value() != 10) return 20;
+    Counter m = c.Me();
+    if (m.Value() != 10) return 21;
+
+    // D87's reproducer: `operator+` declared, a `uptr` field read, `this`
+    // returned from a method of the same class
+    Vec vv = new Vec();
+    vv.Grow().Grow();
+    if (vv.x != 2) return 22;
+    if (vv.Raw() != 0) return 23;
+    Vec vs = vv + vv;
+    if (vs.x != 2) return 24;
+
+    // nothing of the above leaked past what `a`, `o`, `k`, `vv` and `vs` hold:
+    // every discarded `this` was dropped where it was discarded
+    if (rt_live() <= l0) return 25;
+
+    return 42;
+}
