@@ -22,8 +22,12 @@ multidimensional array, a typed variadic list
 remaining entry has to be either implemented or restated as a decision with a reason.
 
 **`teko_std` published.** The compiler alone is not a language a program can be written in.
-The library is versioned in lockstep with `teko` — same tag, released together — because a
-library compiled by a compiler that does not know its surface is not a library.
+The library is versioned in lockstep with `teko` (D15): its MINOR is the compiler's minor,
+`teko_std` 0.N.x is the library `teko` 0.N.y compiles, and it is released behind every
+`teko` tag with its `[deps] teko` pinned exactly — its patch number is its own, so a
+library fix ships without a compiler tag and a compiler fix ships as a library re-pin
+(`teko-std`'s own `CONTRIBUTING.md` § Version). The reason is unchanged: a library compiled
+by a compiler that does not know its surface is not a library.
 
 **Self-hosting on the five pairs.** Already true, and it has to stay true through everything
 above: linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64, windows/aarch64, each on
@@ -86,5 +90,6 @@ Two additions this page proposes, both **pending agreement with the mc project**
 
 `vX.Y.Z`, mc's own three-part format. Publication only from a stable version. A tag is cut
 per landed decision, a patch for a fix and a minor for a new surface, with `teko_std`
-released in lockstep behind the same minor; between here and 1.0.0 the shape of the
+re-pinned and released behind each one under the same minor (the lockstep rule stated
+above); between here and 1.0.0 the shape of the
 intermediate cuts is not decided here — that is part of what this draft is waiting on.
