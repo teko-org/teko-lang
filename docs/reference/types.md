@@ -472,21 +472,49 @@ i64 main() {
 }
 ```
 
+A struct **cannot contain itself**, directly or through a chain of other structs:
+`struct Node { public Node next; }` and `struct A { public B b; } struct B { public A a; }`
+are both refused with `teko: a struct cannot contain itself`, C#'s own CS0523. The `?` does
+not open a door either: a nullable over a struct IS the struct's own pointer, so
+`struct Node { public Node? next; }` is the same refusal. A struct
+value is copied memberwise and either shape would recurse for ever. Use a `class` for a
+linked structure. A `static` field of the struct's own type is fine — it is a global of its
+own and no part of the object — and the refusal is reported at the declaration that closes
+the cycle, so the mutual pair names `B`.
+
 A struct declares methods, with the same implicit receiver, default arguments and
 overloads a class method has ([classes.md](classes.md)). What it does not have is a
 vtable: `virtual`, `override` and `use` of a trait are refused on a struct by name, and a
 struct is never a base class.
 
 A struct is **not reference-counted** — it has no vtable, hence no release function to
-reach. Its allocation lives for the run ([memory.md](memory.md)).
+reach. Its allocation lives for the run ([memory.md](memory.md)), and so does every copy of
+it. A counted FIELD of a struct is another matter: it is gated by the field's own type, so
+a copy of the struct is a new owner of it and takes a reference of its own.
+
+A struct is a **value type**, as it is in C#: a struct value is **copied** where it lands in
+a storage location. `S b = a;` gives `b` a fresh allocation carrying every field `a` held,
+and a write through `b` stops there (D105). The copy is memberwise and **deep** through a
+struct-typed field, it keeps the reference count of every counted field, and `new S` is the
+one expression it does not copy — the block `new` hands out is named by nothing else yet.
+`ref` and `out` are how you keep the alias: `void bump(ref S s)` writes the caller's own
+struct ([parameters.md](parameters.md)).
+
+The representation is unchanged by that (D5): a struct value is still a **pointer**, eight
+bytes wide, and the copy is a fresh `rt_alloc` plus a memberwise copy written at the site,
+not a wider slot. Nothing reclaims it — a struct allocation is declared debt
+([memory.md](memory.md)) — so a struct copied in a long loop spends arena.
+
+Only the **local declaration** copies today. `b = a;` on an existing slot, a field store
+(`x.f = a;`), an element store (`arr[i] = a;`), a by-value argument and `S? b = a;` are the
+five landings still to come, and each one still ALIASES: they are V3 to V5 of
+[struct-value.md](../specs/struct-value.md) § 6.
 
 A struct **global** is the same eight-byte slot a class global is: it converts by the same
-assignment corridor a local's own store takes (D53), and assigning one struct global (or a
-struct-typed local) to another copies the POINTER, not the fields — `gp = p;` makes `gp` and
-`p` the same allocation, so a field written through either name is read through the other
-(D5, D56). It cannot be built at its own declaration: `Point gp = new Point();` at file scope
-is refused by mc's own core, `global initializer must be constant` — `new` is a call, not a
-constant. Declare it bare (`Point gp;`) and build it in a body instead.
+assignment corridor a local's own store takes (D53), and `Point q = gp;` copies it exactly
+as it copies a local. It cannot be built at its own declaration: `Point gp = new Point();`
+at file scope is refused by mc's own core, `global initializer must be constant` — `new` is
+a call, not a constant. Declare it bare (`Point gp;`) and build it in a body instead.
 
 ---
 

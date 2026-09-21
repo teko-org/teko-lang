@@ -1,0 +1,255 @@
+// struct_copy_local.tk -- a struct value is COPIED at a local declaration
+// (L1, docs/specs/struct-value.md § 3.1). Five shapes that answered the
+// ALIAS before D105 -- from a local, from a struct field, from a `T[]`
+// element, from a call return and from a method returning a FIELD -- and the
+// three properties the copy has to carry: it is a NEW block, it keeps the
+// count of every counted field, and `new S` is the one expression it does not
+// copy. The arena numbers are asserted rather than implied: a copy is an
+// allocation nobody reclaims until V7 (docs/reference/memory.md).
+//
+// expect-exit: 42
+#include "rt.tk"
+
+struct S { public i64 n; }
+struct T { public S s; public i64 k; }
+class Cell { public i64 v; }
+struct H { public Cell c; public i64 n; }
+class Box {
+    public S s;
+    public S get() { return s; }                 // a method returning a FIELD
+}
+
+S mk() { S q = new S; q.n = 9; return q; }
+
+// p02: `S b = a;` -- from another local
+i64 fromlocal() {
+    S a = new S;  a.n = 9;
+    S b = a;
+    if (b.n != 9) return 1;                      // the copy carries the fields
+    b.n = 1;
+    if (a.n != 9) return 2;                      // ...and the write stops there
+    return 0;
+}
+
+// p03: `S c = t.s;` -- from a struct FIELD
+i64 fromfield() {
+    S a = new S;  a.n = 9;
+    T t = new T;  t.s = a;                       // L3, still an alias until V3
+    S c = t.s;
+    if (c.n != 9) return 1;
+    c.n = 1;
+    if (a.n != 9) return 2;
+    if (t.s.n != 9) return 3;
+    return 0;
+}
+
+// p04: `S d = arr[0];` -- from a `T[]` element
+i64 fromelement() {
+    S a = new S;  a.n = 9;
+    S[] arr = new S[1];
+    arr[0] = a;                                  // L4, still an alias until V3
+    S d = arr[0];
+    if (d.n != 9) return 1;
+    d.n = 1;
+    if (arr[0].n != 9) return 2;
+    return 0;
+}
+
+// p05: `S e = mk();` -- from a call's return. A returned value is copied like
+// any other: a method may `return f;` on a field, so no call but the generated
+// `name_new` is provably fresh.
+i64 fromcall() {
+    S e = mk();
+    if (e.n != 9) return 1;
+    e.n = 1;
+    S e2 = mk();
+    if (e2.n != 9) return 2;                     // a second call is its own block
+    return 0;
+}
+
+// p47: `S f = bx.get();` -- from a method that returns a FIELD, which is the
+// shape that makes a call's return NOT provably fresh
+i64 frommethod() {
+    S a = new S;  a.n = 9;
+    Box bx = new Box();
+    bx.s = a;
+    S f = bx.get();
+    if (f.n != 9) return 1;
+    f.n = 1;
+    if (bx.s.n != 9) return 2;
+    if (a.n != 9) return 3;
+    return 0;
+}
+
+// the copy is a NEW block, and `new S` is NOT copied: `S x = new S;` allocates
+// exactly once, where `S y = x;` allocates a second time.
+i64 livecheck() {
+    i64 l0 = rt_live();
+    S x = new S;                                 // provably fresh: one allocation
+    if (rt_live() != l0 + 1) return 1;
+    S y = x;                                     // a copy: a second allocation
+    if (rt_live() != l0 + 2) return 2;
+    S z = new S();                               // the `()` form, equally fresh
+    if (rt_live() != l0 + 3) return 3;
+    return 0;
+}
+
+// the copy is a NEW OWNER of every counted field. `rt_copy` moves the pointer
+// bits without touching the count, so `h_copy` runs an `rc_inc` per counted
+// field; without it the two blocks would name one `Cell` with a count of 1 and
+// the first overwriting store would free it under the second.
+//
+// The overwriting store below is the probe: `h.c = new Cell();` allocates one
+// block and releases the old `Cell`. With the `rc_inc` the old count goes 2->1
+// and the `Cell` SURVIVES, so `rt_live()` rises by exactly one; without it the
+// count goes 1->0, the `Cell` is freed, and `rt_live()` does not move at all.
+i64 countedcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    H h2 = h;                                    // the copy: `Cell` count 1 -> 2
+    if (h2.c.v != 7) return 1;
+    i64 l0 = rt_live();
+    h.c = new Cell();                            // +1 block, and rc_dec on the old `Cell`
+    if (rt_live() != l0 + 1) return 2;           // ...which SURVIVES, held by `h2`
+    if (h2.c.v != 7) return 3;                   // ...and still reads its own value
+    return 0;
+}
+
+// the declared debt, made visible: every copy is an allocation nobody reclaims,
+// so a loop that copies moves the arena's high-water mark by one block per turn
+// (docs/reference/memory.md "What is not reclaimed"). S_SIZE is 8 and the
+// allocator rounds to its own 16-byte alignment, so 64 copies cost 1024 bytes.
+i64 peakcheck() {
+    S a = new S;  a.n = 9;
+    i64 p0 = rt_peak();
+    i64 i = 0;
+    loop {
+        if (i >= 64) break;
+        S z = a;
+        if (z.n != 9) return 1;
+        i = i + 1;
+    }
+    if (rt_peak() != p0 + 64 * 16) return 2;
+    return 0;
+}
+
+// a STRUCT-typed field is a value of its own and recurses through that struct's
+// own copy, so the copy is DEEP. A field nobody built is a null handle -- this
+// representation's shape, not C#'s, where a struct field is never null -- and it
+// is copied AS null rather than dereferenced.
+i64 nestedcheck() {
+    S a = new S;  a.n = 9;
+    T t = new T;  t.s = a;  t.k = 5;
+    i64 l0 = rt_live();
+    T t2 = t;                                    // one block for `T`, one for its `S`
+    if (rt_live() != l0 + 2) return 1;
+    if (t2.k != 5) return 2;
+    if (t2.s.n != 9) return 3;
+    t2.s.n = 1;
+    if (t.s.n != 9) return 4;                    // the inner struct is its own block
+    if (a.n != 9) return 5;
+
+    T u = new T;                                 // `u.s` was never built: a null handle
+    i64 l1 = rt_live();
+    T u2 = u;                                    // one block, and no deref of address 0
+    if (rt_live() != l1 + 1) return 6;
+    if (u2.k != 0) return 7;
+    return 0;
+}
+
+// an inline array FIELD of struct type reaches its elements too, one copy per
+// element, and one of counted type retains each of them
+struct G { public S a[2]; public i64 k; }
+struct W { public Cell c[2]; }
+
+i64 inlinecheck() {
+    G g = new G;
+    g.a[0] = new S;  g.a[0].n = 7;
+    g.a[1] = new S;  g.a[1].n = 8;
+    g.k = 3;
+    i64 l0 = rt_live();
+    G g2 = g;                                    // one block for `G`, two for its elements
+    if (rt_live() != l0 + 3) return 1;
+    if (g2.a[0].n != 7) return 2;
+    if (g2.a[1].n != 8) return 3;
+    g2.a[0].n = 1;
+    if (g.a[0].n != 7) return 4;
+    if (g2.k != 3) return 5;
+
+    W w = new W;
+    w.c[0] = new Cell();
+    w.c[0].v = 4;
+    W w2 = w;                                    // the counted elements are retained
+    i64 l1 = rt_live();
+    w.c[0] = new Cell();                         // +1 block, rc_dec on the old `Cell`...
+    if (rt_live() != l1 + 1) return 6;           // ...which survives, held by `w2`
+    if (w2.c[0].v != 4) return 7;
+    return 0;
+}
+
+// the `foreach` element is the COMPILER's declaration, not the source's, so L1
+// does NOT reach it: the write still lands on the array, which is what the base
+// answered. Binding it to a copy would make this program compile and go nowhere.
+// V6 refuses the write outright (C# CS1654) and rewrites this check.
+i64 foreachcheck() {
+    S[] a = new S[2];
+    a[0] = new S;  a[0].n = 1;
+    a[1] = new S;  a[1].n = 2;
+    foreach (S s in a) { s.n = 9; }
+    if (a[0].n != 9) return 1;
+    if (a[1].n != 9) return 2;
+    return 0;
+}
+
+// an `S?` field recurses like an `S` one: Q1a makes a nullable over a reference
+// the reference itself, so the copy has to reach through it or the inner struct
+// stays shared. The null handle takes the `s == 0` road of the generated copy.
+struct N { public S? s; public i64 k; }
+
+i64 nullablecheck() {
+    S a = new S;  a.n = 9;
+    N h = new N;  h.s = a;  h.k = 3;
+    i64 l0 = rt_live();
+    N h2 = h;                                    // one block for `N`, one for its `S`
+    if (rt_live() != l0 + 2) return 1;
+    if (h2.k != 3) return 2;
+    if (h2.s.Value.n != 9) return 3;
+    h2.s.Value.n = 1;
+    if (a.n != 9) return 4;                      // the inner struct is its own block
+
+    N u = new N;                                 // `u.s` is the null handle
+    i64 l1 = rt_live();
+    N u2 = u;                                    // one block, and no deref of 0
+    if (rt_live() != l1 + 1) return 5;
+    if (u2.s != null) return 6;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = fromlocal();
+    if (bad != 0) return 10 + bad;
+    bad = fromfield();
+    if (bad != 0) return 20 + bad;
+    bad = fromelement();
+    if (bad != 0) return 30 + bad;
+    bad = fromcall();
+    if (bad != 0) return 40 + bad;
+    bad = frommethod();
+    if (bad != 0) return 50 + bad;
+    bad = livecheck();
+    if (bad != 0) return 60 + bad;
+    bad = countedcheck();
+    if (bad != 0) return 70 + bad;
+    bad = peakcheck();
+    if (bad != 0) return 80 + bad;
+    bad = nestedcheck();
+    if (bad != 0) return 90 + bad;
+    bad = inlinecheck();
+    if (bad != 0) return 100 + bad;
+    bad = foreachcheck();
+    if (bad != 0) return 110 + bad;
+    bad = nullablecheck();
+    if (bad != 0) return 120 + bad;
+    return 42;
+}

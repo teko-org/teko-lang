@@ -14,13 +14,16 @@
 //      be constant` -- a `new` is a call, not a constant). `gp` is declared
 //      bare and built inside a body instead, then its fields are stored and
 //      read.
-//   2. `aliascheck`    -- the ALIAS a struct global's own pointer licenses:
+//   2. `aliascheck`    -- the ALIAS a WHOLE-STRUCT STORE still licenses:
 //      `gp = p;` makes `gp` and `p` the SAME allocation, so a field written
-//      through either name is read through the other. C# copies a struct on
-//      assignment; teko does not, because here the "struct" IS the pointer
-//      (D5) -- there is no sixteen-byte value to copy in the first place.
-//   3. `localcopycheck` -- `Point q = gp;` is the same alias one more time,
-//      a struct-typed LOCAL built from the global.
+//      through either name is read through the other. D105 makes a struct a
+//      value type, and this is the L2 landing it has not reached yet -- V3 of
+//      docs/specs/struct-value.md § 6 turns this row into a copy too. The
+//      declaration below it (row 3, the L1 landing) already copies.
+//   3. `localcopycheck` -- `Point q = gp;` is a COPY: V2's L1 landing gives the
+//      local a fresh block carrying every field the global had, and a write to
+//      it stops there. It read the same ALIAS as row 2 until then (D56, now
+//      superseded on the semantics by D105).
 //   4. `paramscheck`   -- the struct global passed by value (the parameter
 //      is a copy of the POINTER, so a field store through it still lands on
 //      the object `gp` names), by `ref` (the callee reassigns `gp` itself)
@@ -98,9 +101,11 @@ i64 aliascheck() {
 }
 
 i64 localcopycheck() {
-    Point q = gp;                                   // `q` is the SAME allocation as `gp`
-    q.x = 44;
-    if (gp.x != 44) return 1;
+    gp.x = 44;
+    Point q = gp;                                   // V2: `q` is a fresh block, C#'s answer
+    if (q.x != 44) return 1;                        // ...carrying every field the global had
+    q.x = 45;
+    if (gp.x != 44) return 2;                       // ...and a write to it stops there
     return 0;
 }
 

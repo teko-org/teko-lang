@@ -318,6 +318,7 @@ i64  tk_nlocal = 0;
 
 uptr slv_name[TK_MAXSLV];             // every local's NAME, whatever its type
 i64  slv_ty[TK_MAXSLV];               // ...and the type it was declared with
+i64  slv_node[TK_MAXSLV];             // ...and the N_VAR node the SOURCE wrote (V2)
 i64  tk_nslv = 0;                     // append-only: the whole unit, for a PASS
 
 i64  slv_live[TK_MAXSLV];             // indices into the two above, the ones IN SCOPE
@@ -373,6 +374,7 @@ uptr lv_name_at(i64 i)  { return ld64(lv_name + i * 8); }
 i64  lv_str_at(i64 i)   { return ld64(lv_str + i * 8); }
 uptr slv_name_at(i64 i) { return ld64(slv_name + i * 8); }
 i64  slv_ty_at(i64 i)   { return ld64(slv_ty + i * 8); }
+i64  slv_node_at(i64 i) { return ld64(slv_node + i * 8); }
 i64  slv_live_at(i64 i) { return ld64(slv_live + i * 8); }
 i64  xt_node_at(i64 i)  { return ld64(xt_node + i * 8); }
 i64  xt_str_at(i64 i)   { return ld64(xt_str + i * 8); }
@@ -424,6 +426,7 @@ void set_lv_name_at(i64 i, uptr v)  { st64(lv_name + i * 8, v); }
 void set_lv_str_at(i64 i, i64 v)    { st64(lv_str + i * 8, v); }
 void set_slv_name_at(i64 i, uptr v) { st64(slv_name + i * 8, v); }
 void set_slv_ty_at(i64 i, i64 v)    { st64(slv_ty + i * 8, v); }
+void set_slv_node_at(i64 i, i64 v)  { st64(slv_node + i * 8, v); }
 void set_slv_live_at(i64 i, i64 v)  { st64(slv_live + i * 8, v); }
 void set_xt_node_at(i64 i, i64 v)   { st64(xt_node + i * 8, v); }
 void set_xt_str_at(i64 i, i64 v)    { st64(xt_str + i * 8, v); }
@@ -484,6 +487,8 @@ uptr tk_num(i64 v) {
 
 // Point         ->  point_new       (the generated allocator)
 uptr tk_ctor_name(uptr name) { return tk_join(tk_case(name, 0), "_new"); }
+// Point         ->  point_copy      (the generated memberwise copy, V2)
+uptr tk_copy_name(uptr name) { return tk_join(tk_case(name, 0), "_copy"); }
 // Point         ->  point_release   (word 0 of the vtable, what rc_dec calls)
 uptr tk_release_name(uptr name) { return tk_join(tk_case(name, 0), "_release"); }
 // Point + __i64 ->  point_ctor__i64 (the body of `public Point(i64 x) { ... }`)
@@ -1519,10 +1524,18 @@ void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
 // conversion nobody wrote. A parameter is in no scope table at parse time, so
 // the honest answer for it is -1, "not known here", which every caller of
 // `tk_pty_of` already treats as "refuse nothing".
-void tk_slv_add(uptr name, i64 ty) {
+// `node` is the N_VAR the SOURCE wrote, or 0 when the compiler wrote it. Almost
+// every temporary the passes generate (a ternary's hoisted arm, a nullable's
+// unwrap, a lambda's captured copy) is built straight from `tk_var` and never
+// reaches `tk_on_stmt` at all; the one that DOES is the `foreach` element, and
+// `tk_stmt_gen` above is what marks it. `tk_copy_pass` (teko_copy.tk) reads the
+// column to find the L1 landings, which is what keeps it from copying a
+// declaration the compiler itself put there (V2).
+void tk_slv_add(uptr name, i64 ty, i64 node) {
     if (tk_nslv == TK_MAXSLV) err_at(tk_file, tk_line, "teko: too many locals in one unit");
     set_slv_name_at(tk_nslv, name);
     set_slv_ty_at(tk_nslv, ty);
+    set_slv_node_at(tk_nslv, node);
     set_slv_live_at(tk_nslv_live, tk_nslv);
     tk_nslv_live = tk_nslv_live + 1;
     tk_nslv = tk_nslv + 1;
@@ -1572,6 +1585,16 @@ i64 tk_pty_of(i64 n) {
     return 0 - 1;
 }
 
+// 1 while a PASS-owned declaration is being announced through `tk_on_stmt`.
+// `teko_loop.tk` builds the `foreach` element with `tk_var` and hands it to the
+// hook so the element NAME is in scope for the body, but the node is the
+// COMPILER's: `slv_node` stays 0 for it, and no landing of `teko_copy.tk`'s may
+// touch it. Binding a struct `foreach` variable to a copy would make
+// `foreach (S s in a) { s.n = 9; }` compile and write into a detached block --
+// measured at 3 where the array reads 18 -- which is the class of bug D105
+// exists to remove, and which V6 refuses outright instead (C# CS1654).
+i64 tk_stmt_gen = 0;
+
 // M21.5's statement hook: a local the CORE declared (`Point p = new Point;`)
 // is observable here as the N_VAR node, and its type id is the struct or class.
 // Nothing is rewritten -- the node that arrives is the node that leaves.
@@ -1581,7 +1604,9 @@ i64 tk_on_stmt(i64 n) {
     if (n == 0) return n;
     if (nd_kind(n) != N_VAR) return n;
     if (nd_val(n) != 0) return n;
-    tk_slv_add(nd_name(n), nd_type(n));
+    i64 site = n;
+    if (tk_stmt_gen) site = 0;                   // the compiler's own, not the source's
+    tk_slv_add(nd_name(n), nd_type(n), site);
     i64 si = tk_struct_by_ty(nd_type(n));
     if (si >= 0) {
         tk_line = nd_line(n);
@@ -1610,6 +1635,95 @@ i64 tk_ctor(uptr name, i64 ty, i64 size, i64 install) {
                                                      // names is the type itself
     stmts = list_append(stmts, tk_ret(r));
     return tk_func(ty, tk_ctor_name(name), 0, tk_blk(stmts));
+}
+
+// ---- the memberwise copy (V2, docs/specs/struct-value.md § 3.3) ----
+// The fix-ups the whole-block `rt_copy` cannot carry, one line per field that
+// needs one. Everything else -- padding, a `u8`/`u32` field's exact width, an
+// inline array of scalars -- the bulk copy already moved.
+//
+// A COUNTED field (a class, an interface, a delegate, a `T[]`, a `T?` over any
+// of them) is a new OWNER: `rt_copy` moved the pointer bits without touching
+// the count, and without this line two struct blocks would name one object with
+// a count of 1, the first release freeing it under the second (§ 8). `rc_inc(0)`
+// is already a no-op, so a null field needs no guard.
+//
+// A STRUCT field is a value of its own and recurses through that struct's copy,
+// and so does an `S?` one -- Q1a makes a nullable over a struct the struct's own
+// pointer, `tk_row_through_nl` peels it, and the `s == 0` guard at the top of
+// every generated copy answers the null handle. V1 has already refused the shape
+// that would recurse for ever, through the `?` as well.
+//
+// A STATIC field (`fd_sym_at != 0`) lives in a global and is no part of the
+// object. An inline array field takes the same two roads element by element --
+// its stride is 8, every element of a counted or struct type being a pointer;
+// the struct arm is UNROLLED, which is `nel` statements for a field spelled
+// `S a[nel]` and the same shape `tk_release_fields` (teko_class.tk) avoids by
+// having a runtime helper it can pass a count to, which a per-type recursion
+// has not.
+i64 tk_copy_fields(i64 k) {
+    i64 st = 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfield) break;
+        if (fd_cls_at(i) == k && fd_sym_at(i) == 0) {
+            i64 fty = fd_ty_at(i);
+            i64 off = fd_off_at(i);
+            i64 nel = fd_nel_at(i);
+            if (tk_is_counted(fty)) {
+                if (nel > 0)
+                    st = list_append(st, tk_stmt(tk_call2("rt_retain_array",
+                            tk_bin(K_ADD, tk_id("d"), tk_int(off)), tk_int(nel))));
+                else
+                    st = list_append(st, tk_stmt(tk_call("rc_inc",
+                            tk_call("ld64", tk_bin(K_ADD, tk_id("s"), tk_int(off))))));
+            } else if (tk_is_struct(tk_row_through_nl(fty))) {
+                uptr cp = tk_copy_name(sr_name_at(tk_row_through_nl(fty)));
+                i64 n = nel;
+                if (n == 0) n = 1;
+                i64 j = 0;
+                loop {
+                    if (j >= n) break;
+                    i64 o = off + j * 8;
+                    st = list_append(st, tk_stmt(tk_call2("st64",
+                            tk_bin(K_ADD, tk_id("d"), tk_int(o)),
+                            tk_call(cp, tk_call("ld64", tk_bin(K_ADD, tk_id("s"), tk_int(o)))))));
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return st;
+}
+
+// Name Name_copy(uptr s) { if (s == 0) return 0;
+//                          uptr d = rt_alloc(NAME_SIZE);
+//                          rt_copy(d, s, NAME_SIZE); <fix-ups> return d; }
+// The declared RETURN type is the struct's own id, which is what makes
+// `S b = s_copy(a);` type exactly as `S b = new S;` does -- the call is typed by
+// `decl_ret` (teko_typeof.tk). The PARAMETER is `uptr`, the same spelling a
+// method's implicit receiver takes (teko_this.tk), so the field arithmetic in
+// the body is plain pointer arithmetic and a struct value lands on it the way it
+// lands on `this`.
+//
+// `s == 0` is not C#'s shape -- there a struct field is never null -- but it is
+// this representation's: a struct field is a pointer that `rt_alloc` zeroed, so
+// a struct whose struct-typed field was never built reaches here with 0, and
+// `rt_copy` would read address 0. The null is copied AS null, which is what the
+// alias answered before.
+i64 tk_copy_fn(uptr name, i64 ty, i64 si, i64 size) {
+    i64 z = tk_int(0);                           // the null handle, typed as the struct: the
+    tk_xt_add(z, si, 1, TK_BORROWED);            // slot it returns into is `Name`, not `i64`
+    i64 stmts = tk_if(tk_bin(K_EQ, tk_id("s"), tk_int(0)), tk_ret(z));
+    stmts = list_append(stmts, tk_var(TY_UPTR, "d", tk_call("rt_alloc", tk_int(size))));
+    stmts = list_append(stmts, tk_stmt(tk_call3("rt_copy", tk_id("d"), tk_id("s"), tk_int(size))));
+    stmts = list_append(stmts, tk_copy_fields(si));
+    i64 r = tk_id("d");
+    tk_xt_add(r, si, 1, TK_OWNED);               // `d` is `uptr`, and the fresh block it
+                                                 // names is the type itself (tk_ctor's own note)
+    stmts = list_append(stmts, tk_ret(r));
+    return tk_func(ty, tk_copy_name(name), param_new(TY_UPTR, "s"), tk_blk(stmts));
 }
 
 // a name being declared: an identifier that is still free. `type_new` reserves
@@ -1888,6 +2002,62 @@ i64 tk_size_of(i64 off) {
     return off;
 }
 
+// the type-table row a field's type really names, with every `T?` peeled off
+// (D105). Q1a makes a nullable over a REFERENCE the reference itself -- the
+// handle IS the pointer and 0 is null -- so an `S? f` field holds exactly what
+// an `S f` field holds, and both the cycle check below and the generated copy
+// have to see the struct through it. A nullable over a VALUE is a different
+// thing: it BOXES (`tk_nl_boxes`), and that box is a counted object
+// `tk_is_counted` already answers for, so the row is handed back unpeeled.
+i64 tk_row_through_nl(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    loop {
+        if (!tk_is_nl(si)) break;
+        if (tk_nl_boxes(nl_of_at(si))) break;
+        si = tk_struct_by_ty(nl_of_at(si));
+    }
+    return si;
+}
+
+// ---- a struct cannot contain itself (V1, docs/specs/struct-value.md § 4.4) ----
+// 1 when `si` is reachable from `k` by following the struct-typed fields that
+// live IN the object. A static field (`fd_sym_at != 0`) is a global of its own
+// and is no part of any object, so it closes no cycle; an inline array field
+// (`fd_nel_at > 0`) is read exactly like a scalar one, its element type being
+// the thing that recurses.
+//
+// The walk needs no visited set and cannot loop: every cycle is refused at the
+// closing `}` of the struct that COMPLETES it, so the field graph this reads is
+// acyclic by induction. A forward-declared struct carries no field yet, which
+// is why the mutual case is only visible at the second declaration's own close.
+i64 tk_struct_contains(i64 k, i64 si) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfield) break;
+        if (fd_cls_at(i) == k && fd_sym_at(i) == 0) {
+            i64 fi = tk_row_through_nl(fd_ty_at(i));    // `S? next` is an `S` field (Q1a)
+            if (tk_is_struct(fi)) {
+                if (fi == si) return 1;
+                if (tk_struct_contains(fi, si)) return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// `struct Node { Node next; }` and `struct A { B b; } struct B { A a; }` both
+// compiled before this check, giving `next`/`a` an eight-byte pointer; C#
+// refuses the same shape as CS0523. The copy of V2 is memberwise and recurses
+// through every struct-typed field, so either shape would recurse for ever --
+// at compile time in `tk_copy_fn`, and at run time in the body it emits.
+// A linked structure is a `class`, whose value is a reference this design does
+// not touch.
+void tk_struct_cycle_check(i64 si) {
+    if (!tk_struct_contains(si, si)) return;
+    err_at(tk_file, tk_line, "teko: a struct cannot contain itself");
+}
+
 // ---- struct Name { type field; ... } ----
 void tk_struct() {
     tk_line = p_line();
@@ -1919,8 +2089,10 @@ void tk_struct() {
     p_accept(K_SEMI);                            // a C programmer's trailing ;
     tk_line = head_line;                         // back to the struct's own level
     tk_file = head_file;
+    tk_struct_cycle_check(si);                   // V1, before anything walks the fields
     i64 size = tk_size_of(off);
     set_sr_size_at(si, size);
     def_add(tk_join(tk_case(name, 1), "_SIZE"), size, tk_line, tk_file);
     tk_top_emit_as(tk_ctor(name, ty, size, 0), 0);   // `point_new` is the compiler's (D48)
+    tk_top_emit_as(tk_copy_fn(name, ty, si, size), 0);   // ...and so is `point_copy` (V2)
 }

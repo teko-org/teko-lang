@@ -38,6 +38,17 @@ with that line in its stderr (D52).
   `str`) (D60). A namespaced type keeps the word free for its own namespace
   (`geo.TimeSpan` beside the primitive `TimeSpan`) — only the exact qualified name
   collides.
+- `"teko: a struct cannot contain itself"` — a `struct` field whose type is the struct
+  itself, directly (`struct Node { Node next; }`) or through a chain of other structs
+  (`struct A { B b; } struct B { A a; }`), the `?` included — a nullable over a struct is the
+  struct's own pointer (Q1a), so `struct Node { Node? next; }` is the same refusal. A struct
+  value is copied memberwise, and a
+  memberwise copy of either shape would recurse for ever; C# refuses the same shape as
+  CS0523. Use a `class` for a linked structure — a class value is a reference, and the copy
+  does not touch it. A `static` field of the struct's own type is fine: it is a global of
+  its own and no part of the object. Reported at the declaration that CLOSES the cycle, so
+  the mutual case names `B` and not `A` ([types.md](types.md#struct),
+  [struct-value.md](../specs/struct-value.md) § 4.4).
 - `"teko: the name is already a generic"` — the name belongs to a generic declaration.
 - `"teko: name of "` — completed by *`<what>` expected*: a declaration keyword was read and
   what followed is not a usable name.
@@ -175,8 +186,11 @@ with that line in its stderr (D52).
 - ``"teko: `this` is not a value in a struct"`` — `return this;`, `f(this)`, `S x = this;`
   or any other bare `this` read as a value inside a `struct` body. A struct carries no
   object header and no reference count, so its `this` cannot be the value a class's or an
-  interface's is, and the language does not copy a struct at assignment yet (`P b = a;
-  b.x = 9;` changes `a.x`), so handing the receiver out would alias where C# copies. The
+  interface's is. D105 has since made a struct a value type and `P b = a;` copies, but the
+  refusal is not reopened by it: `this` inside a struct method IS the receiver parameter, and
+  a by-value struct parameter still aliases until V4 of
+  [struct-value.md](../specs/struct-value.md) § 6, so handing the receiver out would still
+  alias where C# copies. The
   field roads are untouched: `this.x`, a bare `x` and `this.x = v` inside the same method
   all keep working. Before D103 this answered the generic
   `teko: a value of type uptr does not convert to P`, which named the receiver parameter's
