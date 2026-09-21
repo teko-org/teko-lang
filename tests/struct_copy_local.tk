@@ -202,6 +202,30 @@ i64 foreachcheck() {
     return 0;
 }
 
+// an `S?` field recurses like an `S` one: Q1a makes a nullable over a reference
+// the reference itself, so the copy has to reach through it or the inner struct
+// stays shared. The null handle takes the `s == 0` road of the generated copy.
+struct N { public S? s; public i64 k; }
+
+i64 nullablecheck() {
+    S a = new S;  a.n = 9;
+    N h = new N;  h.s = a;  h.k = 3;
+    i64 l0 = rt_live();
+    N h2 = h;                                    // one block for `N`, one for its `S`
+    if (rt_live() != l0 + 2) return 1;
+    if (h2.k != 3) return 2;
+    if (h2.s.Value.n != 9) return 3;
+    h2.s.Value.n = 1;
+    if (a.n != 9) return 4;                      // the inner struct is its own block
+
+    N u = new N;                                 // `u.s` is the null handle
+    i64 l1 = rt_live();
+    N u2 = u;                                    // one block, and no deref of 0
+    if (rt_live() != l1 + 1) return 5;
+    if (u2.s != null) return 6;
+    return 0;
+}
+
 i64 main() {
     i64 bad = fromlocal();
     if (bad != 0) return 10 + bad;
@@ -225,5 +249,7 @@ i64 main() {
     if (bad != 0) return 100 + bad;
     bad = foreachcheck();
     if (bad != 0) return 110 + bad;
+    bad = nullablecheck();
+    if (bad != 0) return 120 + bad;
     return 42;
 }

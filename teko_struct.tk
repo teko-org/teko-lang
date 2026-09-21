@@ -1648,8 +1648,11 @@ i64 tk_ctor(uptr name, i64 ty, i64 size, i64 install) {
 // a count of 1, the first release freeing it under the second (§ 8). `rc_inc(0)`
 // is already a no-op, so a null field needs no guard.
 //
-// A STRUCT field is a value of its own and recurses through that struct's copy;
-// V1 has already refused the shape that would recurse for ever.
+// A STRUCT field is a value of its own and recurses through that struct's copy,
+// and so does an `S?` one -- Q1a makes a nullable over a struct the struct's own
+// pointer, `tk_row_through_nl` peels it, and the `s == 0` guard at the top of
+// every generated copy answers the null handle. V1 has already refused the shape
+// that would recurse for ever, through the `?` as well.
 //
 // A STATIC field (`fd_sym_at != 0`) lives in a global and is no part of the
 // object. An inline array field takes the same two roads element by element --
@@ -1674,8 +1677,8 @@ i64 tk_copy_fields(i64 k) {
                 else
                     st = list_append(st, tk_stmt(tk_call("rc_inc",
                             tk_call("ld64", tk_bin(K_ADD, tk_id("s"), tk_int(off))))));
-            } else if (tk_is_struct(tk_struct_by_ty(fty))) {
-                uptr cp = tk_copy_name(sr_name_at(tk_struct_by_ty(fty)));
+            } else if (tk_is_struct(tk_row_through_nl(fty))) {
+                uptr cp = tk_copy_name(sr_name_at(tk_row_through_nl(fty)));
                 i64 n = nel;
                 if (n == 0) n = 1;
                 i64 j = 0;
@@ -1999,6 +2002,23 @@ i64 tk_size_of(i64 off) {
     return off;
 }
 
+// the type-table row a field's type really names, with every `T?` peeled off
+// (D105). Q1a makes a nullable over a REFERENCE the reference itself -- the
+// handle IS the pointer and 0 is null -- so an `S? f` field holds exactly what
+// an `S f` field holds, and both the cycle check below and the generated copy
+// have to see the struct through it. A nullable over a VALUE is a different
+// thing: it BOXES (`tk_nl_boxes`), and that box is a counted object
+// `tk_is_counted` already answers for, so the row is handed back unpeeled.
+i64 tk_row_through_nl(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    loop {
+        if (!tk_is_nl(si)) break;
+        if (tk_nl_boxes(nl_of_at(si))) break;
+        si = tk_struct_by_ty(nl_of_at(si));
+    }
+    return si;
+}
+
 // ---- a struct cannot contain itself (V1, docs/specs/struct-value.md § 4.4) ----
 // 1 when `si` is reachable from `k` by following the struct-typed fields that
 // live IN the object. A static field (`fd_sym_at != 0`) is a global of its own
@@ -2015,7 +2035,7 @@ i64 tk_struct_contains(i64 k, i64 si) {
     loop {
         if (i >= tk_nfield) break;
         if (fd_cls_at(i) == k && fd_sym_at(i) == 0) {
-            i64 fi = tk_struct_by_ty(fd_ty_at(i));
+            i64 fi = tk_row_through_nl(fd_ty_at(i));    // `S? next` is an `S` field (Q1a)
             if (tk_is_struct(fi)) {
                 if (fi == si) return 1;
                 if (tk_struct_contains(fi, si)) return 1;

@@ -12094,8 +12094,9 @@ visited set and cannot loop, because every cycle is refused at the close of the 
 COMPLETES it and the graph it reads is therefore acyclic by induction. A forward-declared
 struct carries no field yet, which is why the mutual case lands at `B`'s declaration and not
 at `A`'s -- the same place C# reports CS0523. Refusal:
-`teko: a struct cannot contain itself`. Two fixtures, `tests/refuse/struct_cycle_self.tk`
-and `tests/refuse/struct_cycle_mutual.tk`, with the D52 two-line oracle each.
+`teko: a struct cannot contain itself`. Three fixtures, `tests/refuse/struct_cycle_self.tk`,
+`tests/refuse/struct_cycle_mutual.tk` and `tests/refuse/struct_cycle_nullable.tk`, with the
+D52 two-line oracle each.
 
 **V2: `rt_copy`, `name_copy`, and the first landing.** The copy has three parts and no
 fourth. `rt_copy(d, s, n)` (lib/rt.tk, six lines) moves the whole block a word at a time,
@@ -12173,6 +12174,20 @@ RUNNING TIME rather than with its shape, so a 16-byte struct copied in a long lo
 `64 * 16` over 64 copies) rather than implying it. `name_copy` is a reserved symbol from
 here on, the same collision rule `point_new` has carried since D48.
 
+**The `?` peels, in both halves.** Q1a makes a nullable over a REFERENCE the reference
+itself -- the handle IS the pointer and 0 is null -- so an `S? f` field holds exactly what an
+`S f` field holds. The first cut of this crumb read the field's row with `tk_struct_by_ty`,
+which answers the TK_KNULL row, so neither half saw the struct through the `?`: a copy of
+`struct H { S? s; }` left `h2.s` ALIASING `h.s` (measured: `rt_live()` rose by 1 where the
+deep copy rises by 2), and `struct Node { public Node? next; }` compiled, whose copy
+recurses for ever on a cyclic list. `tk_row_through_nl` peels every `T?` over a reference
+and stops at a nullable over a VALUE, which BOXES (`tk_nl_boxes`) and is a counted object
+`tk_is_counted` already answers for. Both halves read it now: the copy recurses through an
+`S?` field (the `s == 0` guard answering the null handle) and the cycle check refuses
+`Node? next` with `Node next`, which is C#'s answer too -- `S?` is `Nullable<S>`, and it
+contains an `S`. `tests/refuse/struct_cycle_nullable.tk` and `struct_copy_local.tk`'s
+`nullablecheck` are the oracles. Found by Copilot's review of PR #771.
+
 **The forward row was probed, not assumed.** The copy body is emitted when the struct
 CLOSES, so a field may name a type declared later and still carry a TK_PFWD row. That row is
 not blank: the forward pre-scan (§50 O1, `tk_fwd_reg_type`) records the real KIND before any
@@ -12182,8 +12197,8 @@ through the original) and a forward CLASS field is retained (the overwriting sto
 free it under the copy), across an `#include` boundary as well as within one file, exit 42
 on each. Raised by Copilot's review of PR #771; not reproduced.
 
-**Gate.** `144 passed, 217 refused as expected, 0 failed` (the base is `143 passed, 215
-refused`: `struct_copy_local` and the two cycle fixtures). `FIXPOINT OK`. Docs green.
+**Gate.** `144 passed, 218 refused as expected, 0 failed` (the base is `143 passed, 215
+refused`: `struct_copy_local` and the three cycle fixtures). `FIXPOINT OK`. Docs green.
 `mc limits` on both legs from a CLEAN `build/`: the hello leg moves `passes` **15 -> 16**
 (15/30 -> 16/32, verdict **ok**) and nothing else -- `on_stmt` 4/8, `syntax` 20/40, `alias`
 25/50, `types` 18/36, `intrin` 8/16 all unmoved, `heap` 471920 -> 471936; the compiler leg

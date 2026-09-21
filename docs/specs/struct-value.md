@@ -200,7 +200,9 @@ per-shape code at all, and only the two field kinds that need more get a line. A
 field has `fd_sym_at(fi) != 0` and is no part of the object (`tests/types_struct.tk` proves
 `POINT_SIZE` is the same with and without it), so it is skipped.
 
-`rt_copy` is the only new runtime function, and it is five lines — legal because
+`rt_copy` is the first of the **two** new runtime functions — `rt_retain_array(base, n)`,
+the mirror of the `rt_release_array` a counted inline array field already had, is the other,
+and the "as built" note below says why. `rt_copy` itself is five lines, legal because
 `NAME_SIZE` is always a multiple of 8 (probe `p32`):
 
 ```
@@ -213,7 +215,7 @@ void rt_copy(uptr d, uptr s, i64 n) {
 
 `rc_inc(0)` is already a no-op (`lib/rt.tk:132-135`), so a null field needs no guard.
 
-**As built (D105, V2), three deviations from the sketch above.** The parameter is `uptr s`,
+**As built (D105, V2), four deviations from the sketch above.** The parameter is `uptr s`,
 not `Name s` — the spelling a method's implicit receiver already takes (`teko_this.tk`), so
 the field arithmetic in the body is plain pointer arithmetic and a struct value lands on it
 the way it lands on `this`. The body opens with `if (s == 0) return 0;`: a struct field is a
@@ -222,7 +224,12 @@ recursion with 0, and `rt_copy` would read address 0 — the null is copied AS n
 And `rt_copy` is not the only new runtime function: an inline array FIELD of counted element
 type (`struct W { Cell c[2]; }`, which compiles today) needs one `rc_inc` per element, so
 `rt_retain_array(base, n)` joins it as the mirror of the `rt_release_array` `tk_release_fields`
-already calls. An inline array field of STRUCT element type is unrolled, one copy per element.
+already calls. An inline array field of STRUCT element type is unrolled, one copy per element. And the
+arms select the field's row through `tk_row_through_nl`, not through `tk_struct_by_ty`: Q1a
+makes a nullable over a REFERENCE the reference itself, so an `S? f` field holds exactly
+what an `S f` field holds and has to recurse the same way — the `s == 0` guard answers the
+null handle. The cycle check of § 4.4 peels the same way, so
+`struct Node { public Node? next; }` is refused with the direct shape.
 
 ---
 

@@ -40,7 +40,9 @@ with that line in its stderr (D52).
   collides.
 - `"teko: a struct cannot contain itself"` — a `struct` field whose type is the struct
   itself, directly (`struct Node { Node next; }`) or through a chain of other structs
-  (`struct A { B b; } struct B { A a; }`). A struct value is copied memberwise, and a
+  (`struct A { B b; } struct B { A a; }`), the `?` included — a nullable over a struct is the
+  struct's own pointer (Q1a), so `struct Node { Node? next; }` is the same refusal. A struct
+  value is copied memberwise, and a
   memberwise copy of either shape would recurse for ever; C# refuses the same shape as
   CS0523. Use a `class` for a linked structure — a class value is a reference, and the copy
   does not touch it. A `static` field of the struct's own type is fine: it is a global of
