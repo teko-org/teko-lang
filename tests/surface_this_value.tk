@@ -15,7 +15,10 @@
 //   Counter.Me      an interface DEFAULT body, static type = the interface
 //   Vec             D87's own reproducer: a class that DECLARES `operator+`
 //                   and reads a `uptr` field, so the compiler's own
-//                   `this + OFF` must keep answering `uptr`
+//                   `this + OFF` must keep answering `uptr` -- through a BARE
+//                   name, through `this.`, and through a PARENTHESIZED `(this).`
+//   Link            a class with NO cycle of its own, so `rt_live()` reads an
+//                   EXACT floor across a discarded chain and a kept result
 //
 // The reference count needed no new machinery: `this` is a parameter, so it is
 // borrowed, and `tk_rc_return` emits the caller's `rc_inc`. `rt_live()` proves
@@ -76,7 +79,25 @@ class Vec {
     public Vec() { x = 0; raw = 0; }
     public static Vec operator+(Vec a, Vec b) { return a; }
     public Vec Grow() { x = x + 1; return this; }        // no `+` written on `this`
-    public uptr Raw() { return raw; }                    // a `uptr` field read
+    public uptr Raw() { return raw; }                    // a bare-name `uptr` field read
+    public uptr DotRaw() { return this.raw; }            // through `this.`
+    public uptr ParRaw() { return (this).raw; }          // PARENTHESIZED: the core
+    public i64 ParX() { return (this).x; }               // erases the parens, so the
+                                                         // `.` receiver is the node
+                                                         // tk_this() registered. The
+                                                         // address still never reaches
+                                                         // the operator judge: an
+                                                         // argument of `ld64` is walked
+                                                         // by tk_ops_addr_step, not by
+                                                         // tk_ops_binary
+}
+
+// no cycle, no field holding another object: every count this class takes is
+// one the program can see, so `rt_live()` around it reads an EXACT floor
+class Link {
+    public i64 n;
+    public Link() { n = 0; }
+    public Link Step() { n = n + 1; return this; }
 }
 
 i64 main() {
@@ -129,12 +150,52 @@ i64 main() {
     vv.Grow().Grow();
     if (vv.x != 2) return 22;
     if (vv.Raw() != 0) return 23;
+    if (vv.DotRaw() != 0) return 24;
+    if (vv.ParRaw() != 0) return 25;
+    if (vv.ParX() != 2) return 26;
     Vec vs = vv + vv;
-    if (vs.x != 2) return 24;
+    if (vs.x != 2) return 27;
 
-    // nothing of the above leaked past what `a`, `o`, `k`, `vv` and `vs` hold:
-    // every discarded `this` was dropped where it was discarded
-    if (rt_live() <= l0) return 25;
+    // ---- the reclaim, on an EXACT count ----
+    // `rt_live()` counts live ALLOCATIONS. `Link` holds no other object and
+    // makes no cycle, so the count around this block is a number the program
+    // can predict exactly -- a floor test could not tell a leak from a keep.
+    i64 f = rt_live();
+    {
+        Link p = new Link();
+        if (rt_live() != f + 1) return 30;
+
+        // DISCARDED: `tk_rc_return` raises the count for the caller and
+        // `tk_rc_exprstmt` drops it again at the statement. Lose the drop and
+        // the object outlives this block; lose the inc and it dies inside it.
+        p.Step().Step().Step();
+        if (p.n != 3) return 31;
+        if (rt_live() != f + 1) return 32;
+
+        // KEPT: the same object, so no second allocation -- what rises is the
+        // object's own reference count, and `q` releases it at the block's end
+        Link q = p.Step();
+        if (q.n != 4) return 33;
+        if (rt_live() != f + 1) return 34;
+    }
+    // EXACT, and this is the assertion that bites: three discarded links and
+    // one kept reference all released, so the object is gone. An over-retain
+    // anywhere above leaves it alive here; an over-release would have freed it
+    // while `p.n` was still being read.
+    if (rt_live() != f) return 35;
+
+    // the same road through an interface default body, which also returns a
+    // borrowed `this`
+    i64 g = rt_live();
+    {
+        Link r = new Link();
+        r.Step();
+        if (rt_live() != g + 1) return 36;
+    }
+    if (rt_live() != g) return 37;
+
+    c.Me();
+    if (rt_live() != g) return 38;
 
     return 42;
 }

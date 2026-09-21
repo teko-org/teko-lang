@@ -311,9 +311,10 @@ The improvement is free — `tk_reject_compat` (`teko_struct.tk:1279`) names wha
 design it is refused ``teko: C declares no operator `==` ``. **That is an alignment, not a
 regression**: `C a; C b; if (a == b)` is refused by that exact sentence on `85abd466` —
 `this` typing `uptr` was the one hole in the rule. Nothing in the tree depends on it (140
-passed / 183 refused / 0 failed, unchanged). `this == null` is unaffected: it takes the
-nullable road, measured compiling before and after. It gets its own refuse fixture in crumb
-1 and a diagnostics note.
+passed / 183 refused / 0 failed, unchanged). **`this == o` gets its own refuse fixture in
+crumb 1** (`tests/refuse/this_eq_no_op.tk`) and a diagnostics note. `this == null` is a
+different form and is **unaffected**: it takes the nullable road, measured compiling before
+and after, and has no fixture of its own here.
 
 ---
 
@@ -363,14 +364,24 @@ sh scripts/check-docs.sh
 
 ## 8. The fixtures
 
+**Built by D102** (crumbs 1 and 3):
+
 | fixture | asserts |
 |---|---|
-| `tests/surface_this_value.tk` | `// expect-exit: 42` — `return this;` from a method, a constructor field store, a property `get`, an argument `f(this)`, an initializer `C d = this;`, a ternary arm, a base-typed return, an interface-typed return, an interface default body, a covariant override, and a class that also declares `operator+` and reads a `uptr` field — D87's exact pairing |
-| `tests/surface_this_fluent.tk` | `// expect-exit: 42` — a three-link chain discarded, a chain kept, both bracketed by `rt_live()`; the interface default body through an `I` slot; no leak, no double release |
-| `tests/refuse/this_bad_type.tk` | `// expect-refuse: teko: a value of type D does not convert to U` / `// expect-refuse-line: N` — the class name, not `uptr` |
+| `tests/surface_this_value.tk` | `// expect-exit: 42` — `return this;` from a method, a constructor field store, a property `get` and `set`, an argument `f(this)`, an initializer `C d = this;`, a ternary arm, a base-typed return, an interface-typed return, an interface default body, a parenthesized receiver `(this).field`, and a class that also declares `operator+` and reads a `uptr` field — D87's exact pairing. A three-link chain discarded and a chain kept are bracketed by `rt_live()` on a NON-cyclic class, so the floor is exact on both sides |
+| `tests/refuse/this_bad_type.tk` | `// expect-refuse: teko: a value of type D does not convert to U` — the class name, not `uptr` |
 | `tests/refuse/this_eq_no_op.tk` | ``// expect-refuse: teko: C declares no operator `==` `` — the alignment of § 5 |
 | `tests/refuse/this_assign.tk` | `` // expect-refuse: teko: `this` is read-only `` |
-| `tests/refuse/this_struct_value.tk` | `` // expect-refuse: teko: `this` is not a value in a struct `` |
+| `tests/refuse/this_compound_assign.tk` | the same sentence on `this++`. Not planned by this page: `this += e` and `this++` were measured compiling as silently as `this = e`, so D102's guard covers the whole write set |
+
+**Planned, not built** — crumb 2's separate fluent file was folded into
+`surface_this_value.tk` above, and no fixture in the tree carries a covariant `override` of
+`this` yet:
+
+| fixture | asserts | crumb |
+|---|---|---|
+| `tests/surface_this_fluent.tk` | a covariant `override` returning `this`, beyond what `surface_this_value.tk` already runs | 2 |
+| `tests/refuse/this_struct_value.tk` | `` // expect-refuse: teko: `this` is not a value in a struct `` | 4 |
 
 ## 9. Risks and law tensions
 

@@ -11587,6 +11587,19 @@ ever re-read: the unbracketed callers of `tk_ty_scope_params` are `teko_params.t
 `teko_ns.tk:1056` (was `:1050`), and `teko_ternary.tk:705`, which still holds. **None of
 them is touched** — that is the whole point of the node.
 
+**A parenthesized receiver is safe too, and for a reason that predates this entry.** The
+core erases parentheses, so `(this).f` registers the node exactly as a bare `this` does and
+`tk_field_use` (`teko_expr.tk`) then builds `tk_bin(K_ADD, left, off)` over it — a
+class-typed `+` reaching the ops walk, which is D87's failure shape. It does not fire:
+`tk_ops_visit` (`teko_ops.tk`) marks the argument of a memory intrinsic as `tk_ops_addr`,
+and that node is handed to `tk_ops_addr_step`, never to `tk_ops_binary`. Measured with the
+sharpest probe available — a class declaring `operator+(Vec, i64)`, the exact operand pair
+`this + OFF` would match — `(this).y` reads the field and the operator is not reached;
+`--dump-ast` gives `this.y`, `(this).y` and the bare `y` byte-identical bodies. The `K_DOT`
+guard in `tk_this()` is therefore prudence, not the load-bearing part, exactly as the design
+page measured. `tests/surface_this_value.tk` carries `(this).raw` and `(this).x` as a
+regression.
+
 **What stays open.** `this` in a `struct` keeps the inherited `teko: a value of type uptr
 does not convert to P` and a `not-yet.md` row: a `struct` has no copy at assignment yet
 (`P b = a; b.x = 9;` changes `a.x`), so `return this;` there would alias rather than copy,
