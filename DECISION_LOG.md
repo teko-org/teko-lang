@@ -11817,6 +11817,11 @@ only the compiler leg's size rows move: `nodes` 177785 → 177855, `ins` 246293 
 `funcs` 3478 → 3480, `lowered` 3459 → 3461, `globals` unmoved at 1006, `strings` 2477 →
 2478, `symbols` 6961 → 6964, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
-takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, 0 differing —
-`surface_string_interp` is the one fixture neither binary dumps without the project
-config, and it is excluded rather than counted as an empty-vs-empty match.
+takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, exactly ONE
+differing — `addr_not_member`, whose accepted code this decision changed, and the diff is
+purely additive: the new `thruParam` function (`bump(ref p.n)` on a PARAMETER lowering to
+`BINARY + / IDENT name=p / INT val=16`, which is the whole point of the first half) and
+its two call sites in `main`. Every node the base already had is byte-identical, in that
+fixture and in the other 140. `surface_string_interp` is the one fixture neither binary
+dumps without the project config, and it is excluded rather than counted as an
+empty-vs-empty match.
