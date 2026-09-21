@@ -12200,18 +12200,24 @@ on each. Raised by Copilot's review of PR #771; not reproduced.
 **Gate.** `144 passed, 218 refused as expected, 0 failed` (the base is `143 passed, 215
 refused`: `struct_copy_local` and the three cycle fixtures). `FIXPOINT OK`. Docs green.
 `mc limits` on both legs from a CLEAN `build/`: the hello leg moves `passes` **15 -> 16**
-(15/30 -> 16/32, verdict **ok**) and nothing else -- `on_stmt` 4/8, `syntax` 20/40, `alias`
-25/50, `types` 18/36, `intrin` 8/16 all unmoved, `heap` 471920 -> 471936; the compiler leg
-is identical except the same `passes` 15 -> 16 and the size rows the new module costs
-(`nodes` 215334 -> 216416, `funcs` 4298 -> 4314, `strings` 3153 -> 3166, `ins`
-246890 -> 247910, `symbols` 8883 -> 8918).
+(16 used of 32 reserved) and nothing else -- `on_stmt`, `syntax`, `alias`, `types` and
+`intrin` all unmoved, `heap` 471920 -> 471936. `mc limits` prints `verdict ok` for both
+legs; `scripts/check-limits.sh` separately reports the entry leg as `grew` and NOT GATED,
+which it does at the base too and which this crumb does not move. The compiler leg is
+identical except the same `passes` 15 -> 16 and the size rows the new module costs,
+re-measured on the final head rather than on the commit that first wrote this paragraph:
+`nodes` estimate 216629, `funcs` 4317, `strings` 3166, `ins` 247973, `symbols` 8922.
 
 **`--dump-ast` moves on purpose, and R4 said it would.** 143 accepted fixtures on the base
 and 144 here, 142 and 143 of them non-empty (`surface_string_interp` dumps nothing on either
 side without the project config, and is counted as neither). **Four are byte-identical**
 (`hello`, `primitives_ptr`, `primitives_scalar`, and the empty `surface_string_interp`) and
-**139 move**. In 137 of those the whole movement is `lib/rt.tk` gaining `rt_retain_array`
-and `rt_copy`, which every fixture `#include`s; **20** also gain a `FUNC name=<name>_copy`
+**139 move**. In **119** of those the whole movement is `lib/rt.tk` gaining
+`rt_retain_array` and `rt_copy`, which every fixture `#include`s -- an independent
+verification hashed all 119 diffs and found them byte-identical to one another. (This
+sentence first said 137, which is 139 minus the two that carry a removed line; the count
+whose WHOLE movement is the two runtime functions is 119.) **20** also gain a
+`FUNC name=<name>_copy`
 per struct declared and at least one `CALL name=<name>_copy` at an L1 landing
 (`primitives_decimal_value`, `primitives_f32`, `primitives_float`, `primitives_i128`,
 `primitives_small_ints`, `ref_field_param`, `surface_datetime_kind`,
