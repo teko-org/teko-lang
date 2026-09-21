@@ -181,8 +181,9 @@ design in place (measured; see § 4.3).
 
 **The one leak that remains is the user's own cycle**, not this design's: `public C() { c2
 = this; }` makes an object point at itself, and a plain reference count never collects a
-cycle. `docs/reference/memory.md` already says so for any two objects pointing at each
-other; the constructor form is a one-line addition to that page, not a new rule.
+cycle. [memory.md](../reference/memory.md)'s "What is not reclaimed" table carries the
+rule and names this constructor form; it is a declared debt, counted by `rt_live()`, not a
+defect of this design.
 
 ---
 
@@ -285,6 +286,9 @@ i64 main() {
 // no-run
 #include "rt.tk"
 struct P { public i64 x; public P Self() { return this; } }
+//   NOT BUILT YET (crumb 4). Today this answers the generic sentence,
+//   `teko: a value of type uptr does not convert to P`; the message below is
+//   what crumb 4 will say instead.
 //                                        teko: `this` is not a value in a struct
 class C {
     public i64 v;
@@ -391,7 +395,7 @@ sh scripts/check-docs.sh
 | R2 | **`TK_MAXXT` is 4096** (`teko_struct.tk:55`) and every bare `this` now takes a row. A program with thousands of them refuses `teko: too many expressions whose type is known` | The `K_DOT` guard keeps the cost to bare-`this`-as-value, which no program written today contains. Measured with the guard *off* the fixed point still closes. If a real program ever hits it, the ceiling is raised the way `TK_MAXFS`'s was, not the design changed |
 | R3 | **`tk_xt_at` is a linear scan from the top** (`teko_struct.tk:1049`). More rows is more scan | Measured: `ins` 246193 → 246214, and the fixed point runs in the same band. No action |
 | R4 | **The lambda tells a lie.** `() => this` says `teko: this is not captured; add it to use (...)`, and `use (this)` then says `teko: expected a captured name`. The message names a form that does not exist | **Out of this design's scope, and it is D11's fork, not this one's.** [not-yet.md](../reference/not-yet.md) already carries the row and the reason (a closure holding a counted `this` opens a cycle the reclaim does not break). The honest fix is a message that does not name `use (...)` for `this` — propose it as a follow-up crumb, not a condition of 1.0 |
-| R5 | **The self-referencing constructor leaks** (`public C() { c2 = this; }`) | A cycle, not a defect. `docs/reference/memory.md` already states the rule; crumb 2 adds the constructor as its named example |
+| R5 | **The self-referencing constructor leaks** (`public C() { c2 = this; }`) | A cycle, not a defect. [memory.md](../reference/memory.md)'s "What is not reclaimed" table states the rule and names this constructor form |
 | R6 | **Generic fluent chaining is blocked.** `class Box<T> { public Box<T> Set(T x) { … return this; } }` refuses `expected < after a generic type name` at instantiation, **with or without `this`** (measured on a `return o;` control) | Not this design's. Report it as its own defect with the pure control program; the `not-yet.md` row belongs to generics |
 | R7 | **`struct` is not a value type on assignment** (`P b = a; b.x = 9;` changes `a.x` today, measured) | Refuse `this` as a value in a `struct` (crumb 4) rather than inventing a copy-on-return that exists nowhere else in the language. The struct-copy design is its own page |
 | R8 | **Law tension: "C# decides the form."** C# allows `this` in a struct (as a copy) and captures `this` implicitly in a lambda. This design refuses both | Both exits are refusals with a stated reason, never a wrong answer, which is what the law asks for. Both carry a `not-yet.md` row naming the design owed |

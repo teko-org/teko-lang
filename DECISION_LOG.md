@@ -11570,16 +11570,19 @@ note. `this == null` is unaffected: it takes the nullable road, measured before 
 
 **Fixtures.** `tests/surface_this_value.tk` (42) walks all eleven positions and brackets the
 chain with `rt_live()`; `tests/refuse/this_bad_type.tk`, `tests/refuse/this_eq_no_op.tk` and
-`tests/refuse/this_assign.tk` carry the three refusals. 141 passed, 186 refused as expected,
-0 failed; `FIXPOINT OK`; `docs ok`.
+`tests/refuse/this_assign.tk` and `tests/refuse/this_compound_assign.tk` carry the four
+refusals -- the compound writes are the fourth, added after `this += e`, `this -= e`,
+`this++` and `this--` were measured compiling as silently as `this = e`. 141 passed, 187
+refused as expected, 0 failed; `FIXPOINT OK`; `docs ok`.
 
 **Proof it is a no-op on everything accepted before.** `--dump-ast` over all 140 base
 fixtures, base binary against head, each run in place with `--include=lib --include=tests`:
 **140 identical, 0 different, 139 of the 140 non-empty on both sides.** `mc limits` on both
 legs: `passes`, `syntax`, `alias`, `types`, `on_stmt` and `intrin` unmoved on the compiler
 leg (0/8, 0/16, 1/16, 1/8, 0/8, 0/8) and on the `tests/hello.tk` leg (15/30, 20/40, 25/50,
-18/36, 4/8, 8/16). Only size rows move: `nodes` 212905 → 213073, `ins` 246193 → 246256,
-`strings` 2475 → 2476 (the one new message).
+18/36, 4/8, 8/16). Only size rows move, re-measured on the final head rather than on the
+commit that first wrote this paragraph: `nodes` 212905 → 213100, `ins` 246193 → 246253,
+`strings` 3146 → 3147 and `symbols` 8850 → 8851 (the one new message).
 
 **D87's line citations had all drifted** and are corrected here, in case the redesign is
 ever re-read: the unbracketed callers of `tk_ty_scope_params` are `teko_params.tk:723` (was

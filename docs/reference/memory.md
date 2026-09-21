@@ -178,6 +178,7 @@ with classes sees a floor above zero rather than a wrong answer.
 | a `static` field of class type | it holds its reference correctly, and lives for the whole run |
 | a global, and a global `T[]` | a root by construction: the value it holds at the end of the run is never released. An overwritten one IS released, at the store that overwrote it |
 | a Singleton service | a root by design ([di.md](di.md)) |
+| **a cycle** | a plain reference count never collects one. Two objects that hold each other, or one that holds itself -- `public C() { self = this; }` since D102 taught `this` as a value -- keep each other's count above zero for the whole run. `rt_live()` counts them, so a fixture that builds one sees a floor above its entry count and must measure against that, not against zero |
 
 ---
 
