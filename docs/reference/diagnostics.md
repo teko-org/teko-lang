@@ -186,11 +186,11 @@ with that line in its stderr (D52).
 - ``"teko: `this` is not a value in a struct"`` — `return this;`, `f(this)`, `S x = this;`
   or any other bare `this` read as a value inside a `struct` body. A struct carries no
   object header and no reference count, so its `this` cannot be the value a class's or an
-  interface's is. D105 has since made a struct a value type and `P b = a;` copies, but the
-  refusal is not reopened by it: `this` inside a struct method IS the receiver parameter, and
-  a by-value struct parameter still aliases until V4 of
-  [struct-value.md](../specs/struct-value.md) § 6, so handing the receiver out would still
-  alias where C# copies. The
+  interface's is. D105 has since made a struct a value type and D106 copies at all
+  six landings, the by-value parameter included, but the refusal is not reopened by either:
+  `this` inside a struct method IS the receiver parameter, and the rule is about what `this`
+  IS in a struct body rather than about what a parameter does at the call
+  ([struct-value.md](../specs/struct-value.md) § 6). The
   field roads are untouched: `this.x`, a bare `x` and `this.x = v` inside the same method
   all keep working. Before D103 this answered the generic
   `teko: a value of type uptr does not convert to P`, which named the receiver parameter's
@@ -2134,6 +2134,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many member accesses on a value of unknown type"` | 4096 member accesses waiting for the pass — a `.` on a receiver the parser cannot type (a parameter, a global, a type declared below) and, since D61, a `.` on any CALL the node itself carries no type for, `mkday().Day` included. It was 128 while only the first kind waited here |
 | `"teko: too many stores into a slot of class type"` | 4096 (D69; was 128) |
 | `"teko: too many field stores of unknown type"` | 4096 field stores whose value no oracle types at the site, waiting for the pass; 34 in `tests/surface_field_store.tk`, the busiest fixture |
+| `"teko: too many struct values landing in a slot"` | 4096 landings a SLOT built and the copy pass has still to rewrite — a store into a field or an element of `struct` type, and a by-value struct argument of a VIRTUAL, an INTERFACE or a DELEGATE call, which names no declaration the pass could look up. Recorded where the slot's declared type is at hand (D106); 11 in `tests/struct_copy_store.tk`, the busiest fixture |
 | `"teko: too many deferred call arguments"` | 4096 arguments of a VIRTUAL, an INTERFACE or an unqualified virtual call whose type the site that built the `callp` could not read — a global, a `ref`/`out` pointee, a bare name on the unqualified road — waiting for the pass; 26 in `tests/surface_globals_calls.tk`, the busiest fixture, and 1 in `tests/primitives_float.tk` |
 | `"teko: too many declarations in one unit"` | 8192 |
 | `"teko: too many generated declarations in one unit"` | 4096 top-level declarations the compiler itself writes — a vtable, a release, an allocator, a thunk, a box, an enum's two globals (D69; was 512); 134 in `tests/surface_lambda.tk`, the busiest fixture |

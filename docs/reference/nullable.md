@@ -71,6 +71,12 @@ differs.
 | `struct` | the same pointer | no, exactly as `T` is |
 | `i64`, `f64`, `i8`…`u64`, `bool`, `char`, an `enum`, `TimeSpan`, `DateTime` | a pointer to an **immutable counted box** holding those bytes | yes |
 
+`Vec?` and `Vec` have the same representation for the same reason, which is why a `struct`
+copy needs **no landing of its own** for the `?`: the copy pass peels the nullable and
+`Vec? b = a;`, `b = a;`, `t.v = a;`, `arr[i] = a;` and a by-value `Vec?` argument each give
+the slot a fresh block, exactly as the un-`?`-ed spelling does (D106,
+[types.md](types.md#struct)). A `null` lands no struct and is stored as itself.
+
 `Cell?` and `Cell` therefore have the same representation, and everything the reclaim does
 for a `Cell` it does for a `Cell?` with no line of its own — `rc_dec(0)` and `rt_own(0)`
 are already no-ops over the null handle ([memory.md](memory.md)).

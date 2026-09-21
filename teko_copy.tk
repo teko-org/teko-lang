@@ -14,11 +14,11 @@
 // and small, and this crumb (V2) builds the FIRST of six:
 //
 //   L1   `S b = <e>;`               an N_VAR of struct type with an initializer
-//   L2   `b = <e>;`                 V3
-//   L3   `x.f = <e>;`               V3
-//   L4   `a[i] = <e>;`              V3
-//   L5   a by-value struct argument V4
-//   L6   `S? b = <e>;`              V5
+//   L2   `b = <e>;`                 an N_ASSIGN into a local, parameter or global
+//   L3   `x.f = <e>;`               a store into a field of struct type
+//   L4   `a[i] = <e>;`              a store into an element of struct type
+//   L5   a by-value struct argument at every call road there is
+//   L6   `S? b = <e>;`              the same six, with the nullable peeled
 //
 // The one exception, at every landing: when `<e>` is PROVABLY FRESH -- an
 // N_CALL to the generated `name_new`, which is the `new S` / `new S()` the
@@ -47,37 +47,137 @@
 // measured at 3 where the array reads 18 -- which is the class of bug this
 // design exists to remove, and which V6 refuses outright instead (C# CS1654).
 
-// 1 when `e` is the `new S` the parser lowered for the struct row `si`: the
-// block it hands out is named by nothing else yet, so copying it would allocate
-// twice and throw the first away.
-i64 tk_copy_fresh(i64 e, i64 si) {
-    if (nd_kind(e) != N_CALL) return 0;
-    return str_eq(nd_name(e), tk_ctor_name(sr_name_at(si)));
+// the struct row a slot of type `ty` lands, or -1 for a slot that lands no
+// struct at all. The nullable is PEELED (L6, `tk_row_through_nl`): Q1a makes a
+// nullable over a REFERENCE the reference itself, so an `S?` slot holds exactly
+// what an `S` slot holds -- the same handle, the same block, the same alias --
+// and owes exactly the same copy. A `null` in it is the `s == 0` road of the
+// generated body, so no arm here has to know about it.
+i64 tk_copy_row(i64 ty) {
+    i64 si = tk_row_through_nl(ty);
+    if (!tk_is_struct(si)) return 0 - 1;
+    return si;
 }
 
-// the single door that wraps one expression at one landing. L2..L6 come through
-// it too, which is why it takes the row rather than re-deriving it.
-i64 tk_copy_here(i64 e, i64 si) {
-    if (tk_copy_fresh(e, si)) return e;
-    return tk_call(tk_copy_name(sr_name_at(si)), e);
+// 1 when `e` is provably fresh for the struct row `si` -- a block named by
+// nothing else yet, which copying would allocate twice and throw the first away.
+// Exactly two expressions are:
+//
+//   - the `new S` / `new S()` the parser lowered, an N_CALL to `tk_ctor_name`;
+//   - a copy THIS pass already wrote, an N_CALL to `tk_copy_name`, which is
+//     what keeps a value landing on two roads at once from being copied twice
+//     (an argument of an indirect call is recorded by its own door AND walked
+//     as a call argument here).
+//
+// Both names are the D48 family the struct's own declaration reserves, derived
+// from `sr_name_at(si)` -- the row of the SLOT, so a namespaced `Ns.S` asks
+// about `ns__s_new` and a free function called `s_new` beside it is a different
+// name entirely. Nothing ELSE is provably fresh: a method may `return f;` on a
+// field, so an ordinary call's result is copied like anything else.
+i64 tk_copy_fresh(i64 e, i64 si) {
+    if (nd_kind(e) != N_CALL) return 0;
+    if (str_eq(nd_name(e), tk_ctor_name(sr_name_at(si)))) return 1;
+    return str_eq(nd_name(e), tk_copy_name(sr_name_at(si)));
+}
+
+// the single door that wraps one expression at one landing, IN PLACE: the node
+// keeps its identity and BECOMES the copy, while a fresh node takes over
+// everything it was (`tk_nd_moved`, teko_prim.tk, D48's own rewrite). In place
+// is what makes one door serve all six landings -- an argument spliced into a
+// call's own list, a value spliced into a store's, an initializer hanging off
+// an N_VAR: none of them hands this pass a handle to relink with, and
+// `tk_node_replace` keeps the `nd_next` that holds each of those lists together.
+void tk_copy_at(i64 e, i64 si) {
+    if (e == 0) return;
+    if (si < 0) return;
+    if (tk_is_null_lit(e)) return;               // `S? b = null;` lands no struct
+    if (tk_copy_fresh(e, si)) return;
+    i64 inner = tk_nd_moved(e);
+    tk_node_replace(e, tk_call(tk_copy_name(sr_name_at(si)), inner));
 }
 
 // L1: `S b = <e>;`. `nd_val != 0` is `S tbl[4]`, four slots rather than one
 // value, and it never reached `tk_slv_add` at all (`tk_on_stmt`'s own guard).
 void tk_copy_var(i64 n) {
-    i64 e = nd_a(n);
-    if (e == 0) return;                          // `S p;` -- nothing to copy
-    i64 si = tk_struct_by_ty(nd_type(n));
-    if (!tk_is_struct(si)) return;
-    set_nd_a(n, tk_copy_here(e, si));
+    tk_copy_at(nd_a(n), tk_copy_row(nd_type(n)));
 }
 
+// L2: `b = <e>;` on a name that already exists -- a local, a parameter or a
+// global, read through the one lookup every other bare name takes at pass time
+// (`tk_ty_scope_or_global`, teko_typeof.tk), so a local shadowing a global
+// answers for itself. The scope is alive because the walk below is
+// `tk_ty_pass_walk`'s, the same one the oracle enters each function with.
+//
+// A `ref`/`out` PARAMETER never reaches here: teko_ref.tk rewrites `s = <e>;`
+// inside the callee into a store through the address, which is an N_EXPRSTMT
+// by now and not an N_ASSIGN -- and that store is the caller's slot, not a
+// landing of its own.
+void tk_copy_assign(i64 n) {
+    tk_copy_at(nd_a(n), tk_copy_row(tk_ty_scope_or_global(nd_name(n))));
+}
+
+// L5, the DIRECT road: a by-value argument at a struct-typed parameter of a
+// call that names its callee. `decl_find` answers ONE declaration by now
+// (`tk_over_pass` ran at 14 and left the site carrying its picked symbol), and
+// the indexing is `tk_rc_call_args`'s own -- a method's receiver is parameter
+// zero on both sides.
+//
+// TWO INDEPENDENT GUARDS keep `ref`/`out` aliasing, which is the whole point of
+// that spelling (docs/specs/struct-value.md R3):
+//
+//   - the ARGUMENT is an N_ADDR by now. `tk_ref_pass` (pass 8) turned `ref a`
+//     into the address of `a`, so the node at that position is no longer a
+//     value of struct type at all -- and `tk_ty_of` answering an N_ADDR with
+//     its POINTEE is exactly why the type alone cannot be trusted here.
+//   - the PARAMETER says so. `tk_rp_kind` (teko_ref.tk) reads the declaration's
+//     own `ref`/`out` tag, which no pass rewrites.
+//
+// Neither is the other's spare: an argument already of pointer type is passed
+// on as a plain name and is no N_ADDR (`void g(ref S s) { f(ref s); }`), and a
+// declaration this road cannot reach a parameter node for answers TK_RP_NONE.
+void tk_copy_args(i64 n) {
+    i64 d = decl_find(nd_name(n));
+    if (d < 0) return;
+    i64 a = nd_a(n);
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        i64 nxt = nd_next(a);
+        if (nd_kind(a) != N_ADDR && tk_rp_kind(tk_decl_param_node(d, i)) == TK_RP_NONE)
+            tk_copy_at(a, tk_copy_row(tk_decl_param_ty(d, i)));
+        a = nxt;
+        i = i + 1;
+    }
+}
+
+void tk_copy_visit(i64 n) {
+    i64 k = nd_kind(n);
+    if (k == N_ASSIGN) tk_copy_assign(n);
+    if (k == N_CALL)   tk_copy_args(n);
+}
+
+// Three readers, one door. The declaration list is walked by `tk_nslv` because
+// that is the table which says WHICH N_VAR the source itself wrote; the
+// assignment and the direct call are walked over the tree, with the scope live;
+// and the two landings a SLOT builds -- a field or element store, and the
+// argument of an indirect call -- were recorded at their own site, where the
+// slot's declared type was the only thing in reach (`tk_copy_defer`,
+// teko_struct.tk). A unit that lands no struct anywhere walks an empty table
+// and, but for the N_VAR loop it already walked, takes exactly the road it took
+// before: `--dump-ast` is unmoved for every program with no struct in a slot.
 i64 tk_copy_pass(i64 root) {
     i64 i = 0;
     loop {
         if (i >= tk_nslv) break;
         i64 n = slv_node_at(i);
         if (n != 0 && nd_kind(n) == N_VAR) tk_copy_var(n);
+        i = i + 1;
+    }
+    tk_ty_pass_walk(root, &tk_copy_visit);
+    i = 0;
+    loop {
+        if (i >= tk_ncp) break;
+        tk_copy_at(cp_node_at(i), tk_copy_row(cp_ty_at(i)));
         i = i + 1;
     }
     return root;

@@ -1,0 +1,158 @@
+// struct_copy_nullable.tk -- `S? b = <e>;` copies (L6,
+// docs/specs/struct-value.md § 3.1). p46 -- `S? b = a; a.n = 9;
+// return b.Value.n;` -- answered 9 at `9ab68ba5` where C# reads 1.
+//
+// There is no seventh landing here, and that is the whole point. Q1a makes a
+// nullable over a REFERENCE the reference itself, so an `S?` slot holds exactly
+// what an `S` slot holds -- the same handle, the same block, the same alias --
+// and the copy pass PEELS the `?` (`tk_row_through_nl`) at every one of the six
+// landings instead of growing one of its own. This fixture walks all six with a
+// `?` on the slot.
+//
+// A `null` lands no struct at all and is copied as itself, and a `null` that
+// reaches the generated body all the same takes its `if (s == 0) return 0;`.
+//
+// expect-exit: 42
+#include "rt.tk"
+
+struct S { public i64 n; }
+struct T { public S? s; public i64 k; }
+class C { public S? s; }
+
+S? gq;
+S? mk() { S q = new S; q.n = 9; return q; }
+
+// p46: the L1 landing with a `?` on the slot
+i64 declcheck() {
+    S a = new S;  a.n = 9;
+    S? b = a;
+    if (!b.HasValue) return 1;
+    if (b.Value.n != 9) return 2;                // the copy carries the fields
+    a.n = 1;
+    if (b.Value.n != 9) return 3;                // ...and the write stops there
+    b.Value.n = 5;
+    if (a.n != 1) return 4;                      // ...in both directions
+    return 0;
+}
+
+// L2 with a `?` on the slot, on a local and on a global
+i64 assigncheck() {
+    S a = new S;  a.n = 9;
+    S? b = null;
+    b = a;
+    if (b.Value.n != 9) return 1;
+    a.n = 1;
+    if (b.Value.n != 9) return 2;
+    gq = a;
+    a.n = 3;
+    if (gq.Value.n != 1) return 3;
+    return 0;
+}
+
+// L3 and L4 with a `?` on the slot
+i64 storecheck() {
+    S a = new S;  a.n = 9;
+    T t = new T;
+    t.s = a;
+    if (t.s.Value.n != 9) return 1;
+    a.n = 1;
+    if (t.s.Value.n != 9) return 2;
+
+    C c = new C();
+    c.s = a;
+    a.n = 3;
+    if (c.s.Value.n != 1) return 3;
+
+    S?[] arr = new S?[1];
+    arr[0] = a;
+    a.n = 5;
+    if (arr[0].Value.n != 3) return 4;
+    return 0;
+}
+
+// L5 with a `?` on the parameter
+i64 poke(S? s) {
+    if (!s.HasValue) return 0 - 1;
+    s.Value.n = 99;
+    return 0;
+}
+
+i64 paramcheck() {
+    S a = new S;  a.n = 1;
+    if (poke(a) != 0) return 1;
+    if (a.n != 1) return 2;                      // C#'s answer, 99 before D106
+    S? q = a;
+    if (poke(q) != 0) return 3;
+    if (q.Value.n != 1) return 4;
+    return 0;
+}
+
+// `null` lands no struct: it is copied as itself, and nothing is allocated
+i64 nullcheck() {
+    i64 l0 = rt_live();
+    S? b = null;
+    if (b.HasValue) return 1;
+    if (rt_live() != l0) return 2;               // no allocation for a `null`
+    T t = new T;
+    i64 l1 = rt_live();
+    t.s = null;
+    if (rt_live() != l1) return 3;
+    if (t.s != null) return 4;
+
+    // ...and a null HANDLE that reaches the generated body takes its own guard
+    S? e = null;
+    S? f = e;                                    // `s_copy(0)` returns 0
+    if (f.HasValue) return 5;
+    if (rt_live() != l1) return 6;
+    return 0;
+}
+
+// `??` reads the copy, not the source
+i64 coalescecheck() {
+    S a = new S;  a.n = 9;
+    S d = new S;  d.n = 1;
+    S? b = a;
+    S r = b ?? d;
+    if (r.n != 9) return 1;
+    a.n = 3;
+    if (r.n != 9) return 2;                      // `b` was already a copy of `a`
+    S? z = null;
+    S r2 = z ?? d;
+    if (r2.n != 1) return 3;
+    d.n = 7;
+    if (r2.n != 1) return 4;                     // ...and `r2` is a copy of `d`
+    return 0;
+}
+
+// the copy is a NEW block here too, and `new S` into a `S?` slot is the one
+// expression that is not copied
+i64 livecheck() {
+    S a = new S;
+    i64 l0 = rt_live();
+    S? b = new S;                                // provably fresh: one allocation
+    if (rt_live() != l0 + 1) return 1;
+    S? c = a;                                    // a copy: a second allocation
+    if (rt_live() != l0 + 2) return 2;
+    S? d = mk();                                 // one for `mk`, one for the copy
+    if (rt_live() != l0 + 4) return 3;
+    if (d.Value.n != 9) return 4;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = declcheck();
+    if (bad != 0) return 60 + bad;
+    bad = assigncheck();
+    if (bad != 0) return 70 + bad;
+    bad = storecheck();
+    if (bad != 0) return 80 + bad;
+    bad = paramcheck();
+    if (bad != 0) return 90 + bad;
+    bad = nullcheck();
+    if (bad != 0) return 100 + bad;
+    bad = coalescecheck();
+    if (bad != 0) return 110 + bad;
+    bad = livecheck();
+    if (bad != 0) return 120 + bad;
+    return 42;
+}

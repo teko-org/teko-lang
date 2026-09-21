@@ -1,0 +1,200 @@
+// struct_copy_store.tk -- a struct value is COPIED at every STORE landing
+// (L2, L3, L4, docs/specs/struct-value.md § 3.1). Five shapes that answered
+// the ALIAS at `9ab68ba5`, where D105 had taught only the local declaration:
+//
+//   p10  `t.s = a;`      a struct field of a STRUCT
+//   p22  `c.s = a;`      a struct field of a CLASS
+//   p11  `arr[0] = a;`   an element of a `S[]`
+//   p18  `g = ...;`      a struct GLOBAL, the alias D56 recorded on purpose
+//   p14  `f(a)` on a `params S[]`, whose element store is an L4 like any other
+//
+// ...plus the three properties every landing carries: it is a NEW block, the
+// `new S` the parser lowered is the one expression it does not copy, and the
+// arena rises by exactly one block per copy (docs/reference/memory.md).
+//
+// expect-exit: 42
+#include "rt.tk"
+
+struct S { public i64 n; }
+struct T { public S s; public i64 k; }
+class C { public S s; public i64 k; }
+class Holder { public static S sp; }
+
+S gs;
+S mk() { S q = new S; q.n = 9; return q; }
+
+// p10: a struct field of a STRUCT
+i64 structfield() {
+    S a = new S;  a.n = 9;
+    T t = new T;
+    t.s = a;
+    if (t.s.n != 9) return 1;                    // the copy carries the fields
+    a.n = 1;
+    if (t.s.n != 9) return 2;                    // ...and the write stops there
+    t.s.n = 5;
+    if (a.n != 1) return 3;                      // ...in both directions
+    return 0;
+}
+
+// p22: a struct field of a CLASS -- the same door, a different receiver
+i64 classfield() {
+    S a = new S;  a.n = 9;
+    C c = new C();
+    c.s = a;
+    if (c.s.n != 9) return 1;
+    a.n = 1;
+    if (c.s.n != 9) return 2;
+    c.s.n = 5;
+    if (a.n != 1) return 3;
+    return 0;
+}
+
+// a STATIC field of struct type is the same slot reached through a class name
+i64 staticfield() {
+    S a = new S;  a.n = 9;
+    Holder.sp = a;
+    if (Holder.sp.n != 9) return 1;
+    a.n = 1;
+    if (Holder.sp.n != 9) return 2;
+    return 0;
+}
+
+// p11: an element of a `S[]`
+i64 element() {
+    S a = new S;  a.n = 9;
+    S[] arr = new S[2];
+    arr[0] = a;
+    if (arr[0].n != 9) return 1;
+    a.n = 1;
+    if (arr[0].n != 9) return 2;
+    arr[0].n = 5;
+    if (a.n != 1) return 3;
+    arr[1] = arr[0];                             // element to element, still a copy
+    arr[1].n = 7;
+    if (arr[0].n != 5) return 4;
+    return 0;
+}
+
+// p18: a struct GLOBAL. D56 recorded the alias here on purpose; the assignment
+// is an L2 landing like any other name's.
+i64 global() {
+    S a = new S;  a.n = 9;
+    gs = a;
+    if (gs.n != 9) return 1;
+    a.n = 1;
+    if (gs.n != 9) return 2;
+    gs.n = 5;
+    if (a.n != 1) return 3;
+    return 0;
+}
+
+// L2 on a plain LOCAL, which is the landing `S b = a;` is not: the name already
+// exists, so the node is an N_ASSIGN and not an N_VAR
+i64 localassign() {
+    S a = new S;  a.n = 9;
+    S b = new S;
+    b = a;
+    if (b.n != 9) return 1;
+    a.n = 1;
+    if (b.n != 9) return 2;
+    b.n = 5;
+    if (a.n != 1) return 3;
+    return 0;
+}
+
+// p14: `params S[]`. `tk_params_pass` builds the element stores at pass 13, so
+// they are L4 landings the copy pass reaches like the source's own.
+i64 takeparams(params S[] xs) {
+    if (xs.Length != 2) return 1;
+    if (xs[0].n != 9) return 2;
+    if (xs[1].n != 8) return 3;
+    xs[0].n = 99;                                // lands on the array's own copy
+    return 0;
+}
+
+i64 paramsarray() {
+    S a = new S;  a.n = 9;
+    S b = new S;  b.n = 8;
+    i64 bad = takeparams(a, b);
+    if (bad != 0) return bad;
+    if (a.n != 9) return 4;                      // the caller is untouched
+    if (b.n != 8) return 5;
+    return 0;
+}
+
+// every store landing is a NEW block, and `new S` is NOT copied: `t.s = new S;`
+// allocates exactly once where `t.s = a;` allocates a second time
+i64 livecheck() {
+    S a = new S;  a.n = 9;
+    T t = new T;
+    i64 l0 = rt_live();
+    t.s = new S;                                 // provably fresh: one allocation
+    if (rt_live() != l0 + 1) return 1;
+    t.s = a;                                     // a copy: a second allocation
+    if (rt_live() != l0 + 2) return 2;
+    S[] arr = new S[1];
+    i64 l1 = rt_live();
+    arr[0] = new S();                            // the `()` form, equally fresh
+    if (rt_live() != l1 + 1) return 3;
+    arr[0] = a;
+    if (rt_live() != l1 + 2) return 4;
+    i64 l2 = rt_live();
+    gs = new S;
+    if (rt_live() != l2 + 1) return 5;
+    return 0;
+}
+
+// the declared debt, made visible at a store landing too: every copy is an
+// allocation nobody reclaims until V7 (docs/reference/memory.md "What is not
+// reclaimed"). S_SIZE is 8 and the allocator rounds to its own 16-byte class,
+// so 64 copies cost 1024 bytes.
+i64 peakcheck() {
+    S a = new S;  a.n = 9;
+    T t = new T;
+    i64 p0 = rt_peak();
+    i64 i = 0;
+    loop {
+        if (i >= 64) break;
+        t.s = a;
+        if (t.s.n != 9) return 1;
+        i = i + 1;
+    }
+    if (rt_peak() != p0 + 64 * 16) return 2;
+    return 0;
+}
+
+// a call's return is NOT provably fresh -- a method may `return f;` on a field
+// -- so it is copied at a store landing like anywhere else, and the copy is its
+// own block
+i64 fromcall() {
+    T t = new T;
+    i64 l0 = rt_live();
+    t.s = mk();                                  // one block for `mk`, one for the copy
+    if (rt_live() != l0 + 2) return 1;
+    if (t.s.n != 9) return 2;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = structfield();
+    if (bad != 0) return 60 + bad;
+    bad = classfield();
+    if (bad != 0) return 70 + bad;
+    bad = staticfield();
+    if (bad != 0) return 80 + bad;
+    bad = element();
+    if (bad != 0) return 90 + bad;
+    bad = global();
+    if (bad != 0) return 100 + bad;
+    bad = localassign();
+    if (bad != 0) return 110 + bad;
+    bad = paramsarray();
+    if (bad != 0) return 120 + bad;
+    bad = livecheck();
+    if (bad != 0) return 130 + bad;
+    bad = peakcheck();
+    if (bad != 0) return 140 + bad;
+    bad = fromcall();
+    if (bad != 0) return 150 + bad;
+    return 42;
+}

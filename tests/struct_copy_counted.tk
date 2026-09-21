@@ -1,0 +1,194 @@
+// struct_copy_counted.tk -- a struct copy is a NEW OWNER of every counted
+// field, proved at every landing D106 added (docs/specs/struct-value.md § 8).
+//
+// `rt_copy` moves the pointer bits without touching any count, so the generated
+// `name_copy` runs one `rc_inc` per counted field and one `rt_retain_array` per
+// counted inline-array field. Without them two struct blocks name one `Cell`
+// with a count of 1, and the first release frees it under the second: a
+// use-after-free, which is worse than the aliasing D106 removed. That is why
+// every check below asserts an exact `rt_live()` rather than an exit code
+// alone.
+//
+// The probe, at each landing: build a `Cell`, copy the struct that holds it,
+// then OVERWRITE the original's field. The store releases the old `Cell` -- and
+// with the `rc_inc` its count goes 2->1 and it SURVIVES, so `rt_live()` rises
+// by exactly the one block the new `Cell` cost. Without the `rc_inc` the count
+// goes 1->0, the old `Cell` is freed into the free list, and `rt_live()` does
+// not move at all.
+//
+// D105 proved L1 this way and its mutations are on record: forcing
+// `tk_is_counted` to 0 inside the generated copy exits 72, and killing
+// `rt_retain_array` exits 106.
+//
+// expect-exit: 42
+#include "rt.tk"
+
+class Cell { public i64 v; }
+struct H { public Cell c; public i64 n; }
+struct W { public Cell c[2]; }
+struct Outer { public H h; public i64 k; }
+class Bag { public H h; }
+struct Pair { public H h; public i64 k; }
+
+H gh;
+
+// L2: `b = h;` on a name that already exists
+i64 assigncheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    H h2 = new H();
+    h2 = h;                                      // the copy: `Cell` count 1 -> 2
+    if (h2.c.v != 7) return 1;
+    i64 l0 = rt_live();
+    h.c = new Cell();                            // +1 block, rc_dec on the old `Cell`
+    if (rt_live() != l0 + 1) return 2;           // ...which SURVIVES, held by `h2`
+    if (h2.c.v != 7) return 3;
+    return 0;
+}
+
+// L2 on a GLOBAL slot, which releases its old value the same way a local's does
+i64 globalcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    gh = h;                                      // the copy: count 1 -> 2
+    if (gh.c.v != 7) return 1;
+    i64 l0 = rt_live();
+    h.c = new Cell();
+    if (rt_live() != l0 + 1) return 2;
+    if (gh.c.v != 7) return 3;
+    return 0;
+}
+
+// L3: a struct field of a STRUCT, whose copy recurses into the inner `H` and
+// retains the `Cell` the inner one holds
+i64 structfieldcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    Outer o = new Outer;
+    i64 l0 = rt_live();
+    o.h = h;                                     // one block for the copy of `H`
+    if (rt_live() != l0 + 1) return 1;
+    if (o.h.c.v != 7) return 2;
+    i64 l1 = rt_live();
+    h.c = new Cell();                            // the old `Cell` is held by `o.h`
+    if (rt_live() != l1 + 1) return 3;
+    if (o.h.c.v != 7) return 4;
+    return 0;
+}
+
+// L3: a struct field of a CLASS -- the same door, a different receiver
+i64 classfieldcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    Bag b = new Bag();
+    b.h = h;
+    if (b.h.c.v != 7) return 1;
+    i64 l0 = rt_live();
+    h.c = new Cell();
+    if (rt_live() != l0 + 1) return 2;
+    if (b.h.c.v != 7) return 3;
+    return 0;
+}
+
+// L4: an element of an `H[]`
+i64 elementcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    H[] arr = new H[1];
+    arr[0] = h;
+    if (arr[0].c.v != 7) return 1;
+    i64 l0 = rt_live();
+    h.c = new Cell();
+    if (rt_live() != l0 + 1) return 2;
+    if (arr[0].c.v != 7) return 3;
+    return 0;
+}
+
+// L5: a by-value argument. The callee's copy is a new owner while it runs, and
+// the `Cell` it holds outlives the caller's store into the same field.
+i64 taker(H h, i64 want) {
+    if (h.c.v != want) return 1;
+    return 0;
+}
+
+i64 paramcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    i64 l0 = rt_live();
+    if (taker(h, 7) != 0) return 1;
+    if (rt_live() != l0 + 1) return 2;           // the copy, which V7 will reclaim
+    if (h.c.v != 7) return 3;
+    return 0;
+}
+
+// an inline ARRAY field of counted element type takes `rt_retain_array`, one
+// `rc_inc` per element, at the store landing too
+i64 inlinecheck() {
+    W w = new W;
+    w.c[0] = new Cell();
+    w.c[0].v = 4;
+    w.c[1] = new Cell();
+    w.c[1].v = 5;
+    W w2 = new W;
+    w2 = w;                                      // L2: both elements retained
+    if (w2.c[0].v != 4) return 1;
+    if (w2.c[1].v != 5) return 2;
+    i64 l0 = rt_live();
+    w.c[0] = new Cell();                         // +1 block, rc_dec on the old one...
+    if (rt_live() != l0 + 1) return 3;           // ...which survives, held by `w2`
+    if (w2.c[0].v != 4) return 4;
+    i64 l1 = rt_live();
+    w.c[1] = new Cell();
+    if (rt_live() != l1 + 1) return 5;
+    if (w2.c[1].v != 5) return 6;
+    return 0;
+}
+
+// the copy reaches a counted field TWO levels down: `Pair.h` is a struct whose
+// own `c` is the `Cell`, so the store landing recurses and retains it there
+i64 nestedcheck() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    Pair p = new Pair;
+    p.h = h;
+    p.k = 3;
+    Pair p2 = new Pair;
+    i64 l0 = rt_live();
+    p2 = p;                                      // one block for `Pair`, one for its `H`
+    if (rt_live() != l0 + 2) return 1;
+    if (p2.k != 3) return 2;
+    if (p2.h.c.v != 7) return 3;
+    i64 l1 = rt_live();
+    h.c = new Cell();                            // the `Cell` is now held three times
+    if (rt_live() != l1 + 1) return 4;
+    if (p2.h.c.v != 7) return 5;
+    if (p.h.c.v != 7) return 6;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = assigncheck();
+    if (bad != 0) return 60 + bad;
+    bad = globalcheck();
+    if (bad != 0) return 70 + bad;
+    bad = structfieldcheck();
+    if (bad != 0) return 80 + bad;
+    bad = classfieldcheck();
+    if (bad != 0) return 90 + bad;
+    bad = elementcheck();
+    if (bad != 0) return 100 + bad;
+    bad = paramcheck();
+    if (bad != 0) return 110 + bad;
+    bad = inlinecheck();
+    if (bad != 0) return 120 + bad;
+    bad = nestedcheck();
+    if (bad != 0) return 130 + bad;
+    return 42;
+}
