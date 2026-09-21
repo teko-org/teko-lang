@@ -11133,13 +11133,23 @@ works, `tk_ref_addr`'s `p.x` branch), the repassed `ref` parameter of `tk_ref_wa
 capture shadowing a same-named field, and `&freeFunction` inside a method body.
 
 **Roads NOT reached, reported and left open** (each is a separate crumb, none involves a
-bare name and none is made worse by this one): `&this.n` inside a method builds
-`ADDR(this-slot) + OFF` and answers garbage — 192 against a field worth 42, confirmed in
-`--dump-ast` as `BINARY + / ADDR name=this / INT 24`; `&h.n` on a local object is the same
-miscompile, not a crash: measured at 243 against a field worth 42, and it faults only when
-the offset happens to land outside the mapping -- a wrong answer is the worse half; `&H.n` on a static is refused by the CORE, without a
-`teko:` prefix. `&acc` on a by-REFERENCE lambda capture is a fourth one, untouched here
-because a capture answers before the member question.
+bare name and none is made worse by this one): `&this.n` inside a method, `&h.n` on a
+local object, `&H.n` on a static — refused by the CORE, without a `teko:` prefix — and
+`&acc` on a by-REFERENCE lambda capture, untouched here because a capture answers before
+the member question.
+
+**Amended by D104 (2026-09-21), and the correction is this entry's own.** The paragraph
+above read `&this.n` as ``ADDR(this-slot) + OFF`` and `&h.n` as "the same miscompile, not
+a crash… it faults only when the offset happens to land outside the mapping". Both
+readings are wrong, and they are wrong the same way. `&` in mc is a prefix over a bare
+NAME and binds tighter than `.`, so `&h.n` never was an address computation at all: it
+parses as `(&h).n`, and the `BINARY + / ADDR / INT` fragment recorded here is only the
+INNER half of what `--dump-ast` prints. The whole node is `ld64(&h + OFF)` — a field LOAD
+that many bytes past `h`'s own STACK SLOT, which is why the shape faults as often as it
+answers and why `&this.k` on a field of class type, `&this.k.n` through a chain and
+`st64(&this.n, 42)` fault where `&this.n` on an `i64` returns a number. D104 refuses all
+eight shapes at one point and states the measurements in full; `&H.n` and `&acc` stay as
+this paragraph left them.
 
 **Gate.** `136 passed, 162 refused as expected, 0 failed` at `55cdf69e` →
 `137 passed, 171 refused as expected, 0 failed`: nine refusals and one positive fixture,
@@ -11694,3 +11704,119 @@ the compiler leg and 15/30, 20/40, 25/50, 18/36, 4/8, 8/16 on the `tests/hello.t
 every one of them unmoved — zero new intrinsics, zero new passes, and the hello leg does
 not move at all. Only the compiler leg's size rows move: `nodes` 213100 → 213210, `ins`
 246253 → 246293, `funcs` 4278 → 4280, `strings` 3147 → 3149, `symbols` 8851 → 8855.
+
+### D104 · `&h.n` is not an address: `&` binds tighter than `.`, so the address of a
+qualified field is refused — and `ref h.n` on a PARAMETER stops being a false refusal
+(2026-09-21)
+
+**One bug, not two, and D97 recorded half of it.** `&` in mc is a prefix over a bare NAME
+and binds tighter than `.`. So `&h.n` never was an address computation: it parses as
+`(&h).n`, and the five steps that follow are the same for `&this.n`, `&s.n` on a struct
+and `&this.k.n` through a chain. `tk_dot` (`teko_expr.tk:641`) asks `tk_struct_of_expr`,
+which answers -1 for an `N_ADDR`, so the access DEFERS. `tk_pend_do`
+(`teko_typeof.tk:1657`) asks `tk_ty_of`, which has no `N_ADDR` arm outside the ref/out tag
+(`teko_typeof.tk:354-358`) and answers -1 too. -1 sends the row to the LAST RESORT,
+`tk_pend_by_name` (`:1575`), which resolves the member by NAME across the whole unit.
+`tk_pend_field` (`:1349`) then builds `tk_bin(K_ADD, pd_recv_at(pi), tk_int(fd_off_at(fi)))`
+over the `N_ADDR` and loads through it. What comes out is `ld64(&h + OFF)` — a field LOAD
+that many bytes past `h`'s own STACK SLOT.
+
+D97's own "Roads NOT reached" paragraph recorded the `BINARY + / ADDR / INT` fragment and
+read it as "the slot's address plus the offset". The enclosing `ld64` is the half it
+missed, and it is why the shape faults as often as it answers: a word of stack garbage
+used as an `i64` is a wrong number, and used as a handle it is a fault. That paragraph is
+amended in place, as D94, D97 and D99 were.
+
+**Measured at `f81e0217`, every one of them ACCEPTED, none refused** (a field worth 42 in
+each; the numbers are stack garbage and MOVE WITH THE FRAME, which is why no fixture
+oracle names one):
+
+| shape | answered |
+|---|---|
+| `&this.n`, the field at offset 16 | **233** |
+| `&this.n`, the same field at offset 32 (two padding fields ahead of it) | **176** |
+| `&this.k` on a field of CLASS type | SIGSEGV, exit 139 |
+| `&h.n` on a LOCAL object | **243** |
+| `&h.n` on a PARAMETER | **233** |
+| `&this.k.n`, a chain | SIGSEGV, exit 139 |
+| `uptr p = &this.n; return ld64(p);` — copied into a local first | **233** |
+| `&s.n` on a STRUCT local, the field at offset 8 | **0** (at offset 0 the same program answers 42 by coincidence) |
+| `st64(&this.n, 42)`, the store half | SIGBUS, exit 138 |
+
+**The tell**, and it names the road the row took: the miscompile fires only when exactly
+ONE type in the unit declares that member name. Declare a second class with an `n` and the
+identical program is refused ``teko: the type of the left side of `.` is not known here:
+n`` instead — `tk_pend_by_name` is a resolution by name, and it refuses an ambiguous one.
+Both shapes now answer the message below.
+
+**First half: the false refusal.** `ref h.n` / `out h.n` where `h` is a PARAMETER was
+refused `teko: not an object of a known type: h` (`teko_ref.tk:316`) on a legal program,
+because `tk_ref_addr` asked `tk_local_find` alone — a parse-time SCOPE table, and a
+parameter is in no scope table at all (teko_struct.tk's own invariant, D51's twelfth
+pass). `tk_hp_find` already answers the sibling question for a `T[]` parameter at `tk_dot`
+(`teko_expr.tk:613`), from a table the parameter list fills as it reads each parameter.
+That table now keeps EVERY parameter rather than only a `T[]` one, and the `T[]` question
+moved from the write to the READ: `tk_hp_find` still answers a `T[]` parameter and nothing
+else, so its three callers (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see exactly
+the rows they always saw, and `tk_hp_find_any` is the new door `tk_ref_addr` asks after
+`tk_local_find` misses. `TK_MAXHP` is 32 against mc's own `MAXPARAMS` of 12, so widening
+what the table holds cannot fill it; the ceiling message is renamed to match what it
+counts (``teko: too many `T[]` parameters in one declaration`` → `teko: too many
+parameters in one declaration`) and stays unreachable either way. A `ref`/`out` parameter
+has no row there — its caller registers it with `tk_rp_add` instead — so it keeps the
+refusal, correctly: its slot carries an ADDRESS, not the object, and `name + OFF` would
+not be the field.
+
+This half lands FIRST because the refusal the second half adds points at `ref`/`out` as
+the road to use, and that road has to work for a parameter before a message can name it.
+`tests/ref_field_param.tk` proves `ref`, `out`, a struct parameter and a base class's
+field through a derived parameter.
+
+**Second half: one judge, one point.** All eight wrong shapes are the same deferred row —
+an `N_ADDR` receiver with no ref/out tag — so `tk_addr_recv_reject` (`teko_typeof.tk`) is
+asked in `tk_pend_do` ahead of `tk_ty_of`, before any offset is added to anything. A
+ref/out-TAGGED `N_ADDR` is not this shape: it is a call argument whose pointee `tk_ty_of`
+reads above, so the tag is asked here in the same order.
+
+**The alternative, and why it was not taken.** Giving `tk_ty_of` an `N_ADDR` arm answering
+`TY_UPTR` (`teko_typeof.tk:404`) routes the same eight shapes into
+`tk_reject_scalar_member` — one line less, and no new function. It was rejected for the
+SENTENCE: `teko: uptr has no members: n` describes the PARSE, not the mistake, and names
+no road at all. **Pick one, not both**, and the explicit judge is the pick.
+
+**The message: `` teko: the address of a field is not taught yet; pass it as `ref` or
+`out` ``**, completed by the field name, `err_at2` style, on the shape of D97's own
+`tk_addr_of_member`. It names a road that EXISTS — `tk_ref_addr`'s `p.x` branch, working
+today for a local and, after the first half above, for a parameter. That is exactly the
+wording D97 could NOT use for a BARE member name, because from inside the type no spelling
+of a member's address works at all; here it can, which is why the two messages differ.
+
+**Why refuse rather than implement.** `obj + OFF` is an INTERIOR pointer into a counted
+object. `teko_rc.tk` reclaims on the OBJECT, and nothing in the language can see that a
+`uptr` local aliases the interior of something `rc_dec` is about to free. C# refuses
+`&obj.field` outside `fixed`, and `fixed` is the whole pinning apparatus that answers the
+lifetime question — a spec page, not a crumb. This is D97's own reason, sharpened by the
+measurement: the qualified spelling is not "nearly built", it is a different question.
+
+**Out of scope, left refused, and each a separate crumb.** `&H.n` on a static and `&(h.n)`
+in parentheses both fall to the CORE's `& expects a name` (`mc/src/parse.mc:971`), with no
+`teko:` prefix: `&` is a prefix over a bare name and neither operand is one, so the parser
+refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture answers the
+core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
+the parser accepted. All three are rows in `docs/reference/not-yet.md`.
+
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 198
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and
+eight refusals (`tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`),
+refused rising by exactly the eight added. `tests/addr_not_member.tk` gains its item 7:
+the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
+through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
+CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
+base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
+only the compiler leg's size rows move: `nodes` 177785 → 177855, `ins` 246293 → 246403,
+`funcs` 3478 → 3480, `lowered` 3459 → 3461, `globals` unmoved at 1006, `strings` 2477 →
+2478, `symbols` 6961 → 6964, every row `ok`. `--dump-ast` base against head over every
+fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
+takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, 0 differing —
+`surface_string_interp` is the one fixture neither binary dumps without the project
+config, and it is excluded rather than counted as an empty-vs-empty match.

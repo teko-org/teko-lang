@@ -1635,6 +1635,53 @@ void tk_pend_park_reads(i64 pi) {
     tk_array_walk_reads(pd_arg_at(pi));
 }
 
+// ---- D104: `&h.n`, the address of a QUALIFIED field ----
+//
+// `&` in mc is a prefix over a bare NAME and binds tighter than `.`, so
+// `&h.n` parses as `(&h).n` -- an `N_ADDR` receiver, never an address
+// computation. `tk_struct_of_expr` answers -1 for that node, so the access
+// defers here; `tk_ty_of` has no `N_ADDR` arm outside the ref/out tag and
+// answers -1 too, and the row then fell through to `tk_pend_by_name`, which
+// resolves the member by NAME across the whole unit and hands
+// `tk_pend_field` an `N_ADDR` to add the offset to. What came out was
+// `ld64(&h + OFF)`: a field LOAD read OFF bytes past `h`'s own STACK SLOT --
+// stack garbage that moves with the frame when the read lands inside the
+// mapping and a fault when it does not. Measured at `f81e0217`: `&this.n`
+// answered 233 and 176 against a field worth 42, `&h.n` on a local 243,
+// `&this.k` and `&this.k.n` segfaulted, a struct local answered 0 and
+// `st64(&this.n, 42)` took SIGBUS -- eight shapes, all accepted, none
+// refused. D97 recorded the `BINARY + / ADDR / INT` fragment and read it as
+// "the slot's address plus the offset"; the enclosing `ld64` is the half it
+// missed.
+//
+// One point covers all eight, because every one of them is this same
+// deferred row. Giving `tk_ty_of` an `N_ADDR` arm answering `TY_UPTR` would
+// route them into `tk_reject_scalar_member` instead -- one line less, and a
+// sentence (`teko: uptr has no members: n`) that describes the PARSE rather
+// than the mistake. The explicit judge is taken for the sentence: it names
+// the road that exists, `ref h.n` / `out h.n` through the variable holding
+// the object (`tk_ref_addr`, teko_ref.tk -- for a local since D97, and for a
+// PARAMETER since this same decision). D97 could not use that wording for a
+// BARE member name, because from inside the type no spelling works at all;
+// here it can, which is why the two messages differ.
+//
+// Refused rather than taught: `obj + OFF` is an INTERIOR pointer into a
+// counted object, `teko_rc.tk` reclaims on the object, and nothing can see
+// that a `uptr` local aliases the interior of something `rc_dec` is about to
+// free. C# refuses `&obj.field` outside `fixed`, and `fixed` is the whole
+// pinning apparatus that answers the lifetime question -- a spec page, not a
+// crumb.
+//
+// A ref/out-TAGGED `N_ADDR` is not this shape: it is an argument the call
+// checker owns, and `tk_ty_of` reads its pointee above rather than the node,
+// so the tag is asked here in exactly the same order.
+void tk_addr_recv_reject(i64 recv, uptr m) {
+    if (nd_kind(recv) != N_ADDR) return;
+    if (tk_rfarg_kind(recv) != TK_RP_NONE) return;
+    err_at2(tk_file, tk_line,
+            "teko: the address of a field is not taught yet; pass it as `ref` or `out`", m);
+}
+
 // The rewrite is IN PLACE, so the node index stays what the parent points at
 // and the sibling list is put back untouched -- `mc` docs/reference/hooks.md
 // § pass(). A receiver that is itself deferred is resolved first, which is what
@@ -1655,6 +1702,7 @@ void tk_pend_do(i64 pi) {
     tk_pend_park_reads(pi);
     tk_line = pd_line_at(pi);
     tk_file = pd_file_at(pi);
+    tk_addr_recv_reject(recv, pd_name_at(pi));
     i64 recv_ty = tk_ty_of(recv);
     i64 si = 0 - 1;
     if (recv_ty >= 0) si = tk_struct_by_ty(recv_ty);
