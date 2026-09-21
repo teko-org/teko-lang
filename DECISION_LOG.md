@@ -11659,9 +11659,10 @@ itself.
 
 The guard belongs where D102's kind test already stands, in `tk_this()` (`teko_this.tk`):
 that function knows `tk_body_class`, and `tk_is_class`/`tk_is_iface` already answer there,
-so the struct case is the `else` of a condition that exists. `tk_is_struct` joins its five
-siblings in `teko_struct.tk` and asks for the row FIRST, because `TK_KSTRUCT` is 0 and -1
-("no type here") would otherwise read as a struct.
+so the struct case is the `else` of a condition that exists. `tk_is_struct` joins the six kind
+predicates already in `teko_struct.tk` (`tk_is_class`, `tk_is_iface`, `tk_is_deleg`,
+`tk_is_ha`, `tk_is_enum`, `tk_is_nl`) and asks for the row FIRST, because `TK_KSTRUCT` is 0
+and -1 ("no type here") would otherwise read as a struct.
 
 **Why it is not the class's message.** A class carries an object header and a reference
 count, which is what lets `this` be a borrowed value the caller may keep: `tk_rc_return`
