@@ -11770,8 +11770,9 @@ slot carries an ADDRESS, not the object, and `name + OFF` would not be the field
 This half lands FIRST because the refusal the second half adds points at `ref`/`out` as
 the road to use, and that road has to work for a parameter before a message can name it.
 `tests/ref_field_param.tk` proves `ref`, `out`, a struct parameter, a base class's field
-through a derived parameter, a method's own parameter, a constructor's and a static
-method's.
+through a derived parameter, a method's own parameter, a constructor's, a static
+method's, `value` inside a `set` accessor, and a GENERIC class's method parameter reached
+through the replay -- every one of which `f81e0217` refused.
 
 **Two defects the Copilot review of #770 found in that half, both reproduced, both fixed
 at the root rather than on the path that reported them.**
@@ -11872,8 +11873,11 @@ were measured before they were fixed:
   The reset goes into `tk_prop_params`, the one point both accessor bodies pass through --
   the block one through `tk_member_fn`, the `=>` one through `tk_prop_arrow_body` -- which
   is the property's own analogue of `tk_params`'s first line. Empty is the whole truth for
-  an accessor's window. Fixtures: `tests/refuse/param_row_accessor.tk` and
-  `tests/refuse/param_row_accessor_arrow.tk`.
+  an accessor's window -- except for `value`, which IS the setter's parameter and gets the
+  row every other parameter gets, written on the same two lines. `ref value.n` on a property
+  of CLASS type is the same legal program `ref h.n` is anywhere else, and `f81e0217` refused
+  it with the rest. Fixtures: `tests/refuse/param_row_accessor.tk`,
+  `tests/refuse/param_row_accessor_arrow.tk`, and item 11 of `tests/ref_field_param.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11954,7 +11958,7 @@ the very object `&h.n` now refuses, read through `ref` and `out` in the same pro
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178062, `ins` 246293 → 246702,
+only the compiler leg's size rows move: `nodes` 177785 → 178069, `ins` 246293 → 246709,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
