@@ -11858,6 +11858,13 @@ were measured before they were fixed:
   `p_set_decl_name` sets the lambda's gensym, so the question it asks is about the
   ENCLOSING declaration, the one that owns them. Fixture:
   `tests/refuse/param_row_outlives_decl_lambda.tk`.
+- ...and the owner is compared by POINTER, not by spelling. `p_decl_name()` answers a
+  declaration's IDENTITY, a fresh one per source occurrence, which is exactly what lets
+  `tk_default_param` tell one declaration from the next with `owner != tk_dflt_owner`.
+  Comparing the text left `i64 f(H h)`'s row visible inside a later `i64 f()` — an overload
+  of arity zero, which has no parameter list to reset the table — and `ref h.n` there built
+  an address for a name that declaration never had. Fixture:
+  `tests/refuse/param_row_overload.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11912,8 +11919,8 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 204
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and fourteen
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 205
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and fifteen
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
@@ -11921,13 +11928,13 @@ for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar sh
 `tests/refuse/ref_field_array_local.tk` for the fixed-array one and
 `tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration and
 `tests/refuse/param_row_outlives_decl_lambda.tk` for the same rows laundered through a
-lambda's floor — all six found by the review — refused rising by exactly the fourteen
-added. `tests/addr_not_member.tk` gains its item 7:
+lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overloads —
+all seven found by the review — refused rising by exactly the fifteen added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178060, `ins` 246293 → 246702,
+only the compiler leg's size rows move: `nodes` 177785 → 178059, `ins` 246293 → 246700,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
