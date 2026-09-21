@@ -472,6 +472,14 @@ i64 main() {
 }
 ```
 
+A struct **cannot contain itself**, directly or through a chain of other structs:
+`struct Node { public Node next; }` and `struct A { public B b; } struct B { public A a; }`
+are both refused with `teko: a struct cannot contain itself`, C#'s own CS0523. A struct
+value is copied memberwise and either shape would recurse for ever. Use a `class` for a
+linked structure. A `static` field of the struct's own type is fine — it is a global of its
+own and no part of the object — and the refusal is reported at the declaration that closes
+the cycle, so the mutual pair names `B`.
+
 A struct declares methods, with the same implicit receiver, default arguments and
 overloads a class method has ([classes.md](classes.md)). What it does not have is a
 vtable: `virtual`, `override` and `use` of a trait are refused on a struct by name, and a

@@ -38,6 +38,15 @@ with that line in its stderr (D52).
   `str`) (D60). A namespaced type keeps the word free for its own namespace
   (`geo.TimeSpan` beside the primitive `TimeSpan`) — only the exact qualified name
   collides.
+- `"teko: a struct cannot contain itself"` — a `struct` field whose type is the struct
+  itself, directly (`struct Node { Node next; }`) or through a chain of other structs
+  (`struct A { B b; } struct B { A a; }`). A struct value is copied memberwise, and a
+  memberwise copy of either shape would recurse for ever; C# refuses the same shape as
+  CS0523. Use a `class` for a linked structure — a class value is a reference, and the copy
+  does not touch it. A `static` field of the struct's own type is fine: it is a global of
+  its own and no part of the object. Reported at the declaration that CLOSES the cycle, so
+  the mutual case names `B` and not `A` ([types.md](types.md#struct),
+  [struct-value.md](../specs/struct-value.md) § 4.4).
 - `"teko: the name is already a generic"` — the name belongs to a generic declaration.
 - `"teko: name of "` — completed by *`<what>` expected*: a declaration keyword was read and
   what followed is not a usable name.

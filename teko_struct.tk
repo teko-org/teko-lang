@@ -1888,6 +1888,45 @@ i64 tk_size_of(i64 off) {
     return off;
 }
 
+// ---- a struct cannot contain itself (V1, docs/specs/struct-value.md § 4.4) ----
+// 1 when `si` is reachable from `k` by following the struct-typed fields that
+// live IN the object. A static field (`fd_sym_at != 0`) is a global of its own
+// and is no part of any object, so it closes no cycle; an inline array field
+// (`fd_nel_at > 0`) is read exactly like a scalar one, its element type being
+// the thing that recurses.
+//
+// The walk needs no visited set and cannot loop: every cycle is refused at the
+// closing `}` of the struct that COMPLETES it, so the field graph this reads is
+// acyclic by induction. A forward-declared struct carries no field yet, which
+// is why the mutual case is only visible at the second declaration's own close.
+i64 tk_struct_contains(i64 k, i64 si) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfield) break;
+        if (fd_cls_at(i) == k && fd_sym_at(i) == 0) {
+            i64 fi = tk_struct_by_ty(fd_ty_at(i));
+            if (tk_is_struct(fi)) {
+                if (fi == si) return 1;
+                if (tk_struct_contains(fi, si)) return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// `struct Node { Node next; }` and `struct A { B b; } struct B { A a; }` both
+// compiled before this check, giving `next`/`a` an eight-byte pointer; C#
+// refuses the same shape as CS0523. The copy of V2 is memberwise and recurses
+// through every struct-typed field, so either shape would recurse for ever --
+// at compile time in `tk_copy_fn`, and at run time in the body it emits.
+// A linked structure is a `class`, whose value is a reference this design does
+// not touch.
+void tk_struct_cycle_check(i64 si) {
+    if (!tk_struct_contains(si, si)) return;
+    err_at(tk_file, tk_line, "teko: a struct cannot contain itself");
+}
+
 // ---- struct Name { type field; ... } ----
 void tk_struct() {
     tk_line = p_line();
@@ -1919,6 +1958,7 @@ void tk_struct() {
     p_accept(K_SEMI);                            // a C programmer's trailing ;
     tk_line = head_line;                         // back to the struct's own level
     tk_file = head_file;
+    tk_struct_cycle_check(si);                   // V1, before anything walks the fields
     i64 size = tk_size_of(off);
     set_sr_size_at(si, size);
     def_add(tk_join(tk_case(name, 1), "_SIZE"), size, tk_line, tk_file);
