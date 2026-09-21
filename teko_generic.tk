@@ -407,6 +407,17 @@ void tk_gen_replay(i64 gi, uptr mang, uptr args, uptr vals, i64 n, uptr fl, i64 
     tk_gen_bind(gi, args, vals, n);
     tk_set_decl(0 - 1, 0 - 1, 0);                // the head below says what it is
     i64 s_frame = tk_frame_enter(gn_proj_at(gi));   // ...and the instance is the template's own
+    // D104: an instantiation is reached MID-BODY (`Holder<H> g = new
+    // Holder<H>();` inside `i64 f(H h) {...}`), and every generated method
+    // below runs `tk_params`, whose `tk_hp_reset` would cut the parameter
+    // table back to its floor and overwrite the ENCLOSING declaration's rows
+    // in place -- so `ref h.n` after the instantiation lost `h` (measured;
+    // `f81e0217` refuses it, having no parameter road at all, so this is a
+    // gap of the new road rather than a regression -- Copilot on #770). The
+    // window is the one a lambda's nested list already opens: the rows here
+    // become a floor the replay cannot cut below, and the replay's own rows
+    // die with it.
+    tk_hp_push();
     i64 d0 = p_depth();
     tk_push_source(tk_gen_frame(mang, fl, line), text, len);
     p_next();                                    // spends the `>` the caller sat on
@@ -415,6 +426,7 @@ void tk_gen_replay(i64 gi, uptr mang, uptr args, uptr vals, i64 n, uptr fl, i64 
         tk_top_emit_as(parse_top(), 0);          // the instance's own names are the compiler's (D48)
     }
     tk_frame_leave(s_frame);
+    tk_hp_pop();                                 // D104: ...and the replay's own rows with it
     tk_line = s_line;
     tk_file = s_file;
     p_set_decl_name(s_decl);

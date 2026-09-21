@@ -1635,6 +1635,82 @@ void tk_pend_park_reads(i64 pi) {
     tk_array_walk_reads(pd_arg_at(pi));
 }
 
+// ---- D104: `&h.n`, the address of a QUALIFIED field ----
+//
+// `&` in mc is a prefix over a bare NAME and binds tighter than `.`, so
+// `&h.n` parses as `(&h).n` -- an `N_ADDR` receiver, never an address
+// computation. `tk_struct_of_expr` answers -1 for that node, so the access
+// defers here; `tk_ty_of` has no `N_ADDR` arm outside the ref/out tag and
+// answers -1 too, and the row then fell through to `tk_pend_by_name`, which
+// resolves the member by NAME across the whole unit and hands
+// `tk_pend_field` an `N_ADDR` to add the offset to. What came out was
+// `ld64(&h + OFF)`: a field LOAD read OFF bytes past `h`'s own STACK SLOT --
+// stack garbage that moves with the frame when the read lands inside the
+// mapping and a fault when it does not. Measured at `f81e0217`: `&this.n`
+// answered 233 and 176 against a field worth 42, `&h.n` on a local 243,
+// `&this.k` and `&this.k.n` segfaulted, a struct local answered 0 and
+// `st64(&this.n, 42)` took SIGBUS -- eight shapes, all accepted, none
+// refused. D97 recorded the `BINARY + / ADDR / INT` fragment and read it as
+// "the slot's address plus the offset"; the enclosing `ld64` is the half it
+// missed.
+//
+// One point covers all eight, because every one of them is this same
+// deferred row. Giving `tk_ty_of` an `N_ADDR` arm answering `TY_UPTR` would
+// route them into `tk_reject_scalar_member` instead -- one line less, and a
+// sentence (`teko: uptr has no members: n`) that describes the PARSE rather
+// than the mistake. The explicit judge is taken for the sentence: it names
+// the road that exists, `ref h.n` / `out h.n` through the variable holding
+// the object (`tk_ref_addr`, teko_ref.tk -- for a local since D97, and for a
+// PARAMETER since this same decision). D97 could not use that wording for a
+// BARE member name, because from inside the type no spelling works at all;
+// here it can, which is why the two messages differ.
+//
+// Refused rather than taught: `obj + OFF` is an INTERIOR pointer into a
+// counted object, `teko_rc.tk` reclaims on the object, and nothing can see
+// that a `uptr` local aliases the interior of something `rc_dec` is about to
+// free. C# refuses `&obj.field` outside `fixed`, and `fixed` is the whole
+// pinning apparatus that answers the lifetime question -- a spec page, not a
+// crumb.
+//
+// A ref/out-TAGGED `N_ADDR` is not this shape: it is an argument the call
+// checker owns, and `tk_ty_of` reads its pointee above rather than the node,
+// so the tag is asked here in exactly the same order.
+// 1 when `m` names a member of SOME type in the unit: the four questions
+// `tk_pend_by_name` asks, in its order. -2 ("more than one type declares it")
+// is a YES here -- the name IS a member, it is only the receiver that cannot
+// be settled -- which is why each test is against -1 rather than >= 0.
+i64 tk_addr_member_named(uptr m) {
+    if (tk_field_by_name(m) != 0 - 1)  return 1;
+    if (tk_prop_by_name(m) != 0 - 1)   return 1;
+    if (tk_ifmeth_by_name(m) != 0 - 1) return 1;
+    return tk_method_has_name(m);
+}
+
+void tk_addr_recv_reject(i64 recv, uptr m, i64 form) {
+    if (nd_kind(recv) != N_ADDR) return;
+    if (tk_rfarg_kind(recv) != TK_RP_NONE) return;
+    // a name NO type declares is not this decision's to answer: the road below
+    // says `teko: unknown member` for it, which is the truth and is what
+    // `f81e0217` said (Copilot on #770 -- this judge used to promise a
+    // `ref`/`out` for `&h.missing`, a field that does not exist).
+    if (!tk_addr_member_named(m)) return;
+    // ...and the ADVICE is an INSTANCE field's alone. A method (`&h.go()`), a
+    // property, a field spelled as a call and a STATIC field have no
+    // `ref`/`out` road at all -- `tk_ref_addr`'s own static gate refuses
+    // `ref h.tally`, so naming it would send the reader down a road that
+    // refuses -- so each takes D97's own wording instead, the same sentence a
+    // bare member name under `&` already gets. Every one of them is a refusal
+    // either way: `&h.go()` and `&h.Side` answered 243 at `f81e0217`,
+    // measured, the receiver being `(&h)`.
+    if (form != TK_PCALL) {
+        i64 fi = tk_field_by_name(m);
+        if (fi == 0 - 2 || (fi >= 0 && !fd_sym_at(fi)))
+            err_at2(tk_file, tk_line,
+                    "teko: the address of a field is not taught yet; pass it as `ref` or `out`", m);
+    }
+    err_at2(tk_file, tk_line, "teko: the address of a member is not taught yet", m);
+}
+
 // The rewrite is IN PLACE, so the node index stays what the parent points at
 // and the sibling list is put back untouched -- `mc` docs/reference/hooks.md
 // § pass(). A receiver that is itself deferred is resolved first, which is what
@@ -1655,6 +1731,7 @@ void tk_pend_do(i64 pi) {
     tk_pend_park_reads(pi);
     tk_line = pd_line_at(pi);
     tk_file = pd_file_at(pi);
+    tk_addr_recv_reject(recv, pd_name_at(pi), pd_form_at(pi));
     i64 recv_ty = tk_ty_of(recv);
     i64 si = 0 - 1;
     if (recv_ty >= 0) si = tk_struct_by_ty(recv_ty);

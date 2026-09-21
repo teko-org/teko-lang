@@ -605,7 +605,11 @@ i64 tk_params(uptr pnp, uptr pnreq, i64 extra, i64 recv) {
         i64 pnode = param_new(pslot, pn);
         head = list_append(head, pnode);
         np = np + 1;
-        if (rk != TK_RP_NONE) { tk_rp_add(pnode, rk, ty); tk_ref_deny_default(rk, p_line(), p_file()); }
+        if (rk != TK_RP_NONE) {
+            tk_rp_add(pnode, rk, ty);
+            tk_hp_shadow(pn);                    // D104: the name is BOUND here, and is no object
+            tk_ref_deny_default(rk, p_line(), p_file());
+        }
         else { tk_hp_add(pn, ty); tk_param_default(mark); }
         if (np + recv + extra > MAXPARAMS)
             err_at(p_file(), p_line(), "teko: method with too many parameters (the receiver counts, and so does the vtable pointer of a virtual call)");
@@ -822,6 +826,7 @@ i64 tk_member_fn(i64 ci, i64 fty, uptr fn, i64 prs, i64 stat) {
     i64 keep = tk_this_enter_body(ci, stat, &keepstat);
     i64 line = p_line();
     uptr fl = p_file();
+    tk_hp_own(fn);                               // D104: `parse_function` answers `p_decl_name()` with it
     i64 f = parse_function(fty, fn, prs);
     tk_this_leave_body(keep, keepstat);
     tk_nlocal = mark;
@@ -990,6 +995,14 @@ i64 tk_member_dtor(i64 ci, uptr name, i64 off, i64 ti) {
     uptr fn = tk_dtor_sym(name);
     i64 mi = tk_method_add(tk_dtor_key(), ci, "", fn, 0, 0, tk_ndflt, TY_VOID, 0 - 1);
     set_mt_vis_at(mi, TK_VPRIVATE);
+    // D104: a destructor takes no parameter and so never goes through
+    // `tk_params`, which is where every other member empties the parameter
+    // window. Its own is empty, and saying so is what stops `tk_hp_own`
+    // (called by `tk_member_fn` below) from relabelling the PREVIOUS
+    // declaration's rows as this body's -- `ref h.n` in a destructor then
+    // resolved a parameter it never had (Copilot on #770; `f81e0217` refuses
+    // it). The accessor's own case is the same line in `tk_prop_params`.
+    tk_hp_reset();
     tk_member_body(ci, TY_VOID, fn, param_new(TY_UPTR, tk_this_name()), 0);
     return off;
 }

@@ -151,7 +151,18 @@ with that line in its stderr (D52).
   property, an interface property in a default body, a base interface's included), in a
   method or inside a lambda
   alike. No spelling of a member's address works from inside the type yet; from outside,
-  `ref h.n` / `out h.n` through a variable holding the object does.
+  `ref h.n` / `out h.n` through a variable holding the object does. Since D104 the same
+  message also covers a QUALIFIED address whose member has no `ref`/`out` road to name —
+  `&h.go()` on a method, `&h.Side` on a property, and `&h.tally` on a STATIC field, whose
+  `ref` form the static gate below refuses. A qualified INSTANCE field gets the sharper one
+  below, and a name no type declares keeps `teko: unknown member`.
+- ``"teko: the address of a field is not taught yet; pass it as `ref` or `out`"`` —
+  completed by the field name: `&h.n`, `&this.n`, `&s.n` on a struct and `&this.k.n`
+  through a chain, read or written (`st64(&this.n, v)`). `&` in mc is a prefix over a bare
+  NAME and binds tighter than `.`, so `&h.n` is `(&h).n` — a field LOAD past `h`'s own
+  stack slot, never an address. Until D104 every one of those shapes compiled and answered
+  stack garbage or faulted. The road that works is `ref h.n` / `out h.n` through the
+  variable holding the object — a local, and since D104 a parameter too.
 - `"teko: methods take no explicit receiver; use this"` — a parameter named as the
   receiver. The receiver is implicit; `this` names it.
 - ``"teko: `this` is only valid inside the body of a type"`` — `this` in a free function.
@@ -1657,8 +1668,19 @@ Every one of these is [nullable.md](nullable.md)'s.
   expression.
 - ``"teko: the `out` parameter "`` — completed by *`x` is never assigned*: an `out`
   parameter is written before the function returns.
-- `"teko: not an object of a known type"` — `ref p.f` where `p` is not a local of a known
-  type.
+- `"teko: not an object of a known type"` — `ref p.f` / `out p.f` where the innermost
+  binding of `p` still in scope is not an object of a type the parse knows. Since D104 the
+  question is asked in one place and in C#'s order: the innermost LOCAL, whatever its type
+  (so a scalar `i64 h` shadowing an object blocks the access instead of letting the outer
+  one answer at the inner one's slot), and, when no local of that name is in scope, the
+  enclosing declaration's own PARAMETER — which stops answering the moment that declaration
+  is over (`tk_hp_own`), and is shadowed by a `ref`/`out` parameter or a FIXED ARRAY of the
+  same name, neither of which is an object. A `ref`/`out` parameter of the object itself
+  keeps the refusal too: its slot carries an address, not the object. The member itself
+  passes the same two gates an ordinary field read does, in the same order (D104): `` `X.m`
+  is private ``/`` is protected `` (`tk_check_member`) and `` `X.m` is static; reach it
+  through its type `` (`tk_reject_static_member`) — an address the callee WRITES through is
+  no weaker a door than a read.
 - `"teko: not a local array"` — `ref a[i]` where `a` is not a local array.
 - ``"teko: two overloads differ only by `ref`/`out`"`` — a site could not tell them apart.
 
@@ -2089,7 +2111,8 @@ truncation; the fix is to split the unit.
 | `"teko: too many array writes waiting to be resolved"` | 512 |
 | `"teko: too many array indexes waiting to be resolved"` | 4096 index bases a global-array rewrite consumed and left for the typeof pass to judge the binding of (D96) — one per `g[i]` on a global array, read or write |
 | `"teko: too many array-field accesses"` | 128 |
-| ``"teko: too many `T[]` parameters in one declaration"`` | 32 |
+| `"teko: too many parameters in the open declarations"` | 128 rows, **one per parameter**, counted over every parameter list still OPEN at once — an enclosing declaration's, plus each lambda nested inside it (D104's floor, `tk_hp_push`), which is why the message names the declarations rather than one of them. A `ref`/`out` parameter spends a row like any other: it is written as a SHADOW (`tk_hp_shadow`, the name with −1 for the type) so that it blocks an enclosing row of the same name rather than letting it answer. mc's own `MAXPARAMS` is 12, so ten open lists fit; it was 32 rows for `T[]` parameters alone, in one list, before D104 |
+| `"teko: lambdas nested too deep"` | 16 parameter lists open at once — a lambda inside a lambda inside … , each one pushing the floor D104 gives `tk_hp_reset` |
 | `"teko: too many locals in one unit"` | 8192 |
 | `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |
 | `"teko: too many locals of struct type"` | 256 |

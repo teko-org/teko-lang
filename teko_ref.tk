@@ -87,6 +87,12 @@ i64 tk_ref_cur_fn = 0;                 // the N_FUNC this pass is walking right 
 i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
 i64 tk_deleg_is_thunk(i64 f);                     // teko_deleg.tk, included after this file
 
+// D104: the two member gates `tk_member_of` (teko_expr.tk) puts in front of a
+// field it is about to read -- both modules are included after this one, and
+// `tk_ref_addr` below asks them the same questions in the same order
+void tk_check_member(i64 owner, i64 vis, uptr m, i64 line, uptr fl);          // teko_access.tk
+void tk_reject_static_member(i64 si, uptr m, i64 line, uptr fl);              // teko_expr.tk
+
 // teko_typeof.tk, included after this file -- but this pass RUNS after that
 // one (`teko.tk`: `tk_typeof_pass`, then `tk_ref_pass`), so the oracle's own
 // scope stack is exactly the table this walk keeps live and reads a bare name
@@ -310,10 +316,74 @@ i64 tk_ref_addr(i64 line, uptr fl, i64 pty) {
     if (p_id() == tk_ref_dot) {
         p_next();
         uptr m = tk_member_name();                // D68
-        i64 si = tk_local_find(name);
+        // D104: the INNERMOST binding wins, and it is asked in one place.
+        //
+        // `tk_slv_find` (teko_struct.tk) is the live-scoped table of EVERY
+        // local with its declared type -- an object one is in it as well as
+        // in `tk_local_find`'s, registered by the same `tk_on_stmt` -- so its
+        // answer IS the innermost local, whatever its type, and
+        // `tk_struct_by_ty` turns it into a row or into -1. Reading
+        // `tk_local_find` alone could not see a SCALAR local shadowing an
+        // object one: `H h = new H(); { i64 h = 0; bump(ref h.n); }` found
+        // the outer `H` and added the field offset to the inner `i64` slot,
+        // a SIGSEGV at `f81e0217` (Copilot on #770). `this` has a row in
+        // `tk_local_find`'s table and none in `tk_slv_find`'s
+        // (teko_class.tk's `tk_local_add(tk_this_name(), ci)`), so it keeps
+        // the fallback below -- and never reaches here anyway, `this` being
+        // no `T_IDENT` for the guard above.
+        //
+        // Only when NO local of that name is in scope does a PARAMETER
+        // answer (`tk_hp_find_any`) -- which is in no scope table at all, and
+        // whose declared type the parameter list recorded as it read it. That
+        // second question is what makes `ref h.n` / `out h.n` legal on a
+        // struct/class parameter, the sibling `tk_hp_find` already answers
+        // for a `T[]` parameter at `tk_dot` (teko_expr.tk). A `ref`/`out`
+        // parameter keeps the refusal: it has no row in that table, and its
+        // slot carries an address rather than the object, so `name + OFF`
+        // would not be the field.
+        // A FIXED-ARRAY local is in NEITHER table above: `tk_on_stmt` returns
+        // before `tk_slv_add` for a declaration with a length, and the array
+        // lives in `tk_arr_find`'s own scoped table (teko_array.tk). Asked
+        // after `tk_slv_find` and before everything else, it blocks the
+        // parameter fallback the way any other local does -- without it an
+        // inner `i64 h[2]` shadowing an `H h` PARAMETER built `h + OFF`
+        // against the ARRAY's storage (Copilot on #770; `f81e0217` refuses
+        // that program). An array is never an object with fields, so there is
+        // nothing to answer with, only something to block.
+        i64 lty = tk_slv_find(name);
+        i64 si;
+        if (lty >= 0) si = tk_struct_by_ty(lty);
+        else if (tk_arr_find(name) >= 0) si = 0 - 1;
+        else {
+            si = tk_local_find(name);
+            if (si < 0) {
+                i64 hty = tk_hp_find_any(name);
+                if (hty >= 0) si = tk_struct_by_ty(hty);
+            }
+        }
         if (si < 0) err_at2(fl, line, "teko: not an object of a known type", name);
         i64 fi = tk_field_find(si, m);
         if (fi < 0) err_at2(fl, line, "teko: unknown member", m);
+        // D104: the SAME two gates `tk_member_of` (teko_expr.tk) puts in front
+        // of an ordinary field read, in its order. This door had neither, and
+        // `name + OFF` is an address a caller then WRITES through, so it was
+        // the laxest of the two: `bump(ref h.secret)` wrote a `private` field
+        // from outside its type (measured, 42 where the read is refused), and
+        // `bump(ref h.tally)` on a STATIC lowered to `h + fd_off` although a
+        // static's storage is a symbol of its own and not inside the object at
+        // all -- SIGSEGV, measured on `f81e0217` too through a LOCAL receiver.
+        // The parameter receiver this decision adds would have inherited both,
+        // so the gate goes where BOTH receivers pass (Copilot on #770).
+        // ...and each gate is given what `tk_member_of` gives it: the field's
+        // OWNER for the visibility question, which is the declaring type's to
+        // answer, and the RECEIVER's own row for the static one, so an
+        // inherited static names the type the source wrote. `tk_field_find`
+        // walks the base chain, so the two differ exactly when it does: with
+        // `class D : B` and a static `B.tally`, `ref d.tally` said
+        // `B.tally is static` where the ordinary read says `D.tally is static`
+        // (measured -- Copilot on #770).
+        tk_check_member(tk_field_owner(fi), fd_vis_at(fi), m, line, fl);
+        if (fd_sym_at(fi)) tk_reject_static_member(si, m, line, fl);
         set_pty(pty, fd_ty_at(fi));
         return tk_bin(K_ADD, tk_id(name), tk_int(fd_off_at(fi)));
     }

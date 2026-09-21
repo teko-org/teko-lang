@@ -2078,6 +2078,7 @@ i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) 
     tk_xt_add(call, si, 0, TK_OWNED);
     tk_nlc = tk_lc_base;                          // higiene 2, item 6: pop THIS lambda's own window
     tk_lc_base = saved_lc_base;
+    tk_hp_pop();                                  // D104: ...and THIS lambda's own parameter rows
     p_set_decl_name(saved);
     return call;
 }
@@ -2089,8 +2090,9 @@ i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) 
 i64 tk_lambda_build(i64 si, i64 line, uptr fl) {
     uptr name = tk_lambda_gensym(sr_name_at(si));
     uptr saved = p_decl_name();
-    p_set_decl_name(name);
-    i64 prs = parse_params();
+    tk_hp_push();                                 // D104: the enclosing list's rows are a FLOOR
+    p_set_decl_name(name);                        // ...pushed FIRST, while `p_decl_name` still
+    i64 prs = parse_params();                     // names the declaration that owns them
     return tk_lambda_finish(si, name, saved, prs, line, fl);
 }
 
@@ -2118,7 +2120,18 @@ i64 tk_deleg_short_lambda(i64 si, i64 line, uptr fl) {
     uptr pname = p_ident();
     uptr name = tk_lambda_gensym(sr_name_at(si));
     uptr saved = p_decl_name();
-    p_set_decl_name(name);
+    tk_hp_push();                                 // D104: `tk_lambda_finish` pops, on every grafia
+    p_set_decl_name(name);                        // ...and the push comes first, as above
+    // D104: ...and this grafia builds its one parameter by hand rather than
+    // through `parse_params`, so the row `tk_default_param` would have written
+    // is written here (Copilot on #770). Without it the short lambda's own
+    // parameter was invisible to `tk_ref_addr` -- and, once the floor above
+    // kept the enclosing rows alive, a same-named ENCLOSING parameter answered
+    // for it: `i64 f(Wide h) { Take t = h => { bump(ref h.n); ... }; }` added
+    // Wide's offset to the `B` the lambda receives, measured at 41 where 42 is
+    // right. `dg_pty_at` is the delegate's own declared parameter type, which
+    // is what the implicit parameter IS (D221 decision 19).
+    tk_hp_add(pname, dg_pty_at(si, 0));
     i64 prs = param_new(dg_pty_at(si, 0), pname);
     return tk_lambda_finish(si, name, saved, prs, line, fl);
 }

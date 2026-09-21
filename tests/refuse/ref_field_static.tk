@@ -1,0 +1,39 @@
+// ref_field_static.tk -- D104: `ref h.tally` on a STATIC field is refused; a
+// static's storage is a symbol of its own (`fd_sym_at`), not a word inside the
+// object, so `h + fd_off` is not its address at all.
+//
+// `f81e0217` compiles this program and faults on the STORE -- SIGBUS, exit 138,
+// which is the structurally right signal for a write through a bad address; an
+// independent verification corrected the exit 139 first recorded here. Measured
+// through the LOCAL receiver below; the PARAMETER receiver this decision adds
+// would have inherited it. `tk_reject_static_member` is the same gate
+// `tk_member_of` (teko_expr.tk) already put in front of an ordinary read, now
+// asked where both receivers pass. Found by the Copilot review of #770.
+//
+// The name in the message is the RECEIVER's, not the field's owner: the field
+// here is INHERITED from `B`, and `tk_member_of` names the type the source
+// wrote (`D.tally is static`, measured on the ordinary read of the same
+// shape), so this door says the same thing.
+//
+// expect-refuse: teko: D.tally is static; reach it through its type
+// expect-refuse-line: 37
+#include "../../lib/rt.tk"
+
+class B {
+    public static i64 tally;
+    public i64 n;
+    public B() { n = 1; }
+}
+
+class D : B {
+    public D() { }
+}
+
+void bump(ref i64 v) { v = v + 1; }
+
+i64 main() {
+    B.tally = 41;
+    D h = new D();
+    bump(ref h.tally);
+    return B.tally;
+}

@@ -1,0 +1,40 @@
+// param_row_outlives_decl_lambda.tk -- D104: a stale row is not laundered by
+// becoming a lambda's FLOOR.
+//
+// `tk_hp_in_owner` answers 1 unconditionally while a nested parameter list is
+// open, because the enclosing declaration's rows are exactly what a lambda
+// body must still see (`tests/ref_field_param.tk` item 7 proves that half). A
+// table that was already STALE when the lambda opened is then trusted for the
+// whole body: a free function spelled `()` never resets it, so the lambda here
+// read `first`'s own `H h` row and, with the global `i64 h` for mc to resolve
+// the name against, built `<the global> + OFF` -- SIGSEGV, found by the
+// Copilot review of #770. `f81e0217` refuses it.
+//
+// The floor is validated as it is laid: `tk_hp_push` cuts rows that do not
+// belong to the declaration being parsed, and it is called BEFORE
+// `p_set_decl_name` sets the lambda's gensym, so the question it asks is about
+// the enclosing declaration.
+//
+// expect-refuse: teko: not an object of a known type: h
+// expect-refuse-line: 33
+#include "../../lib/rt.tk"
+
+class H { public i64 pad; public i64 n; public H() { pad = 0; n = 41; } }
+
+delegate i64 Op(i64 x);
+
+i64 h = 100;
+
+void bump(ref i64 v) { v = v + 1; }
+
+i64 first(H h) { return h.n; }
+
+i64 second() {
+    Op g = new Op((i64 x) => { bump(ref h.n); return x; });
+    return g(1);
+}
+
+i64 main() {
+    H a = new H();
+    return first(a) + second();
+}

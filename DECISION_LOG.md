@@ -11133,13 +11133,23 @@ works, `tk_ref_addr`'s `p.x` branch), the repassed `ref` parameter of `tk_ref_wa
 capture shadowing a same-named field, and `&freeFunction` inside a method body.
 
 **Roads NOT reached, reported and left open** (each is a separate crumb, none involves a
-bare name and none is made worse by this one): `&this.n` inside a method builds
-`ADDR(this-slot) + OFF` and answers garbage — 192 against a field worth 42, confirmed in
-`--dump-ast` as `BINARY + / ADDR name=this / INT 24`; `&h.n` on a local object is the same
-miscompile, not a crash: measured at 243 against a field worth 42, and it faults only when
-the offset happens to land outside the mapping -- a wrong answer is the worse half; `&H.n` on a static is refused by the CORE, without a
-`teko:` prefix. `&acc` on a by-REFERENCE lambda capture is a fourth one, untouched here
-because a capture answers before the member question.
+bare name and none is made worse by this one): `&this.n` inside a method, `&h.n` on a
+local object, `&H.n` on a static — refused by the CORE, without a `teko:` prefix — and
+`&acc` on a by-REFERENCE lambda capture, untouched here because a capture answers before
+the member question.
+
+**Amended by D104 (2026-09-21), and the correction is this entry's own.** The paragraph
+above read `&this.n` as ``ADDR(this-slot) + OFF`` and `&h.n` as "the same miscompile, not
+a crash… it faults only when the offset happens to land outside the mapping". Both
+readings are wrong, and they are wrong the same way. `&` in mc is a prefix over a bare
+NAME and binds tighter than `.`, so `&h.n` never was an address computation at all: it
+parses as `(&h).n`, and the `BINARY + / ADDR / INT` fragment recorded here is only the
+INNER half of what `--dump-ast` prints. The whole node is `ld64(&h + OFF)` — a field LOAD
+that many bytes past `h`'s own STACK SLOT, which is why the shape faults as often as it
+answers and why `&this.k` on a field of class type, `&this.k.n` through a chain and
+`st64(&this.n, 42)` fault where `&this.n` on an `i64` returns a number. D104 refuses all
+eight shapes at one point and states the measurements in full; `&H.n` and `&acc` stay as
+this paragraph left them.
 
 **Gate.** `136 passed, 162 refused as expected, 0 failed` at `55cdf69e` →
 `137 passed, 171 refused as expected, 0 failed`: nine refusals and one positive fixture,
@@ -11694,3 +11704,342 @@ the compiler leg and 15/30, 20/40, 25/50, 18/36, 4/8, 8/16 on the `tests/hello.t
 every one of them unmoved — zero new intrinsics, zero new passes, and the hello leg does
 not move at all. Only the compiler leg's size rows move: `nodes` 213100 → 213210, `ins`
 246253 → 246293, `funcs` 4278 → 4280, `strings` 3147 → 3149, `symbols` 8851 → 8855.
+
+### D104 · `&h.n` is not an address: `&` binds tighter than `.`, so the address of a
+qualified field is refused — and `ref h.n` on a PARAMETER stops being a false refusal
+(2026-09-21)
+
+**One bug, not two, and D97 recorded half of it.** `&` in mc is a prefix over a bare NAME
+and binds tighter than `.`. So `&h.n` never was an address computation: it parses as
+`(&h).n`, and the five steps that follow are the same for `&this.n`, `&s.n` on a struct
+and `&this.k.n` through a chain. `tk_dot` (`teko_expr.tk:641`) asks `tk_struct_of_expr`,
+which answers -1 for an `N_ADDR`, so the access DEFERS. `tk_pend_do`
+(`teko_typeof.tk:1657`) asks `tk_ty_of`, which has no `N_ADDR` arm outside the ref/out tag
+(`teko_typeof.tk:354-358`) and answers -1 too. -1 sends the row to the LAST RESORT,
+`tk_pend_by_name` (`:1575`), which resolves the member by NAME across the whole unit.
+`tk_pend_field` (`:1349`) then builds `tk_bin(K_ADD, pd_recv_at(pi), tk_int(fd_off_at(fi)))`
+over the `N_ADDR` and loads through it. What comes out is `ld64(&h + OFF)` — a field LOAD
+that many bytes past `h`'s own STACK SLOT.
+
+D97's own "Roads NOT reached" paragraph recorded the `BINARY + / ADDR / INT` fragment and
+read it as "the slot's address plus the offset". The enclosing `ld64` is the half it
+missed, and it is why the shape faults as often as it answers: a word of stack garbage
+used as an `i64` is a wrong number, and used as a handle it is a fault. That paragraph is
+amended in place, as D94, D97 and D99 were.
+
+**Measured at `f81e0217`, every one of them ACCEPTED, none refused** (a field worth 42 in
+each; the numbers are stack garbage and MOVE WITH THE FRAME, which is why no fixture
+oracle names one):
+
+| shape | answered |
+|---|---|
+| `&this.n`, the field at offset 16 | **233** |
+| `&this.n`, the same field at offset 32 (two padding fields ahead of it) | **176** |
+| `&this.k` on a field of CLASS type | **233** (an independent verification measured this; it cannot fault -- `ld64` returns the garbage word and `main` returns it as the exit code, nothing dereferences it) |
+| `&h.n` on a LOCAL object | **243** |
+| `&h.n` on a PARAMETER | **233** |
+| `&this.k.n`, a chain | SIGSEGV, exit 139 |
+| `uptr p = &this.n; return ld64(p);` — copied into a local first | **233** |
+| `&s.n` on a STRUCT local, the field at offset 8 | **0** (at offset 0 the same program answers 42 by coincidence) |
+| `st64(&this.n, 42)`, the store half | SIGBUS, exit 138 |
+
+**The tell**, and it names the road the row took: the miscompile fires only when exactly
+ONE type in the unit declares that member name. Declare a second class with an `n` and the
+identical program is refused ``teko: the type of the left side of `.` is not known here:
+n`` instead — `tk_pend_by_name` is a resolution by name, and it refuses an ambiguous one.
+Both shapes now answer the message below.
+
+**Two diagnostics moved with it, neither of them a refusal gained or lost** (found by the
+independent verification, not by this entry's own measurement): `ref hs.n` on a `H[]`
+parameter and `ref x.n` on an interface-typed parameter answered
+`teko: not an object of a known type` before and answer `teko: unknown member: n` now. Both
+still refuse; the new wording names the member rather than the receiver, which is the more
+precise of the two. And one program that was REFUSED becomes accepted, which is a fix
+rather than a regression but is an accepted-code move on the `T[]` door and so belongs
+here: `i64 f(i64[] xs) { Op g = new Op((i64 xs) => xs + 1); return xs[0]; }` was
+``teko: `[` needs an array: xs `` and now answers, because the floor restores the enclosing
+`T[]` row when the lambda's own parameter goes out of scope. It is item 8 of the positive
+fixture.
+
+**First half: the false refusal.** `ref h.n` / `out h.n` where `h` is a PARAMETER was
+refused `teko: not an object of a known type: h` (`teko_ref.tk:316`) on a legal program,
+because `tk_ref_addr` asked `tk_local_find` alone — a parse-time SCOPE table, and a
+parameter is in no scope table at all (teko_struct.tk's own invariant, D51's twelfth
+pass). `tk_hp_find` already answers the sibling question for a `T[]` parameter at `tk_dot`
+(`teko_expr.tk:613`), from a table the parameter list fills as it reads each parameter.
+That table now keeps EVERY parameter rather than only a `T[]` one, and the `T[]` question
+moved from the write to the READ: `tk_hp_find` still answers a `T[]` parameter and nothing
+else, so its three callers (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see exactly
+the rows they always saw, and `tk_hp_find_any` is the new door `tk_ref_addr` asks after
+`tk_local_find` misses. The ceiling message is renamed to match what it counts
+(``teko: too many `T[]` parameters in one declaration`` → `teko: too many parameters in
+the open declarations`); the table itself grows to 128 rows in the review pass below, where the
+rows of every OPEN parameter list start sharing it, and mc's own `MAXPARAMS` of 12 leaves
+room for ten such lists. A `ref`/`out` parameter gets a row too — a SHADOW, the name with
+-1 for the type (`tk_hp_shadow`, and also below) — so it keeps the refusal, correctly: its
+slot carries an ADDRESS, not the object, and `name + OFF` would not be the field.
+
+This half lands FIRST because the refusal the second half adds points at `ref`/`out` as
+the road to use, and that road has to work for a parameter before a message can name it.
+`tests/ref_field_param.tk` proves `ref`, `out`, a struct parameter, a base class's field
+through a derived parameter, a method's own parameter, a constructor's, a static
+method's, `value` inside a `set` accessor, a GENERIC class's method parameter reached
+through the replay, and the enclosing declaration's own parameter AFTER an instantiation
+mid-body -- every one of which `f81e0217` refused.
+
+**Two defects the Copilot review of #770 found in that half, both reproduced, both fixed
+at the root rather than on the path that reported them.**
+
+*The innermost binding.* `tk_ref_addr` read `tk_local_find`, which holds OBJECT locals
+only — so a SCALAR local shadowing an object was invisible to it. Reading the parameter
+table after that miss made `void f(H h) { { i64 h = 0; bump(ref h.n); } }` compile and
+take SIGSEGV: the field offset added to the inner `i64` slot. The same blindness is
+OLDER than this decision over a LOCAL — `H h = new H(); { i64 h = 0; bump(ref h.n); }`
+compiles and segfaults at `f81e0217` too, measured — so the question is asked once, in
+C#'s order, and answers both: `tk_slv_find` is the live-scoped table of EVERY local with
+its declared type (an object local is in it as well, registered by the same
+`tk_on_stmt`), so its answer IS the innermost local and `tk_struct_by_ty` turns it into a
+row or into -1. Only when NO local of that name is in scope does a parameter answer.
+`this` has a row in `tk_local_find`'s table and none in `tk_slv_find`'s, so it keeps the
+old road — and never reaches here anyway, `this` being no `T_IDENT` for the guard above.
+Fixture: `tests/refuse/ref_field_shadow.tk`.
+
+*The reset had no floor.* A LAMBDA's parameter list is a declaration of its own —
+`tk_lambda_build` (teko_deleg.tk) sets `p_decl_name` to the gensym before `parse_params`,
+`tk_default_param` sees a new owner and calls `tk_hp_reset`. Cutting to ZERO took the
+ENCLOSING declaration's rows with it and left the lambda's standing, so everything after
+a lambda literal in the same body read the LAMBDA's parameters. `f81e0217` already has
+that gap on the `T[]` road — `i64 f(i64[] xs) { Op g = new Op((i64 x) => x + 1); return
+xs[0]; }` is refused ``teko: `[` needs an array: xs`` there, measured — and the new road
+would have inherited it as a WRONG ANSWER rather than a refusal: with `i64 f(Wide h)` and
+a lambda `(B h) => …` between the list and the use, `ref h.n` added B's offset (0) to the
+`Wide` object whose `n` is at 8, incremented the field next door and answered 41 where 42
+is right. An owner column on each row (`p_decl_name()` at the instant the parameter was
+read) was tried first and REJECTED: `tk_params` (teko_class.tk) reads a method's list
+without an owner, so every method, constructor and static method lost the new road. The
+fix is the floor, and it is the shape `tk_lc_base` (teko_deleg.tk's own lambda capture
+window) already has: `tk_hp_push` before a nested list makes the rows already there a
+floor `tk_hp_reset` cannot cut below, `tk_hp_pop` in `tk_lambda_finish` drops the nested
+list's own rows beside the capture window's. One table, one floor, and the `T[]` sibling
+is answered by the same change — items 7 and 8 of `tests/ref_field_param.tk`. `TK_MAXHP`
+grows 32 → 128 because the rows of every open list now coexist — a `ref`/`out` shadow row
+among them — `TK_MAXHPB` (16) bounds the nesting with its own message, and the ceiling's
+own message names the open declarations rather than one of them.
+
+**The review's second pass, and the same table again.** Keeping the enclosing rows alive
+opened two shapes where the INNERMOST parameter list had no row to shadow with, and both
+were measured before they were fixed:
+
+- a `ref`/`out` parameter is registered by `tk_rp_add`, not here, so a lambda's
+  `(ref i64 h)` left an enclosing `H h` answering for it and `ref h.n` in the body added
+  H's field offset to the inner ADDRESS slot: SIGSEGV. `tk_hp_shadow` writes the NAME with
+  -1 for the type — the lookup stops at the newest row bearing the name, so the shadow is
+  an answer of "no object" rather than a miss. `f81e0217` refuses that program and so does
+  this. Fixture: `tests/refuse/ref_field_refparam_shadow.tk`.
+- `tk_hp_find`, the `T[]` door, skipped a row that was not a `T[]` and kept scanning —
+  harmless while one list was open, and wrong under the floor: a lambda's `(i64 xs)` or
+  `(ref i64 xs)` fell through to an enclosing `i64[] xs` and indexed the ENCLOSING array,
+  SIGSEGV. It asks `tk_hp_find_any` now and answers -1 when the innermost row is no `T[]`,
+  so one rule — the innermost binding decides — serves both doors, and with a single list
+  open the two rules are the same rule the three callers always saw. `f81e0217` refuses
+  that program (the reset had wiped the enclosing row), and so does this. Fixture:
+  `tests/refuse/lambda_param_shadows_array.tk`.
+- a FIXED-ARRAY local is in NEITHER table `tk_ref_addr` reads: it never reaches
+  `tk_slv_add` (`tk_on_stmt` returns first for a declaration with a length) and it is no
+  object for `tk_local_find`; it lives in `tk_arr_find`'s own scoped table. So an inner
+  `i64 h[2]` shadowing an `H h` PARAMETER was invisible, and `h + OFF` was built against
+  the ARRAY's storage. It is asked after `tk_slv_find` and blocks the fallback the way any
+  other local does — an array is never an object with fields, so there is nothing to answer
+  with, only something to block. Fixture: `tests/refuse/ref_field_array_local.tk`.
+- a parameter's rows OUTLIVED their declaration. The reset is driven by the parameter LIST,
+  and a free function spelled `()` has no list to drive it, so its body read the PREVIOUS
+  declaration's rows; with a same-named GLOBAL for mc to resolve the identifier against,
+  the address built was `<the global> + OFF`. `f81e0217` has that on the `T[]` road —
+  `i64 first(i64[] xs) {…} i64 second() { return xs[0]; }` beside a global `i64 xs`
+  segfaults there, measured — and the parameter road would have inherited it. `tk_hp_own`
+  records the declaration the rows belong to (the name `p_decl_name()` answers inside its
+  own body: the function's for a free one, the MANGLED member name `parse_function` is
+  given for a member, the accessor's for a `=>` property body) and `tk_hp_in_owner` asks it
+  again where the rows are read. A lambda is not another declaration for this purpose —
+  its floor is open, and the enclosing rows are exactly what it must still see, so the
+  owner is stacked beside the floor. Both roads read one lookup, so the `T[]` sibling is
+  answered by the same change. Fixture: `tests/refuse/param_row_outlives_decl.tk`.
+- ...and a stale table is not laundered by BECOMING a floor. `tk_hp_in_owner` answers 1
+  unconditionally while a nested list is open, so a lambda opened inside a parameterless
+  free function trusted the previous declaration's rows for its whole body — the same
+  SIGSEGV one level in. The floor is VALIDATED as it is laid: `tk_hp_push` cuts rows that
+  do not belong to the declaration being parsed, and it is called BEFORE
+  `p_set_decl_name` sets the lambda's gensym, so the question it asks is about the
+  ENCLOSING declaration, the one that owns them. Fixture:
+  `tests/refuse/param_row_outlives_decl_lambda.tk`.
+- ...and the owner is compared by POINTER, not by spelling. `p_decl_name()` answers a
+  declaration's IDENTITY, a fresh one per source occurrence, which is exactly what lets
+  `tk_default_param` tell one declaration from the next with `owner != tk_dflt_owner`.
+  Comparing the text left `i64 f(H h)`'s row visible inside a later `i64 f()` — an overload
+  of arity zero, which has no parameter list to reset the table — and `ref h.n` there built
+  an address for a name that declaration never had. Fixture:
+  `tests/refuse/param_row_overload.tk`.
+- ...and a property ACCESSOR has no `tk_params` to reset its window at all: it builds its
+  compiler-generated `this`/`value` in `tk_prop_params` with `param_new`, and neither was
+  ever a row of this table. `tk_hp_own` therefore RELABELLED the previous declaration's
+  rows as the accessor's own, and `ref h.n` in the body resolved a parameter it never had.
+  The reset goes into `tk_prop_params`, the one point both accessor bodies pass through --
+  the block one through `tk_member_fn`, the `=>` one through `tk_prop_arrow_body` -- which
+  is the property's own analogue of `tk_params`'s first line. Empty is the whole truth for
+  an accessor's window -- except for `value`, which IS the setter's parameter and gets the
+  row every other parameter gets, written on the same two lines. `ref value.n` on a property
+  of CLASS type is the same legal program `ref h.n` is anywhere else, and `f81e0217` refused
+  it with the rest. Fixtures: `tests/refuse/param_row_accessor.tk`,
+  `tests/refuse/param_row_accessor_arrow.tk`, and item 11 of `tests/ref_field_param.tk`.
+- ...and a GENERIC REPLAY is a parse inside a parse. An instantiation is reached MID-BODY
+  (`Holder<H> g = new Holder<H>();` inside `i64 f(H h) {…}`), and every generated method it
+  parses runs `tk_params`, whose `tk_hp_reset` cut the table back to its floor and
+  overwrote the ENCLOSING declaration's rows in place -- so `ref h.n` after the
+  instantiation lost `h`. `tk_gen_replay` (teko_generic.tk) already saves and restores
+  `tk_line`, `p_decl_name` and half a dozen tables around the replayed text; the parameter
+  window joins them through the very pair a lambda's nested list uses, `tk_hp_push` /
+  `tk_hp_pop`. Item 13 of `tests/ref_field_param.tk`, with the generated method's own
+  parameter spelled like the enclosing one and of another class, so the offset says which
+  row answered.
+- ...and the floor is a SCOPE, not only a guard against the reset. A lambda captures
+  EXPLICITLY in teko (`use (...)`, K4) and `tk_lambda_use` accepts a LOCAL alone, so an
+  enclosing PARAMETER is not in scope inside a lambda body at all. The scan reached it
+  anyway: without a same-named global the capture judge refuses first
+  (`teko: h is not captured; add it to use (...)`), but WITH one the name binds to the
+  global and the judge lets it through -- and the enclosing parameter's row then supplied
+  the offset, `<the global> + OFF` and SIGSEGV. `tk_hp_find_any` stops at `tk_hp_base`; the
+  floor is still kept for RESTORATION, which is what makes the enclosing list answer again
+  the moment `tk_hp_pop` runs. Fixture: `tests/refuse/ref_field_lambda_outer_param.tk`,
+  beside item 7 of `tests/ref_field_param.tk`, which is the same program shape with the use
+  AFTER the lambda instead of inside it.
+- ...and the door had NEITHER of the two member gates `tk_member_of` (teko_expr.tk) puts in
+  front of an ordinary field read. `name + OFF` is an address the callee then WRITES
+  through, so this was the laxer of the two doors: `bump(ref h.secret)` wrote a `private`
+  field from OUTSIDE its type where `h.secret` as a plain read is refused, and
+  `bump(ref h.tally)` on a STATIC lowered to `h + fd_off` although a static's storage is a
+  symbol of its own (`fd_sym_at`) and not a word inside the object -- it faults on the
+  STORE, SIGBUS/exit 138 as an independent verification measured, not the SIGSEGV first
+  recorded here. Both reproduce at `f81e0217` through the LOCAL receiver (42 and 138), so the
+  gate goes where BOTH receivers pass and the parameter road never inherits them.
+  `tk_check_member` then `tk_reject_static_member`, in `tk_member_of`'s own order -- and
+  each is given what `tk_member_of` gives it: the field's OWNER for the visibility
+  question, which is the declaring type's to answer, and the RECEIVER's own row for the
+  static one, so an inherited static names the type the source wrote (`D.tally is static`,
+  not `B.tally is static`; `tk_field_find` walks the base chain, so the two differ exactly
+  when it does). Fixtures: `tests/refuse/ref_field_private.tk` and
+  `tests/refuse/ref_field_static.tk`, the latter written on an INHERITED static for that
+  reason.
+- ...and a DESTRUCTOR takes no parameter, so it never goes through `tk_params` either --
+  the same hole the accessor had, one member shape over. `tk_member_dtor` empties its own
+  window, the destructor's analogue of `tk_params`'s first line. Fixture:
+  `tests/refuse/param_row_dtor.tk`.
+- ...and the judge chose its SENTENCE before knowing what the member was. `&h.missing`,
+  where no type declares the name, was told a field's address is not taught yet and offered
+  a `ref` for a field that does not exist; `f81e0217` says `teko: unknown member` and that
+  is the truth, so the judge now returns for a name no type declares and lets the road say
+  it. `&h.go()` on a METHOD and `&h.Side` on a PROPERTY stay refused -- both answered 243
+  at `f81e0217`, the receiver being `(&h)` -- but take D97's own wording,
+  `teko: the address of a member is not taught yet`, because neither has a `ref`/`out` road
+  for a message to name -- and neither does a STATIC field, whose `ref` form `tk_ref_addr`'s
+  own static gate refuses, so the field wording would have sent the reader down a road that
+  refuses (`f81e0217` reported the static diagnostic there, through `tk_pend_by_name`). One
+  judge, three sentences, each true, and the field one is an INSTANCE field's alone.
+  Fixtures: `tests/refuse/addr_member_qualified_{call,prop,static,unknown}.tk` -- four,
+  because a refusal stops the compile and one file cannot exercise two of them.
+- the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
+  with `param_new` instead of `parse_params`, so no row was written for it at all. An
+  enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
+  at the wrong offset — 41 where 42 is right, measured. The row is written where the
+  parameter is built, from `dg_pty_at` (the delegate's own declared type, which is what the
+  implicit parameter IS, D221 decision 19), and the lambda's own parameter now works inside
+  its body as well — `f81e0217` refuses that too. Items 9 and 10 of
+  `tests/ref_field_param.tk`.
+
+**Three shapes the review raised that are NOT this decision's**, every one measured
+identically at `f81e0217` and at head, so none is made worse here — for the lambda shapes
+the parameter road simply did not exist there. An enclosing LOCAL of another class spelled
+like a lambda's parameter (`Wide h = new Wide(); Take t = new Take((B h) =>
+bump(ref h.n));`) resolves to the OUTER local and writes at ITS offset; an enclosing
+FIXED-ARRAY local of the same name (`i64 h[2]; Take t = new Take((H h) => …);`) blocks the
+lambda's own parameter and refuses a legal program; and an inner fixed-array local under an
+OUTER object local (`H h = new H(); { i64 h[2]; bump(ref h.n); }`) is answered by the outer
+object, so the offset is built against the array's storage.
+
+All three are the SAME missing fact, and it is not a missing question but a missing ORDER:
+`tk_slv_find` (every local with a declared type), `tk_arr_find` (fixed arrays) and the
+parameter table are three separate stacks with no shared scope counter, and none of them is
+cut at a lambda boundary. Nothing today can say which of two LIVE entries is the inner one,
+so no order of asking is right for every pair — asking arrays first refuses a legal inner
+object, asking the parameter list first would let it beat a local declared inside the
+lambda body. Giving the three a shared scope mark, and asking for an INDEX rather than a
+type, is the crumb that fixes all three at once. The order taken here is the one that
+matches `f81e0217` wherever `f81e0217` had an answer: `tk_slv_find`, then `tk_arr_find` as
+a blocker, then the parameter. Reported, and a row of `docs/reference/not-yet.md`; not
+widened.
+
+**Second half: one judge, one point.** All eight wrong shapes are the same deferred row —
+an `N_ADDR` receiver with no ref/out tag — so `tk_addr_recv_reject` (`teko_typeof.tk`) is
+asked in `tk_pend_do` ahead of `tk_ty_of`, before any offset is added to anything. A
+ref/out-TAGGED `N_ADDR` is not this shape: it is a call argument whose pointee `tk_ty_of`
+reads above, so the tag is asked here in the same order.
+
+**The alternative, and why it was not taken.** Giving `tk_ty_of` an `N_ADDR` arm answering
+`TY_UPTR` (`teko_typeof.tk:404`) routes the same eight shapes into
+`tk_reject_scalar_member` — one line less, and no new function. It was rejected for the
+SENTENCE: `teko: uptr has no members: n` describes the PARSE, not the mistake, and names
+no road at all. **Pick one, not both**, and the explicit judge is the pick.
+
+**The message: `` teko: the address of a field is not taught yet; pass it as `ref` or
+`out` ``**, completed by the field name, `err_at2` style, on the shape of D97's own
+`tk_addr_of_member`. It names a road that EXISTS — `tk_ref_addr`'s `p.x` branch, working
+today for a local and, after the first half above, for a parameter. That is exactly the
+wording D97 could NOT use for a BARE member name, because from inside the type no spelling
+of a member's address works at all; here it can, which is why the two messages differ.
+
+**Why refuse rather than implement.** `obj + OFF` is an INTERIOR pointer into a counted
+object. `teko_rc.tk` reclaims on the OBJECT, and nothing in the language can see that a
+`uptr` local aliases the interior of something `rc_dec` is about to free. C# refuses
+`&obj.field` outside `fixed`, and `fixed` is the whole pinning apparatus that answers the
+lifetime question — a spec page, not a crumb. This is D97's own reason, sharpened by the
+measurement: the qualified spelling is not "nearly built", it is a different question.
+
+**Out of scope, left refused, and each a separate crumb.** `&H.n` on a static and `&(h.n)`
+in parentheses both fall to the CORE's `& expects a name` (`mc/src/parse.mc:971`), with no
+`teko:` prefix: `&` is a prefix over a bare name and neither operand is one, so the parser
+refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture answers the
+core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
+the parser accepted. All three are rows in `docs/reference/not-yet.md`.
+
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 215
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and twenty-five
+refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
+for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
+`tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
+`tests/refuse/lambda_param_shadows_array.tk` for the `T[]` one,
+`tests/refuse/ref_field_array_local.tk` for the fixed-array one and
+`tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration and
+`tests/refuse/param_row_outlives_decl_lambda.tk` for the same rows laundered through a
+lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overloads and
+`tests/refuse/param_row_accessor{,_arrow}.tk` for a property accessor's own window and
+`tests/refuse/ref_field_lambda_outer_param.tk` for an enclosing parameter read inside a
+lambda, and `tests/refuse/ref_field_{private,static}.tk` for the two member gates the door
+never had, `tests/refuse/param_row_dtor.tk` for a destructor's own window and
+`tests/refuse/addr_member_qualified_{call,prop,static,unknown}.tk` for the sentences the
+judge owed — all seventeen found by the review — refused rising by exactly the twenty-five
+added. `tests/addr_not_member.tk` gains its item 7:
+the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
+through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
+CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
+base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
+only the compiler leg's size rows move: `nodes` 177785 → 178190, `ins` 246293 → 246890,
+`funcs` 3478 → 3486, `lowered` 3459 → 3467, `globals` 1006 → 1011, `strings` 2477 → 2479,
+`defines` 1305 → 1306, `symbols` 6961 → 6976, every row `ok`. `--dump-ast` base against head over every
+fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
+takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, exactly ONE
+differing — `addr_not_member`, whose accepted code this decision changed, and the diff is
+purely additive: the new `thruParam` function (`bump(ref p.n)` on a PARAMETER lowering to
+`BINARY + / IDENT name=p / INT val=16`, which is the whole point of the first half) and
+its two call sites in `main`. Every node the base already had is byte-identical, in that
+fixture and in the other 140. `surface_string_interp` is the one fixture neither binary
+dumps without the project config, and it is excluded rather than counted as an
+empty-vs-empty match.

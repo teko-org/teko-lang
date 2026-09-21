@@ -1,0 +1,40 @@
+// param_row_accessor.tk -- D104: a property ACCESSOR's parameter window is
+// empty, so a preceding declaration's rows are never relabelled as its own.
+//
+// An accessor does not go through `tk_params` (teko_class.tk): it builds its
+// compiler-generated `this`/`value` in `tk_prop_params` (teko_prop.tk) with
+// `param_new`, and neither was ever a row of the parameter table. Nothing
+// there reset the window, so `tk_hp_own` -- which records the declaration the
+// rows belong to -- relabelled the PREVIOUS declaration's rows as this
+// accessor's, and `ref h.n` in the body resolved a parameter it never had:
+// with the global `i64 h` for mc to resolve the name against, `<the global> +
+// OFF` and SIGSEGV, found by the Copilot review of #770. `f81e0217` refuses
+// it. The reset is in `tk_prop_params`, the one point both accessor bodies
+// pass through -- the block one below through `tk_member_fn`, the `=>` one
+// through `tk_prop_arrow_body`.
+//
+// The property is the FIRST member on purpose: any method or constructor ahead
+// of it runs `tk_params`, whose own reset would hide the defect.
+//
+// expect-refuse: teko: not an object of a known type: h
+// expect-refuse-line: 32
+#include "../../lib/rt.tk"
+
+class H { public i64 pad; public i64 n; public H() { pad = 0; n = 41; } }
+
+i64 h = 100;
+
+void bump(ref i64 v) { v = v + 1; }
+
+i64 first(H h) { return h.n; }
+
+class C {
+    public i64 Side { get { bump(ref h.n); return h; } }
+    public C() { }
+}
+
+i64 main() {
+    H a = new H();
+    C c = new C();
+    return first(a) + c.Side;
+}

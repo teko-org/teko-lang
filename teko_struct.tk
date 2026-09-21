@@ -899,7 +899,7 @@ uptr tk_ty_mangle_name(i64 ty) {
     return type_name(ty);
 }
 
-// ---- a `T[]` PARAMETER of the declaration currently being read (K3) ----
+// ---- a PARAMETER of the declaration currently being read (K3) ----
 // The core never reports a parameter to a module mid-body any more than it
 // reports a struct/class one (teko_expr.tk's own header) -- but a `T[]`
 // parameter's TYPE is known the instant the parser reads it, at the SAME
@@ -911,7 +911,28 @@ uptr tk_ty_mangle_name(i64 ty) {
 // parameter is read, so `xs[i]`/`xs.Length` on a `T[]` parameter resolve AT
 // PARSE TIME too (`teko_params.tk`'s `tk_bracket`, `teko_expr.tk`'s
 // `tk_dot`) -- with no oracle, and no placeholder left for a later pass.
-#define TK_MAXHP 32
+//
+// D104: EVERY parameter has a row -- a `T[]` one, a struct/class one, a
+// scalar, and a `ref`/`out` one as a SHADOW (`tk_hp_shadow` below, the name
+// with -1 for the type). A struct/class parameter's type is known at the very
+// same instant a `T[]` one's is, and `tk_ref_addr` (teko_ref.tk) needs exactly
+// that row to build `ref h.n` / `out h.n` on a parameter -- a legal program it
+// refused `teko: not an object of a known type: h` because `tk_local_find` is
+// a parse-time SCOPE table and a parameter is in no scope table at all. The
+// `T[]` question simply moved from the write to the READ: `tk_hp_find` below
+// answers a `T[]` parameter and nothing else, so its three callers (`tk_dot`,
+// `tk_bracket`, teko_loop.tk's `foreach`) see the same rows they always saw,
+// and `tk_hp_find_any` is the new door.
+//
+// The rows of every parameter list still OPEN share the table -- an enclosing
+// declaration's under each lambda nested inside it, the floor below -- so the
+// ceiling counts them all: `TK_MAXHP` is 128 against mc's own `MAXPARAMS` of
+// 12, room for ten open lists, and `TK_MAXHPB` (16) bounds the nesting with
+// its own message. It was 32 rows for `T[]` parameters alone before D104.
+#define TK_MAXHP  128                 // every parameter of every list still open
+#define TK_MAXHPB 16                  // how deep a lambda may nest inside a list
+
+uptr tk_hp_owner = 0;                 // the declaration the rows belong to (below)
 
 uptr hp_name[TK_MAXHP];
 i64  hp_ty[TK_MAXHP];
@@ -922,26 +943,162 @@ i64  hp_ty_at(i64 i)   { return ld64(hp_ty + i * 8); }
 void set_hp_name_at(i64 i, uptr v) { st64(hp_name + i * 8, v); }
 void set_hp_ty_at(i64 i, i64 v)    { st64(hp_ty + i * 8, v); }
 
-void tk_hp_reset() { tk_nhp = 0; }
+// D104: the reset has a FLOOR, and the floor is a stack -- the same shape
+// `tk_lc_base` (teko_deleg.tk's own lambda capture window) already has, and
+// for the same reason. A LAMBDA's parameter list is a declaration of its own:
+// `tk_lambda_build` sets `p_decl_name` to the gensym before `parse_params`,
+// `tk_default_param` sees a new owner and resets. With the reset cutting to
+// ZERO that took the ENCLOSING declaration's rows with it and left the
+// lambda's standing, so everything after a lambda literal in the same body
+// read the LAMBDA's parameters. `f81e0217` already had it for a `T[]`
+// parameter -- `i64 f(i64[] xs) { Op g = new Op((i64 x) => x + 1); return
+// xs[0]; }` is refused ``teko: `[` needs an array: xs`` there, measured --
+// and the parameter road D104 opens would have inherited it as a WRONG
+// ANSWER rather than a refusal: with `i64 f(G h)` and a lambda `(H h) => ...`
+// between the list and the use, `ref h.n` added H's offset to G's object and
+// wrote the field next door (measured, exit 41 where 42 is right). One floor
+// fixes both, because both read this one table.
+i64  hp_base_st[TK_MAXHPB];
+uptr hp_own_st[TK_MAXHPB];
+i64 tk_nhpb = 0;
+i64 tk_hp_base = 0;
 
+void tk_hp_reset() { tk_nhp = tk_hp_base; }
+
+// D104: the DECLARATION the rows belong to -- the name `p_decl_name()` answers
+// while that declaration's own body is being parsed. The reset is driven by
+// the parameter LIST (`tk_default_param` for a free function, `tk_params` for
+// a member), and a free function with an EMPTY list has no list to drive it:
+// its body then read the PREVIOUS declaration's rows. Measured at `f81e0217`
+// on the `T[]` road -- `i64 first(i64[] xs) {...} i64 second() { return
+// xs[0]; }` beside a global `i64 xs` segfaults there -- and the parameter road
+// would have inherited it (`ref h.n` in `second`, SIGSEGV; Copilot on #770).
+// The owner is recorded where the body's name is known and compared where the
+// rows are read: a row of another declaration answers nothing. A lambda is not
+// another declaration for this purpose -- its floor is open (`tk_nhpb > 0`),
+// and the enclosing rows are exactly what it must still see.
+void tk_hp_own(uptr name) { tk_hp_owner = name; }
+
+// 1 when the rows in the table belong to the declaration being parsed now
+i64 tk_hp_in_owner() {
+    if (tk_nhpb != 0) return 1;                   // inside a nested list: the floor answers
+    if (tk_hp_owner == 0) return 1;               // nothing recorded: as before
+    uptr cur = p_decl_name();
+    if (cur == 0) return 1;                       // mc is not reporting one here
+    // the POINTER, not the spelling: `p_decl_name()` is a declaration's
+    // IDENTITY, a fresh one per source occurrence, which is what lets
+    // `tk_default_param` tell two same-named OVERLOADS apart with the very
+    // same comparison (`owner != tk_dflt_owner`, teko_default.tk). Comparing
+    // the text instead left `i64 f(H h) {…}`'s row visible inside a later
+    // `i64 f() {…}` -- an overload of arity zero, which has no parameter list
+    // to reset the table -- and `ref h.n` there built an address for a name
+    // that declaration never had: SIGSEGV, where `f81e0217` refuses (Copilot
+    // on #770).
+    return cur == tk_hp_owner;
+}
+
+// entering a nested parameter list: the rows already there become a floor
+// `tk_hp_reset` cannot cut below
+// The floor is VALIDATED as it is laid: the rows about to become one have to
+// belong to the declaration being parsed right now, or they are cut first.
+// Inside a nested list `tk_hp_in_owner` answers 1 unconditionally -- the
+// enclosing rows are exactly what the lambda must still see -- so without this
+// check a stale table became a lambda's floor and was trusted for the whole
+// body: a lambda inside a parameterless `second()` after `i64 first(H h)` read
+// `first`'s row and, beside a same-named global, built `<the global> + OFF`
+// (SIGSEGV; `f81e0217` refuses it -- Copilot on #770). The caller pushes
+// BEFORE it sets `p_decl_name` to the lambda's gensym, so the question asked
+// here is about the ENCLOSING declaration, which is the one that owns them.
+void tk_hp_push() {
+    if (tk_nhpb == TK_MAXHPB) err_at(tk_file, tk_line, "teko: lambdas nested too deep");
+    if (!tk_hp_in_owner()) tk_nhp = tk_hp_base;
+    st64(hp_base_st + tk_nhpb * 8, tk_hp_base);
+    st64(hp_own_st + tk_nhpb * 8, tk_hp_owner);   // the lambda's own list will overwrite it
+    tk_nhpb = tk_nhpb + 1;
+    tk_hp_base = tk_nhp;
+}
+
+// leaving it: the nested list's own rows die, the floor goes back
+void tk_hp_pop() {
+    if (tk_nhpb == 0) return;
+    tk_nhp = tk_hp_base;
+    tk_nhpb = tk_nhpb - 1;
+    tk_hp_base = ld64(hp_base_st + tk_nhpb * 8);
+    tk_hp_owner = ld64(hp_own_st + tk_nhpb * 8);  // ...and the enclosing one owns them again
+}
+
+// D104: the row is kept for EVERY parameter, not only a `T[]` one. A
+// struct/class parameter's type is known at the very same instant, and
+// `tk_ref_addr` (teko_ref.tk) needs exactly that row to build `ref h.n` /
+// `out h.n` on a parameter -- a legal program it refused
+// `teko: not an object of a known type: h` because `tk_local_find` is a
+// parse-time SCOPE table and a parameter is in no scope table at all. The
+// `T[]` question simply moved from the write to the READ: `tk_hp_find` still
+// answers a `T[]` parameter and nothing else, so its three callers
+// (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see the same rows they
+// always saw, and `tk_hp_find_any` is the new door.
 void tk_hp_add(uptr name, i64 ty) {
-    if (!tk_is_ha(tk_struct_by_ty(ty))) return;
-    if (tk_nhp == TK_MAXHP) err_at(tk_file, tk_line, "teko: too many `T[]` parameters in one declaration");
+    if (tk_nhp == TK_MAXHP) err_at(tk_file, tk_line, "teko: too many parameters in the open declarations");
     set_hp_name_at(tk_nhp, name);
     set_hp_ty_at(tk_nhp, ty);
     tk_nhp = tk_nhp + 1;
 }
 
-// the type of a `T[]` parameter named `name`, or -1: the newest one wins,
-// the same rule `tk_local_find` gives a shadowed local.
-i64 tk_hp_find(uptr name) {
+// a `ref`/`out` parameter's own row: the NAME, and -1 for the type. It is a
+// SHADOW, not an answer -- the lookup below stops at the newest row bearing
+// the name, so the enclosing declaration's `H h` stops answering for a
+// lambda's `(ref i64 h)` the moment that list is open (Copilot on #770:
+// without it, `ref h.n` in the lambda body added H's field offset to the
+// inner ADDRESS slot and took SIGSEGV; `f81e0217` refuses that program, and
+// so does this row). A `ref`/`out` slot carries an address rather than the
+// object, so the honest type for it here is "no object at all".
+void tk_hp_shadow(uptr name) { tk_hp_add(name, 0 - 1); }
+
+// the declared type of the parameter named `name`, or -1: the newest one
+// wins, the same rule `tk_local_find` gives a shadowed local. A `ref`/`out`
+// parameter has a SHADOW row (-1 for the type, `tk_hp_shadow` above): the scan
+// stops there and answers "no object", so its slot -- which holds an ADDRESS
+// rather than the object -- is never mistaken for the object itself, and an
+// older row of the same name never answers past it.
+//
+// The scan stops at `tk_hp_base`, the CURRENT list's own floor, and that is a
+// scope rule rather than bookkeeping: a lambda captures EXPLICITLY in teko
+// (`use (...)`, K4) and `tk_lambda_use` accepts a local alone, so an enclosing
+// PARAMETER is not in scope inside a lambda body at all. Scanning past the
+// floor reached it anyway: with `i64 f(H h)` and `bump(ref h.n)` inside a
+// lambda, the capture judge lets the name through when a same-named GLOBAL
+// exists (the name binds to the global) and the enclosing parameter's row then
+// supplied the offset -- `<the global> + OFF`, SIGSEGV, where `f81e0217`
+// refuses (Copilot on #770). The floor is still kept for RESTORATION, which is
+// what makes the enclosing list answer again the moment `tk_hp_pop` runs
+// (`tests/ref_field_param.tk` item 7). With no nested list open the floor is
+// 0 and this is the whole table, as it always was.
+i64 tk_hp_find_any(uptr name) {
+    if (!tk_hp_in_owner()) return 0 - 1;
     i64 i = tk_nhp - 1;
     loop {
-        if (i < 0) break;
+        if (i < tk_hp_base) break;
         if (str_eq(hp_name_at(i), name)) return hp_ty_at(i);
         i = i - 1;
     }
     return 0 - 1;
+}
+
+// the type of a `T[]` parameter named `name`, or -1 -- the question the table
+// answered before D104 widened what it holds, asked through the SAME lookup.
+// It stops at the newest row bearing the name and answers -1 when that row is
+// no `T[]`, rather than scanning past it: with the floor keeping an enclosing
+// list alive, skipping would let a lambda's `(i64 xs)` or `(ref i64 xs)` fall
+// through to an enclosing `i64[] xs` and index the ENCLOSING array (measured,
+// SIGSEGV; `f81e0217` refuses it, because the reset had already wiped the
+// enclosing row -- Copilot on #770). The innermost binding decides, here as in
+// `tk_hp_find_any`, and with a single list open the two rules are one rule --
+// which is why this is exactly what the three callers saw before.
+i64 tk_hp_find(uptr name) {
+    i64 ty = tk_hp_find_any(name);
+    if (ty < 0) return 0 - 1;
+    if (!tk_is_ha(tk_struct_by_ty(ty))) return 0 - 1;
+    return ty;
 }
 
 // a store this module emitted into a slot of counted type -- a field, an

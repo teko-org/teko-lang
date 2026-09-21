@@ -1,0 +1,239 @@
+// ref_field_param.tk -- D104, the first half: `ref h.n` / `out h.n` where `h`
+// is a PARAMETER. It was refused `teko: not an object of a known type: h` on a
+// legal program, because `tk_ref_addr` (teko_ref.tk) asked `tk_local_find`
+// alone -- a parse-time SCOPE table, and a parameter is in no scope table at
+// all (teko_struct.tk's own invariant). The parameter list already records
+// every parameter's declared type as it reads it, which is the sibling
+// `tk_hp_find` answers for a `T[]` parameter at `tk_dot`; `tk_hp_find_any` is
+// the same row asked for a struct/class one.
+//
+// This is the road the D104 refusal points at, so it has to work for a
+// parameter before that refusal can name it.
+//
+//   1. `ref` on a field of a CLASS parameter -- the caller sees the write,
+//      because the parameter holds the object's own pointer.
+//   2. `out` on the same.
+//   3. a field of a STRUCT parameter. What this fixture pins is what teko
+//      ACTUALLY does: a struct parameter's slot carries the caller's buffer,
+//      not a copy of it, so the write through `ref s.n` is the caller's too.
+//      That is a property of how a struct is passed, measured identically at
+//      `f81e0217` with a plain `s.n = 99;` and no `ref` in sight, and it is
+//      not this decision's to change -- C# copies a struct parameter, and the
+//      gap is reported, not widened here.
+//   4. a BASE CLASS's field through a derived parameter: base-first layout
+//      keeps the offset valid, the same reason `tk_field_find` walks the
+//      chain for a local.
+//   5. a `ref` parameter of the OBJECT itself keeps the old refusal -- its
+//      slot carries an address, not the object, so `h + OFF` would not be the
+//      field. Refused, not silently wrong (`tests/refuse/` has no room for a
+//      shape that only a comment names, so this one is stated, not compiled).
+//   6. a METHOD's own parameter, a CONSTRUCTOR's and a STATIC method's --
+//      three lists `tk_params` (teko_class.tk) reads rather than
+//      `tk_default_param`.
+//   7. a LAMBDA literal between the parameter list and the use. A lambda's
+//      parameter list is a declaration of its own, and the reset it triggers
+//      used to take the enclosing declaration's rows with it: `f81e0217`
+//      refuses this program, and an earlier draft of this decision ANSWERED
+//      41 instead of 42 when the lambda declared a same-named parameter of
+//      another class -- the lambda's offset added to the enclosing object.
+//      `tk_hp_push`/`tk_hp_pop` (teko_struct.tk) give the reset a floor.
+//   8. the same floor seen from the `T[]` side: `xs[0]` on a `T[]` PARAMETER
+//      after a lambda, refused ``teko: `[` needs an array: xs`` at
+//      `f81e0217`. One table, one floor, both roads.
+//   9. a lambda's OWN parameter, inside its body -- the explicit grafia and
+//      the SHORT one (`h => ...`), which builds its single parameter by hand
+//      rather than through `parse_params` and so had no row of its own.
+//  10. the short lambda's parameter with an ENCLOSING parameter of another
+//      class spelled the same: the inner one wins, and the outer object is
+//      untouched. Without 9 the outer row answered and the write landed at
+//      the wrong offset (measured, 41 where 42 is right).
+//  11. `value` inside a `set` accessor whose property is of CLASS type --
+//      the accessor's own parameter, registered where it is built
+//      (`tk_prop_params`, teko_prop.tk) beside the window's reset.
+//  12. a GENERIC class's method parameter, reached through the replay
+//      (`Holder<H>.poke(H h)`), which `f81e0217` refused with the rest.
+//  13. an instantiation reached MID-BODY, with `ref h.n` on the enclosing
+//      declaration's own parameter AFTER it -- and the generated method's
+//      parameter spelled the same, of another class. Every generated method
+//      runs `tk_params`, whose reset would have cut the table back and
+//      overwritten the enclosing rows in place; `tk_gen_replay` opens the
+//      same window a lambda's nested list does.
+//
+// expect-exit: 0
+#include "../lib/rt.tk"
+
+struct S { public i64 a; public i64 n; }
+
+class B { public i64 n; public B() { n = 41; } }
+class D : B { public i64 extra; public D() { extra = 9; } }
+
+class H { public i64 n; public H() { n = 41; } }
+
+void bump(ref i64 v) { v = v + 1; }
+void setit(out i64 v) { v = 7; }
+
+// 1
+i64 viaRef(H h) {
+    bump(ref h.n);
+    return h.n;
+}
+
+// 2
+i64 viaOut(H h) {
+    setit(out h.n);
+    return h.n;
+}
+
+// 3
+i64 viaStruct(S s) {
+    bump(ref s.n);
+    return s.n;
+}
+
+// 4
+i64 viaBase(D d) {
+    bump(ref d.n);
+    return d.n;
+}
+
+// 6: three lists `tk_params` reads
+class Own {
+    public i64 seed;
+    public Own(H h) { bump(ref h.n); seed = h.n; }
+    public i64 go(H h) { bump(ref h.n); return h.n; }
+    public static i64 sgo(H h) { bump(ref h.n); return h.n; }
+}
+
+// 7: a lambda between the list and the use, declaring a same-named parameter
+// of ANOTHER class -- `B.n` is at offset 0, `Wide.n` at 8
+class Wide { public i64 pad; public i64 n; public Wide() { pad = 1; n = 41; } }
+delegate i64 Take(B h);
+
+i64 afterLambda(Wide h) {
+    Take t = new Take((B h) => h.n);
+    bump(ref h.n);
+    if (t(new B()) != 41) return 0 - 1;
+    return h.n;
+}
+
+// 8: the `T[]` side of the same floor
+i64 afterLambdaArr(i64[] xs) {
+    Take t = new Take((B h) => h.n);
+    return xs[0];
+}
+
+// 9/10: a lambda's own parameter, explicit and short, and the short one with
+// an enclosing parameter spelled the same
+delegate i64 Take2(B h);
+
+i64 lamOwn() {
+    Take2 t = new Take2((B h) => { bump(ref h.n); return h.n; });
+    return t(new B());
+}
+
+i64 lamShort(Wide h) {
+    Take2 t = h => { bump(ref h.n); return h.n; };
+    i64 r = t(new B());
+    if (h.n != 41) return 0 - 1;                 // the ENCLOSING object is untouched
+    if (h.pad != 1) return 0 - 2;
+    return r;
+}
+
+// 11: `value`, the setter's own parameter
+class Cell {
+    public B held;
+    public Cell() { held = new B(); }
+    public B Held {
+        get { return held; }
+        set { bump(ref value.n); held = value; }
+    }
+}
+
+// 12: a generic class's method parameter, through the replay
+class Holder<T> {
+    public T inner;
+    public i64 poke(B b) { bump(ref b.n); return b.n; }
+    public i64 twice(B h) { return h.n * 2; }
+}
+
+// 13: the instantiation is reached mid-body, and `Holder`'s own `twice(B h)`
+// is spelled like the enclosing parameter but is another class
+i64 midBody(Wide h) {
+    Holder<B> g = new Holder<B>();
+    bump(ref h.n);
+    if (h.pad != 1) return 0 - 1;                // Wide's own offset, not B's
+    return h.n;
+}
+
+i64 main() {
+    // 1: the callee's write is the caller's too -- a class parameter is the
+    // object's own pointer
+    H h = new H();
+    if (viaRef(h) != 42) return 1;
+    if (h.n != 42) return 2;
+
+    // 2
+    if (viaOut(h) != 7) return 3;
+    if (h.n != 7) return 4;
+
+    // 3: the struct parameter carries the caller's buffer (see the header),
+    // so both sides read 42; the neighbouring field is untouched, which is
+    // what proves the offset was the right one
+    S s = new S();
+    s.a = 5;
+    s.n = 41;
+    if (viaStruct(s) != 42) return 5;
+    if (s.n != 42) return 6;
+    if (s.a != 5) return 7;
+
+    // 4: a base class's field, reached through a derived parameter
+    D d = new D();
+    if (viaBase(d) != 42) return 8;
+    if (d.n != 42) return 9;
+    if (d.extra != 9) return 10;
+
+    // 6
+    H e = new H();
+    Own o = new Own(e);
+    if (o.seed != 42) return 11;
+    if (e.n != 42) return 12;
+    H f = new H();
+    if (o.go(f) != 42) return 13;
+    H g = new H();
+    if (Own.sgo(g) != 42) return 14;
+
+    // 7: `h` after the lambda is the enclosing `Wide`, at ITS own offset
+    Wide w = new Wide();
+    if (afterLambda(w) != 42) return 15;
+    if (w.pad != 1) return 16;
+
+    // 8
+    i64[] xs = new i64[2];
+    xs[0] = 42;
+    if (afterLambdaArr(xs) != 42) return 17;
+
+    // 11
+    Cell cl = new Cell();
+    B held = new B();
+    cl.Held = held;
+    if (held.n != 42) return 21;
+    if (cl.Held.n != 42) return 22;
+
+    // 12
+    Holder<B> hb = new Holder<B>();
+    B gb = new B();
+    if (hb.poke(gb) != 42) return 23;
+
+    // 13
+    Wide mw = new Wide();
+    if (midBody(mw) != 42) return 24;
+    if (mw.pad != 1) return 25;
+
+    // 9, 10
+    if (lamOwn() != 42) return 18;
+    Wide v = new Wide();
+    if (lamShort(v) != 42) return 19;
+    if (v.n != 41) return 20;
+
+    return 0;
+}
