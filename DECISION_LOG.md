@@ -11874,17 +11874,27 @@ were measured before they were fixed:
   its body as well — `f81e0217` refuses that too. Items 9 and 10 of
   `tests/ref_field_param.tk`.
 
-**Two shapes the review raised that are NOT this decision's**, both measured identically at
-`f81e0217` and at head, so neither is made worse here — the parameter road simply did not
-exist there. An enclosing LOCAL of another class spelled like a lambda's parameter
-(`Wide h = new Wide(); Take t = new Take((B h) => bump(ref h.n));`) resolves through
-`tk_slv_find`/`tk_local_find` to the OUTER local and writes at ITS offset; an enclosing
+**Three shapes the review raised that are NOT this decision's**, every one measured
+identically at `f81e0217` and at head, so none is made worse here — for the lambda shapes
+the parameter road simply did not exist there. An enclosing LOCAL of another class spelled
+like a lambda's parameter (`Wide h = new Wide(); Take t = new Take((B h) =>
+bump(ref h.n));`) resolves to the OUTER local and writes at ITS offset; an enclosing
 FIXED-ARRAY local of the same name (`i64 h[2]; Take t = new Take((H h) => …);`) blocks the
-lambda's own parameter and refuses a legal program. Both are the same missing fact: a
-lambda's parameter list is in neither of those tables, and `tk_slv_live` is cut at `}`
-rather than at a lambda boundary, so nothing says where the enclosing scope stops being
-visible. Marking the body's own scope entry is the crumb that orders them. Reported, and a
-row of `docs/reference/not-yet.md`; not widened.
+lambda's own parameter and refuses a legal program; and an inner fixed-array local under an
+OUTER object local (`H h = new H(); { i64 h[2]; bump(ref h.n); }`) is answered by the outer
+object, so the offset is built against the array's storage.
+
+All three are the SAME missing fact, and it is not a missing question but a missing ORDER:
+`tk_slv_find` (every local with a declared type), `tk_arr_find` (fixed arrays) and the
+parameter table are three separate stacks with no shared scope counter, and none of them is
+cut at a lambda boundary. Nothing today can say which of two LIVE entries is the inner one,
+so no order of asking is right for every pair — asking arrays first refuses a legal inner
+object, asking the parameter list first would let it beat a local declared inside the
+lambda body. Giving the three a shared scope mark, and asking for an INDEX rather than a
+type, is the crumb that fixes all three at once. The order taken here is the one that
+matches `f81e0217` wherever `f81e0217` had an answer: `tk_slv_find`, then `tk_arr_find` as
+a blocker, then the parameter. Reported, and a row of `docs/reference/not-yet.md`; not
+widened.
 
 **Second half: one judge, one point.** All eight wrong shapes are the same deferred row —
 an `N_ADDR` receiver with no ref/out tag — so `tk_addr_recv_reject` (`teko_typeof.tk`) is
