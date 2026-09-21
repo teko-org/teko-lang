@@ -1,11 +1,14 @@
 # `struct` as a value type
 
-**Partly built.** Nothing on this page ran at `e3e6aa13`, where it was written. **V1 and V2
-of the crumb table in § 6 have since landed** (D105): a struct cannot contain itself, and
-`S b = <e>;` copies. V3 to V7 are still designed, not built, and every "today" below is the
-measurement at `e3e6aa13` unless a row says otherwise. The reference describes what runs;
-this page describes what a struct is *supposed* to be and the ordered crumbs that get it
-there.
+**Mostly built.** Nothing on this page ran at `e3e6aa13`, where it was written. **V1 and V2
+landed with D105**; **V3, V4 and V5 landed with D106**, so all six landings of § 3.1 copy: a
+struct cannot contain itself, and `S b = <e>;`, `b = <e>;`, `x.f = <e>;`, `a[i] = <e>;`, a
+by-value argument at every call road and `S? b = <e>;` each give the destination a fresh
+block. **V6 and V7 are still designed, not built** — the `foreach` element is still bound to
+the array's own element, a struct captured by value is still refused with a generic
+conversion message, and nothing reclaims a copy. Every "today" below is the measurement at
+`e3e6aa13` unless a row says otherwise. The reference describes what runs; this page
+describes what a struct is *supposed* to be and the ordered crumbs that get it there.
 
 Two rows of [`../reference/not-yet.md`](../reference/not-yet.md) point at each other and
 are one missing piece: a `struct` parameter is not copied, and a `struct` has no copy at
@@ -161,6 +164,17 @@ and small:
 | L4 | `a[i] = <e>;` on a `S[]`, `params S[]` included | the element store, where the **element** type is a struct |
 | L5 | a by-value argument at a struct-typed parameter | the argument at index `i` where `decl_param_type(d, i)` is a struct row **and** `tk_rp_kind` says the parameter is not `ref`/`out` |
 | L6 | `S? b = <e>;` | the nullable conversion, where the enclosed type is a struct |
+
+**As built (D106, V3–V5), three deviations from the table above.** L3 and L4 are ONE arm,
+not two: every one of the nine sites that builds a slot store passes `tk_os_mark`
+(teko_struct.tk), which already holds the slot's declared type, so the value node is
+recorded there and the row resolved at pass 16 — where a FORWARD type is a real row and
+`tk_params_pass` has already built its `params` element stores. L5 is TWO roads, not one:
+`decl_find` answers for a call that names its callee, and the three INDIRECT roads — the
+vtable, the itab and the delegate — name none, so their argument is recorded at the one door
+all three pass (`tk_vca_park`, teko_typeof.tk). And L6 is NO arm at all: Q1a makes a nullable
+over a reference the reference itself, so peeling the slot's row with `tk_row_through_nl` in
+the one place that derives it gives the `?` spelling of all five other landings for free.
 
 **The one exception, at every landing:** when `<e>` is *provably fresh* — an `N_CALL` to
 the generated `name_new` symbol, i.e. the `new S` / `new S()` the parser just lowered — the
@@ -331,16 +345,19 @@ the `not-yet.md` row.
 |---|---|---|
 | **`teko_struct.tk`** | parse time, `tk_struct()` at the closing `}` (`:1892-1926`) | `tk_copy_name` (mirrors `tk_ctor_name`, `:486`); `tk_copy_fn(name, si, ty, size)` building the body of § 3.3 from the field table (`fd_off`/`fd_ty`/`fd_sym`, `:300-306`); one `tk_top_emit_as` beside the existing one at `:1925`. The cycle check of § 4.4, run at the same close over the field graph. Reads `tk_is_counted` (`:816`) and `tk_is_struct` (`:405`) — both already public |
 | **`teko_copy.tk`** (new, module 42) | `pass(&tk_copy_pass)`, registered in `teko.tk` immediately before `pass(&tk_rc_pass)` | the whole landing walk: L1–L6, the `name_new` freshness exception, and `tk_copy_here(e, ty)` — the single door that wraps one expression. Reads `decl_find` / `decl_param_type` (mc core, `docs/reference/hooks.md:1154-1157`) and `tk_rp_kind` (`teko_ref.tk:140`) |
-| **`teko_null.tk`** | — | L6 only: the nullable conversion site asks `tk_copy_here` when the enclosed type is a struct row |
+| **`teko_null.tk`** | — | **nothing, as built.** L6 needed no site of its own: peeling the slot's row with `tk_row_through_nl` where it is derived gives the `?` spelling of all five other landings at once (D106) |
+| **`teko_struct.tk`** | `tk_os_mark` | one line and a two-column table: the value node of a landing a SLOT built, recorded where the slot's declared type is at hand and rewritten at pass 16 (D106, L3 and L4) |
+| **`teko_typeof.tk`** | `tk_vca_park` | one line: the same record for the argument of an INDIRECT call, the one door the vtable, the itab and the delegate roads all pass (D106, the indirect half of L5) |
 | **`teko_loop.tk`** | parse time, `foreach` | the read-only refusal of § 4.5 |
 | **`teko_deleg.tk`** | parse time, `use (...)` | the by-value capture refusal of § 4.6, replacing the generic conversion message |
 | **`lib/rt.tk`** | runtime | `rt_copy(d, s, n)` — five lines, § 3.3 |
 | **`core_teko.mc` / `user.mc`** | — | **nothing.** No new subcommand, no new hook registration; `teko_init()` in `teko.tk` gains one `pass()` and `teko.tk` one `#include` |
 
-**`mc limits` after the whole sequence:** `passes` **15 → 16** of 30 (measured today:
-15/30, verdict ok); `syntax` 20/40, `types` 18/36, `alias` 25/50, `on_stmt` 4/8 all
-unmoved, because the design registers no word and no type. `heap` rises with the source
-(469 184 of 33 554 432 today); every crumb re-runs `teko limits` as part of its gate.
+**`mc limits` after the whole sequence:** `passes` **15 → 16** of 32, which is where D105
+left it and where D106 leaves it — V3, V4 and V5 register no pass of their own. `syntax`
+20/40, `types` 18/36, `alias` 25/50, `on_stmt` 4/8 all unmoved, because the design registers
+no word and no type. `heap` rises with the source (471 936 of 33 554 432 at D106, from
+469 184); every crumb re-runs `teko limits` as part of its gate.
 
 ---
 
@@ -352,9 +369,9 @@ Ordered, each landable on its own, each with its oracle.
 |---|---|---|---|---|---|---|
 | **V1** *(landed, D105)* | **A struct cannot contain itself.** The direct case and the mutual case, checked at each struct's closing `}` over the field graph | **S** | `teko_struct.tk` | `tests/refuse/struct_cycle_self.tk` + `tests/refuse/struct_cycle_mutual.tk`, both `expect-refuse: teko: a struct cannot contain itself` with the exact line; the whole fixture suite green; `teko limits` unmoved | `not-yet.md` row; `types.md` § struct one sentence | **no** — `teko_struct.tk` is the busiest file in the tree and D104 touched it two days ago. Must land alone, and **before V2** |
 | **V2** *(landed, D105)* | **`rt_copy`, `name_copy`, and the first landing (L1).** `S b = <e>;` copies; `new S` is the one exception | **M** | `lib/rt.tk`, `teko_struct.tk`, **new** `teko_copy.tk`, `teko.tk` (one `#include`, one `pass`) | `tests/struct_copy_local.tk` **exit 42** — p02/p03/p04/p05/p47 inverted in one program, plus `rt_live()` proving the copy is a *new* block; `teko limits` shows `passes` 16/30, verdict ok; the fixed point closes; the whole suite green | `types.md` § struct (replace the alias paragraph), `memory.md` "What is not reclaimed" (a copy is one more uncounted allocation), `not-yet.md` (delete the assignment row), `DECISION_LOG.md` (supersede D56's one sentence) | **no** — it edits `teko.tk`'s pass list and `teko_struct.tk` |
-| **V3** | **The store landings (L2, L3, L4).** assignment, field store, `S[]` element store, `params S[]` element | **M** | `teko_copy.tk` only | `tests/struct_copy_store.tk` **exit 42** — p10/p11/p18/p22/p14 inverted; the suite green | `types.md`, `arrays.md` one row each; `not-yet.md` (delete the `params` note if one exists) | **yes** — one file, and nothing else in the tree reads it. Depends on V2 |
-| **V4** | **The call landing (L5).** A by-value struct parameter is copied at the call; `ref`/`out` is not | **M** | `teko_copy.tk` (+ *reads* `teko_ref.tk`, no edit) | `tests/struct_copy_param.tk` **exit 42** — p01/p43 inverted, a method parameter, a delegate parameter, a `params` element, and a `ref`/`out` parameter proving it still aliases; the suite green | `types.md` § struct, `not-yet.md` (delete the parameter row) | **yes**, same file as V3 so **not beside V3**. Depends on V2 |
-| **V5** | **The counted field, proved; and `S?` (L6).** The copy keeps the count of a class-typed field; `S? b = a;` copies | **S** | `teko_copy.tk`, `teko_null.tk` | `tests/struct_copy_counted.tk` **exit 42** with exact `rt_live()` assertions (copy a struct holding a `Cell`, drop one copy's scope, the `Cell` survives; drop both, it dies); `tests/struct_copy_nullable.tk` **exit 42** — p46 inverted | `memory.md` (a struct copy is a new owner of every counted field), `nullable.md` | **yes**. Depends on V2 |
+| **V3** *(landed, D106)* | **The store landings (L2, L3, L4).** assignment, field store, `S[]` element store, `params S[]` element | **M** | `teko_copy.tk` only | `tests/struct_copy_store.tk` **exit 42** — p10/p11/p18/p22/p14 inverted; the suite green | `types.md`, `arrays.md` one row each; `not-yet.md` (delete the `params` note if one exists) | **yes** — one file, and nothing else in the tree reads it. Depends on V2 |
+| **V4** *(landed, D106)* | **The call landing (L5).** A by-value struct parameter is copied at the call; `ref`/`out` is not | **M** | `teko_copy.tk` (+ *reads* `teko_ref.tk`, no edit) | `tests/struct_copy_param.tk` **exit 42** — p01/p43 inverted, a method parameter, a delegate parameter, a `params` element, and a `ref`/`out` parameter proving it still aliases; the suite green | `types.md` § struct, `not-yet.md` (delete the parameter row) | **yes**, same file as V3 so **not beside V3**. Depends on V2 |
+| **V5** *(landed, D106)* | **The counted field, proved; and `S?` (L6).** The copy keeps the count of a class-typed field; `S? b = a;` copies | **S** | `teko_copy.tk`, `teko_null.tk` | `tests/struct_copy_counted.tk` **exit 42** with exact `rt_live()` assertions (copy a struct holding a `Cell`, drop one copy's scope, the `Cell` survives; drop both, it dies); `tests/struct_copy_nullable.tk` **exit 42** — p46 inverted | `memory.md` (a struct copy is a new owner of every counted field), `nullable.md` | **yes**. Depends on V2 |
 | **V6** | **The two refusals the copy cannot serve.** A `foreach` variable of struct type is read-only; a struct is captured with `&` | **S** | `teko_loop.tk`, `teko_deleg.tk` | `tests/refuse/struct_foreach_readonly.tk` and `tests/refuse/struct_capture_byvalue.tk`, exact message + exact line | `not-yet.md` two rows; `delegates.md`, `loops.md` one sentence each | **yes**, and it is the only crumb here that is independent of V2 as well — it can land first, in parallel with V1 |
 | **V7** | **The reclaim of copies** (*optional for 1.0*). A copy the pass itself created is owned by its scope: `rt_free(p, SIZE)` at the `}`, at every jump that leaves it, and not at all when it is returned | **L** | `teko_rc.tk`, `teko_copy.tk` | `tests/struct_copy_reclaim.tk` **exit 42**: `rt_live()` back to its entry floor after a scope, and `rt_peak()` **not growing** across a 100 000-iteration loop that copies a struct; the suite green | `memory.md` (move the struct-copy row out of "What is not reclaimed") | **no** — `teko_rc.tk` is the reclaim's single source. Depends on V2..V5 |
 
@@ -452,7 +469,7 @@ That is also why it is not freed, which is the next section's problem.
 |---|---|---|
 | R1 | **The arena.** `lib/rt.tk:42` is a fixed **4 MiB** heap. A copy is an allocation nobody reclaims, so a loop that passes a struct by value exhausts it: a 16-byte struct copied 262 144 times is `arena exhausted`. Today the same loop allocates nothing | **Land V7.** Until it lands, `memory.md`'s "What is not reclaimed" gains the struct **copy** beside the struct allocation, in the same declared-debt table, and V2's own fixture asserts `rt_peak()` so the number is visible rather than discovered in the field. V7 is tractable: a copy the pass created escapes its scope only through `return` — every other exit (a store, an argument, a capture) is itself a landing that copies again, and `ref` hands out an address that dies with the call |
 | R2 | **D56 says the opposite.** D56 (2026-09-14) recorded *"C# copies a struct on assignment; teko does not"* as the deliberate semantics of a struct global, and `docs/reference/types.md:484-486` says the same in the reference's own voice. `not-yet.md`'s row (written at `f81e0217`, newer) calls it "not judged" and owes a design | **The newest ruling wins, and C# decides the form.** V2's decision entry supersedes D56 **on the semantics only** and cites it: the *representation* D5 gave — a pointer, eight bytes — is untouched, and every road built on it (D53, D56, Q1a, D104) keeps working. `types.md`'s paragraph is rewritten by V2, not deleted |
-| R3 | **A `ref` argument must not be copied.** If the pass mistakes `f(ref a)` for a by-value landing, `ref` silently stops working — a new silently-wrong result in exchange for the one removed | Two independent guards, and V4's fixture proves both: `tk_ref_pass` has already turned the argument into an address by the time `tk_copy_pass` runs, so its node type is no longer a struct row; and the parameter itself is checked with `tk_rp_kind` (`teko_ref.tk:140`). V4's gate fails if either guard alone is removed |
+| R3 | **A `ref` argument must not be copied.** If the pass mistakes `f(ref a)` for a by-value landing, `ref` silently stops working — a new silently-wrong result in exchange for the one removed | Three guards as built (D106), not the two this row predicted, and the partition is **not** the one it predicted either. Measured by mutation: removing `tk_rp_kind` alone from the direct road fails the gate (`struct_copy_param` exits 132, the `ref` parameter forwarded on); removing `tk_rfarg_kind` alone from the indirect door fails it (exit 172, the delegate/vtable/itab `ref`); removing the N_ADDR shape check alone **does not** fail it, because `tk_rp_kind` already carries every measured shape, and removing the pair fails at the plainest `ref` of all (exit 122). The N_ADDR check is kept as the one guard that does not depend on `decl_find` answering with the call's own declaration, and the gate cannot prove it |
 | R4 | **`--dump-ast` moves.** The law is that the dump is identical when a change does not change accepted code. V2 changes what accepted code *answers* | Say it in the decision entry rather than working around it. V1 and V6 are refusals and **must** leave the dump of accepted code byte-identical — that is their own gate. V2/V3/V4/V5 change it on purpose, and each names in its PR body exactly which fixtures' dumps moved and why |
 | R5 | **`TK_MAXXT`** (4 096 expressions whose type is known, `teko_struct.tk:56`) gains rows from every generated copy body — a few per field | Measured today's worst fixture at 239 of 4 096. A unit with all 256 fields (`TK_MAXFIELD`) adds roughly 512. No change recommended; V2's gate re-runs `teko limits` and the number is watched |
 | R6 | **`name_copy` is a reserved symbol.** A user function called `point_copy` now collides with the compiler's, exactly as `point_new` already does (D48) | Same rule, same message road as `point_new`. V2 adds a refuse fixture only if `point_new`'s own collision has one; if it does not, neither does this, and the row goes in `not-yet.md` beside D48's |

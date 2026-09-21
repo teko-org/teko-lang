@@ -493,22 +493,37 @@ it. A counted FIELD of a struct is another matter: it is gated by the field's ow
 a copy of the struct is a new owner of it and takes a reference of its own.
 
 A struct is a **value type**, as it is in C#: a struct value is **copied** where it lands in
-a storage location. `S b = a;` gives `b` a fresh allocation carrying every field `a` held,
-and a write through `b` stops there (D105). The copy is memberwise and **deep** through a
-struct-typed field, it keeps the reference count of every counted field, and `new S` is the
-one expression it does not copy — the block `new` hands out is named by nothing else yet.
+a storage location, at **every one of the six landings** (D105, D106).
+
+| landing | written |
+|---|---|
+| a local declaration | `S b = a;` |
+| an assignment to an existing name — local, parameter or global | `b = a;` |
+| a field store, on a struct or on a class, instance or `static` | `x.f = a;` |
+| an element store, a `params S[]` element included | `arr[i] = a;` |
+| a **by-value argument**, at a free function, a method, a `virtual` method, an interface method or a delegate | `f(a)` |
+| the same six with a `?` on the slot | `S? b = a;` |
+
+Each gives the destination a fresh allocation carrying every field the source held, and a
+write through it stops there. The copy is memberwise and **deep** through a struct-typed
+field, it keeps the reference count of every counted field, and `new S` is the one
+expression it does not copy — the block `new` hands out is named by nothing else yet, so
+`f(new S)` and `x.f = new S;` allocate exactly once.
+
 `ref` and `out` are how you keep the alias: `void bump(ref S s)` writes the caller's own
-struct ([parameters.md](parameters.md)).
+struct ([parameters.md](parameters.md)), and that is the one spelling the copy leaves alone.
 
 The representation is unchanged by that (D5): a struct value is still a **pointer**, eight
 bytes wide, and the copy is a fresh `rt_alloc` plus a memberwise copy written at the site,
 not a wider slot. Nothing reclaims it — a struct allocation is declared debt
 ([memory.md](memory.md)) — so a struct copied in a long loop spends arena.
 
-Only the **local declaration** copies today. `b = a;` on an existing slot, a field store
-(`x.f = a;`), an element store (`arr[i] = a;`), a by-value argument and `S? b = a;` are the
-five landings still to come, and each one still ALIASES: they are V3 to V5 of
-[struct-value.md](../specs/struct-value.md) § 6.
+What is **not** built is the reclaim. A copy is an allocation nobody frees, so a loop that
+copies a 16-byte struct exhausts the 4 MiB arena on its 262 143rd turn
+([memory.md](memory.md)); V7 of [struct-value.md](../specs/struct-value.md) § 6 is the crumb
+that closes it. Two neighbouring shapes stay as they are: a `foreach` variable of struct
+type is still bound to the array's own element rather than to a copy, and a struct captured
+by value in a lambda is still refused with a generic conversion message (V6).
 
 A struct **global** is the same eight-byte slot a class global is: it converts by the same
 assignment corridor a local's own store takes (D53), and `Point q = gp;` copies it exactly
@@ -605,7 +620,9 @@ is a parameter, not a slot; assign to a field instead. The compound spellings of
 write (`this += e`, `this++`) earn the same sentence. `this == o` is a comparison of two
 class references and gets the rule every class reference gets, ``teko: C declares no
 operator `==` ``. And `this` inside a `struct` body is not a value
-([not-yet.md](not-yet.md)), because a `struct` has no copy at assignment yet.
+([not-yet.md](not-yet.md)): it is the receiver parameter, not a slot, and the rule is about
+what `this` IS rather than about the copy — D105 and D106 taught the copy at all six
+landings and neither reopens it.
 
 ---
 

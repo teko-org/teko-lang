@@ -12237,3 +12237,135 @@ refusal: `this` is the receiver PARAMETER and a by-value struct parameter is its
 alias until V4. V3 (the store landings), V4 (the call landing), V5 (`S?` and the counted
 field proved end to end), V6 (the `foreach` and capture refusals) and V7 (the reclaim of
 copies) are the remaining crumbs, ordered in § 6 of the spec page.
+
+---
+
+### D106 · A `struct` is copied at all SIX landings: the store, the call and the `?` —
+V3, V4 and V5 of the value-type design (2026-09-21)
+
+**What D105 left.** D105 made a struct a value type and built exactly one landing, the local
+declaration `S b = <e>;`. Measured at `9ab68ba5`, one probe over the seven remaining shapes
+answered `127` — every bit set, every shape aliasing: `b = a;` on an existing name, `t.s = a;`
+on a struct field, `c.s = a;` on a CLASS field, `arr[0] = a;` on a `S[]` element, a
+`params S[]` element, a **by-value argument** and `S? b = a;`. Each read 9 where C# reads 1,
+with no `ref` written anywhere. This entry lands V3, V4 and V5 of
+[`docs/specs/struct-value.md`](docs/specs/struct-value.md) § 6 together, because they are one
+walk over one table and splitting them would have meant three rewrites of the same function.
+
+**What copies now.** All six landings of § 3.1, plus every road each of them has:
+
+| landing | roads |
+|---|---|
+| L1 `S b = <e>;` | D105's, unchanged |
+| L2 `b = <e>;` | a local, a parameter, a global |
+| L3 `x.f = <e>;` | a field of a struct, of a class, `this.f`, a `static` field, an auto-property's backing, an object initializer |
+| L4 `a[i] = <e>;` | a `S[]` element, a global array's, an inline array field's, a `params S[]` element |
+| L5 `f(<e>)` | a free function, a method, a `static` method, a **`virtual`** method, an **interface** method, a **delegate** |
+| L6 `S? <slot> = <e>;` | all five above with a `?` on the slot |
+
+**Three arms, not six, and why.** The design predicted one arm per landing. What it took is
+three:
+
+- **L2 and the direct road of L5** are walked over the tree with the scope live
+  (`tk_ty_pass_walk`, the oracle's own walk), because an `N_ASSIGN` names a slot only the
+  scope can type and a call that names its callee has `decl_find` to answer for it.
+- **L3, L4 and the three INDIRECT roads of L5** name no declaration pass 16 could look up.
+  Both are recorded where the slot's declared type is the only thing in reach: `tk_os_mark`
+  (`teko_struct.tk`), the ONE mark every one of the nine store sites passes, and
+  `tk_vca_park` (`teko_typeof.tk`), the ONE door the vtable, the itab and the delegate roads
+  all pass. The node goes in a two-column table and the ROW is resolved at pass 16 — which
+  is what makes a FORWARD type work (`tk_struct_by_ty` falls back to `tk_fwd_row_by_ty`,
+  and a struct used before its declaration is a real row only later) and what lets
+  `tk_params_pass` build its element stores at pass 13 and still be caught.
+- **L6 is no arm at all.** Q1a makes a nullable over a REFERENCE the reference itself, so an
+  `S?` slot holds exactly what an `S` slot holds. Peeling the row with `tk_row_through_nl`
+  in the one place that derives it (`tk_copy_row`) gives the `?` spelling of all five other
+  landings for free, and a `null` lands no struct and is stored as itself.
+
+**The rewrite is IN PLACE.** `tk_nd_moved` + `tk_node_replace`, the shape D48 wrote for a
+deferred primitive argument: the node keeps its identity and BECOMES the copy while a fresh
+node takes over everything it was. That is what makes one door serve six landings — an
+argument spliced into a call's own list, a value spliced into a store's and an initializer
+hanging off an N_VAR none of them hand the pass a handle to relink with, and
+`tk_node_replace` keeps the `nd_next` that holds each list together.
+
+**The freshness exception, re-attacked and widened by one.** An `N_CALL` to `tk_ctor_name`
+is still the block `new S` just handed out and is not copied. D106 adds the second
+provably-fresh expression: an `N_CALL` to `tk_copy_name`, a copy this pass already wrote,
+which is what stops a value landing on two roads at once from being copied twice. Both names
+are the D48 family the struct's own declaration reserves — measured on this head, a free
+function called `s_new` OR `s_copy` is refused `teko: the name is the compiler's own`, so
+neither can be faked. Re-attacked at the NEW landings rather than assumed to carry over: a
+namespaced `A.S` at the field store and at the call, two structs of one name in two
+namespaces, a `static` method's return, a generic instance's field, an `extern`, and `new S`
+handed straight to a parameter — no road where a node looks fresh and is not
+(`probe/p_fresh.tk`, exit 42).
+
+**`ref`/`out` keeps the alias, and the design's own R3 is corrected.** The spec predicted two
+independent guards and said the gate would fail if either were removed alone. As built there
+are three, and the partition is not the predicted one. Measured by mutation, each removed
+alone and the whole suite re-run:
+
+| mutation | result |
+|---|---|
+| `tk_rp_kind` removed from the direct road | `struct_copy_param` **exits 132** — `refchain`, a `ref` parameter forwarded on, where the argument is a plain NAME because the slot already holds an address |
+| `tk_rfarg_kind` removed from the indirect door | `struct_copy_param` **exits 172** — `indirectref`, the delegate, vtable and itab roads with a `ref S` parameter |
+| the N_ADDR shape check removed from the direct road | **green.** `tk_rp_kind` already carries every measured shape; the check is kept as the one guard that does not depend on `decl_find` answering with the call's own declaration, and the gate cannot prove it |
+| both direct guards removed | `struct_copy_param` **exits 122** and `surface_globals_struct` **43** — the plainest `ref` and `out` of all |
+
+**The rc line, proved per landing.** A copy is a new owner of every counted field, and
+without the `rc_inc` two struct blocks name one `Cell` with a count of 1 and the first
+release frees it under the second. `tests/struct_copy_counted.tk` asserts exact `rt_live()`
+numbers at L2, at a global slot, at L3 on a struct and on a class, at L4, at L5 and two
+levels down. Mutated: forcing `tk_is_counted` to 0 inside the generated copy exits **62**
+there (and 72 in D105's own fixture, the figure that entry recorded); killing
+`rt_retain_array` exits **123** there (and 106, likewise unchanged). Every landing routes
+through the same generated `name_copy`, so one mutation covers them all.
+
+**Every landing is load-bearing, by its own mutation.** Removing the L3/L4 record exits 62,
+81 and 82 across three fixtures; removing L2 exits 102, 62, 72 and 23; removing the direct
+road of L5 exits 124, 61, 112, 92, 6 and 41; reverting the nullable peel exits 63; removing
+the freshness exception exits 61, 131, 142 and 121. No arm of this crumb is dead code.
+
+**Two landed fixtures pinned the alias on purpose and now read C#'s answer.**
+`tests/ref_field_param.tk` row 3 said in its own header that a struct parameter carries the
+caller's buffer and called it "the gap reported, not widened here" (D104); it now asserts the
+caller reads 41 where the callee reads 42. `tests/surface_globals_struct.tk` rows 2 and 4 —
+`aliascheck` and `paramscheck` — were D56's recorded alias and now assert the copy.
+
+**`--dump-ast` moves on purpose, and only where it must.** 148 accepted fixtures, **143
+non-empty dumps on the base and 147 on this head** (the four new fixtures). **Nine** moved,
+every one of them a `<name>_copy` CALL inserted at a landing: `ref_field_param`,
+`struct_copy_local`, `surface_datetime_kind`, `surface_globals_struct`,
+`surface_nullable_ops`, `surface_nullable_ref`, `surface_overload_free`,
+`surface_typeof_expr`, `types_struct`. **All nine carry a REMOVED line**, and in every case
+it is the same line re-indented one level under the inserted CALL — the smallest of them,
+`types_struct`, is one `IDENT type=i64 name=p` becoming
+`CALL type=i64 name=point_copy` over that same IDENT. The other 138 are byte-identical.
+
+**The arena debt is worse in shape, not in number.** Re-measured at this head by bisection: a
+loop copying a 16-byte struct runs **262 142 turns and exits 70, `teko: arena exhausted`, on
+the 262 143rd** — the same figure D105 recorded, because every landing costs exactly one
+16-byte block per turn. L1, L5 and L6 exhaust at turn 262 143; L2, L3 and L4 at 262 141, the
+two-block difference being each probe's own preamble and not the landing. A struct with one
+struct-typed FIELD costs two blocks per copy and exhausts at turn **131 070**. What changed
+is that six more shapes now spend that budget where one did: a `params` call, a field store
+in a loop and a by-value argument were all free before this entry.
+`docs/reference/memory.md`'s declared-debt row carries the numbers.
+
+**One new refusal**, a capacity one: `teko: too many struct values landing in a slot`, 4096
+rows, the busiest fixture in this tree at **11** (`tests/struct_copy_store.tk`, measured by
+bisecting `TK_MAXCP`). Documented in `docs/reference/diagnostics.md` beside its siblings.
+
+**`mc limits` is unmoved where it counts.** `passes` **16 of 32**, `syntax` 20/40, `types`
+18/36, `alias` 25/50, `on_stmt` 4/8 — every one of them identical to the base, because this
+crumb registers no pass, no word and no type of its own. `heap` 471 936 of 33 554 432,
+verdict ok, which is the base's own figure.
+
+**What stays open.** V6 — a `foreach` variable of struct type is still bound to the array's
+own element, so `foreach (S s in a) { s.n = 9; }` still writes the array where C# refuses it
+(CS1654), and `use (s)` capturing a struct by value is still refused with the generic
+`teko: a value of type S does not convert to i64` rather than a message naming the `&` road.
+V7 — nothing reclaims a copy, which is the arena row above. Neither is reopened here, and
+§ 7 of the spec page still refuses a generated memberwise `==` and still leaves `new S[n]`
+handing out `n` null rows.

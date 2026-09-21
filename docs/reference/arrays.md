@@ -27,6 +27,13 @@ A **literal** index outside `[0, N)` is a compile-time error,
 not guarded. Width and sign follow the element type: `u8`/`u16`/`u32` read back
 zero-extended, `i32` sign-extended.
 
+An element of **`struct`** type is a value type like any other slot: `a[i] = s;` gives the
+element a fresh block carrying every field `s` held, and a write through either stops there
+(D106, [types.md](types.md#struct)). A `params S[]` element takes the same road, the pass
+that builds the array building an element store like the source's own. `new S[n]` still
+hands out `n` **null** rows rather than `n` zeroed structs, so assign the row before you
+read it ([not-yet.md](not-yet.md)).
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"

@@ -27,17 +27,23 @@ class Cell { public i64 v; }
 struct H { public Cell c; }
 
 delegate i64 Op(S s);
+delegate void RefOp(ref S s);
 
 class Box {
     public i64 take(S s) { s.n = 99; return s.n; }
     public virtual i64 vtake(S s) { s.n = 88; return s.n; }
+    public virtual void vpoke(ref S s) { s.n = 10; }
     public static i64 stake(S s) { s.n = 77; return s.n; }
 }
 class Derived : Box {
     public override i64 vtake(S s) { s.n = 66; return s.n; }
+    public override void vpoke(ref S s) { s.n = 11; }
 }
-interface I { i64 itake(S s); }
-class J : I { public i64 itake(S s) { s.n = 55; return s.n; } }
+interface I { i64 itake(S s); void ipoke(ref S s); }
+class J : I {
+    public i64 itake(S s) { s.n = 55; return s.n; }
+    public void ipoke(ref S s) { s.n = 12; }
+}
 
 // p01: the callee writes its own struct
 void poke(S s) { s.n = 99; }
@@ -109,6 +115,29 @@ i64 paramscall() {
     S a = new S;  a.n = 1;
     if (countparams(a) != 1) return 1;
     if (a.n != 1) return 2;
+    return 0;
+}
+
+// ...and the same three roads with a `ref` parameter, which must keep the alias
+// like every other `ref`. An indirect call names no declaration, so its
+// argument is recorded at the door it passes (`tk_vca_park`, teko_typeof.tk),
+// whose `pt` is the parameter's own type -- the POINTEE, a struct row, for a
+// `ref S` -- and only `tk_rfarg_kind` there says the argument is an address.
+i64 indirectref() {
+    S a = new S;  a.n = 1;
+    RefOp f = byref;
+    Box b = new Derived();
+    I i = new J();
+    i64 l0 = rt_live();                          // after every receiver is built
+    f(ref a);
+    if (a.n != 33) return 1;                     // the delegate road
+    if (rt_live() != l0) return 2;               // ...and nothing was allocated
+    b.vpoke(ref a);
+    if (a.n != 11) return 3;                     // the vtable road
+    if (rt_live() != l0) return 4;
+    i.ipoke(ref a);
+    if (a.n != 12) return 5;                     // the itab road
+    if (rt_live() != l0) return 6;
     return 0;
 }
 
@@ -186,26 +215,28 @@ i64 peakcheck() {
 
 i64 main() {
     i64 bad = freecall();
-    if (bad != 0) return 10 + bad;
-    bad = methodcall();
-    if (bad != 0) return 20 + bad;
-    bad = virtualcall();
-    if (bad != 0) return 30 + bad;
-    bad = ifacecall();
-    if (bad != 0) return 40 + bad;
-    bad = delegcall();
-    if (bad != 0) return 50 + bad;
-    bad = paramscall();
     if (bad != 0) return 60 + bad;
-    bad = refguard();
+    bad = methodcall();
     if (bad != 0) return 70 + bad;
-    bad = refchain();
+    bad = virtualcall();
     if (bad != 0) return 80 + bad;
-    bad = livecheck();
+    bad = ifacecall();
     if (bad != 0) return 90 + bad;
-    bad = countedcall();
+    bad = delegcall();
     if (bad != 0) return 100 + bad;
-    bad = peakcheck();
+    bad = paramscall();
     if (bad != 0) return 110 + bad;
+    bad = refguard();
+    if (bad != 0) return 120 + bad;
+    bad = refchain();
+    if (bad != 0) return 130 + bad;
+    bad = indirectref();
+    if (bad != 0) return 170 + bad;
+    bad = livecheck();
+    if (bad != 0) return 140 + bad;
+    bad = countedcall();
+    if (bad != 0) return 150 + bad;
+    bad = peakcheck();
+    if (bad != 0) return 160 + bad;
     return 42;
 }
