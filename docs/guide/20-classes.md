@@ -18,6 +18,44 @@ name is a member of `this` whenever no local or parameter carries that name. `th
 says the same out loud, and `base.m()` calls the base's implementation directly, without
 the vtable.
 
+**`this` is a value**, of the class or the interface whose body it stands in, so
+`return this;` builds a fluent chain the way C# does:
+
+```teko
+// expect-exit: 42
+#include "rt.tk"
+
+class Cell {
+    public i64 n;
+    public Cell() { n = 0; }
+    public Cell Bump(i64 x) { n = n + x; return this; }   // hand the receiver back
+}
+
+i64 main() {
+    Cell c = new Cell();
+    c.Bump(1).Bump(2).Bump(3);        // discarded: released where it was produced
+    Cell k = c.Bump(36);              // kept: the same object, one more reference
+    return k.n;
+}
+```
+
+Three rules are worth knowing before writing one:
+
+- **The count takes care of itself.** `this` is a borrowed parameter, so the callee raises
+  the count for the caller and the caller releases it — a discarded result at the end of
+  a chain, a kept one at the end of its block. Nothing to write by hand
+  ([memory.md](../reference/memory.md)).
+- **The return type may narrow.** `return this;` also fits a slot typed as the base class
+  or as an interface the class implements, and an `override` may narrow the return to its
+  own type (C# 9's covariant returns), so the chain continues in the derived type.
+- **A link whose method is `virtual` needs a name or a field on the left.** `c.Me()` is
+  fine, `c.Me().Me()` is refused `teko: a virtual call needs a name or a field on the
+  left`. Keep the chain's links non-virtual, or park the result in a local.
+
+A `struct` has no `this` value of its own: `return this;` there is refused ``teko: `this`
+is not a value in a struct``, because a `struct` does not copy at assignment yet and the
+return would alias ([not-yet.md](../reference/not-yet.md)).
+
 One base class, first in the `:` list, then any number of interfaces. `virtual` takes a
 vtable slot and `override` fills it — hiding an inherited virtual without saying
 `override` is refused. An `abstract` class cannot be instantiated and its abstract members

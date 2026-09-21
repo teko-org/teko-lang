@@ -1,10 +1,10 @@
 # `this` as a value — `return this;`
 
-**Crumbs 1 and 3 are BUILT** (D102): `this` is a value of the enclosing class or
-interface, and `this = e;` is refused. Crumb 2 (the fluent fixture and its `rt_live()`
-assertions, folded into `tests/surface_this_value.tk` for the eleven positions) and crumb 4
-(a `struct`'s own message) are still open. What follows is the design as it was measured
-before the build; § 4.3's table is the architect's measurement, and § 7 marks what landed.
+**All four crumbs are BUILT**: 1 and 3 by D102 (`this` is a value of the enclosing class
+or interface, and `this = e;` is refused), 2 and 4 by D103 (the fluent fixture with its
+exact `rt_live()` assertions, and the `struct`'s own message). What follows is the design
+as it was measured before the build; § 4.3's table is the architect's measurement, and
+§ 7 marks what landed.
 
 Everything below was measured on `mc` 1.0.1, macos/aarch64, against `origin/main`
 `85abd466`, in a detached worktree. Where a claim of [D87](../../DECISION_LOG.md) is
@@ -53,7 +53,7 @@ at the line of the construct that consumes the value:
 | ternary arm, `b ? this : o` | `public C M(C o, bool b) { return b ? this : o; }` | `teko: the two arms of ?: have different types` |
 | lambda body, `() => this` | `F f = () => this;` | `teko: this is not captured; add it to use (...)` |
 | `use (this)` on that lambda | `() use (this) => this` | `teko: expected a captured name` |
-| `struct` method, `return this;` | `struct P { public i64 x; public P Self() { return this; } }` | `teko: a value of type uptr does not convert to P` |
+| `struct` method, `return this;` | `struct P { public i64 x; public P Self() { return this; } }` | measured before the build: `teko: a value of type uptr does not convert to P`. **Since D103** (crumb 4) it is ``teko: `this` is not a value in a struct`` |
 | static member | `public static i64 S() { C d = this; ... }` | ``teko: `this` is not there in a static member`` |
 | file scope | `i64 main() { uptr q = this; ... }` | ``teko: `this` is only valid inside the body of a type`` |
 
@@ -62,7 +62,7 @@ D87, and they are the part of the ground truth the log had missed:
 
 | accepted today | what it compiles to | verdict |
 |---|---|---|
-| `public uptr M() { return this; }` — a method DECLARED `uptr` | returns the receiver address as a raw `uptr` | accepted; an escape hatch nobody should write, and it stays legal |
+| `public uptr M() { return this; }` — a method DECLARED `uptr` | returns the receiver address as a raw `uptr` | accepted in a CLASS, and it stays legal there. **Since D103** it is refused in a `struct`, where the same guard answers before the return type is read -- measured working on the base, returning a usable address |
 | `this == o` in a method of `C`, `o` of type `C` | a raw pointer compare | **wrong**: `C a; C b; a == b;` is refused ``teko: C declares no operator `==` `` everywhere else. `this` typing `uptr` is the only reason it slips past `tk_ops_binary` |
 | `this = o;` as a statement | `ASSIGN name=this` over the receiver parameter, with **no** reference counting at all (`tk_rc_assign` sees `TY_UPTR`, which is not counted, and leaves) | **wrong**: C# refuses `this = e;` on a class outright |
 
@@ -286,10 +286,13 @@ i64 main() {
 // no-run
 #include "rt.tk"
 struct P { public i64 x; public P Self() { return this; } }
-//   NOT BUILT YET (crumb 4). Today this answers the generic sentence,
-//   `teko: a value of type uptr does not convert to P`; the message below is
-//   what crumb 4 will say instead.
 //                                        teko: `this` is not a value in a struct
+//   BUILT (D103), raised at the `this` itself in `tk_this()` -- the `else` of
+//   the kind test crumb 1 added. It used to answer the generic
+//   `teko: a value of type uptr does not convert to P`, at the construct that
+//   CONSUMED the value and naming the receiver parameter's declared type. The
+//   field roads are untouched: `this.x`, a bare `x` and `this.x = v` inside a
+//   struct method all still work (measured before and after).
 class C {
     public i64 v;
     public C() { v = 0; }
@@ -327,7 +330,7 @@ and after, and has no fixture of its own here.
 | module | pass | what it grows |
 |---|---|---|
 | `teko_this.tk` | parse (`tk_this`, `teko_this.tk:112`, registered at `teko.tk:435`) | the four-line registration of § 4.2 and the header paragraph that says why the node and not the scope. Crumb 3 adds the `this = e;` refusal; crumb 4 adds the `struct` one. **`tk_addr_of_member` (`teko_this.tk:516`, D97) is untouched** — `tk_ty_of` tests `tk_rfarg_kind` at `teko_typeof.tk:354`, *before* the table, so `&this` / `ref this` never read the new row |
-| `teko_struct.tk` | — | nothing. `tk_xt_add`/`tk_xt_put` (`:1111`/`:1101`), `tk_xt_ty` (`:1070`), `tk_row_fits` (`:1244`) and `tk_reject_compat` (`:1279`) are used as they are |
+| `teko_struct.tk` | — | nothing for crumb 1: `tk_xt_add`/`tk_xt_put` (`:1111`/`:1101`), `tk_xt_ty` (`:1070`), `tk_row_fits` (`:1244`) and `tk_reject_compat` (`:1279`) are used as they are. **Crumb 4 (D103) adds one line**, `tk_is_struct`, beside the six kind predicates that were already there — it asks for the row first, because `TK_KSTRUCT` is 0 and -1 would otherwise read as a struct |
 | `teko_typeof.tk` | 6 (`teko.tk:496`) | nothing. `tk_ty_of` (`:352`) already reads the table ahead of the scope; `tk_check_compat` (`:700`) already asks `tk_row_fits`. `tk_ty_scope_params` (`:264`) is **not** touched — that is the whole point |
 | `teko_rc.tk` | 14 (`teko.tk:568`) | nothing. `tk_rc_return`'s `needinc` (`:261`) and `tk_rc_exprstmt` (`:316`) already do the work of § 3 |
 | `teko_ops.tk` | 11 (`teko.tk:535`) | nothing, and that is the load-bearing claim: the compiler's own `this + OFF` nodes are unregistered and keep answering `uptr` at `teko_ops.tk:840` |
@@ -348,9 +351,9 @@ re-measured green in the 140/183/0 and the fixed point of § 4.3.
 | # | crumb | size | depends on | gate | docs owed |
 |---|---|---|---|---|---|
 | **1** | **BUILT (D102). `this` is a value: the node registration.** The four lines of § 4.2 (with the `K_DOT` and kind guards), the header paragraph, and the fixtures. Every position in § 1.1's first table starts compiling | **S** — one module, one function, three fixtures | — | `surface_this_value.tk` (42), `refuse/this_bad_type.tk`, `refuse/this_eq_no_op.tk`; **`--dump-ast` identical over all 140 base fixtures**; fixed point closes; `mc limits` six rows unmoved on both legs | `docs/reference/types.md` § `class` gains the paragraph; `docs/reference/not-yet.md` **loses** the `return this;` row and gains the `struct` one; `docs/reference/diagnostics.md` gains nothing new (every message already exists) and gains the note on `this == o` |
-| **2** | **Fluent chaining, proved end to end, and the reclaim.** No compiler change: the fixture that runs a three-link chain with a discarded result, a kept one, an interface default body, a base-typed return and a covariant override, all under `rt_live()` | **S** — one fixture, no module | crumb 1 | `surface_this_fluent.tk` (42) — the § 5 legal program with `rt_live()` assertions at every step | `docs/guide/` gains the chaining recipe; `docs/reference/memory.md` gains the sentence on the self-referencing constructor (a cycle a count never collects) |
+| **2** | **BUILT (D103). Fluent chaining, proved end to end, and the reclaim.** No compiler change: the fixture that runs a three-link chain with a discarded result, a kept one, an interface default body, a base-typed return and a covariant override, all under `rt_live()` | **S** — one fixture, no module | crumb 1 | `surface_this_fluent.tk` (42) — the § 5 legal program with `rt_live()` assertions at every step | `docs/guide/20-classes.md` gains the chaining recipe. `docs/reference/memory.md` owes nothing: D102 already landed the self-referencing-constructor sentence in its "What is not reclaimed" table |
 | **3** | **BUILT (D102). `this = e;` is refused.** A pre-existing silent wrong answer (§ 1.1). One guard, in `tk_this()`'s own file, at the point the parser sees `this` followed by `=` | **S** — one module, one refuse fixture | none — **runs in parallel with any unrelated crumb**, and with crumbs 1/2 if the implementer keeps the two edits apart in `tk_this()` | `refuse/this_assign.tk`, message ``teko: `this` is read-only``; `--dump-ast` identical over all 140 (nothing accepted today changes except the refused form) | `docs/reference/diagnostics.md` gains the message; `docs/reference/not-yet.md` needs no row |
-| **4** | **`this` in a `struct` gets its own message.** Replace the inherited `teko: a value of type uptr does not convert to P` with ``teko: `this` is not a value in a struct``, raised where the kind guard of crumb 1 declines | **S** — one module, one refuse fixture | crumb 1 (the kind guard is the hook) | `refuse/this_struct_value.tk`; `--dump-ast` identical | `docs/reference/not-yet.md` gains the `struct` row; `docs/reference/diagnostics.md` gains the message |
+| **4** | **BUILT (D103). `this` in a `struct` gets its own message.** Replace the inherited `teko: a value of type uptr does not convert to P` with ``teko: `this` is not a value in a struct``, raised where the kind guard of crumb 1 declines | **S** — one module, one refuse fixture | crumb 1 (the kind guard is the hook) | `refuse/this_struct_value.tk`; `--dump-ast` identical | `docs/reference/not-yet.md` gains the `struct` row; `docs/reference/diagnostics.md` gains the message |
 
 **Order and parallelism.** 1 → 2 and 1 → 4 are hard dependencies. **Crumb 3 is independent
 of all three** and of everything else in flight; it is the one that can be handed to an
@@ -378,14 +381,18 @@ sh scripts/check-docs.sh
 | `tests/refuse/this_assign.tk` | `` // expect-refuse: teko: `this` is read-only `` |
 | `tests/refuse/this_compound_assign.tk` | the same sentence on `this++`. Not planned by this page: `this += e` and `this++` were measured compiling as silently as `this = e`, so D102's guard covers the whole write set |
 
-**Planned, not built** — crumb 2's separate fluent file was folded into
-`surface_this_value.tk` above, and no fixture in the tree carries a covariant `override` of
-`this` yet:
+**Built by D103** (crumbs 2 and 4):
 
 | fixture | asserts | crumb |
 |---|---|---|
-| `tests/surface_this_fluent.tk` | a covariant `override` returning `this`, beyond what `surface_this_value.tk` already runs | 2 |
+| `tests/surface_this_fluent.tk` | `// expect-exit: 42` — a three-frame chain DISCARDED, one KEPT, one PASSED ON as an argument to a callee that allocates while holding it, one built a frame DOWN over a receiver that is not the callee's own `this`, one RETURNED from an interface default body, and a covariant `override Cell Me()` reached through a BASE-typed slot. Every `rt_live()` read is EXACT, over cycle-free classes, and both assertions were proved to bite by mutating the compiler: killing `tk_rc_exprstmt`'s sweep gives exit 29, killing `tk_rc_return`'s `needinc` gives exit 70 (`teko: reference count below zero`) | 2 |
 | `tests/refuse/this_struct_value.tk` | `` // expect-refuse: teko: `this` is not a value in a struct `` | 4 |
+
+One boundary the fixture cannot cross, and it is not this design's: a link whose method is
+`virtual` needs a name or a field on the left (`teko: a virtual call needs a name or a
+field on the left`, `teko_expr.tk`), so `b.Me().Me()` is refused with or without `this`.
+The covariant override is reached through a name and the chain continues over non-virtual
+links.
 
 ## 9. Risks and law tensions
 

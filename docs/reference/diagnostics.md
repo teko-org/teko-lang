@@ -161,6 +161,15 @@ with that line in its stderr (D52).
   parameter, not a slot: it names the object the call arrived on, and nothing rebinds it.
   Assign to a field instead. All five forms compiled silently before D102, with no
   reference counting at all, because the receiver parameter is declared `uptr`.
+- ``"teko: `this` is not a value in a struct"`` — `return this;`, `f(this)`, `S x = this;`
+  or any other bare `this` read as a value inside a `struct` body. A struct carries no
+  object header and no reference count, so its `this` cannot be the value a class's or an
+  interface's is, and the language does not copy a struct at assignment yet (`P b = a;
+  b.x = 9;` changes `a.x`), so handing the receiver out would alias where C# copies. The
+  field roads are untouched: `this.x`, a bare `x` and `this.x = v` inside the same method
+  all keep working. Before D103 this answered the generic
+  `teko: a value of type uptr does not convert to P`, which named the receiver parameter's
+  declared type rather than saying why.
 - ``"teko: `base` is not there in a static member"`` — the same, for `base`.
 - ``"teko: `base` in a type with no base class"`` — the type has no base to reach.
 - ``"teko: `base` reaches a method of the base class"`` — `base` was followed by something
