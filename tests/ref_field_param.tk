@@ -27,6 +27,19 @@
 //      slot carries an address, not the object, so `h + OFF` would not be the
 //      field. Refused, not silently wrong (`tests/refuse/` has no room for a
 //      shape that only a comment names, so this one is stated, not compiled).
+//   6. a METHOD's own parameter, a CONSTRUCTOR's and a STATIC method's --
+//      three lists `tk_params` (teko_class.tk) reads rather than
+//      `tk_default_param`.
+//   7. a LAMBDA literal between the parameter list and the use. A lambda's
+//      parameter list is a declaration of its own, and the reset it triggers
+//      used to take the enclosing declaration's rows with it: `f81e0217`
+//      refuses this program, and an earlier draft of this decision ANSWERED
+//      41 instead of 42 when the lambda declared a same-named parameter of
+//      another class -- the lambda's offset added to the enclosing object.
+//      `tk_hp_push`/`tk_hp_pop` (teko_struct.tk) give the reset a floor.
+//   8. the same floor seen from the `T[]` side: `xs[0]` on a `T[]` PARAMETER
+//      after a lambda, refused ``teko: `[` needs an array: xs`` at
+//      `f81e0217`. One table, one floor, both roads.
 //
 // expect-exit: 0
 #include "../lib/rt.tk"
@@ -65,6 +78,32 @@ i64 viaBase(D d) {
     return d.n;
 }
 
+// 6: three lists `tk_params` reads
+class Own {
+    public i64 seed;
+    public Own(H h) { bump(ref h.n); seed = h.n; }
+    public i64 go(H h) { bump(ref h.n); return h.n; }
+    public static i64 sgo(H h) { bump(ref h.n); return h.n; }
+}
+
+// 7: a lambda between the list and the use, declaring a same-named parameter
+// of ANOTHER class -- `B.n` is at offset 0, `Wide.n` at 8
+class Wide { public i64 pad; public i64 n; public Wide() { pad = 1; n = 41; } }
+delegate i64 Take(B h);
+
+i64 afterLambda(Wide h) {
+    Take t = new Take((B h) => h.n);
+    bump(ref h.n);
+    if (t(new B()) != 41) return 0 - 1;
+    return h.n;
+}
+
+// 8: the `T[]` side of the same floor
+i64 afterLambdaArr(i64[] xs) {
+    Take t = new Take((B h) => h.n);
+    return xs[0];
+}
+
 i64 main() {
     // 1: the callee's write is the caller's too -- a class parameter is the
     // object's own pointer
@@ -91,6 +130,26 @@ i64 main() {
     if (viaBase(d) != 42) return 8;
     if (d.n != 42) return 9;
     if (d.extra != 9) return 10;
+
+    // 6
+    H e = new H();
+    Own o = new Own(e);
+    if (o.seed != 42) return 11;
+    if (e.n != 42) return 12;
+    H f = new H();
+    if (o.go(f) != 42) return 13;
+    H g = new H();
+    if (Own.sgo(g) != 42) return 14;
+
+    // 7: `h` after the lambda is the enclosing `Wide`, at ITS own offset
+    Wide w = new Wide();
+    if (afterLambda(w) != 42) return 15;
+    if (w.pad != 1) return 16;
+
+    // 8
+    i64[] xs = new i64[2];
+    xs[0] = 42;
+    if (afterLambdaArr(xs) != 42) return 17;
 
     return 0;
 }

@@ -310,21 +310,40 @@ i64 tk_ref_addr(i64 line, uptr fl, i64 pty) {
     if (p_id() == tk_ref_dot) {
         p_next();
         uptr m = tk_member_name();                // D68
-        // D104: a LOCAL first (`tk_local_find` is the parse-time scope table,
-        // so the innermost declaration still open wins), then a PARAMETER --
-        // which is in no scope table at all, and whose declared type the
-        // parameter list recorded as it was read (`tk_hp_find_any`,
-        // teko_struct.tk). Without the second question a legal program was
-        // refused `teko: not an object of a known type: h` for every
-        // struct/class parameter, which is the sibling `tk_hp_find` already
-        // answers for a `T[]` parameter at `tk_dot` (teko_expr.tk). A
-        // `ref`/`out` parameter keeps the refusal: it has no row in that
-        // table, and its slot carries an address rather than the object, so
-        // `name + OFF` would not be the field.
-        i64 si = tk_local_find(name);
-        if (si < 0) {
-            i64 hty = tk_hp_find_any(name);
-            if (hty >= 0) si = tk_struct_by_ty(hty);
+        // D104: the INNERMOST binding wins, and it is asked in one place.
+        //
+        // `tk_slv_find` (teko_struct.tk) is the live-scoped table of EVERY
+        // local with its declared type -- an object one is in it as well as
+        // in `tk_local_find`'s, registered by the same `tk_on_stmt` -- so its
+        // answer IS the innermost local, whatever its type, and
+        // `tk_struct_by_ty` turns it into a row or into -1. Reading
+        // `tk_local_find` alone could not see a SCALAR local shadowing an
+        // object one: `H h = new H(); { i64 h = 0; bump(ref h.n); }` found
+        // the outer `H` and added the field offset to the inner `i64` slot,
+        // a SIGSEGV at `f81e0217` (Copilot on #770). `this` has a row in
+        // `tk_local_find`'s table and none in `tk_slv_find`'s
+        // (teko_class.tk's `tk_local_add(tk_this_name(), ci)`), so it keeps
+        // the fallback below -- and never reaches here anyway, `this` being
+        // no `T_IDENT` for the guard above.
+        //
+        // Only when NO local of that name is in scope does a PARAMETER
+        // answer (`tk_hp_find_any`) -- which is in no scope table at all, and
+        // whose declared type the parameter list recorded as it read it. That
+        // second question is what makes `ref h.n` / `out h.n` legal on a
+        // struct/class parameter, the sibling `tk_hp_find` already answers
+        // for a `T[]` parameter at `tk_dot` (teko_expr.tk). A `ref`/`out`
+        // parameter keeps the refusal: it has no row in that table, and its
+        // slot carries an address rather than the object, so `name + OFF`
+        // would not be the field.
+        i64 lty = tk_slv_find(name);
+        i64 si;
+        if (lty >= 0) si = tk_struct_by_ty(lty);
+        else {
+            si = tk_local_find(name);
+            if (si < 0) {
+                i64 hty = tk_hp_find_any(name);
+                if (hty >= 0) si = tk_struct_by_ty(hty);
+            }
         }
         if (si < 0) err_at2(fl, line, "teko: not an object of a known type", name);
         i64 fi = tk_field_find(si, m);
