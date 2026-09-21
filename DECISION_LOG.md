@@ -11771,8 +11771,9 @@ This half lands FIRST because the refusal the second half adds points at `ref`/`
 the road to use, and that road has to work for a parameter before a message can name it.
 `tests/ref_field_param.tk` proves `ref`, `out`, a struct parameter, a base class's field
 through a derived parameter, a method's own parameter, a constructor's, a static
-method's, `value` inside a `set` accessor, and a GENERIC class's method parameter reached
-through the replay -- every one of which `f81e0217` refused.
+method's, `value` inside a `set` accessor, a GENERIC class's method parameter reached
+through the replay, and the enclosing declaration's own parameter AFTER an instantiation
+mid-body -- every one of which `f81e0217` refused.
 
 **Two defects the Copilot review of #770 found in that half, both reproduced, both fixed
 at the root rather than on the path that reported them.**
@@ -11878,6 +11879,16 @@ were measured before they were fixed:
   of CLASS type is the same legal program `ref h.n` is anywhere else, and `f81e0217` refused
   it with the rest. Fixtures: `tests/refuse/param_row_accessor.tk`,
   `tests/refuse/param_row_accessor_arrow.tk`, and item 11 of `tests/ref_field_param.tk`.
+- ...and a GENERIC REPLAY is a parse inside a parse. An instantiation is reached MID-BODY
+  (`Holder<H> g = new Holder<H>();` inside `i64 f(H h) {…}`), and every generated method it
+  parses runs `tk_params`, whose `tk_hp_reset` cut the table back to its floor and
+  overwrote the ENCLOSING declaration's rows in place -- so `ref h.n` after the
+  instantiation lost `h`. `tk_gen_replay` (teko_generic.tk) already saves and restores
+  `tk_line`, `p_decl_name` and half a dozen tables around the replayed text; the parameter
+  window joins them through the very pair a lambda's nested list uses, `tk_hp_push` /
+  `tk_hp_pop`. Item 13 of `tests/ref_field_param.tk`, with the generated method's own
+  parameter spelled like the enclosing one and of another class, so the offset says which
+  row answered.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11958,7 +11969,7 @@ the very object `&h.n` now refuses, read through `ref` and `out` in the same pro
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178069, `ins` 246293 → 246709,
+only the compiler leg's size rows move: `nodes` 177785 → 178075, `ins` 246293 → 246713,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
