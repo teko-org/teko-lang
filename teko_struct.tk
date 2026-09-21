@@ -60,6 +60,11 @@
 // TK_MAXXT/TK_MAXFS at the same ceiling for the same reason -- one row per
 // counted store in a unit that never releases them.
 #define TK_MAXOS     4096             // stores into a slot of counted type
+// One row, one pair of i64 columns, and the same ceiling for the same shape of
+// program: one row per landing a SLOT built (teko_copy.tk's L3, L4 and the
+// indirect half of L5), live until pass 16. 4096 rows over two columns cost
+// 64 KB, against the largest fixture in this tree at 62.
+#define TK_MAXCP     4096             // landings recorded where the SLOT's type is at hand
 #define TK_MAXSLV    8192             // every local seen via on_stmt, any type (K4's `use`)
 
 // The two answers a registration gives, and they are DIFFERENT questions.
@@ -333,6 +338,10 @@ i64  tk_nxt = 0;
 
 i64  os_node[TK_MAXOS];               // a store into a slot of counted type
 i64  tk_nos = 0;
+
+i64  cp_node[TK_MAXCP];               // the VALUE node of a landing into a struct slot
+i64  cp_ty[TK_MAXCP];                 // the slot's own declared type
+i64  tk_ncp = 0;
 
 // position used on generated nodes and on declaration-level errors
 i64  tk_line = 0;
@@ -1121,8 +1130,38 @@ void tk_os_add(i64 n) {
 // records the store only when the slot really is a counted one
 i64 tk_os_mark(i64 n, i64 ty) {
     if (tk_is_counted(ty)) tk_os_add(n);
+    tk_copy_defer(ty, nd_next(nd_a(n)));         // ...and the copy a STRUCT slot lands (V3)
     return n;
 }
+
+// ---- the landings a SLOT builds (teko_copy.tk's L3, L4 and half of L5) ----
+// A struct value is copied where it LANDS, and two of the six landings are
+// built by a site that holds the slot's declared type and nothing else: a
+// field or element store (`tk_os_mark` above, the ONE mark every one of the
+// nine store sites passes) and the argument of an INDIRECT call, which names
+// no declaration a later pass could look up (`tk_vca_park`, teko_typeof.tk).
+// The node is recorded HERE, where the type is; the ROW is resolved and the
+// rewrite written in `tk_copy_pass` (pass 16), which is where a forward type
+// is a real row, where `tk_params_pass` has already built its element stores
+// and where the reclaim has not yet run.
+//
+// The filter is the row itself, peeled through `T?` the way `tk_copy_fields`
+// peels a field: Q1a makes a nullable over a REFERENCE the reference itself,
+// so an `S? f` slot holds exactly what an `S f` slot holds and lands the same
+// copy (L6). A slot of any other type -- a scalar, a class, a delegate, an
+// array -- records nothing at all, so a unit with no struct in a slot walks an
+// empty table.
+void tk_copy_defer(i64 ty, i64 n) {
+    if (n == 0) return;
+    if (!tk_is_struct(tk_row_through_nl(ty))) return;
+    if (tk_ncp == TK_MAXCP) err_at(tk_file, tk_line, "teko: too many struct values landing in a slot");
+    st64(cp_node + tk_ncp * 8, n);
+    st64(cp_ty + tk_ncp * 8, ty);
+    tk_ncp = tk_ncp + 1;
+}
+
+i64 cp_node_at(i64 i) { return ld64(cp_node + i * 8); }
+i64 cp_ty_at(i64 i)   { return ld64(cp_ty + i * 8); }
 
 // the SAME store, re-pointed: `tk_hg_resolve_write` (teko_array.tk) copies the
 // store it has just built into the placeholder node the tree already holds

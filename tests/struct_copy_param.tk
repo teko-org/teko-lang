@@ -1,0 +1,211 @@
+// struct_copy_param.tk -- a by-value struct ARGUMENT is copied at the call
+// (L5, docs/specs/struct-value.md § 3.1), and `ref`/`out` is not, which is the
+// whole point of that spelling. Two shapes that answered the ALIAS at
+// `9ab68ba5` -- p01 (`void f(S s) { s.n = 99; }`) and p43 (the callee's own
+// increment seen by the caller) -- over all four call roads there are:
+//
+//   a FREE function          the direct road: `decl_find` names the callee
+//   a METHOD                 the same road, with the receiver at parameter 0
+//   a VIRTUAL method         a `callp` through the vtable
+//   an INTERFACE method      a `callp` through the itab
+//   a DELEGATE               a `callp` through the object's code pointer
+//
+// The last three name no declaration a pass could look up, so their argument is
+// recorded at the one door all three pass (`tk_vca_park`, teko_typeof.tk).
+//
+// TWO INDEPENDENT GUARDS keep `ref`/`out` aliasing (§ 9, R3), and the gate is
+// what proves they are not each other's spare: `refguard` passes a plain local
+// by `ref` (the argument is an N_ADDR by pass 16) and `refchain` forwards a
+// `ref` PARAMETER on (the argument is a plain name, because the slot already
+// holds an address -- only the parameter's own `tk_rp_kind` catches that one).
+//
+// expect-exit: 42
+#include "rt.tk"
+
+struct S { public i64 n; }
+class Cell { public i64 v; }
+struct H { public Cell c; }
+
+delegate i64 Op(S s);
+
+class Box {
+    public i64 take(S s) { s.n = 99; return s.n; }
+    public virtual i64 vtake(S s) { s.n = 88; return s.n; }
+    public static i64 stake(S s) { s.n = 77; return s.n; }
+}
+class Derived : Box {
+    public override i64 vtake(S s) { s.n = 66; return s.n; }
+}
+interface I { i64 itake(S s); }
+class J : I { public i64 itake(S s) { s.n = 55; return s.n; } }
+
+// p01: the callee writes its own struct
+void poke(S s) { s.n = 99; }
+
+// p43: the callee's own increment. In C# the callee reads 2 and the caller
+// still reads 1; before D106 both read 2.
+i64 bump(S s) { s.n = s.n + 1; return s.n; }
+
+i64 dtake(S s) { s.n = 44; return s.n; }
+
+// `ref` and `out` keep the alias, and that is the escape hatch the design
+// exists to preserve
+void byref(ref S s) { s.n = 33; }
+void byout(out S s) { s = new S; s.n = 22; }
+void fwdref(ref S s) { byref(ref s); }           // a `ref` parameter forwarded on
+
+i64 freecall() {
+    S a = new S;  a.n = 1;
+    poke(a);
+    if (a.n != 1) return 1;                      // C#'s answer, 99 before D106
+    if (bump(a) != 2) return 2;                  // the callee reads its own copy
+    if (a.n != 1) return 3;                      // ...and the caller is untouched
+    return 0;
+}
+
+i64 methodcall() {
+    S a = new S;  a.n = 1;
+    Box b = new Box();
+    if (b.take(a) != 99) return 1;
+    if (a.n != 1) return 2;
+    if (Box.stake(a) != 77) return 3;            // a STATIC method: no receiver at 0
+    if (a.n != 1) return 4;
+    return 0;
+}
+
+i64 virtualcall() {
+    S a = new S;  a.n = 1;
+    Box b = new Derived();
+    if (b.vtake(a) != 66) return 1;              // the override runs
+    if (a.n != 1) return 2;
+    return 0;
+}
+
+i64 ifacecall() {
+    S a = new S;  a.n = 1;
+    I i = new J();
+    if (i.itake(a) != 55) return 1;
+    if (a.n != 1) return 2;
+    return 0;
+}
+
+i64 delegcall() {
+    S a = new S;  a.n = 1;
+    Op f = dtake;
+    if (f(a) != 44) return 1;
+    if (a.n != 1) return 2;
+    return 0;
+}
+
+// `params S[]` reaches its element through the array the pass builds, so the
+// caller's values are copied twice over -- once into the array (L4) and never
+// again, the array itself being the argument
+i64 countparams(params S[] xs) {
+    xs[0].n = 99;
+    return xs.Length;
+}
+
+i64 paramscall() {
+    S a = new S;  a.n = 1;
+    if (countparams(a) != 1) return 1;
+    if (a.n != 1) return 2;
+    return 0;
+}
+
+// GUARD ONE, on its own: `byref(ref a)` hands over an N_ADDR, a node that is no
+// value of struct type at all by the time the copy pass runs.
+i64 refguard() {
+    S a = new S;  a.n = 1;
+    i64 l0 = rt_live();
+    byref(ref a);
+    if (a.n != 33) return 1;                     // the caller SEES the write
+    if (rt_live() != l0) return 2;               // ...and nothing was allocated
+    S b;
+    byout(out b);
+    if (b.n != 22) return 3;                     // `out` builds the caller's own
+    return 0;
+}
+
+// GUARD TWO, on its own: inside `fwdref` the slot `s` already holds an address,
+// so `ref s` is forwarded as a plain NAME and there is no N_ADDR to see. Only
+// the parameter's own `ref` tag says this argument keeps the alias.
+i64 refchain() {
+    S a = new S;  a.n = 1;
+    i64 l0 = rt_live();
+    fwdref(ref a);
+    if (a.n != 33) return 1;
+    if (rt_live() != l0) return 2;
+    return 0;
+}
+
+// the copy is a NEW block at the call too, and `new S` handed straight to a
+// parameter is the one argument that is not copied
+i64 livecheck() {
+    S a = new S;
+    i64 l0 = rt_live();
+    poke(a);                                     // a copy: one allocation
+    if (rt_live() != l0 + 1) return 1;
+    poke(new S);                                 // provably fresh: still one
+    if (rt_live() != l0 + 2) return 2;
+    poke(new S());
+    if (rt_live() != l0 + 3) return 3;
+    return 0;
+}
+
+// a counted FIELD crossing a by-value parameter is a new owner: the callee's
+// copy holds the `Cell` too, so overwriting the caller's field does not free it
+i64 counted(H h) {
+    if (h.c.v != 7) return 1;
+    return 0;
+}
+
+i64 countedcall() {
+    H h = new H();
+    h.c = new Cell();
+    h.c.v = 7;
+    if (counted(h) != 0) return 1;
+    if (h.c.v != 7) return 2;                    // the `Cell` survived the call
+    return 0;
+}
+
+// the declared debt at a call: one block per by-value struct argument per turn
+// (docs/reference/memory.md). H_SIZE is 8, the allocator's class 16.
+i64 peakcheck() {
+    S a = new S;  a.n = 1;
+    i64 p0 = rt_peak();
+    i64 i = 0;
+    loop {
+        if (i >= 64) break;
+        poke(a);
+        i = i + 1;
+    }
+    if (rt_peak() != p0 + 64 * 16) return 1;
+    if (a.n != 1) return 2;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = freecall();
+    if (bad != 0) return 10 + bad;
+    bad = methodcall();
+    if (bad != 0) return 20 + bad;
+    bad = virtualcall();
+    if (bad != 0) return 30 + bad;
+    bad = ifacecall();
+    if (bad != 0) return 40 + bad;
+    bad = delegcall();
+    if (bad != 0) return 50 + bad;
+    bad = paramscall();
+    if (bad != 0) return 60 + bad;
+    bad = refguard();
+    if (bad != 0) return 70 + bad;
+    bad = refchain();
+    if (bad != 0) return 80 + bad;
+    bad = livecheck();
+    if (bad != 0) return 90 + bad;
+    bad = countedcall();
+    if (bad != 0) return 100 + bad;
+    bad = peakcheck();
+    if (bad != 0) return 110 + bad;
+    return 42;
+}
