@@ -156,6 +156,10 @@ with that line in its stderr (D52).
   receiver. The receiver is implicit; `this` names it.
 - ``"teko: `this` is only valid inside the body of a type"`` — `this` in a free function.
 - ``"teko: `this` is not there in a static member"`` — a static member has no receiver.
+- ``"teko: `this` is read-only"`` — `this = e;`. The receiver is a borrowed parameter, not
+  a slot: it names the object the call arrived on, and nothing rebinds it. Assign to a
+  field instead. This form compiled silently before D102, with no reference counting at
+  all, because the receiver parameter is declared `uptr`.
 - ``"teko: `base` is not there in a static member"`` — the same, for `base`.
 - ``"teko: `base` in a type with no base class"`` — the type has no base to reach.
 - ``"teko: `base` reaches a method of the base class"`` — `base` was followed by something

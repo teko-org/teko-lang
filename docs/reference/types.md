@@ -543,9 +543,40 @@ compiler's temporaries use wherever a user-chosen name can share the scope), nev
 spelling such as `p`, so a constructor parameter written with that same ordinary identifier
 reads its own argument and never the allocator's local. (Four other generators still declare
 a fixed `p` — a delegate's, a heap array's, a struct's allocator, a DI getter — in functions
-whose every parameter is the compiler's own, where no collision is possible; D87.) A bare
-`this` used as a VALUE — `return this;`, `C d = this;` — is still refused today
-(`teko: a value of type uptr does not convert to C`): the redesign is owed, D87.
+whose every parameter is the compiler's own, where no collision is possible; D87.)
+
+**`this` is a value of the enclosing class** (D102). `return this;` is what fluent chaining
+is made of, and `C d = this;`, `f(this)`, `b ? this : o`, a property accessor's `return
+this;`, a return typed as a BASE class, and a return typed as an INTERFACE the class
+implements all read as the class. An interface's own default body sees `this` as the
+interface. The receiver is a **borrowed** reference — a parameter — so returning it raises
+the count for the caller and nothing leaks; a discarded link of a chain is released where it
+is discarded ([memory.md](memory.md)).
+
+```teko
+// expect-exit: 42
+#include "../../lib/rt.tk"
+interface Counter { i64 Value(); Counter Me() { return this; } }
+class Acc : Counter {
+    public i64 v;
+    public Acc() { v = 0; }
+    public i64 Value() { return v; }
+    public Acc Bump(i64 x) { v = v + x; return this; }
+    public Counter AsI() { return this; }
+}
+i64 main() {
+    Acc a = new Acc();
+    a.Bump(1).Bump(2).Bump(3);                   // chained, the result discarded
+    Counter c = a.AsI();
+    return c.Value() + 36;                       // 6 + 36
+}
+```
+
+Three limits. `this = e;` is refused — ``teko: `this` is read-only`` — because the receiver
+is a parameter, not a slot; assign to a field instead. `this == o` is a comparison of two
+class references and gets the rule every class reference gets, ``teko: C declares no
+operator `==` ``. And `this` inside a `struct` body is not a value
+([not-yet.md](not-yet.md)), because a `struct` has no copy at assignment yet.
 
 ---
 

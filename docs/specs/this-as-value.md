@@ -1,8 +1,10 @@
 # `this` as a value — `return this;`
 
-**Designed, not built.** The reference describes only what runs; today a bare `this` used as
-a value is refused and [not-yet.md](../reference/not-yet.md) carries the row. This page is
-the plan that closes it — the last undesigned item of [the 1.0 roadmap](roadmap-1.0.md).
+**Crumbs 1 and 3 are BUILT** (D102): `this` is a value of the enclosing class or
+interface, and `this = e;` is refused. Crumb 2 (the fluent fixture and its `rt_live()`
+assertions, folded into `tests/surface_this_value.tk` for the eleven positions) and crumb 4
+(a `struct`'s own message) are still open. What follows is the design as it was measured
+before the build; § 4.3's table is the architect's measurement, and § 7 marks what landed.
 
 Everything below was measured on `mc` 1.0.1, macos/aarch64, against `origin/main`
 `85abd466`, in a detached worktree. Where a claim of [D87](../../DECISION_LOG.md) is
@@ -340,9 +342,9 @@ re-measured green in the 140/183/0 and the fixed point of § 4.3.
 
 | # | crumb | size | depends on | gate | docs owed |
 |---|---|---|---|---|---|
-| **1** | **`this` is a value: the node registration.** The four lines of § 4.2 (with the `K_DOT` and kind guards), the header paragraph, and the fixtures. Every position in § 1.1's first table starts compiling | **S** — one module, one function, three fixtures | — | `surface_this_value.tk` (42), `refuse/this_bad_type.tk`, `refuse/this_eq_no_op.tk`; **`--dump-ast` identical over all 140 base fixtures**; fixed point closes; `mc limits` six rows unmoved on both legs | `docs/reference/types.md` § `class` gains the paragraph; `docs/reference/not-yet.md` **loses** the `return this;` row and gains the `struct` one; `docs/reference/diagnostics.md` gains nothing new (every message already exists) and gains the note on `this == o` |
+| **1** | **BUILT (D102). `this` is a value: the node registration.** The four lines of § 4.2 (with the `K_DOT` and kind guards), the header paragraph, and the fixtures. Every position in § 1.1's first table starts compiling | **S** — one module, one function, three fixtures | — | `surface_this_value.tk` (42), `refuse/this_bad_type.tk`, `refuse/this_eq_no_op.tk`; **`--dump-ast` identical over all 140 base fixtures**; fixed point closes; `mc limits` six rows unmoved on both legs | `docs/reference/types.md` § `class` gains the paragraph; `docs/reference/not-yet.md` **loses** the `return this;` row and gains the `struct` one; `docs/reference/diagnostics.md` gains nothing new (every message already exists) and gains the note on `this == o` |
 | **2** | **Fluent chaining, proved end to end, and the reclaim.** No compiler change: the fixture that runs a three-link chain with a discarded result, a kept one, an interface default body, a base-typed return and a covariant override, all under `rt_live()` | **S** — one fixture, no module | crumb 1 | `surface_this_fluent.tk` (42) — the § 5 legal program with `rt_live()` assertions at every step | `docs/guide/` gains the chaining recipe; `docs/reference/memory.md` gains the sentence on the self-referencing constructor (a cycle a count never collects) |
-| **3** | **`this = e;` is refused.** A pre-existing silent wrong answer (§ 1.1). One guard, in `tk_this()`'s own file, at the point the parser sees `this` followed by `=` | **S** — one module, one refuse fixture | none — **runs in parallel with any unrelated crumb**, and with crumbs 1/2 if the implementer keeps the two edits apart in `tk_this()` | `refuse/this_assign.tk`, message ``teko: `this` is read-only``; `--dump-ast` identical over all 140 (nothing accepted today changes except the refused form) | `docs/reference/diagnostics.md` gains the message; `docs/reference/not-yet.md` needs no row |
+| **3** | **BUILT (D102). `this = e;` is refused.** A pre-existing silent wrong answer (§ 1.1). One guard, in `tk_this()`'s own file, at the point the parser sees `this` followed by `=` | **S** — one module, one refuse fixture | none — **runs in parallel with any unrelated crumb**, and with crumbs 1/2 if the implementer keeps the two edits apart in `tk_this()` | `refuse/this_assign.tk`, message ``teko: `this` is read-only``; `--dump-ast` identical over all 140 (nothing accepted today changes except the refused form) | `docs/reference/diagnostics.md` gains the message; `docs/reference/not-yet.md` needs no row |
 | **4** | **`this` in a `struct` gets its own message.** Replace the inherited `teko: a value of type uptr does not convert to P` with ``teko: `this` is not a value in a struct``, raised where the kind guard of crumb 1 declines | **S** — one module, one refuse fixture | crumb 1 (the kind guard is the hook) | `refuse/this_struct_value.tk`; `--dump-ast` identical | `docs/reference/not-yet.md` gains the `struct` row; `docs/reference/diagnostics.md` gains the message |
 
 **Order and parallelism.** 1 → 2 and 1 → 4 are hard dependencies. **Crumb 3 is independent
