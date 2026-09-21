@@ -912,18 +912,23 @@ uptr tk_ty_mangle_name(i64 ty) {
 // PARSE TIME too (`teko_params.tk`'s `tk_bracket`, `teko_expr.tk`'s
 // `tk_dot`) -- with no oracle, and no placeholder left for a later pass.
 //
-// D104: the row is kept for EVERY parameter, not only a `T[]` one. A
-// struct/class parameter's type is known at the very same instant, and
-// `tk_ref_addr` (teko_ref.tk) needs exactly that row to build `ref h.n` /
-// `out h.n` on a parameter -- a legal program it refused
-// `teko: not an object of a known type: h` because `tk_local_find` is a
-// parse-time SCOPE table and a parameter is in no scope table at all. The
-// `T[]` question simply moved from the write to the READ: `tk_hp_find` still
-// answers a `T[]` parameter and nothing else, so its three callers
-// (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see the same rows they
-// always saw, and `tk_hp_find_any` is the new door. `TK_MAXHP` is 32 against
-// mc's own `MAXPARAMS` of 12, so widening what the table holds cannot fill
-// it: the ceiling below stays unreachable, as it was.
+// D104: EVERY parameter has a row -- a `T[]` one, a struct/class one, a
+// scalar, and a `ref`/`out` one as a SHADOW (`tk_hp_shadow` below, the name
+// with -1 for the type). A struct/class parameter's type is known at the very
+// same instant a `T[]` one's is, and `tk_ref_addr` (teko_ref.tk) needs exactly
+// that row to build `ref h.n` / `out h.n` on a parameter -- a legal program it
+// refused `teko: not an object of a known type: h` because `tk_local_find` is
+// a parse-time SCOPE table and a parameter is in no scope table at all. The
+// `T[]` question simply moved from the write to the READ: `tk_hp_find` below
+// answers a `T[]` parameter and nothing else, so its three callers (`tk_dot`,
+// `tk_bracket`, teko_loop.tk's `foreach`) see the same rows they always saw,
+// and `tk_hp_find_any` is the new door.
+//
+// The rows of every parameter list still OPEN share the table -- an enclosing
+// declaration's under each lambda nested inside it, the floor below -- so the
+// ceiling counts them all: `TK_MAXHP` is 128 against mc's own `MAXPARAMS` of
+// 12, room for ten open lists, and `TK_MAXHPB` (16) bounds the nesting with
+// its own message. It was 32 rows for `T[]` parameters alone before D104.
 #define TK_MAXHP  128                 // every parameter of every list still open
 #define TK_MAXHPB 16                  // how deep a lambda may nest inside a list
 
@@ -1004,10 +1009,11 @@ void tk_hp_shadow(uptr name) { tk_hp_add(name, 0 - 1); }
 // the declared type of the parameter named `name`, or -1: the newest one
 // wins, the same rule `tk_local_find` gives a shadowed local -- so a lambda's
 // own parameter answers inside its body and the enclosing one answers again
-// after `tk_hp_pop`. A `ref`/`out` parameter has no row here at all -- its
-// caller (`tk_params`, teko_class.tk) registers it with `tk_rp_add` instead
-// -- so its slot, which holds an ADDRESS rather than the object, is never
-// mistaken for the object itself.
+// after `tk_hp_pop`. A `ref`/`out` parameter has a SHADOW row (-1 for the
+// type, `tk_hp_shadow` above): the scan stops there and answers "no object",
+// so its slot -- which holds an ADDRESS rather than the object -- is never
+// mistaken for the object itself, and an enclosing row of the same name never
+// answers past it.
 i64 tk_hp_find_any(uptr name) {
     i64 i = tk_nhp - 1;
     loop {
@@ -1019,18 +1025,20 @@ i64 tk_hp_find_any(uptr name) {
 }
 
 // the type of a `T[]` parameter named `name`, or -1 -- the question the table
-// answered before D104 widened what it holds. A row that is not a `T[]` is
-// invisible here, exactly as it was when `tk_hp_add` refused to write one.
+// answered before D104 widened what it holds, asked through the SAME lookup.
+// It stops at the newest row bearing the name and answers -1 when that row is
+// no `T[]`, rather than scanning past it: with the floor keeping an enclosing
+// list alive, skipping would let a lambda's `(i64 xs)` or `(ref i64 xs)` fall
+// through to an enclosing `i64[] xs` and index the ENCLOSING array (measured,
+// SIGSEGV; `f81e0217` refuses it, because the reset had already wiped the
+// enclosing row -- Copilot on #770). The innermost binding decides, here as in
+// `tk_hp_find_any`, and with a single list open the two rules are one rule --
+// which is why this is exactly what the three callers saw before.
 i64 tk_hp_find(uptr name) {
-    i64 i = tk_nhp - 1;
-    loop {
-        if (i < 0) break;
-        if (str_eq(hp_name_at(i), name) && hp_ty_at(i) >= 0
-            && tk_is_ha(tk_struct_by_ty(hp_ty_at(i))))
-            return hp_ty_at(i);
-        i = i - 1;
-    }
-    return 0 - 1;
+    i64 ty = tk_hp_find_any(name);
+    if (ty < 0) return 0 - 1;
+    if (!tk_is_ha(tk_struct_by_ty(ty))) return 0 - 1;
+    return ty;
 }
 
 // a store this module emitted into a slot of counted type -- a field, an

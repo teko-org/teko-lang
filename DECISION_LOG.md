@@ -11759,13 +11759,13 @@ That table now keeps EVERY parameter rather than only a `T[]` one, and the `T[]`
 moved from the write to the READ: `tk_hp_find` still answers a `T[]` parameter and nothing
 else, so its three callers (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see exactly
 the rows they always saw, and `tk_hp_find_any` is the new door `tk_ref_addr` asks after
-`tk_local_find` misses. `TK_MAXHP` is 32 against mc's own `MAXPARAMS` of 12, so widening
-what the table holds cannot fill it; the ceiling message is renamed to match what it
-counts (``teko: too many `T[]` parameters in one declaration`` → `teko: too many
-parameters in one declaration`) and stays unreachable either way. A `ref`/`out` parameter
-has no row there — its caller registers it with `tk_rp_add` instead — so it keeps the
-refusal, correctly: its slot carries an ADDRESS, not the object, and `name + OFF` would
-not be the field.
+`tk_local_find` misses. The ceiling message is renamed to match what it counts
+(``teko: too many `T[]` parameters in one declaration`` → `teko: too many parameters in
+one declaration`); the table itself grows to 128 rows in the review pass below, where the
+rows of every OPEN parameter list start sharing it, and mc's own `MAXPARAMS` of 12 leaves
+room for ten such lists. A `ref`/`out` parameter gets a row too — a SHADOW, the name with
+-1 for the type (`tk_hp_shadow`, and also below) — so it keeps the refusal, correctly: its
+slot carries an ADDRESS, not the object, and `name + OFF` would not be the field.
 
 This half lands FIRST because the refusal the second half adds points at `ref`/`out` as
 the road to use, and that road has to work for a parameter before a message can name it.
@@ -11808,8 +11808,8 @@ window) already has: `tk_hp_push` before a nested list makes the rows already th
 floor `tk_hp_reset` cannot cut below, `tk_hp_pop` in `tk_lambda_finish` drops the nested
 list's own rows beside the capture window's. One table, one floor, and the `T[]` sibling
 is answered by the same change — items 7 and 8 of `tests/ref_field_param.tk`. `TK_MAXHP`
-grows 32 → 128 because the rows of every open list now coexist, and `TK_MAXHPB` (16)
-bounds the nesting with its own message.
+grows 32 → 128 because the rows of every open list now coexist — a `ref`/`out` shadow row
+among them — and `TK_MAXHPB` (16) bounds the nesting with its own message.
 
 **The review's second pass, and the same table again.** Keeping the enclosing rows alive
 opened two shapes where the INNERMOST parameter list had no row to shadow with, and both
@@ -11821,6 +11821,14 @@ were measured before they were fixed:
   -1 for the type — the lookup stops at the newest row bearing the name, so the shadow is
   an answer of "no object" rather than a miss. `f81e0217` refuses that program and so does
   this. Fixture: `tests/refuse/ref_field_refparam_shadow.tk`.
+- `tk_hp_find`, the `T[]` door, skipped a row that was not a `T[]` and kept scanning —
+  harmless while one list was open, and wrong under the floor: a lambda's `(i64 xs)` or
+  `(ref i64 xs)` fell through to an enclosing `i64[] xs` and indexed the ENCLOSING array,
+  SIGSEGV. It asks `tk_hp_find_any` now and answers -1 when the innermost row is no `T[]`,
+  so one rule — the innermost binding decides — serves both doors, and with a single list
+  open the two rules are the same rule the three callers always saw. `f81e0217` refuses
+  that program (the reset had wiped the enclosing row), and so does this. Fixture:
+  `tests/refuse/lambda_param_shadows_array.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11871,17 +11879,18 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 200
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and ten
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 201
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and eleven
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
-`tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one, both found by the
-review — refused rising by exactly the ten added. `tests/addr_not_member.tk` gains its item 7:
+`tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
+`tests/refuse/lambda_param_shadows_array.tk` for the `T[]` one, all three found by the
+review — refused rising by exactly the eleven added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 177986, `ins` 246293 → 246600,
+only the compiler leg's size rows move: `nodes` 177785 → 177966, `ins` 246293 → 246563,
 `funcs` 3478 → 3483, `lowered` 3459 → 3464, `globals` 1006 → 1009, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6971, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
