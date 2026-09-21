@@ -991,6 +991,16 @@ void tk_hp_add(uptr name, i64 ty) {
     tk_nhp = tk_nhp + 1;
 }
 
+// a `ref`/`out` parameter's own row: the NAME, and -1 for the type. It is a
+// SHADOW, not an answer -- the lookup below stops at the newest row bearing
+// the name, so the enclosing declaration's `H h` stops answering for a
+// lambda's `(ref i64 h)` the moment that list is open (Copilot on #770:
+// without it, `ref h.n` in the lambda body added H's field offset to the
+// inner ADDRESS slot and took SIGSEGV; `f81e0217` refuses that program, and
+// so does this row). A `ref`/`out` slot carries an address rather than the
+// object, so the honest type for it here is "no object at all".
+void tk_hp_shadow(uptr name) { tk_hp_add(name, 0 - 1); }
+
 // the declared type of the parameter named `name`, or -1: the newest one
 // wins, the same rule `tk_local_find` gives a shadowed local -- so a lambda's
 // own parameter answers inside its body and the enclosing one answers again
@@ -1015,7 +1025,8 @@ i64 tk_hp_find(uptr name) {
     i64 i = tk_nhp - 1;
     loop {
         if (i < 0) break;
-        if (str_eq(hp_name_at(i), name) && tk_is_ha(tk_struct_by_ty(hp_ty_at(i))))
+        if (str_eq(hp_name_at(i), name) && hp_ty_at(i) >= 0
+            && tk_is_ha(tk_struct_by_ty(hp_ty_at(i))))
             return hp_ty_at(i);
         i = i - 1;
     }

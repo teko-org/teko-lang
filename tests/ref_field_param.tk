@@ -40,6 +40,13 @@
 //   8. the same floor seen from the `T[]` side: `xs[0]` on a `T[]` PARAMETER
 //      after a lambda, refused ``teko: `[` needs an array: xs`` at
 //      `f81e0217`. One table, one floor, both roads.
+//   9. a lambda's OWN parameter, inside its body -- the explicit grafia and
+//      the SHORT one (`h => ...`), which builds its single parameter by hand
+//      rather than through `parse_params` and so had no row of its own.
+//  10. the short lambda's parameter with an ENCLOSING parameter of another
+//      class spelled the same: the inner one wins, and the outer object is
+//      untouched. Without 9 the outer row answered and the write landed at
+//      the wrong offset (measured, 41 where 42 is right).
 //
 // expect-exit: 0
 #include "../lib/rt.tk"
@@ -104,6 +111,23 @@ i64 afterLambdaArr(i64[] xs) {
     return xs[0];
 }
 
+// 9/10: a lambda's own parameter, explicit and short, and the short one with
+// an enclosing parameter spelled the same
+delegate i64 Take2(B h);
+
+i64 lamOwn() {
+    Take2 t = new Take2((B h) => { bump(ref h.n); return h.n; });
+    return t(new B());
+}
+
+i64 lamShort(Wide h) {
+    Take2 t = h => { bump(ref h.n); return h.n; };
+    i64 r = t(new B());
+    if (h.n != 41) return 0 - 1;                 // the ENCLOSING object is untouched
+    if (h.pad != 1) return 0 - 2;
+    return r;
+}
+
 i64 main() {
     // 1: the callee's write is the caller's too -- a class parameter is the
     // object's own pointer
@@ -150,6 +174,12 @@ i64 main() {
     i64[] xs = new i64[2];
     xs[0] = 42;
     if (afterLambdaArr(xs) != 42) return 17;
+
+    // 9, 10
+    if (lamOwn() != 42) return 18;
+    Wide v = new Wide();
+    if (lamShort(v) != 42) return 19;
+    if (v.n != 41) return 20;
 
     return 0;
 }

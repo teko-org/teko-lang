@@ -1,0 +1,33 @@
+// ref_field_refparam_shadow.tk -- D104: a `ref`/`out` parameter SHADOWS an
+// enclosing parameter of the same name, and a `ref`/`out` slot is no object.
+//
+// Once the parameter table keeps the enclosing declaration's rows alive across
+// a nested list (`tk_hp_push`/`tk_hp_pop`, teko_struct.tk), a lambda parameter
+// that is `ref i64 h` had NO row of its own -- `tk_rp_add` is where a
+// `ref`/`out` parameter is registered -- so the enclosing `H h` answered for
+// it and `ref h.n` added H's field offset to the inner ADDRESS slot: SIGSEGV,
+// exit 139, found by the Copilot review of #770. `f81e0217` refuses this
+// program, and so does the shadow row `tk_hp_shadow` now writes: the name is
+// BOUND here, and what it is bound to carries an address rather than an
+// object.
+//
+// expect-refuse: teko: not an object of a known type: h
+// expect-refuse-line: 25
+#include "../../lib/rt.tk"
+
+class H { public i64 n; public H() { n = 41; } }
+
+delegate i64 Take(ref i64 h);
+
+void bump(ref i64 v) { v = v + 1; }
+
+i64 f(H h) {
+    Take t = new Take((ref i64 h) => { bump(ref h.n); return 1; });
+    i64 v = 5;
+    return t(ref v);
+}
+
+i64 main() {
+    H a = new H();
+    return f(a);
+}

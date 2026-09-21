@@ -11811,6 +11811,33 @@ is answered by the same change — items 7 and 8 of `tests/ref_field_param.tk`. 
 grows 32 → 128 because the rows of every open list now coexist, and `TK_MAXHPB` (16)
 bounds the nesting with its own message.
 
+**The review's second pass, and the same table again.** Keeping the enclosing rows alive
+opened two shapes where the INNERMOST parameter list had no row to shadow with, and both
+were measured before they were fixed:
+
+- a `ref`/`out` parameter is registered by `tk_rp_add`, not here, so a lambda's
+  `(ref i64 h)` left an enclosing `H h` answering for it and `ref h.n` in the body added
+  H's field offset to the inner ADDRESS slot: SIGSEGV. `tk_hp_shadow` writes the NAME with
+  -1 for the type — the lookup stops at the newest row bearing the name, so the shadow is
+  an answer of "no object" rather than a miss. `f81e0217` refuses that program and so does
+  this. Fixture: `tests/refuse/ref_field_refparam_shadow.tk`.
+- the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
+  with `param_new` instead of `parse_params`, so no row was written for it at all. An
+  enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
+  at the wrong offset — 41 where 42 is right, measured. The row is written where the
+  parameter is built, from `dg_pty_at` (the delegate's own declared type, which is what the
+  implicit parameter IS, D221 decision 19), and the lambda's own parameter now works inside
+  its body as well — `f81e0217` refuses that too. Items 9 and 10 of
+  `tests/ref_field_param.tk`.
+
+**One shape the review raised that is NOT this decision's**, measured identically at
+`f81e0217` and at head: an enclosing LOCAL of another class spelled like a lambda's
+parameter (`Wide h = new Wide(); Take t = new Take((B h) => bump(ref h.n));`) resolves
+through `tk_slv_find`/`tk_local_find` to the OUTER local and writes at its offset. A
+lambda's parameter list is not in either table, and telling the lambda's body scope apart
+from the enclosing one inside `tk_slv_live` is the crumb that fixes it. Reported, not
+widened.
+
 **Second half: one judge, one point.** All eight wrong shapes are the same deferred row —
 an `N_ADDR` receiver with no ref/out tag — so `tk_addr_recv_reject` (`teko_typeof.tk`) is
 asked in `tk_pend_do` ahead of `tk_ty_of`, before any offset is added to anything. A
@@ -11844,18 +11871,19 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 199
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and nine
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 200
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and ten
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
-for the eight wrong shapes, and `tests/refuse/ref_field_shadow.tk` for the shadowing the
-review found — refused rising by exactly the nine added. `tests/addr_not_member.tk` gains its item 7:
+for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
+`tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one, both found by the
+review — refused rising by exactly the ten added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 177954, `ins` 246293 → 246548,
-`funcs` 3478 → 3482, `lowered` 3459 → 3463, `globals` 1006 → 1009, `strings` 2477 → 2479,
-`defines` 1305 → 1306, `symbols` 6961 → 6970, every row `ok`. `--dump-ast` base against head over every
+only the compiler leg's size rows move: `nodes` 177785 → 177986, `ins` 246293 → 246600,
+`funcs` 3478 → 3483, `lowered` 3459 → 3464, `globals` 1006 → 1009, `strings` 2477 → 2479,
+`defines` 1305 → 1306, `symbols` 6961 → 6971, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
 takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, exactly ONE
 differing — `addr_not_member`, whose accepted code this decision changed, and the diff is
