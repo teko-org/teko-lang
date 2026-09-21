@@ -1,0 +1,171 @@
+// surface_this_fluent.tk -- fluent chaining on `this`, proved end to end
+// (D103, docs/specs/this-as-value.md § 7 crumb 2). No compiler change: D102
+// made `this` a value, and this fixture is the coverage that holds the
+// reclaim honest over the four shapes a chain's result can take.
+//
+// What each part proves, in order:
+//   Cell.Bump       a link of the chain: one frame, `this` back out of it
+//   Cell.Thru       a chain built INSIDE another frame and handed on
+//   Cell.Me         a COVARIANT `override` returning `this`, reached through
+//                   a BASE-typed slot -- the vtable answers `Cell`, the slot
+//                   reads `Node`. Nothing in the suite held this before
+//   Tap.Ping        an interface DEFAULT body returning `this`
+//   take(...)       a chain's result PASSED ON as an argument
+//
+// The links a chain is built from here are NON-virtual on purpose: a virtual
+// call takes `teko: a virtual call needs a name or a field on the left`
+// (teko_expr.tk, and diagnostics.md's own row), so `b.Me().Me()` is refused
+// for a reason that has nothing to do with `this`. The covariant override is
+// therefore reached through a NAME -- which is the position C# reaches it in
+// too -- and the chain continues over the non-virtual `Bump`.
+//
+// Every `rt_live()` assertion here is EXACT and FALSIFIABLE: `Node`, `Cell`
+// and `Box` hold no reference to each other and no reference to themselves,
+// so the live count around each block is a number this program predicts to
+// the unit. A floor comparison could not tell a leak from a keep -- the D102
+// fixture's own receiver sits in a deliberate cycle, which is why the counts
+// here are built on cycle-free objects instead.
+//
+// Both assertions were proved to BITE by mutating the compiler and running
+// this fixture against the mutant (D103; each mutation reverted afterwards):
+//   teko_rc.tk, tk_rc_exprstmt -- drop the sweep of a discarded owned value
+//                                 and every chained result stays alive: this
+//                                 fixture exits 29, the block's exact count
+//   teko_rc.tk, tk_rc_return   -- drop `needinc` and the callee hands back a
+//                                 reference it never took: the object is
+//                                 freed under the caller and lib/rt.tk's own
+//                                 `teko: reference count below zero` ends the
+//                                 run with exit 70
+//
+// expect-exit: 42
+#include "../lib/rt.tk"
+
+interface Tap {
+    i64 N();
+
+    // a DEFAULT body: `this` here has the static type of the interface, and
+    // the reference it hands back is counted like any other return
+    Tap Ping() { return this; }
+}
+
+// no field holding another object and no field holding itself: every count
+// this class takes is one the program can see
+class Node {
+    public i64 n;
+    public Node() { n = 0; }
+    public virtual Node Me() { return this; }
+}
+
+class Cell : Node, Tap {
+    public Cell() { n = 0; }
+
+    public i64 N() { return n; }
+
+    // one link: a frame that writes and hands the receiver back
+    public Cell Bump(i64 x) { n = n + x; return this; }
+
+    // a chain built one frame DOWN, over a receiver that is not `this`, and
+    // the result handed on to the caller
+    public Cell Thru(Cell o) { return o.Bump(1).Bump(2); }
+
+    // covariant: the base declares `virtual Node Me()`, this narrows the
+    // return to `Cell`. Teko matches an override by name and arity, so the
+    // narrower type is accepted (C# 9's rule)
+    public override Cell Me() { return this; }
+}
+
+// a second cycle-free class, so a chain's result can be an ARGUMENT whose
+// callee also allocates
+class Box {
+    public i64 k;
+    public Box() { k = 0; }
+}
+
+i64 take(Cell c) { return c.n; }
+
+// the argument is a chain's result, and the callee makes an allocation of its
+// own while holding it: the borrowed argument must still be alive at return
+i64 weigh(Cell c) {
+    Box b = new Box();
+    b.k = c.n;
+    return b.k;
+}
+
+i64 main() {
+    // ---- the chain runs, and answers ----
+    i64 f = rt_live();
+    {
+        Cell c = new Cell();
+        if (rt_live() != f + 1) return 10;
+
+        // THREE frames, result DISCARDED: `tk_rc_return` hands the caller a
+        // reference of its own at every link and `tk_rc_exprstmt` drops the last
+        c.Bump(1).Bump(2).Bump(3);
+        if (c.n != 6) return 11;
+        if (rt_live() != f + 1) return 12;
+
+        // KEPT: the same object, so the live count does not move -- what rises is
+        // the object's own reference count, released when `k` leaves this frame
+        Cell k = c.Bump(4).Bump(5);
+        if (k.n != 15) return 13;
+        if (rt_live() != f + 1) return 14;
+
+        // PASSED ON as an argument, and the callee allocates while holding it
+        if (take(c.Bump(1)) != 16) return 15;
+        if (rt_live() != f + 1) return 16;
+        if (weigh(c.Bump(1)) != 17) return 17;
+        if (rt_live() != f + 1) return 18;
+
+        // a chain built a frame DOWN, on a receiver that is not the callee's own
+        // `this`, and handed back up
+        Cell t = c.Thru(c);
+        if (t.n != 20) return 19;
+        if (rt_live() != f + 1) return 20;
+
+        // ---- the covariant override, through a BASE-typed slot ----
+        Node b = c;                                  // a derived object, base slot
+        Node m = b.Me();                             // the vtable reaches Cell.Me
+        if (m.n != 20) return 21;
+        if (rt_live() != f + 1) return 22;
+        m.Me();                                      // the same call, DISCARDED
+        if (rt_live() != f + 1) return 23;
+
+        // the override's own static type is `Cell`, so the chain continues in the
+        // derived type without a cast
+        if (c.Me().Bump(2).n != 22) return 24;
+        if (rt_live() != f + 1) return 25;
+
+        // ---- the interface default body ----
+        Tap p = c;
+        Tap q = p.Ping();                            // returned from a default body
+        if (q.N() != 22) return 26;
+        if (rt_live() != f + 1) return 27;
+        p.Ping();                                    // ...and discarded
+        if (rt_live() != f + 1) return 28;
+    }
+    // every reference the chains above took is released when the block
+    // ends: the one object they all named is gone, exactly
+    if (rt_live() != f) return 29;
+
+    // ---- the same five shapes over one object, in one tight block ----
+    // discarded, kept, argument, the covariant override and the interface
+    // default body, all on an object whose whole life fits between two
+    // `rt_live()` reads
+    i64 g = rt_live();
+    {
+        Cell z = new Cell();
+        if (rt_live() != g + 1) return 30;
+        z.Bump(1).Bump(1).Bump(1);               // discarded
+        Cell y = z.Bump(1);                      // kept
+        if (take(z.Bump(1)) != 5) return 31;     // an argument
+        Node zb = z;
+        zb.Me();                                 // the override, discarded
+        Tap zt = z;
+        zt.Ping();                               // the default body, discarded
+        if (y.n != 5) return 32;                 // `y` IS `z`: one object
+        if (rt_live() != g + 1) return 33;
+    }
+    if (rt_live() != g) return 34;
+
+    return 42;
+}
