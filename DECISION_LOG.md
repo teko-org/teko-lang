@@ -11614,3 +11614,78 @@ this; }`) leaks, and that is a cycle a plain count never collects, not a defect 
 entry. Generic fluent chaining is blocked by a pre-existing generics defect that reproduces
 with `return o;` and no `this` anywhere. No re-typing of the receiver parameter was made,
 and none should be.
+
+### D103 · Fluent chaining is proved by a fixture, not by a claim; and `this` in a `struct`
+says so in its own words (2026-09-20)
+
+**What landed.** Crumbs 2 and 4 of
+[docs/specs/this-as-value.md](docs/specs/this-as-value.md), the two that page left open
+after D102. One adds no compiler code at all; the other adds one guard, in the `else` of
+the kind test D102 wrote.
+
+**Crumb 2 — the fluent fixture.** `tests/surface_this_fluent.tk` (`// expect-exit: 42`)
+runs a chain of three frames whose result is DISCARDED, one whose result is KEPT, one
+PASSED ON as an argument to a callee that allocates while holding it, one built a frame
+DOWN over a receiver that is not the callee's own `this`, one RETURNED from an interface
+default body, and a covariant `override Cell Me()` reached through a BASE-typed slot —
+the vtable answers `Cell`, the slot reads `Node`. The suite held none of them: D102's
+`tests/surface_this_value.tk` runs a chain, but `grep -c override` on it answers 0.
+
+**Every assertion is falsifiable, and each was proved to bite.** Copilot's finding on
+D102's own fixture is the reason: a receiver sitting in a deliberate cycle can only be
+compared against a floor, and a floor cannot tell a leak from a keep. `Node`, `Cell` and
+`Box` here hold no reference to each other and none to themselves, so every `rt_live()`
+read is an exact number the program predicts. Two mutations of the compiler, each run
+against the fixture and then reverted:
+
+| mutation | what breaks | the fixture's answer |
+|---|---|---|
+| `tk_rc_exprstmt` (`teko_rc.tk`), the sweep of a discarded owned value removed | nothing releases a chain's last link | exit **29** — the block's exact count, `rt_live() != f` after the block |
+| `tk_rc_return` (`teko_rc.tk`), `needinc` forced to 0 | the callee hands back a reference it never took | exit **70** — the object is freed under its caller and `lib/rt.tk` ends the run with `teko: reference count below zero` |
+
+Both mutations also move `tests/surface_this_value.tk` (35 and 70), so the two fixtures
+now bracket the reclaim from both sides. The guide gains the recipe
+(`docs/guide/20-classes.md`), including the boundary a chain really has: a link whose
+method is `virtual` needs a name or a field on the left — `b.Me().Me()` is refused
+`teko: a virtual call needs a name or a field on the left` (`teko_expr.tk`), a
+pre-existing rule with nothing to do with `this`, so the links of a chain stay
+non-virtual or the result is parked in a local.
+
+**Crumb 4 — the `struct`'s own sentence.** A bare `this` read as a value inside a `struct`
+body answered `teko: a value of type uptr does not convert to P`: raised at the construct
+that CONSUMED the value, and naming the receiver parameter's declared type, a word no
+source writes. It now says ``teko: `this` is not a value in a struct``, at the `this`
+itself.
+
+The guard belongs where D102's kind test already stands, in `tk_this()` (`teko_this.tk`):
+that function knows `tk_body_class`, and `tk_is_class`/`tk_is_iface` already answer there,
+so the struct case is the `else` of a condition that exists. `tk_is_struct` joins its five
+siblings in `teko_struct.tk` and asks for the row FIRST, because `TK_KSTRUCT` is 0 and -1
+("no type here") would otherwise read as a struct.
+
+**Why it is not the class's message.** A class carries an object header and a reference
+count, which is what lets `this` be a borrowed value the caller may keep: `tk_rc_return`
+raises the count, `tk_rc_exprstmt` drops it. A struct has neither, and the language does
+not copy one at assignment yet — `P b = a; b.x = 9;` changes `a.x` — so handing the
+receiver out would ALIAS where C# copies. A copy-on-return would be the only place in the
+language that copies, which is a lie about the type; the struct-as-a-value-type design is
+its own page (`docs/specs/this-as-value.md` § 10).
+
+**What did NOT change, measured.** The field roads inside a struct method: `this.x`, a
+bare `x` and `this.x = v` all take the `K_DOT` branch or never reach `tk_this()` at all. A
+probe carrying the three exits 42 on the base binary and on the head binary alike. That
+is the whole of the struct story this entry touches.
+
+**The gate.** 142 passed, 190 refused as expected, 0 failed (base: 141/189/0 — one run
+fixture, one refuse fixture). `FIXPOINT OK`. `docs ok`. `--dump-ast` over all 142 accepted
+fixtures, base against head, both binaries run in place with `--include=lib
+--include=tests`: the 141 fixtures both sides have are byte-identical, 140 of them
+NON-EMPTY on both (the one empty pair is `surface_string_interp`, which dumps nothing
+without a config on either binary — an empty-vs-empty match, and no evidence). The
+142nd is the new fixture, which the base has no file for. `mc limits` on both legs, from
+a CLEAN `build/` — a stale `build/` left by `bootstrap.sh` makes the `heap` row lie:
+`passes` 0/8, `syntax` 0/16, `alias` 1/16, `types` 1/8, `on_stmt` 0/8 and `intrin` 0/8 on
+the compiler leg and 15/30, 20/40, 25/50, 18/36, 4/8, 8/16 on the `tests/hello.tk` leg,
+every one of them unmoved — zero new intrinsics, zero new passes, and the hello leg does
+not move at all. Only the compiler leg's size rows move: `nodes` 213100 → 213210, `ins`
+246253 → 246293, `funcs` 4278 → 4280, `strings` 3147 → 3149, `symbols` 8851 → 8855.
