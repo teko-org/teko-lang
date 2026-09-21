@@ -11927,9 +11927,12 @@ were measured before they were fixed:
   it. `&h.go()` on a METHOD and `&h.Side` on a PROPERTY stay refused -- both answered 243
   at `f81e0217`, the receiver being `(&h)` -- but take D97's own wording,
   `teko: the address of a member is not taught yet`, because neither has a `ref`/`out` road
-  for a message to name. One judge, three sentences, each true. Fixtures:
-  `tests/refuse/addr_member_qualified_call.tk` and
-  `tests/refuse/addr_member_qualified_unknown.tk`.
+  for a message to name -- and neither does a STATIC field, whose `ref` form `tk_ref_addr`'s
+  own static gate refuses, so the field wording would have sent the reader down a road that
+  refuses (`f81e0217` reported the static diagnostic there, through `tk_pend_by_name`). One
+  judge, three sentences, each true, and the field one is an INSTANCE field's alone.
+  Fixtures: `tests/refuse/addr_member_qualified_{call,prop,static,unknown}.tk` -- four,
+  because a refusal stops the compile and one file cannot exercise two of them.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11994,8 +11997,8 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 213
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and twenty-three
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 215
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and twenty-five
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
@@ -12008,13 +12011,14 @@ lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overl
 `tests/refuse/ref_field_lambda_outer_param.tk` for an enclosing parameter read inside a
 lambda, and `tests/refuse/ref_field_{private,static}.tk` for the two member gates the door
 never had, `tests/refuse/param_row_dtor.tk` for a destructor's own window and
-`tests/refuse/addr_member_qualified_{call,unknown}.tk` for the two sentences the judge owed
-— all fifteen found by the review — refused rising by exactly the twenty-three added. `tests/addr_not_member.tk` gains its item 7:
+`tests/refuse/addr_member_qualified_{call,prop,static,unknown}.tk` for the sentences the
+judge owed — all seventeen found by the review — refused rising by exactly the twenty-five
+added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178178, `ins` 246293 → 246869,
+only the compiler leg's size rows move: `nodes` 177785 → 178190, `ins` 246293 → 246890,
 `funcs` 3478 → 3486, `lowered` 3459 → 3467, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6976, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag

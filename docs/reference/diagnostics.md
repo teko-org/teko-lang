@@ -152,10 +152,10 @@ with that line in its stderr (D52).
   method or inside a lambda
   alike. No spelling of a member's address works from inside the type yet; from outside,
   `ref h.n` / `out h.n` through a variable holding the object does. Since D104 the same
-  message also covers a QUALIFIED address whose member is not a field — `&h.go()` on a
-  method, `&h.Side` on a property — because neither has a `ref`/`out` road for a message to
-  name; a qualified FIELD gets the sharper one below, and a name no type declares keeps
-  `teko: unknown member`.
+  message also covers a QUALIFIED address whose member has no `ref`/`out` road to name —
+  `&h.go()` on a method, `&h.Side` on a property, and `&h.tally` on a STATIC field, whose
+  `ref` form the static gate below refuses. A qualified INSTANCE field gets the sharper one
+  below, and a name no type declares keeps `teko: unknown member`.
 - ``"teko: the address of a field is not taught yet; pass it as `ref` or `out`"`` —
   completed by the field name: `&h.n`, `&this.n`, `&s.n` on a struct and `&this.k.n`
   through a chain, read or written (`st64(&this.n, v)`). `&` in mc is a prefix over a bare
