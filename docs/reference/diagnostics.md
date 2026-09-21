@@ -186,11 +186,11 @@ with that line in its stderr (D52).
 - ``"teko: `this` is not a value in a struct"`` — `return this;`, `f(this)`, `S x = this;`
   or any other bare `this` read as a value inside a `struct` body. A struct carries no
   object header and no reference count, so its `this` cannot be the value a class's or an
-  interface's is. D105 has since made a struct a value type and `P b = a;` copies, but the
-  refusal is not reopened by it: `this` inside a struct method IS the receiver parameter, and
-  a by-value struct parameter still aliases until V4 of
-  [struct-value.md](../specs/struct-value.md) § 6, so handing the receiver out would still
-  alias where C# copies. The
+  interface's is. D105 has since made a struct a value type and D106 copies at all
+  six landings, the by-value parameter included, but the refusal is not reopened by either:
+  `this` inside a struct method IS the receiver parameter, and the rule is about what `this`
+  IS in a struct body rather than about what a parameter does at the call
+  ([struct-value.md](../specs/struct-value.md) § 6). The
   field roads are untouched: `this.x`, a bare `x` and `this.x = v` inside the same method
   all keep working. Before D103 this answered the generic
   `teko: a value of type uptr does not convert to P`, which named the receiver parameter's
