@@ -11908,8 +11908,14 @@ were measured before they were fixed:
   symbol of its own (`fd_sym_at`) and not a word inside the object -- SIGSEGV. Both
   reproduce at `f81e0217` through the LOCAL receiver (42 and exit 139, measured), so the
   gate goes where BOTH receivers pass and the parameter road never inherits them.
-  `tk_check_member` then `tk_reject_static_member`, in `tk_member_of`'s own order.
-  Fixtures: `tests/refuse/ref_field_private.tk` and `tests/refuse/ref_field_static.tk`.
+  `tk_check_member` then `tk_reject_static_member`, in `tk_member_of`'s own order -- and
+  each is given what `tk_member_of` gives it: the field's OWNER for the visibility
+  question, which is the declaring type's to answer, and the RECEIVER's own row for the
+  static one, so an inherited static names the type the source wrote (`D.tally is static`,
+  not `B.tally is static`; `tk_field_find` walks the base chain, so the two differ exactly
+  when it does). Fixtures: `tests/refuse/ref_field_private.tk` and
+  `tests/refuse/ref_field_static.tk`, the latter written on an INHERITED static for that
+  reason.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11992,7 +11998,7 @@ the very object `&h.n` now refuses, read through `ref` and `out` in the same pro
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178111, `ins` 246293 → 246753,
+only the compiler leg's size rows move: `nodes` 177785 → 178109, `ins` 246293 → 246751,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
