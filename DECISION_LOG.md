@@ -11916,6 +11916,20 @@ were measured before they were fixed:
   when it does). Fixtures: `tests/refuse/ref_field_private.tk` and
   `tests/refuse/ref_field_static.tk`, the latter written on an INHERITED static for that
   reason.
+- ...and a DESTRUCTOR takes no parameter, so it never goes through `tk_params` either --
+  the same hole the accessor had, one member shape over. `tk_member_dtor` empties its own
+  window, the destructor's analogue of `tk_params`'s first line. Fixture:
+  `tests/refuse/param_row_dtor.tk`.
+- ...and the judge chose its SENTENCE before knowing what the member was. `&h.missing`,
+  where no type declares the name, was told a field's address is not taught yet and offered
+  a `ref` for a field that does not exist; `f81e0217` says `teko: unknown member` and that
+  is the truth, so the judge now returns for a name no type declares and lets the road say
+  it. `&h.go()` on a METHOD and `&h.Side` on a PROPERTY stay refused -- both answered 243
+  at `f81e0217`, the receiver being `(&h)` -- but take D97's own wording,
+  `teko: the address of a member is not taught yet`, because neither has a `ref`/`out` road
+  for a message to name. One judge, three sentences, each true. Fixtures:
+  `tests/refuse/addr_member_qualified_call.tk` and
+  `tests/refuse/addr_member_qualified_unknown.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11980,8 +11994,8 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 210
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and twenty
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 213
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and twenty-three
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
@@ -11993,14 +12007,16 @@ lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overl
 `tests/refuse/param_row_accessor{,_arrow}.tk` for a property accessor's own window and
 `tests/refuse/ref_field_lambda_outer_param.tk` for an enclosing parameter read inside a
 lambda, and `tests/refuse/ref_field_{private,static}.tk` for the two member gates the door
-never had — all twelve found by the review — refused rising by exactly the twenty added. `tests/addr_not_member.tk` gains its item 7:
+never had, `tests/refuse/param_row_dtor.tk` for a destructor's own window and
+`tests/refuse/addr_member_qualified_{call,unknown}.tk` for the two sentences the judge owed
+— all fifteen found by the review — refused rising by exactly the twenty-three added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178109, `ins` 246293 → 246751,
-`funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
-`defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
+only the compiler leg's size rows move: `nodes` 177785 → 178178, `ins` 246293 → 246869,
+`funcs` 3478 → 3486, `lowered` 3459 → 3467, `globals` 1006 → 1011, `strings` 2477 → 2479,
+`defines` 1305 → 1306, `symbols` 6961 → 6976, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
 takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, exactly ONE
 differing — `addr_not_member`, whose accepted code this decision changed, and the diff is
