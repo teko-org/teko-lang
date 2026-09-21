@@ -1672,7 +1672,11 @@ Every one of these is [nullable.md](nullable.md)'s.
   enclosing declaration's own PARAMETER — which stops answering the moment that declaration
   is over (`tk_hp_own`), and is shadowed by a `ref`/`out` parameter or a FIXED ARRAY of the
   same name, neither of which is an object. A `ref`/`out` parameter of the object itself
-  keeps the refusal too: its slot carries an address, not the object.
+  keeps the refusal too: its slot carries an address, not the object. The member itself
+  passes the same two gates an ordinary field read does, in the same order (D104): `` `X.m`
+  is private ``/`` is protected `` (`tk_check_member`) and `` `X.m` is static; reach it
+  through its type `` (`tk_reject_static_member`) — an address the callee WRITES through is
+  no weaker a door than a read.
 - `"teko: not a local array"` — `ref a[i]` where `a` is not a local array.
 - ``"teko: two overloads differ only by `ref`/`out`"`` — a site could not tell them apart.
 

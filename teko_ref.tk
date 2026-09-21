@@ -87,6 +87,12 @@ i64 tk_ref_cur_fn = 0;                 // the N_FUNC this pass is walking right 
 i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
 i64 tk_deleg_is_thunk(i64 f);                     // teko_deleg.tk, included after this file
 
+// D104: the two member gates `tk_member_of` (teko_expr.tk) puts in front of a
+// field it is about to read -- both modules are included after this one, and
+// `tk_ref_addr` below asks them the same questions in the same order
+void tk_check_member(i64 owner, i64 vis, uptr m, i64 line, uptr fl);          // teko_access.tk
+void tk_reject_static_member(i64 si, uptr m, i64 line, uptr fl);              // teko_expr.tk
+
 // teko_typeof.tk, included after this file -- but this pass RUNS after that
 // one (`teko.tk`: `tk_typeof_pass`, then `tk_ref_pass`), so the oracle's own
 // scope stack is exactly the table this walk keeps live and reads a bare name
@@ -358,6 +364,19 @@ i64 tk_ref_addr(i64 line, uptr fl, i64 pty) {
         if (si < 0) err_at2(fl, line, "teko: not an object of a known type", name);
         i64 fi = tk_field_find(si, m);
         if (fi < 0) err_at2(fl, line, "teko: unknown member", m);
+        // D104: the SAME two gates `tk_member_of` (teko_expr.tk) puts in front
+        // of an ordinary field read, in its order. This door had neither, and
+        // `name + OFF` is an address a caller then WRITES through, so it was
+        // the laxest of the two: `bump(ref h.secret)` wrote a `private` field
+        // from outside its type (measured, 42 where the read is refused), and
+        // `bump(ref h.tally)` on a STATIC lowered to `h + fd_off` although a
+        // static's storage is a symbol of its own and not inside the object at
+        // all -- SIGSEGV, measured on `f81e0217` too through a LOCAL receiver.
+        // The parameter receiver this decision adds would have inherited both,
+        // so the gate goes where BOTH receivers pass (Copilot on #770).
+        i64 owner = tk_field_owner(fi);
+        tk_check_member(owner, fd_vis_at(fi), m, line, fl);
+        if (fd_sym_at(fi)) tk_reject_static_member(owner, m, line, fl);
         set_pty(pty, fd_ty_at(fi));
         return tk_bin(K_ADD, tk_id(name), tk_int(fd_off_at(fi)));
     }
