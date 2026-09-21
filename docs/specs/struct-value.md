@@ -213,6 +213,17 @@ void rt_copy(uptr d, uptr s, i64 n) {
 
 `rc_inc(0)` is already a no-op (`lib/rt.tk:132-135`), so a null field needs no guard.
 
+**As built (D105, V2), three deviations from the sketch above.** The parameter is `uptr s`,
+not `Name s` — the spelling a method's implicit receiver already takes (`teko_this.tk`), so
+the field arithmetic in the body is plain pointer arithmetic and a struct value lands on it
+the way it lands on `this`. The body opens with `if (s == 0) return 0;`: a struct field is a
+pointer `rt_alloc` zeroed, so a struct whose struct-typed field was never built reaches the
+recursion with 0, and `rt_copy` would read address 0 — the null is copied AS null instead.
+And `rt_copy` is not the only new runtime function: an inline array FIELD of counted element
+type (`struct W { Cell c[2]; }`, which compiles today) needs one `rc_inc` per element, so
+`rt_retain_array(base, n)` joins it as the mirror of the `rt_release_array` `tk_release_fields`
+already calls. An inline array field of STRUCT element type is unrolled, one copy per element.
+
 ---
 
 ## 4. The surface

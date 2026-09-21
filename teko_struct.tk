@@ -1524,12 +1524,13 @@ void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
 // conversion nobody wrote. A parameter is in no scope table at parse time, so
 // the honest answer for it is -1, "not known here", which every caller of
 // `tk_pty_of` already treats as "refuse nothing".
-// `node` is the N_VAR the SOURCE wrote, and this is the ONLY door it arrives
-// by: every temporary the passes generate (a foreach element, a ternary's
-// hoisted arm, a nullable's unwrap, a lambda's captured copy) is built straight
-// from `tk_var` and never reaches `tk_on_stmt`. `tk_copy_pass` (teko_copy.tk)
-// reads the column to find the L1 landings, which is what keeps it from
-// copying a temporary the compiler itself put there (V2).
+// `node` is the N_VAR the SOURCE wrote, or 0 when the compiler wrote it. Almost
+// every temporary the passes generate (a ternary's hoisted arm, a nullable's
+// unwrap, a lambda's captured copy) is built straight from `tk_var` and never
+// reaches `tk_on_stmt` at all; the one that DOES is the `foreach` element, and
+// `tk_stmt_gen` above is what marks it. `tk_copy_pass` (teko_copy.tk) reads the
+// column to find the L1 landings, which is what keeps it from copying a
+// declaration the compiler itself put there (V2).
 void tk_slv_add(uptr name, i64 ty, i64 node) {
     if (tk_nslv == TK_MAXSLV) err_at(tk_file, tk_line, "teko: too many locals in one unit");
     set_slv_name_at(tk_nslv, name);
@@ -1584,6 +1585,16 @@ i64 tk_pty_of(i64 n) {
     return 0 - 1;
 }
 
+// 1 while a PASS-owned declaration is being announced through `tk_on_stmt`.
+// `teko_loop.tk` builds the `foreach` element with `tk_var` and hands it to the
+// hook so the element NAME is in scope for the body, but the node is the
+// COMPILER's: `slv_node` stays 0 for it, and no landing of `teko_copy.tk`'s may
+// touch it. Binding a struct `foreach` variable to a copy would make
+// `foreach (S s in a) { s.n = 9; }` compile and write into a detached block --
+// measured at 3 where the array reads 18 -- which is the class of bug D105
+// exists to remove, and which V6 refuses outright instead (C# CS1654).
+i64 tk_stmt_gen = 0;
+
 // M21.5's statement hook: a local the CORE declared (`Point p = new Point;`)
 // is observable here as the N_VAR node, and its type id is the struct or class.
 // Nothing is rewritten -- the node that arrives is the node that leaves.
@@ -1593,7 +1604,9 @@ i64 tk_on_stmt(i64 n) {
     if (n == 0) return n;
     if (nd_kind(n) != N_VAR) return n;
     if (nd_val(n) != 0) return n;
-    tk_slv_add(nd_name(n), nd_type(n), n);
+    i64 site = n;
+    if (tk_stmt_gen) site = 0;                   // the compiler's own, not the source's
+    tk_slv_add(nd_name(n), nd_type(n), site);
     i64 si = tk_struct_by_ty(nd_type(n));
     if (si >= 0) {
         tk_line = nd_line(n);

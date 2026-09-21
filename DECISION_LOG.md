@@ -4966,6 +4966,14 @@ rows are compared), with `passes` 15/30, `types` 11, `intrin` 8/16,
 listed file, so the hash moves by design).
 
 ### D56 · A STRUCT global is a class global (G-d, 2026-09-14)
+**SUPERSEDED IN PART by D105 (2026-09-21), on the SEMANTICS only.** Everything below about
+the REPRESENTATION stands: a struct value is a POINTER, eight bytes, a struct global is the
+slot a class global is, D53's corridor judges its store, and `tk_is_counted` answers 0 for
+it. What no longer holds is the sentence marked below -- **a struct IS copied where it
+lands**, and `Point q = gp;` is a COPY, not an alias (the whole-struct STORE `gp = p;` is
+still an alias, and V3 of docs/specs/struct-value.md § 6 closes it). D105 carries the
+semantics in force.
+
 D5 already settled a struct value as a POINTER, eight bytes, so a struct global takes the
 door every other reference-typed global takes, three doors already cut: D48 gives it a ROW
 in the slot table, D53 runs its assignment through the same compat/widen corridor a local
@@ -4978,10 +4986,14 @@ from that corridor by TYPE, not by being a global. **Measured: G-d is zero compi
 DECLARATION is refused by mc's own core, `global initializer must be constant` -- a `new` is
 a call, never a constant, so no `teko:` refusal of this crumb's own is possible or needed
 here); a field store and read; a whole-struct store aliasing a local (`gp = p; p.x = 42;`
-reads 42 through `gp`) -- the RECORDED semantics: **C# copies a struct on assignment; teko
-does not**, because a struct global (like a struct local) holds no sixteen-byte value to
-copy, only the pointer D5 already gave it, so `gp = p` is the exact alias a class global
-already licensed; a local built from the global (`Point q = gp;`) is the same alias; the
+reads 42 through `gp`) -- the semantics recorded HERE, and **SUPERSEDED by D105**: *"C#
+copies a struct on assignment; teko does not"*, because a struct global (like a struct
+local) holds no sixteen-byte value to copy, only the pointer D5 already gave it, so `gp = p`
+was the exact alias a class global already licensed. D105 keeps that pointer and writes the
+copy AT THE SITE instead -- a fresh `rt_alloc` plus a memberwise copy -- so the conclusion
+drawn from the representation here was the wrong one, and C#'s form is what teko answers. A
+local built from the global (`Point q = gp;`) was the same alias and **COPIES since D105's
+V2**; the whole-struct STORE above it still aliases, until V3. The
 global passed by value, by `ref` and by `out`; a method through the implicit `this`; a nested
 struct field two levels deep (`gl.a.x`); a struct global whose OWN field is counted (`struct
 S { Cell c; } S gs;`) survives two unrelated `Cell` allocations still reading its own value
@@ -12122,13 +12134,20 @@ a `new S` that a hoist has already moved into a temporary (`Vec w = c ? new Vec(
 the safe side of the test, and visible in that fixture's dump.
 
 **What the pass reads, and why it is not the node array.** `slv_node` is a new column on the
-existing `slv` table (teko_struct.tk), written by `tk_on_stmt` and by nothing else -- the
-N_VAR the SOURCE wrote. Every temporary the passes generate (a `foreach` element, a
-ternary's hoisted arm, a nullable's unwrap, a lambda's captured copy) is built straight from
-`tk_var` and never reaches that hook. Walking the node array instead would have copied them
-all, and the `foreach` one is the case that matters: binding a foreach variable to a copy
-would make `foreach (S s in a) { s.n = 9; }` compile and go nowhere, which is the class of
-bug this ruling exists to remove and which V6 refuses outright instead (C#'s CS1654).
+existing `slv` table (teko_struct.tk), written by `tk_on_stmt`: the N_VAR the SOURCE wrote,
+and 0 when the compiler wrote it. Almost every temporary the passes generate -- a ternary's
+hoisted arm, a nullable's unwrap, a lambda's captured copy -- is built straight from
+`tk_var` and never reaches that hook at all, so walking the node array instead would have
+copied them all. **Exactly one generated declaration DOES reach it**, and the first cut of
+this crumb got it wrong: `teko_loop.tk:481` hands the `foreach` element's own `varDecl` to
+`tk_on_stmt` so the element NAME is in scope for the body. With `slv_node` set for it, L1
+wrapped the element in `name_copy` and `foreach (S s in a) { s.n = 9; }` wrote into a
+detached block -- measured at **3** where the array reads **18**, a silently wrong result
+where the base had a merely surprising one. `tk_stmt_gen` is the mark: teko_loop.tk raises
+it around that call, `tk_on_stmt` records 0, and the element is out of every landing. C#
+refuses the write outright (CS1654) and V6 is that crumb;
+`tests/struct_copy_local.tk`'s `foreachcheck` pins the base's answer until then. Found by
+Copilot's review of PR #771, reproduced with a probe before it was fixed.
 
 **The rc line is not optional, and the fixture proves it by mutation.** A struct's own block
 is uncounted, but its FIELDS are gated by the field's own type (`tk_os_mark`), never by the
@@ -12153,6 +12172,15 @@ RUNNING TIME rather than with its shape, so a 16-byte struct copied in a long lo
 `tests/struct_copy_local.tk`'s `peakcheck` asserts the number (`rt_peak()` rises by exactly
 `64 * 16` over 64 copies) rather than implying it. `name_copy` is a reserved symbol from
 here on, the same collision rule `point_new` has carried since D48.
+
+**The forward row was probed, not assumed.** The copy body is emitted when the struct
+CLOSES, so a field may name a type declared later and still carry a TK_PFWD row. That row is
+not blank: the forward pre-scan (§50 O1, `tk_fwd_reg_type`) records the real KIND before any
+field is parsed, so `tk_is_struct` and `tk_is_counted` both answer correctly at the close.
+Measured twice -- a forward STRUCT field deep-copies (two blocks, the inner write not seen
+through the original) and a forward CLASS field is retained (the overwriting store does not
+free it under the copy), across an `#include` boundary as well as within one file, exit 42
+on each. Raised by Copilot's review of PR #771; not reproduced.
 
 **Gate.** `144 passed, 217 refused as expected, 0 failed` (the base is `143 passed, 215
 refused`: `struct_copy_local` and the two cycle fixtures). `FIXPOINT OK`. Docs green.
