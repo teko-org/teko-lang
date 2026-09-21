@@ -143,10 +143,26 @@ i64 tk_this() {
     // borrowed: a parameter sits below `tk_rc_floor`, which is what makes
     // `tk_rc_return` emit the caller's own `rc_inc` and needs no new machinery.
     // A `this` about to be a `.` receiver is left unregistered -- the member
-    // road is untouched and the table costs one row per BARE `this`. A `struct`
-    // is not a value type on assignment yet, so its `this` keeps its refusal.
-    if (p_id() != K_DOT && (tk_is_class(tk_body_class) || tk_is_iface(tk_body_class)))
-        tk_xt_add(r, tk_body_class, 1, TK_BORROWED);
+    // road is untouched and the table costs one row per BARE `this`.
+    if (p_id() != K_DOT) {
+        // D103: a `struct` is the ELSE of D102's kind test, and it earns its
+        // own sentence there. A struct has no object header and no reference
+        // count, so `this` in one cannot be the value a class's is; and the
+        // language does not copy a struct at assignment yet (`P b = a;
+        // b.x = 9;` changes `a.x`), so handing the receiver out would alias
+        // where C# copies. The sentence the reader used to get named the
+        // RECEIVER PARAMETER's declared type -- `teko: a value of type uptr
+        // does not convert to P` -- which says nothing about why. Refused at
+        // the word itself, not at the construct that consumes it.
+        // `this.x`, `x` and `this.x = v` inside a struct method are a FIELD
+        // road, not a value, and are untouched: they take the `K_DOT` branch
+        // or never reach this function at all (docs/specs/this-as-value.md
+        // § 10 -- the struct-as-a-value-type design is its own page).
+        if (tk_is_struct(tk_body_class))
+            err_at(fl, line, "teko: `this` is not a value in a struct");
+        if (tk_is_class(tk_body_class) || tk_is_iface(tk_body_class))
+            tk_xt_add(r, tk_body_class, 1, TK_BORROWED);
+    }
     return r;
 }
 
