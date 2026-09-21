@@ -1,0 +1,39 @@
+// ref_field_lambda_outer_param.tk -- D104: an enclosing PARAMETER is not in
+// scope inside a lambda body, so `ref h.n` on one is refused there.
+//
+// A lambda captures EXPLICITLY in teko (`use (...)`, K4) and `tk_lambda_use`
+// accepts a LOCAL alone -- a parameter is not capturable at all. Without a
+// same-named global the capture judge says so (`teko: h is not captured; add
+// it to use (...)`); WITH one, as here, the name binds to the global and the
+// judge lets it through, so the only thing left to refuse was the parameter
+// row -- and the parameter table's scan reached across the lambda's own floor
+// to find it, supplying the enclosing `H`'s offset for the global: `<the
+// global> + OFF`, SIGSEGV, found by the Copilot review of #770. `f81e0217`
+// refuses it.
+//
+// The scan now stops at `tk_hp_base`, the current list's own floor. The floor
+// is still kept for RESTORATION, which is what makes the enclosing list answer
+// again the moment the lambda closes -- `tests/ref_field_param.tk` item 7
+// proves that half in the same program shape.
+//
+// expect-refuse: teko: not an object of a known type: h
+// expect-refuse-line: 32
+#include "../../lib/rt.tk"
+
+class H { public i64 pad; public i64 n; public H() { pad = 0; n = 41; } }
+
+delegate i64 Op(i64 x);
+
+i64 h = 100;
+
+void bump(ref i64 v) { v = v + 1; }
+
+i64 f(H h) {
+    Op g = new Op((i64 x) => { bump(ref h.n); return x; });
+    return g(1) + h.n;
+}
+
+i64 main() {
+    H a = new H();
+    return f(a);
+}

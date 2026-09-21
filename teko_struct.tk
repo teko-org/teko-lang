@@ -1055,18 +1055,29 @@ void tk_hp_add(uptr name, i64 ty) {
 void tk_hp_shadow(uptr name) { tk_hp_add(name, 0 - 1); }
 
 // the declared type of the parameter named `name`, or -1: the newest one
-// wins, the same rule `tk_local_find` gives a shadowed local -- so a lambda's
-// own parameter answers inside its body and the enclosing one answers again
-// after `tk_hp_pop`. A `ref`/`out` parameter has a SHADOW row (-1 for the
-// type, `tk_hp_shadow` above): the scan stops there and answers "no object",
-// so its slot -- which holds an ADDRESS rather than the object -- is never
-// mistaken for the object itself, and an enclosing row of the same name never
-// answers past it.
+// wins, the same rule `tk_local_find` gives a shadowed local. A `ref`/`out`
+// parameter has a SHADOW row (-1 for the type, `tk_hp_shadow` above): the scan
+// stops there and answers "no object", so its slot -- which holds an ADDRESS
+// rather than the object -- is never mistaken for the object itself, and an
+// older row of the same name never answers past it.
+//
+// The scan stops at `tk_hp_base`, the CURRENT list's own floor, and that is a
+// scope rule rather than bookkeeping: a lambda captures EXPLICITLY in teko
+// (`use (...)`, K4) and `tk_lambda_use` accepts a local alone, so an enclosing
+// PARAMETER is not in scope inside a lambda body at all. Scanning past the
+// floor reached it anyway: with `i64 f(H h)` and `bump(ref h.n)` inside a
+// lambda, the capture judge lets the name through when a same-named GLOBAL
+// exists (the name binds to the global) and the enclosing parameter's row then
+// supplied the offset -- `<the global> + OFF`, SIGSEGV, where `f81e0217`
+// refuses (Copilot on #770). The floor is still kept for RESTORATION, which is
+// what makes the enclosing list answer again the moment `tk_hp_pop` runs
+// (`tests/ref_field_param.tk` item 7). With no nested list open the floor is
+// 0 and this is the whole table, as it always was.
 i64 tk_hp_find_any(uptr name) {
     if (!tk_hp_in_owner()) return 0 - 1;
     i64 i = tk_nhp - 1;
     loop {
-        if (i < 0) break;
+        if (i < tk_hp_base) break;
         if (str_eq(hp_name_at(i), name)) return hp_ty_at(i);
         i = i - 1;
     }

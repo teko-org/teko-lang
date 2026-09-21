@@ -11889,6 +11889,17 @@ were measured before they were fixed:
   `tk_hp_pop`. Item 13 of `tests/ref_field_param.tk`, with the generated method's own
   parameter spelled like the enclosing one and of another class, so the offset says which
   row answered.
+- ...and the floor is a SCOPE, not only a guard against the reset. A lambda captures
+  EXPLICITLY in teko (`use (...)`, K4) and `tk_lambda_use` accepts a LOCAL alone, so an
+  enclosing PARAMETER is not in scope inside a lambda body at all. The scan reached it
+  anyway: without a same-named global the capture judge refuses first
+  (`teko: h is not captured; add it to use (...)`), but WITH one the name binds to the
+  global and the judge lets it through -- and the enclosing parameter's row then supplied
+  the offset, `<the global> + OFF` and SIGSEGV. `tk_hp_find_any` stops at `tk_hp_base`; the
+  floor is still kept for RESTORATION, which is what makes the enclosing list answer again
+  the moment `tk_hp_pop` runs. Fixture: `tests/refuse/ref_field_lambda_outer_param.tk`,
+  beside item 7 of `tests/ref_field_param.tk`, which is the same program shape with the use
+  AFTER the lambda instead of inside it.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11953,8 +11964,8 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 207
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and seventeen
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 208
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and eighteen
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
@@ -11963,13 +11974,14 @@ for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar sh
 `tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration and
 `tests/refuse/param_row_outlives_decl_lambda.tk` for the same rows laundered through a
 lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overloads and
-`tests/refuse/param_row_accessor{,_arrow}.tk` for a property accessor's own window —
-all nine found by the review — refused rising by exactly the seventeen added. `tests/addr_not_member.tk` gains its item 7:
+`tests/refuse/param_row_accessor{,_arrow}.tk` for a property accessor's own window and
+`tests/refuse/ref_field_lambda_outer_param.tk` for an enclosing parameter read inside a
+lambda — all ten found by the review — refused rising by exactly the eighteen added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178075, `ins` 246293 → 246713,
+only the compiler leg's size rows move: `nodes` 177785 → 178075, `ins` 246293 → 246715,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
