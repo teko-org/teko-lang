@@ -1669,8 +1669,10 @@ Every one of these is [nullable.md](nullable.md)'s.
   question is asked in one place and in C#'s order: the innermost LOCAL, whatever its type
   (so a scalar `i64 h` shadowing an object blocks the access instead of letting the outer
   one answer at the inner one's slot), and, when no local of that name is in scope, the
-  enclosing declaration's own PARAMETER. A `ref`/`out` parameter of the object itself keeps
-  the refusal: its slot carries an address, not the object.
+  enclosing declaration's own PARAMETER — which stops answering the moment that declaration
+  is over (`tk_hp_own`), and is shadowed by a `ref`/`out` parameter or a FIXED ARRAY of the
+  same name, neither of which is an object. A `ref`/`out` parameter of the object itself
+  keeps the refusal too: its slot carries an address, not the object.
 - `"teko: not a local array"` — `ref a[i]` where `a` is not a local array.
 - ``"teko: two overloads differ only by `ref`/`out`"`` — a site could not tell them apart.
 
@@ -2101,7 +2103,7 @@ truncation; the fix is to split the unit.
 | `"teko: too many array writes waiting to be resolved"` | 512 |
 | `"teko: too many array indexes waiting to be resolved"` | 4096 index bases a global-array rewrite consumed and left for the typeof pass to judge the binding of (D96) — one per `g[i]` on a global array, read or write |
 | `"teko: too many array-field accesses"` | 128 |
-| `"teko: too many parameters in one declaration"` | 128 rows, **one per parameter**, counted over every parameter list still open at once — an enclosing declaration's, plus each lambda nested inside it (D104's floor, `tk_hp_push`). A `ref`/`out` parameter spends a row like any other: it is written as a SHADOW (`tk_hp_shadow`, the name with −1 for the type) so that it blocks an enclosing row of the same name rather than letting it answer. mc's own `MAXPARAMS` is 12, so ten nested lists fit; it was 32 rows for `T[]` parameters alone before D104, and unreachable then too |
+| `"teko: too many parameters in the open declarations"` | 128 rows, **one per parameter**, counted over every parameter list still OPEN at once — an enclosing declaration's, plus each lambda nested inside it (D104's floor, `tk_hp_push`), which is why the message names the declarations rather than one of them. A `ref`/`out` parameter spends a row like any other: it is written as a SHADOW (`tk_hp_shadow`, the name with −1 for the type) so that it blocks an enclosing row of the same name rather than letting it answer. mc's own `MAXPARAMS` is 12, so ten open lists fit; it was 32 rows for `T[]` parameters alone, in one list, before D104 |
 | `"teko: lambdas nested too deep"` | 16 parameter lists open at once — a lambda inside a lambda inside … , each one pushing the floor D104 gives `tk_hp_reset` |
 | `"teko: too many locals in one unit"` | 8192 |
 | `"teko: too many locals in one function"` | 8192, the same ceiling — the names one body has in scope at once (its parameters, its locals and the temporaries the compiler declares beside them) are a subset of the unit's own locals, so a body the parser accepted always fits and only a compiler-written temporary can reach this. It was a silent stop at 256 before, which answered −1 about a declaration that was right there: past 255 locals a `f64 x` shadowing a `ref i64 x` parameter went unrecorded, and the call that passed `ref x` was refused *teko: a value of type i64 does not convert to f64* on a legal program |

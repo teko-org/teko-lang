@@ -932,6 +932,8 @@ uptr tk_ty_mangle_name(i64 ty) {
 #define TK_MAXHP  128                 // every parameter of every list still open
 #define TK_MAXHPB 16                  // how deep a lambda may nest inside a list
 
+uptr tk_hp_owner = 0;                 // the declaration the rows belong to (below)
+
 uptr hp_name[TK_MAXHP];
 i64  hp_ty[TK_MAXHP];
 i64  tk_nhp = 0;
@@ -956,17 +958,42 @@ void set_hp_ty_at(i64 i, i64 v)    { st64(hp_ty + i * 8, v); }
 // between the list and the use, `ref h.n` added H's offset to G's object and
 // wrote the field next door (measured, exit 41 where 42 is right). One floor
 // fixes both, because both read this one table.
-i64 hp_base_st[TK_MAXHPB];
+i64  hp_base_st[TK_MAXHPB];
+uptr hp_own_st[TK_MAXHPB];
 i64 tk_nhpb = 0;
 i64 tk_hp_base = 0;
 
 void tk_hp_reset() { tk_nhp = tk_hp_base; }
+
+// D104: the DECLARATION the rows belong to -- the name `p_decl_name()` answers
+// while that declaration's own body is being parsed. The reset is driven by
+// the parameter LIST (`tk_default_param` for a free function, `tk_params` for
+// a member), and a free function with an EMPTY list has no list to drive it:
+// its body then read the PREVIOUS declaration's rows. Measured at `f81e0217`
+// on the `T[]` road -- `i64 first(i64[] xs) {...} i64 second() { return
+// xs[0]; }` beside a global `i64 xs` segfaults there -- and the parameter road
+// would have inherited it (`ref h.n` in `second`, SIGSEGV; Copilot on #770).
+// The owner is recorded where the body's name is known and compared where the
+// rows are read: a row of another declaration answers nothing. A lambda is not
+// another declaration for this purpose -- its floor is open (`tk_nhpb > 0`),
+// and the enclosing rows are exactly what it must still see.
+void tk_hp_own(uptr name) { tk_hp_owner = name; }
+
+// 1 when the rows in the table belong to the declaration being parsed now
+i64 tk_hp_in_owner() {
+    if (tk_nhpb != 0) return 1;                   // inside a nested list: the floor answers
+    if (tk_hp_owner == 0) return 1;               // nothing recorded: as before
+    uptr cur = p_decl_name();
+    if (cur == 0) return 1;                       // mc is not reporting one here
+    return str_eq(cur, tk_hp_owner);
+}
 
 // entering a nested parameter list: the rows already there become a floor
 // `tk_hp_reset` cannot cut below
 void tk_hp_push() {
     if (tk_nhpb == TK_MAXHPB) err_at(tk_file, tk_line, "teko: lambdas nested too deep");
     st64(hp_base_st + tk_nhpb * 8, tk_hp_base);
+    st64(hp_own_st + tk_nhpb * 8, tk_hp_owner);   // the lambda's own list will overwrite it
     tk_nhpb = tk_nhpb + 1;
     tk_hp_base = tk_nhp;
 }
@@ -977,6 +1004,7 @@ void tk_hp_pop() {
     tk_nhp = tk_hp_base;
     tk_nhpb = tk_nhpb - 1;
     tk_hp_base = ld64(hp_base_st + tk_nhpb * 8);
+    tk_hp_owner = ld64(hp_own_st + tk_nhpb * 8);  // ...and the enclosing one owns them again
 }
 
 // D104: the row is kept for EVERY parameter, not only a `T[]` one. A
@@ -990,7 +1018,7 @@ void tk_hp_pop() {
 // (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) see the same rows they
 // always saw, and `tk_hp_find_any` is the new door.
 void tk_hp_add(uptr name, i64 ty) {
-    if (tk_nhp == TK_MAXHP) err_at(tk_file, tk_line, "teko: too many parameters in one declaration");
+    if (tk_nhp == TK_MAXHP) err_at(tk_file, tk_line, "teko: too many parameters in the open declarations");
     set_hp_name_at(tk_nhp, name);
     set_hp_ty_at(tk_nhp, ty);
     tk_nhp = tk_nhp + 1;
@@ -1015,6 +1043,7 @@ void tk_hp_shadow(uptr name) { tk_hp_add(name, 0 - 1); }
 // mistaken for the object itself, and an enclosing row of the same name never
 // answers past it.
 i64 tk_hp_find_any(uptr name) {
+    if (!tk_hp_in_owner()) return 0 - 1;
     i64 i = tk_nhp - 1;
     loop {
         if (i < 0) break;

@@ -11761,7 +11761,7 @@ else, so its three callers (`tk_dot`, `tk_bracket`, teko_loop.tk's `foreach`) se
 the rows they always saw, and `tk_hp_find_any` is the new door `tk_ref_addr` asks after
 `tk_local_find` misses. The ceiling message is renamed to match what it counts
 (``teko: too many `T[]` parameters in one declaration`` → `teko: too many parameters in
-one declaration`); the table itself grows to 128 rows in the review pass below, where the
+the open declarations`); the table itself grows to 128 rows in the review pass below, where the
 rows of every OPEN parameter list start sharing it, and mc's own `MAXPARAMS` of 12 leaves
 room for ten such lists. A `ref`/`out` parameter gets a row too — a SHADOW, the name with
 -1 for the type (`tk_hp_shadow`, and also below) — so it keeps the refusal, correctly: its
@@ -11809,7 +11809,8 @@ floor `tk_hp_reset` cannot cut below, `tk_hp_pop` in `tk_lambda_finish` drops th
 list's own rows beside the capture window's. One table, one floor, and the `T[]` sibling
 is answered by the same change — items 7 and 8 of `tests/ref_field_param.tk`. `TK_MAXHP`
 grows 32 → 128 because the rows of every open list now coexist — a `ref`/`out` shadow row
-among them — and `TK_MAXHPB` (16) bounds the nesting with its own message.
+among them — `TK_MAXHPB` (16) bounds the nesting with its own message, and the ceiling's
+own message names the open declarations rather than one of them.
 
 **The review's second pass, and the same table again.** Keeping the enclosing rows alive
 opened two shapes where the INNERMOST parameter list had no row to shadow with, and both
@@ -11829,6 +11830,26 @@ were measured before they were fixed:
   open the two rules are the same rule the three callers always saw. `f81e0217` refuses
   that program (the reset had wiped the enclosing row), and so does this. Fixture:
   `tests/refuse/lambda_param_shadows_array.tk`.
+- a FIXED-ARRAY local is in NEITHER table `tk_ref_addr` reads: it never reaches
+  `tk_slv_add` (`tk_on_stmt` returns first for a declaration with a length) and it is no
+  object for `tk_local_find`; it lives in `tk_arr_find`'s own scoped table. So an inner
+  `i64 h[2]` shadowing an `H h` PARAMETER was invisible, and `h + OFF` was built against
+  the ARRAY's storage. It is asked after `tk_slv_find` and blocks the fallback the way any
+  other local does — an array is never an object with fields, so there is nothing to answer
+  with, only something to block. Fixture: `tests/refuse/ref_field_array_local.tk`.
+- a parameter's rows OUTLIVED their declaration. The reset is driven by the parameter LIST,
+  and a free function spelled `()` has no list to drive it, so its body read the PREVIOUS
+  declaration's rows; with a same-named GLOBAL for mc to resolve the identifier against,
+  the address built was `<the global> + OFF`. `f81e0217` has that on the `T[]` road —
+  `i64 first(i64[] xs) {…} i64 second() { return xs[0]; }` beside a global `i64 xs`
+  segfaults there, measured — and the parameter road would have inherited it. `tk_hp_own`
+  records the declaration the rows belong to (the name `p_decl_name()` answers inside its
+  own body: the function's for a free one, the MANGLED member name `parse_function` is
+  given for a member, the accessor's for a `=>` property body) and `tk_hp_in_owner` asks it
+  again where the rows are read. A lambda is not another declaration for this purpose —
+  its floor is open, and the enclosing rows are exactly what it must still see, so the
+  owner is stacked beside the floor. Both roads read one lookup, so the `T[]` sibling is
+  answered by the same change. Fixture: `tests/refuse/param_row_outlives_decl.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11879,20 +11900,22 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 201
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and eleven
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 203
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and thirteen
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
-`tests/refuse/lambda_param_shadows_array.tk` for the `T[]` one, all three found by the
-review — refused rising by exactly the eleven added. `tests/addr_not_member.tk` gains its item 7:
+`tests/refuse/lambda_param_shadows_array.tk` for the `T[]` one,
+`tests/refuse/ref_field_array_local.tk` for the fixed-array one and
+`tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration —
+all five found by the review — refused rising by exactly the thirteen added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 177966, `ins` 246293 → 246563,
-`funcs` 3478 → 3483, `lowered` 3459 → 3464, `globals` 1006 → 1009, `strings` 2477 → 2479,
-`defines` 1305 → 1306, `symbols` 6961 → 6971, every row `ok`. `--dump-ast` base against head over every
+only the compiler leg's size rows move: `nodes` 177785 → 178053, `ins` 246293 → 246690,
+`funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
+`defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
 takes no `--config`): 141 fixtures, all 141 NON-EMPTY ON BOTH SIDES, exactly ONE
 differing — `addr_not_member`, whose accepted code this decision changed, and the diff is
