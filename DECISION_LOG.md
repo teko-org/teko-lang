@@ -11492,3 +11492,125 @@ unprefixed core message on a nullable-row WRITE stands exactly where D100 left i
 `tk_bracket` defers only an `N_IDENT` or `N_INDEX` base; this crumb makes one more spelling
 reach it (`m` can now be allocated with `new`) and widens no defect — store the row whole.
 A FIXED array of arrays (`i64[] xs[2]`) stays where D99 left the fixed road.
+
+### D102 · `this` is a value: the class belongs to the NODE the parser built, not to the
+scope; and `this = e;` is refused (2026-09-20)
+
+**What landed.** Crumbs 1 and 3 of
+[docs/specs/this-as-value.md](docs/specs/this-as-value.md). A bare `this` used as a value
+was refused in every surface position — `teko: a value of type uptr does not convert to C` —
+because the receiver parameter is declared `TY_UPTR` (`teko_class.tk`). It is now a value of
+the enclosing class or interface.
+
+**Why the node and not the scope.** D87 (2026-09-15) retyped `this` in the pass SCOPE,
+`tk_ty_scope_params`, and was withdrawn: the compiler's own field addressing
+(`tk_this_addr`, `tk_bin(K_ADD, tk_this_recv(), tk_int(off))`) became a class-typed `+`,
+reached `tk_ops_binary`, and a class that DECLARES an `operator+` either refused a line
+that writes no `+` or compiled a wrong load. D87 then owed "the class for surface
+consumers, established in every scope walk", and that premise is what made it fail: the
+distinction is not a property of the scope. It is a property of the node.
+
+`tk_this()` (`teko_this.tk`) is the only place a `this` a user WROTE becomes a node.
+`tk_this_addr`, `teko_prop.tk`, `teko_class.tk` and `teko_deleg.tk` each build their OWN
+fresh `tk_this_recv()`. So registering only the parsed node in the expression table gives
+the surface its class while every generated `this + OFF` keeps answering `uptr` — D87's
+collision is structurally absent rather than worked around. Four lines:
+
+```
+i64 r = tk_this_recv();
+if (p_id() != K_DOT && (tk_is_class(tk_body_class) || tk_is_iface(tk_body_class)))
+    tk_xt_add(r, tk_body_class, 1, TK_BORROWED);
+return r;
+```
+
+`tk_ty_of` (`teko_typeof.tk`) reads that table BEFORE the `N_IDENT` scope lookup, so every
+consumer — `return`, an initializer, an argument, `?:`, `==` — gets the answer through the
+one function they all already ask, and `tk_struct_of_expr` reads the same table, so the
+parse-time door agrees for free. The `K_DOT` guard leaves a `.` receiver unregistered: the
+whole member road is untouched and the table costs one row per BARE `this`. The kind test
+excludes `struct`, whose `this` keeps its inherited refusal. No new table, no new state, no
+new pass, no new intrinsic.
+
+**Eleven positions taught**, each measured refusing before and running after: a method
+return typed as its own class; a constructor storing `this` in a field; a property `get`;
+the `set` half of a property; an argument, `f(this)`; an initializer, `C d = this;`; a
+ternary arm, `b ? this : o`; a return typed as the BASE class; a return typed as an
+INTERFACE the class implements; an interface DEFAULT body, where the static type is the
+interface; and a class that declares `operator+` beside a `uptr` field read — D87's own
+reproducer, which now compiles and runs.
+
+**The reference count needed no new code.** `this` is a parameter, so it sits below
+`tk_rc_floor` (`teko_rc.tk`) and `tk_rc_own` answers 0 — borrowed, never released by the
+callee. `tk_rc_return`'s `needinc` emits the `rc_inc` the caller's own reference wants, and
+a DISCARDED link of a chain (`a.Bump(1).Bump(2);`) is swept by `tk_rc_exprstmt`. This is
+exactly the road a method returning a parameter of class type already took. Proved under
+`rt_live()` in `tests/surface_this_value.tk`.
+
+**Two refusals.** `this = e;` compiled SILENTLY before this entry, with **no reference
+counting at all**: the parameter reads `uptr`, which `tk_rc_assign` is not asked to count,
+so the store overwrote the receiver and neither side's count moved (`--dump-ast` showed a
+bare `ASSIGN name=this`). It is now `` teko: `this` is read-only ``, C#'s own rule — the
+receiver is a borrowed parameter, not a slot. **The guard covers the compound spellings
+too.** `this += e`, `this -= e`, `this++` and `this--` are the same write through a
+different word and were measured compiling just as silently; the design page named only
+`=`, and refusing only `=` would have left four siblings wrong. The predicate is
+`tk_arr_write_follows` (`teko_array.tk`), which already answers "does a write follow?" —
+one guard over the set, not one per spelling. And a return typed as an unrelated class now
+names the class: `teko: a value of type D does not convert to U`, where it used to say
+`uptr`.
+
+**One acceptance becomes a refusal, taken openly.** `this == o` on two references of the
+same class compiled today into a RAW POINTER COMPARE, while `C a; C b; a == b;` is refused
+`` teko: C declares no operator `==` ``. `this` typing `uptr` was the one hole in that rule,
+and closing the hole closes it here too: `this == o` is now refused by that same sentence.
+**A program that wrote `this == o` and compiled yesterday stops compiling.** That is the
+alignment, not a regression — a class reference gets the rule every class reference gets —
+and it carries its own refuse fixture (`tests/refuse/this_eq_no_op.tk`) and a diagnostics
+note. `this == null` is unaffected: it takes the nullable road, measured before and after.
+
+**Fixtures.** `tests/surface_this_value.tk` (42) walks all eleven positions and brackets the
+chain with `rt_live()`; `tests/refuse/this_bad_type.tk`, `tests/refuse/this_eq_no_op.tk` and
+`tests/refuse/this_assign.tk` and `tests/refuse/this_compound_assign.tk` carry the four
+refusals -- the compound writes are the fourth, added after `this += e`, `this -= e`,
+`this++` and `this--` were measured compiling as silently as `this = e`. 141 passed, 187
+refused as expected, 0 failed; `FIXPOINT OK`; `docs ok`.
+
+**Proof it is a no-op on everything accepted before.** `--dump-ast` over all 140 base
+fixtures, base binary against head, each run in place with `--include=lib --include=tests`:
+**140 identical, 0 different, 139 of the 140 non-empty on both sides.** `mc limits` on both
+legs: `passes`, `syntax`, `alias`, `types`, `on_stmt` and `intrin` unmoved on the compiler
+leg (0/8, 0/16, 1/16, 1/8, 0/8, 0/8) and on the `tests/hello.tk` leg (15/30, 20/40, 25/50,
+18/36, 4/8, 8/16). Only size rows move, re-measured on the final head rather than on the
+commit that first wrote this paragraph: `nodes` 212905 → 213100, `ins` 246193 → 246253,
+`strings` 3146 → 3147 and `symbols` 8850 → 8851 (the one new message).
+
+**D87's line citations had all drifted** and are corrected here, in case the redesign is
+ever re-read: the unbracketed callers of `tk_ty_scope_params` are `teko_params.tk:723` (was
+`:685`), `teko_deleg.tk:2065` (was `:2043`), `teko_deleg.tk:2283` (was `:2261`),
+`teko_ns.tk:1056` (was `:1050`), and `teko_ternary.tk:705`, which still holds. **None of
+them is touched** — that is the whole point of the node.
+
+**A parenthesized receiver is safe too, and for a reason that predates this entry.** The
+core erases parentheses, so `(this).f` registers the node exactly as a bare `this` does and
+`tk_field_use` (`teko_expr.tk`) then builds `tk_bin(K_ADD, left, off)` over it — a
+class-typed `+` reaching the ops walk, which is D87's failure shape. It does not fire:
+`tk_ops_visit` (`teko_ops.tk`) marks the argument of a memory intrinsic as `tk_ops_addr`,
+and that node is handed to `tk_ops_addr_step`, never to `tk_ops_binary`. Measured with the
+sharpest probe available — a class declaring `operator+(Vec, i64)`, the exact operand pair
+`this + OFF` would match — `(this).y` reads the field and the operator is not reached;
+`--dump-ast` gives `this.y`, `(this).y` and the bare `y` byte-identical bodies. The `K_DOT`
+guard in `tk_this()` is therefore prudence, not the load-bearing part, exactly as the design
+page measured. `tests/surface_this_value.tk` carries `(this).raw` and `(this).x` as a
+regression.
+
+**What stays open.** `this` in a `struct` keeps the inherited `teko: a value of type uptr
+does not convert to P` and a `not-yet.md` row: a `struct` has no copy at assignment yet
+(`P b = a; b.x = 9;` changes `a.x`), so `return this;` there would alias rather than copy,
+and half a value-type semantics shipped inside `return this;` would be worse than the
+refusal — its own message is crumb 4, and the copy is its own design. Implicit `this`
+capture in a lambda stays refused, D11 stands: a closure holding a counted `this` opens a
+reference cycle the reclaim does not break. The self-referencing constructor (`C() { c2 =
+this; }`) leaks, and that is a cycle a plain count never collects, not a defect of this
+entry. Generic fluent chaining is blocked by a pre-existing generics defect that reproduces
+with `return o;` and no `this` anywhere. No re-typing of the receiver parameter was made,
+and none should be.

@@ -1,0 +1,205 @@
+// surface_this_value.tk -- `this` is a value (D102, docs/specs/this-as-value.md
+// § 5). Every position below refused `teko: a value of type uptr does not
+// convert to C` before the node the parser builds carried the enclosing type.
+//
+// What each part proves, in order:
+//   Acc.Bump        a method returning `this`, typed as its own class
+//   Acc(...)        a constructor storing `this` in a field of the class
+//   Acc.Self        a property `get` whose body is `return this;`
+//   Acc.Mirror      the `set` half of a property, `this` as an argument
+//   Acc.Twin        an argument, `take(this)`
+//   Acc.Copy        an initializer, `Acc d = this;`
+//   Acc.Pick        a ternary arm, `b ? this : o`
+//   Acc.Up          a return typed as the BASE class
+//   Acc.AsI         a return typed as an INTERFACE the class implements
+//   Counter.Me      an interface DEFAULT body, static type = the interface
+//   Vec             D87's own reproducer: a class that DECLARES `operator+`
+//                   and reads a `uptr` field, so the compiler's own
+//                   `this + OFF` must keep answering `uptr` -- through a BARE
+//                   name, through `this.`, and through a PARENTHESIZED `(this).`
+//   Link            a class with NO cycle of its own, so `rt_live()` reads an
+//                   EXACT floor across a discarded chain and a kept result
+//
+// The reference count needed no new machinery: `this` is a parameter, so it is
+// borrowed, and `tk_rc_return` emits the caller's `rc_inc`. `rt_live()` proves
+// it -- a discarded result is swept, a kept one is released at its block's end.
+//
+// expect-exit: 42
+#include "../lib/rt.tk"
+
+interface Counter {
+    i64 Value();
+    // a DEFAULT body: `this` here has the static type of the interface
+    Counter Me() { return this; }
+}
+
+class Base {
+    public i64 v;
+    public Base() { v = 0; }
+}
+
+i64 take(Acc a) { return a.v; }
+
+class Acc : Base, Counter {
+    public Acc twin;
+    public i64 seen;
+
+    public Acc() { v = 0; seen = 0; twin = this; }   // a constructor, `this` stored
+
+    public i64 Value() { return v; }
+
+    public Acc Bump(i64 x) { v = v + x; return this; }   // a method return
+
+    public Acc Self { get { return this; } }             // a property `get`
+
+    public i64 Mirror {
+        get { return seen; }
+        set { seen = take(this); }                       // the `set` half
+    }
+
+    public i64 Twin() { return take(this); }             // an argument
+
+    public i64 Copy() { Acc d = this; return d.v; }      // an initializer
+
+    public Acc Pick(Acc o, bool b) { return b ? this : o; }   // a ternary arm
+
+    public Base Up() { return this; }                    // typed as the BASE
+
+    public Counter AsI() { return this; }                // typed as the INTERFACE
+}
+
+// D87's exact pairing: the class declares its own `operator+` AND reads a
+// `uptr` field. If `this` were retyped in the pass scope, the compiler's
+// `this + OFF` addressing would reach this operator and either refuse a line
+// that writes no `+` or compile a wrong load. Registering the parsed node
+// leaves those generated nodes untouched.
+class Vec {
+    public i64 x;
+    public uptr raw;
+    public Vec() { x = 0; raw = 0; }
+    public static Vec operator+(Vec a, Vec b) { return a; }
+    public Vec Grow() { x = x + 1; return this; }        // no `+` written on `this`
+    public uptr Raw() { return raw; }                    // a bare-name `uptr` field read
+    public uptr DotRaw() { return this.raw; }            // through `this.`
+    public uptr ParRaw() { return (this).raw; }          // PARENTHESIZED: the core
+    public i64 ParX() { return (this).x; }               // erases the parens, so the
+                                                         // `.` receiver is the node
+                                                         // tk_this() registered. The
+                                                         // address still never reaches
+                                                         // the operator judge: an
+                                                         // argument of `ld64` is walked
+                                                         // by tk_ops_addr_step, not by
+                                                         // tk_ops_binary
+}
+
+// no cycle, no field holding another object: every count this class takes is
+// one the program can see, so `rt_live()` around it reads an EXACT floor
+class Link {
+    public i64 n;
+    public Link() { n = 0; }
+    public Link Step() { n = n + 1; return this; }
+}
+
+i64 main() {
+    // The floor here is NOT zero and is not compared against: `Acc`'s constructor
+    // stores `this` in `twin`, a cycle a plain count never collects (memory.md).
+    // Section 6 below measures an exact allocation count over a cycle-free `Link`
+    // instead, which is the assertion that can actually fail.
+
+    // a method return, chained -- the result of the first two links is
+    // DISCARDED, and swept by tk_rc_exprstmt
+    Acc a = new Acc();
+    a.Bump(1).Bump(2).Bump(3);
+    if (a.v != 6) return 10;
+
+    // a kept result: an owning local, released at the end of this block
+    Acc k = a.Bump(4);
+    if (k.v != 10) return 11;
+
+    // the constructor stored `this` in `twin`: a self-reference, and a cycle a
+    // plain count never collects -- docs/reference/memory.md's "What is not
+    // reclaimed" table carries the rule and names this constructor form
+    if (a.twin.v != 10) return 12;
+
+    // a property `get`
+    if (a.Self.v != 10) return 13;
+
+    // the `set` half of a property, and the argument road it uses
+    a.Mirror = 0;
+    if (a.Mirror != 10) return 14;
+
+    // an argument and an initializer
+    if (a.Twin() != 10) return 15;
+    if (a.Copy() != 10) return 16;
+
+    // a ternary arm, both ways
+    Acc o = new Acc();
+    o.Bump(99);
+    if (a.Pick(o, true).v != 10) return 17;
+    if (a.Pick(o, false).v != 99) return 18;
+
+    // typed as the BASE class
+    Base b = a.Up();
+    if (b.v != 10) return 19;
+
+    // typed as the INTERFACE, and the interface's own DEFAULT body
+    Counter c = a.AsI();
+    if (c.Value() != 10) return 20;
+    Counter m = c.Me();
+    if (m.Value() != 10) return 21;
+
+    // D87's reproducer: `operator+` declared, a `uptr` field read, `this`
+    // returned from a method of the same class
+    Vec vv = new Vec();
+    vv.Grow().Grow();
+    if (vv.x != 2) return 22;
+    if (vv.Raw() != 0) return 23;
+    if (vv.DotRaw() != 0) return 24;
+    if (vv.ParRaw() != 0) return 25;
+    if (vv.ParX() != 2) return 26;
+    Vec vs = vv + vv;
+    if (vs.x != 2) return 27;
+
+    // ---- the reclaim, on an EXACT count ----
+    // `rt_live()` counts live ALLOCATIONS. `Link` holds no other object and
+    // makes no cycle, so the count around this block is a number the program
+    // can predict exactly -- a floor test could not tell a leak from a keep.
+    i64 f = rt_live();
+    {
+        Link p = new Link();
+        if (rt_live() != f + 1) return 30;
+
+        // DISCARDED: `tk_rc_return` raises the count for the caller and
+        // `tk_rc_exprstmt` drops it again at the statement. Lose the drop and
+        // the object outlives this block; lose the inc and it dies inside it.
+        p.Step().Step().Step();
+        if (p.n != 3) return 31;
+        if (rt_live() != f + 1) return 32;
+
+        // KEPT: the same object, so no second allocation -- what rises is the
+        // object's own reference count, and `q` releases it at the block's end
+        Link q = p.Step();
+        if (q.n != 4) return 33;
+        if (rt_live() != f + 1) return 34;
+    }
+    // EXACT, and this is the assertion that bites: three discarded links and
+    // one kept reference all released, so the object is gone. An over-retain
+    // anywhere above leaves it alive here; an over-release would have freed it
+    // while `p.n` was still being read.
+    if (rt_live() != f) return 35;
+
+    // the same road through an interface default body, which also returns a
+    // borrowed `this`
+    i64 g = rt_live();
+    {
+        Link r = new Link();
+        r.Step();
+        if (rt_live() != g + 1) return 36;
+    }
+    if (rt_live() != g) return 37;
+
+    c.Me();
+    if (rt_live() != g) return 38;
+
+    return 42;
+}

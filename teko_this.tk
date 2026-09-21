@@ -109,15 +109,45 @@ void tk_reject_self(uptr name) {
 // `this`, a word of the language (syntax_expr): the receiver of the method
 // being parsed. teko_class.tk registers it as a local of the type, so `.` on it
 // resolves against that type and nothing else.
+//
+// D102: `this` is also a VALUE, and it is the NODE that carries the class, not
+// the scope. The receiver parameter stays declared `uptr` (teko_class.tk),
+// because every generated body -- the release, the vtable initializer, the
+// property thunk, the delegate's own shim -- passes a raw address; and the
+// compiler's own field addressing (`tk_this_addr` below, and the same shape in
+// teko_prop.tk, teko_class.tk, teko_deleg.tk) each builds a FRESH
+// `tk_this_recv()`. Only the node parsed HERE came from something a user wrote,
+// so registering only this one gives the surface its class type while
+// `this + OFF` keeps answering `uptr` in `tk_ops_binary` -- the `operator+`
+// collision D87 measured is absent by construction rather than worked around.
+// `tk_ty_of` (teko_typeof.tk) reads the expression table BEFORE the scope, so
+// every consumer -- `return`, an initializer, an argument, `?:`, `==` -- gets
+// the answer through the one function they all already ask.
 i64 tk_this() {
     i64 line = p_line();
     uptr fl = p_file();
     p_next();                                    // the `this` word
     if (tk_body_class < 0) err_at(fl, line, "teko: `this` is only valid inside the body of a type");
     if (tk_body_static) err_at(fl, line, "teko: `this` is not there in a static member");
+    // D102: the receiver is not a slot. `this = e;`, `this += e;` and `this++`
+    // all compiled SILENTLY before, with no reference counting at all, because
+    // the parameter reads `uptr` and `tk_rc_assign` leaves an uncounted type
+    // alone. C# refuses `this = e;` on a class outright, and the four compound
+    // spellings are the same write through a different word -- one guard over
+    // the whole set, not one per spelling. `tk_arr_write_follows`
+    // (teko_array.tk) is already the question "does a write follow?".
+    if (tk_arr_write_follows()) err_at(fl, line, "teko: `this` is read-only");
     tk_line = line;
     tk_file = fl;
-    return tk_this_recv();
+    i64 r = tk_this_recv();
+    // borrowed: a parameter sits below `tk_rc_floor`, which is what makes
+    // `tk_rc_return` emit the caller's own `rc_inc` and needs no new machinery.
+    // A `this` about to be a `.` receiver is left unregistered -- the member
+    // road is untouched and the table costs one row per BARE `this`. A `struct`
+    // is not a value type on assignment yet, so its `this` keeps its refusal.
+    if (p_id() != K_DOT && (tk_is_class(tk_body_class) || tk_is_iface(tk_body_class)))
+        tk_xt_add(r, tk_body_class, 1, TK_BORROWED);
+    return r;
 }
 
 // 1 when the left side of a `.` is the contextual `base` of the type being
