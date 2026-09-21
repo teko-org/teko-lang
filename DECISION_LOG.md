@@ -11865,6 +11865,15 @@ were measured before they were fixed:
   of arity zero, which has no parameter list to reset the table — and `ref h.n` there built
   an address for a name that declaration never had. Fixture:
   `tests/refuse/param_row_overload.tk`.
+- ...and a property ACCESSOR has no `tk_params` to reset its window at all: it builds its
+  compiler-generated `this`/`value` in `tk_prop_params` with `param_new`, and neither was
+  ever a row of this table. `tk_hp_own` therefore RELABELLED the previous declaration's
+  rows as the accessor's own, and `ref h.n` in the body resolved a parameter it never had.
+  The reset goes into `tk_prop_params`, the one point both accessor bodies pass through --
+  the block one through `tk_member_fn`, the `=>` one through `tk_prop_arrow_body` -- which
+  is the property's own analogue of `tk_params`'s first line. Empty is the whole truth for
+  an accessor's window. Fixtures: `tests/refuse/param_row_accessor.tk` and
+  `tests/refuse/param_row_accessor_arrow.tk`.
 - the SHORT lambda grafia (`h => …`, `tk_deleg_short_lambda`) builds its single parameter
   with `param_new` instead of `parse_params`, so no row was written for it at all. An
   enclosing `Wide h` then answered for the `B h` the lambda receives and the write landed
@@ -11929,8 +11938,8 @@ refuses before any teko hook is asked. `&acc` on a by-REFERENCE lambda capture a
 core's `unknown name`. None is reached by this judge, which only ever sees a deferred `.`
 the parser accepted. All three are rows in `docs/reference/not-yet.md`.
 
-**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 205
-refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and fifteen
+**Gate.** `142 passed, 190 refused as expected, 0 failed` at `f81e0217` → `143 passed, 207
+refused as expected, 0 failed`: one positive fixture (`tests/ref_field_param.tk`) and seventeen
 refusals — `tests/refuse/addr_field_{this,this_class,local,param,chain,copy,struct,store}.tk`
 for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar shadow and
 `tests/refuse/ref_field_refparam_shadow.tk` for the `ref`/`out` one and
@@ -11938,13 +11947,14 @@ for the eight wrong shapes, `tests/refuse/ref_field_shadow.tk` for the scalar sh
 `tests/refuse/ref_field_array_local.tk` for the fixed-array one and
 `tests/refuse/param_row_outlives_decl.tk` for the rows that outlived their declaration and
 `tests/refuse/param_row_outlives_decl_lambda.tk` for the same rows laundered through a
-lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overloads —
-all seven found by the review — refused rising by exactly the fifteen added. `tests/addr_not_member.tk` gains its item 7:
+lambda's floor and `tests/refuse/param_row_overload.tk` for two same-named overloads and
+`tests/refuse/param_row_accessor{,_arrow}.tk` for a property accessor's own window —
+all nine found by the review — refused rising by exactly the seventeen added. `tests/addr_not_member.tk` gains its item 7:
 the very object `&h.n` now refuses, read through `ref` and `out` in the same program,
 through a local and through a parameter alike. `FIXPOINT OK`, `docs ok`. `mc limits` on a
 CLEAN `build/`, both legs: the ENTRY leg (`tests/hello.tk`) is byte-identical to the
 base's, `intrin` 8 and `passes` 15 on both — zero new intrinsics, zero new passes — and
-only the compiler leg's size rows move: `nodes` 177785 → 178059, `ins` 246293 → 246700,
+only the compiler leg's size rows move: `nodes` 177785 → 178062, `ins` 246293 → 246702,
 `funcs` 3478 → 3485, `lowered` 3459 → 3466, `globals` 1006 → 1011, `strings` 2477 → 2479,
 `defines` 1305 → 1306, `symbols` 6961 → 6975, every row `ok`. `--dump-ast` base against head over every
 fixture both binaries accept, run in place with `--include=lib --include=tests` (the flag
