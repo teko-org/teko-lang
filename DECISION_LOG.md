@@ -12338,17 +12338,31 @@ non-empty dumps on the base and 147 on this head** (the four new fixtures). **Ni
 every one of them a `<name>_copy` CALL inserted at a landing: `ref_field_param`,
 `struct_copy_local`, `surface_datetime_kind`, `surface_globals_struct`,
 `surface_nullable_ops`, `surface_nullable_ref`, `surface_overload_free`,
-`surface_typeof_expr`, `types_struct`. **All nine carry a REMOVED line**, and in every case
-it is the same line re-indented one level under the inserted CALL — the smallest of them,
-`types_struct`, is one `IDENT type=i64 name=p` becoming
-`CALL type=i64 name=point_copy` over that same IDENT. The other 138 are byte-identical.
+`surface_typeof_expr`, `types_struct`. **All nine carry a REMOVED line.** In seven the removal is
+purely the re-indentation of the wrapped node under the inserted CALL — the smallest,
+`types_struct`, is one `IDENT type=i64 name=p` becoming `CALL type=i64 name=point_copy` over
+that same IDENT, and in two of the seven what re-indents is a multi-line SUBTREE rather than
+a single line. The remaining two, `ref_field_param` and `surface_globals_struct`, also carry
+removals that are NOT re-indentations, because this crumb edits those two fixtures' own
+SOURCE (`INT val=42` becomes `41`, and `surface_globals_struct` gains new `IF`/`EXPRSTMT`
+nodes). An independent verification separated the two causes mechanically: unwrapping every
+`<row>_copy` CALL on both sides leaves seven of the nine byte-identical, and dumping the
+head's own fixture source with the BASE compiler and unwrapping both leaves 0 diff lines for
+the other two — so the whole residual is the fixture edit and none of it is the compiler.
+The other 138 are byte-identical, and `--dump-syms` gives an identical symbol-name set for
+all 144 common fixtures.
 
 **The arena debt is worse in shape, not in number.** Re-measured at this head by bisection: a
-loop copying a 16-byte struct runs **262 142 turns and exits 70, `teko: arena exhausted`, on
-the 262 143rd** — the same figure D105 recorded, because every landing costs exactly one
-16-byte block per turn. L1, L5 and L6 exhaust at turn 262 143; L2, L3 and L4 at 262 141, the
-two-block difference being each probe's own preamble and not the landing. A struct with one
-struct-typed FIELD costs two blocks per copy and exhausts at turn **131 070**. What changed
+loop copying a 16-byte struct exhausts the arena after **262 143 turns**, panicking
+`teko: arena exhausted` on the **262 144th** — 4 MiB divided by a 16-byte block, and every
+landing costs exactly one block per turn, so the invariant and not the headline is the thing
+to carry. (This paragraph first wrote 262 142 / 262 143; an independent verification
+re-bisected a MINIMAL probe and got 262 143 / 262 144. The earlier pair counted one probe's
+own preamble as if it were the landing's, which is also why the per-landing figures below
+differ by one or two.) Counting each probe's preamble separately: L1, L5 and L6 spend one
+block before the loop, L2 and L3-on-a-struct two, L3-on-a-class and L4 three — every one of
+them summing to the same 262 144 blocks. A struct with one struct-typed FIELD costs two
+blocks per copy and so reaches **131 071** turns. What changed
 is that six more shapes now spend that budget where one did: a `params` call, a field store
 in a loop and a by-value argument were all free before this entry.
 `docs/reference/memory.md`'s declared-debt row carries the numbers.
