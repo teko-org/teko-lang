@@ -1129,6 +1129,15 @@ Two are **run-time panics**, exit 70 and on stderr with no `file:line`
   function may be captured; a parameter cannot.
 - `"teko: a capture by reference of a counted type is not taught yet"` — capture the object
   **by value**; the closure then holds a reference of its own.
+- ``"teko: a struct is captured with `&`; there is no capture by value of a struct"`` — a
+  `use (s)` whose captured name is a local of `struct` type. A struct value is copied where
+  it lands in a storage location (D105, D106) and the closure's own slot is a landing no
+  crumb of that design builds, so the capture by value is refused rather than aliasing
+  silently. `use (&s)` captures the same struct by reference and is what a lambda over a
+  struct writes. Before D108 the same program died further in, at the closure slot's own
+  store, as *teko: a value of type S does not convert to i64* — a type the user never wrote,
+  and no mention of the road that works ([delegates.md](delegates.md),
+  [struct-value.md](../specs/struct-value.md) § 7.3).
 - `"teko: a lambda that captures by reference cannot leave its scope"` — such a closure
   cannot be returned, nor stored in a field, a static field, a GLOBAL of delegate type or
   an ELEMENT of a `T[]`, whether the array is a local or a global. A slot declared `T?` is
@@ -1658,6 +1667,20 @@ Every one of these is [nullable.md](nullable.md)'s.
 - `"teko: not an array"` — the field named is not an array.
 - `"teko: the foreach variable's type does not fit the array element"` — the element type
   may widen into the variable, never narrow.
+- `"teko: a foreach variable of struct type is read-only"` — a write through the element of
+  a `foreach` over an array of `struct`: `s.n = e`, a nested `s.inner.n = e`, an inline
+  element `s.a[i] = e`, and a property's `s.P = e`. The element is the compiler's own
+  declaration and is **not** copied (D106), so it names the array's own row and the write
+  would reach the array — C# refuses the whole set as CS1654, *cannot modify members of `s`
+  because it is a foreach iteration variable*. Reading the element is untouched, and
+  `S b = s;` inside the body is the road that replaces the write: that declaration is an
+  ordinary landing and does copy. A **class** element is a reference and writing through it
+  is not this rule; a scalar element has no member to write. `bump(ref s)` and a mutating
+  method call `s.bump()` are not judged here — the first is C#'s own CS1657, a rule of its
+  own, and the second is a call C# accepts ([control-flow.md](control-flow.md),
+  [struct-value.md](../specs/struct-value.md) § 4.5).
+- `"teko: too many nested foreach loops over a struct array"` — more than 32 `foreach`
+  loops over an array of `struct` nested inside one another.
 - ``"teko: a local const is not taught; declare it at the top or as a member"`` — a `const`
   is a program-wide folded constant.
 - `"teko: const requires a constant expression"` — the value is folded at the declaration.

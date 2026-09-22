@@ -1128,8 +1128,94 @@ void tk_os_add(i64 n) {
     tk_nos = tk_nos + 1;
 }
 
+// ---- D108: a `foreach` variable of struct type is read-only ----
+// `foreach (S s in a)` binds `s` to the array's OWN row, not to a copy of it:
+// D106 kept the element declaration out of the copy pass on purpose
+// (`tk_stmt_gen`, teko_loop.tk), because a copy there would let a write
+// through `s` compile and reach nothing. So the write is refused instead,
+// which is C#'s own answer (CS1654, "cannot modify members of `s` because it
+// is a foreach iteration variable"). Reading the element is untouched, and a
+// CLASS element is a reference whose write is not this rule -- the table only
+// ever holds an element of struct type.
+//
+// One row per nesting level, pushed by `tk_foreach` (teko_loop.tk) around the
+// body it parses and dropped at that body's own end, so the name is
+// read-only exactly where it is in scope. The refusal itself lives where a
+// write through the name is JUDGED and nowhere else -- `tk_os_mark` below
+// (every field and inline-element store of the language), `tk_defer_member`
+// (teko_typeof.tk, the same store on a receiver only a pass can type) and
+// `tk_prop_use` (teko_prop.tk, a property's `set`). Three doors, C#'s CS1654
+// set; `ref s` is C#'s CS1657, a rule of its own and not built here.
+//
+// A row is the element's local-table SLOT beside its name, not the name alone:
+// a body may declare a local that SHADOWS the element (`C s = new C; s.n = 5;`
+// inside a `foreach (S s in a)`, which the base accepted), and a write through
+// the shadow is a write through another variable entirely. The slot is what
+// tells the two apart -- `tk_local_find_ix` answers with the newest
+// declaration of the name, so the rule applies exactly while the element is
+// still what the name means.
+#define TK_MAXFERO 32                 // `foreach` loops over a struct array, nested
+uptr fero_name[TK_MAXFERO];
+i64  fero_slot[TK_MAXFERO];
+i64  tk_nfero = 0;
+
+void tk_fero_push(uptr name, i64 slot) {
+    if (tk_nfero == TK_MAXFERO)
+        err_at(tk_file, tk_line, "teko: too many nested foreach loops over a struct array");
+    st64(fero_name + tk_nfero * 8, name);
+    st64(fero_slot + tk_nfero * 8, slot);
+    tk_nfero = tk_nfero + 1;
+}
+
+void tk_fero_drop(i64 mark) { tk_nfero = mark; }
+
+// the NAME a receiver is rooted at: a field store's address is `ident + off`,
+// a nested one `ld64(ident + off) + off2`, an inline element's
+// `ident + off + i * w`. The receiver is always the FIRST child, so following
+// `nd_a` alone reaches the name that is written through and never wanders into
+// an index expression -- `a[s.n] = e` writes `a`, and merely reads `s`.
+//
+// Three node kinds carry a spine and no others. An ordinary `N_CALL` ENDS it:
+// its first child is an ARGUMENT, not a receiver, so `mk(s).f = e` writes the
+// value `mk` returned and the name `s` in it is a by-value argument the call
+// already copied (D106). The one call an address does pass through is the
+// pointer load `ld64`, which is how a nested struct field is reached. The walk
+// needs no depth bound: every step descends into a child of a tree the parser
+// has just built, so it ends at an `N_IDENT`, at a leaf, or at a node of some
+// other kind -- and a bound would be a hole, letting a chain deeper than it
+// answer "no name" and pass the rule.
+uptr tk_fero_root(i64 n) {
+    loop {
+        if (n == 0) break;
+        i64 k = nd_kind(n);
+        if (k == N_IDENT) return nd_name(n);
+        i64 spine = 0;
+        if (k == N_BINARY) spine = 1;            // `<receiver> + off`, `+ i * w`
+        if (k == N_CAST) spine = 1;              // a narrow field's own re-read
+        if (k == N_CALL && str_eq(nd_name(n), "ld64")) spine = 1;   // a nested struct field
+        if (!spine) break;
+        n = nd_a(n);
+    }
+    return 0;
+}
+
+void tk_fero_check(i64 recv, i64 line, uptr fl) {
+    if (tk_nfero == 0) return;                   // no foreach over a struct array is open
+    uptr r = tk_fero_root(recv);
+    if (r == 0) return;
+    i64 now = tk_local_find_ix(r);               // what the name means where it is written
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfero) break;
+        if (str_eq(ld64(fero_name + i * 8), r) && ld64(fero_slot + i * 8) == now)
+            err_at(fl, line, "teko: a foreach variable of struct type is read-only");
+        i = i + 1;
+    }
+}
+
 // records the store only when the slot really is a counted one
 i64 tk_os_mark(i64 n, i64 ty) {
+    tk_fero_check(nd_a(n), tk_line, tk_file);    // D108: ...and never through a foreach element
     if (tk_is_counted(ty)) tk_os_add(n);
     tk_copy_defer(ty, nd_next(nd_a(n)));         // ...and the copy a STRUCT slot lands (V3)
     return n;
@@ -1243,15 +1329,26 @@ i64 tk_field_by_name(uptr name) {
 // the table is a STACK, marked at every `{` and cut back at the matching `}`
 // (teko_stmt.tk's tk_block), so what it holds is exactly the names in scope
 // where the parser stands; the newest entry wins, which is what makes an inner
-// declaration shadow an outer one for as long as its block is open
-i64 tk_local_find(uptr name) {
+// declaration shadow an outer one for as long as its block is open.
+//
+// The ROW the newest entry sits at, which is the declaration ITSELF and not
+// just its type: `tk_fero_check` (D108) asks whether a name still means the
+// very declaration a `foreach` published, and two declarations of one struct
+// type answer the same `si` while being different variables.
+i64 tk_local_find_ix(uptr name) {
     i64 i = tk_nlocal - 1;
     loop {
         if (i < 0) break;
-        if (str_eq(lv_name_at(i), name)) return lv_str_at(i);
+        if (str_eq(lv_name_at(i), name)) return i;
         i = i - 1;
     }
     return 0 - 1;
+}
+
+i64 tk_local_find(uptr name) {
+    i64 i = tk_local_find_ix(name);
+    if (i < 0) return 0 - 1;
+    return lv_str_at(i);
 }
 
 i64 tk_xt_at(i64 n) {

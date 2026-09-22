@@ -12485,3 +12485,119 @@ the point: no assertion moved. `FIXPOINT OK`. `--dump-ast --include=lib --includ
 either, a pre-existing condition), **thirteen moved** — the thirteen renumbered here and no other
 — and every difference in them is an `INT val=` leaf and nothing structural. The other 135 are
 byte-identical.
+
+### D108 · A write through a `foreach` variable of struct type is refused, and a struct is
+captured with `&` (2026-09-21)
+
+**Two refusals, independent of each other and of the copy** — V6 of
+[`docs/specs/struct-value.md`](docs/specs/struct-value.md), the crumb that closes what D105
+and D106 deliberately left open. Both halves were measured on this head before anything was
+written, and both follow C#.
+
+**Half one: `foreach (S s in a) { s.n = 9; }` is refused.** D106 made a struct a value type
+at all six landings, and deliberately did **not** wrap the `foreach` element declaration in a
+copy: `tk_foreach` raises `tk_stmt_gen` so the landing pass skips it (teko_loop.tk), because
+a copy there would let the write compile and reach nothing — silently, which is the class of
+bug the whole design exists to remove. So `s` is the array's **own row**, and a write through
+it mutates the array. C#'s answer is CS1654, *cannot modify members of `s` because it is a
+foreach iteration variable*, and it is teko's now:
+
+> `teko: a foreach variable of struct type is read-only`
+
+**This breaks programs that compile today.** `foreach (S s in a) { s.n = 9; }` built and ran
+at the base head, answering 99 on the two-row probe, and now it does not build. That is the
+trade `../reference/not-yet.md`'s third line asks for — a silently wrong result becomes a
+refusal where it is written — and the release notes have to carry it. One fixture in the tree
+wrote through a `foreach` element: `tests/struct_copy_local.tk`'s own `foreachcheck`, which
+D106 wrote as the *record* of the alias and which said in its comment that V6 would rewrite
+it. It now proves what stays legal instead: reading the element, and `S b = s;` inside the
+body — an ordinary L1 landing that copies, the road that replaces the write.
+
+**Where it is judged, and why not at the loop.** The element declaration is the compiler's
+own; the thing the user writes is the **write**. So the question is asked at the doors where
+a write through a name is judged, and `tk_foreach` only publishes the name for the body it
+parses (`tk_fero_push`/`tk_fero_drop`, one row per nesting level, dropped at the body's end,
+so the rule holds exactly where the name is in scope and a same-named local elsewhere is
+untouched). Three doors carry it, and they are C#'s CS1654 set:
+
+| door | what it catches |
+|---|---|
+| `tk_os_mark` (teko_struct.tk) | every field and inline-element store of the language — `s.n = e`, `s.inner.n = e` through a nested struct, `s.a[i] = e` on an inline array field. It is the ONE mark all nine store sites already pass |
+| `tk_defer_member` (teko_typeof.tk) | the same store on a receiver only a pass can type. The store is BUILT at pass time, where the loop's scope is gone, so the form is judged at the parse that decides it — which is how a **forward-declared** struct is covered |
+| `tk_prop_use` (teko_prop.tk) | a property's `set`. `s.P = 9` runs a setter that writes the receiver's fields, so it is the same write under another spelling; the `get` is a read and is untouched |
+
+All four of those shapes **compiled and mutated the array** at the base head, measured one by
+one. The receiver is matched by the name at the root of its own spine (`tk_fero_root`,
+following `nd_a` alone), so an index expression is never mistaken for a receiver:
+`a[s.n] = e` writes `a` and merely reads `s`.
+
+**What stays legal, measured before and after.** Reading the element (`i64 t = s.n;`), a
+`foreach` over a scalar array, a `foreach` over a **class** array with a write through the
+element — a class value is a reference and writing through it is not this rule — and
+`S b = s;` inside the body.
+
+**What is NOT judged, on purpose.** `bump(ref s)` is C#'s own **CS1657**, a rule about
+handing the variable out rather than about modifying its members, with a different door
+(teko_ref.tk) and a message of its own; and `s.bump()` on a mutating method is a call **C#
+accepts** — in C# it mutates the loop variable's copy and the array is untouched, while here
+it still reaches the row. Both compile today, both are recorded in
+[`docs/reference/not-yet.md`](docs/reference/not-yet.md), and neither is smuggled into this
+crumb's message.
+
+**Half two: `use (a)` on a struct names the struct and the road.** It answered
+`teko: a value of type S does not convert to i64` — a type the user never wrote, the fourth
+message of that shape found in the struct family in three days (D102, D103, D104 were the
+others). The closure slot's layout is teko_deleg.tk's own and copying a struct into it is a
+seventh landing no crumb of the copy design builds
+([`docs/specs/struct-value.md`](docs/specs/struct-value.md) § 7.3), so the capture by value
+stays refused — with words that name what is there instead:
+
+> ``teko: a struct is captured with `&`; there is no capture by value of a struct``
+
+Judged at `tk_lambda_use` (teko_deleg.tk), where the capture list is read and the captured
+local's type is already in hand for the counted check beside it, so the refusal lands on the
+`use (...)` the user wrote. The row is peeled through `T?` with `tk_row_through_nl`, the same
+peel every struct road takes since Q1a. `use (&a)` is measured working on both sides of this
+crumb, so the message names a road that exists.
+
+**Two shapes the spine walk has to get right, both measured.** A body may declare a local
+that **shadows** the element — `foreach (S s in a) { C s = new C; s.n = 5; }`, which the base
+accepts and C# refuses for a reason of its own (CS0136) — and a write through the shadow is a
+write through another variable. So a row holds the element's local-table **slot** beside its
+name, not the name alone, and `tk_local_find_ix` answers with the newest declaration of the
+name: the rule applies exactly while the element is still what the name means. And an
+ordinary `N_CALL` **ends** the spine rather than continuing through its first argument, which
+is an argument and not a receiver: `mk(s).f = e` writes the value `mk` returned, and the `s`
+inside it is a by-value argument the call already copied (D106). The one call an address does
+pass through is the pointer load `ld64`, which is how a nested struct field is reached. The
+walk carries **no depth bound**: every step descends into a child of a tree the parser has
+just built, so it ends on its own, and a bound would be a hole — a chain deeper than it would
+answer "no name" and pass the rule (Copilot on #774).
+
+**Six fixtures, one rewrite.** One per door and per reach, each with the two-line D52 oracle
+and each line **measured from the compiler's own output** rather than guessed:
+`struct_foreach_readonly.tk` (the direct field store, line 23 — the write's own line, not the
+`foreach` header, because that is where the store is built),
+`struct_foreach_readonly_nested.tk` (a nested struct field, 22),
+`struct_foreach_readonly_inline.tk` (an inline array field's element, 20),
+`struct_foreach_readonly_prop.tk` (the property `set`, 24, the one door `tk_os_mark` never
+sees because a property store is a call), `struct_foreach_readonly_fwd.tk` (the deferred
+door, 21, with `S` declared below the write) and `struct_capture_byvalue.tk` (21). Every one
+of the five write shapes compiled and mutated the array at the base head.
+`tests/struct_copy_local.tk`'s `foreachcheck` is rewritten as described above; its dispatch
+offset (150) is unchanged and already satisfies D107 — no reachable `K + arm` reaches 42 and
+the highest code in the file is 164.
+
+**The gate.** `mc build . --config mc.macos.toml` clean. `148 passed, 224 refused as
+expected, 0 failed` — the same 148 accepted as the base, six refusals added. `FIXPOINT OK`.
+`sh scripts/check-docs.sh` green. `mc limits` on a clean `build/`, one run on each side so
+neither reads the other's previous measurement: the **entry** table is **byte-identical** to
+the base's — `passes` **16**, `syntax` 20, `alias` 25, `types` 18, `on_stmt` 4,
+`heap` 469 184 — because nothing this crumb adds is a pass, a word or a type; the compiler
+table grows with the source alone (`nodes` 179 036 → 179 292, `funcs` 3 505 → 3 510,
+`ins` 248 385 → 248 773), every row `ok`. `--dump-ast --include=lib --include=tests` over all
+148 accepted fixtures: **147 non-empty on both sides** (`surface_string_interp` dumps nothing
+on either, a pre-existing condition — it needs a config to resolve its namespace), no fixture
+stopped compiling, and exactly **one** differs, `struct_copy_local`, whose source this crumb
+rewrote. Every other accepted program dumps byte-identically, which is what a crumb that only
+refuses owes.

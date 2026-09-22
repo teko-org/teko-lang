@@ -189,16 +189,26 @@ i64 inlinecheck() {
 }
 
 // the `foreach` element is the COMPILER's declaration, not the source's, so L1
-// does NOT reach it: the write still lands on the array, which is what the base
-// answered. Binding it to a copy would make this program compile and go nowhere.
-// V6 refuses the write outright (C# CS1654) and rewrites this check.
+// does NOT reach it: `s` is the array's own row. Binding it to a copy would
+// make a write through it compile and go nowhere, so V6 refuses the write
+// instead (D108, `tests/refuse/struct_foreach_readonly.tk`). What stays legal
+// is what this check now proves: READING the element, and the road that
+// replaces the write -- `S b = s;` inside the body, an L1 landing like any
+// other, whose write stops at the copy.
 i64 foreachcheck() {
     S[] a = new S[2];
     a[0] = new S;  a[0].n = 1;
     a[1] = new S;  a[1].n = 2;
-    foreach (S s in a) { s.n = 9; }
-    if (a[0].n != 9) return 1;
-    if (a[1].n != 9) return 2;
+    i64 seen = 0;
+    foreach (S s in a) { seen = seen * 10 + s.n; }
+    if (seen != 12) return 1;                    // both rows, in order
+    foreach (S s in a) {
+        S b = s;                                 // L1: a copy of the row
+        b.n = 9;
+        if (s.n == 9) return 2;                  // the row is untouched
+    }
+    if (a[0].n != 1) return 3;
+    if (a[1].n != 2) return 4;
     return 0;
 }
 
