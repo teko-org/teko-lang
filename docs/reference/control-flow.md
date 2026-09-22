@@ -156,6 +156,14 @@ array field reached through the receiver (`this.items`). A **global** `T[]` is r
 `break`, `break N` and `continue` inside the body behave as in any loop, and the
 per-iteration variable only borrows: a counted element is not released by the loop.
 
+The element of a `foreach` over an array of **`struct`** is **read-only**. It is the
+compiler's own declaration and carries no copy of its own, so it names the array's own row:
+`s.n = 9` would reach the array, and `teko: a foreach variable of struct type is read-only`
+refuses it — the same program C# refuses as CS1654. Reading the element is untouched, and
+`S b = s;` inside the body is the road that replaces the write, since that declaration
+copies like any other landing ([types.md](types.md#struct)). A **class** element is a
+reference and writing through it is unchanged.
+
 ```teko
 // expect-exit: 42
 #include "rt.tk"

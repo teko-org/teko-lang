@@ -344,6 +344,12 @@ value and the closure holds a reference of its own — the object outlives the d
 local and is released when the closure is. A capture **by reference** cannot leave the
 scope that declared it: returning such a lambda, or storing it into a field, is refused.
 
+A local of **`struct`** type is captured with `&` and by nothing else: a struct value is
+copied wherever it lands in a storage location, and the closure's own slot is a landing the
+copy design does not build, so `use (s)` answers ``teko: a struct is captured with `&`;
+there is no capture by value of a struct``. `use (&s)` captures the same struct by reference
+and runs.
+
 A global, a `const` and a free function are read **live** and need no `use` at all — and so
 is a **member** of the enclosing class, judged BEFORE any global of the same name ever gets
 a look: a STATIC field, a member `const` and a STATIC property resolve with no `use` and no
@@ -476,6 +482,7 @@ slot releases it. Nothing about the reclaim is special-cased for delegates
 | parameters of a delegate | 10 (an indirect call spends two of the twelve) |
 | captures, summed across every lambda still being read | 32 |
 | a capture **by reference** of a counted type | not taught |
+| capturing a local of `struct` type **by value** | not taught; capture it with `&` |
 | capturing a **parameter** of the declaring function | not taught; capture a local initialized from it |
 | a by-reference capture leaving its scope | refused (`return`, a field, a static field) |
 | `return (i64 x) => e;` | not taught; `return new Op(...)` |

@@ -4,9 +4,11 @@
 landed with D105**; **V3, V4 and V5 landed with D106**, so all six landings of § 3.1 copy: a
 struct cannot contain itself, and `S b = <e>;`, `b = <e>;`, `x.f = <e>;`, `a[i] = <e>;`, a
 by-value argument at every call road and `S? b = <e>;` each give the destination a fresh
-block. **V6 and V7 are still designed, not built** — the `foreach` element is still bound to
-the array's own element, a struct captured by value is still refused with a generic
-conversion message, and nothing reclaims a copy. Every "today" below is the measurement at
+block. **V6 landed with D108**: the `foreach` element is still bound to the array's own row
+— a copy there would send the write nowhere — so a write through it is refused the way C#
+refuses it, and a struct captured by value names the struct and the `&` road instead of a
+generic conversion. **V7 is still designed, not built** — nothing reclaims a copy. Every
+"today" below is the measurement at
 `e3e6aa13` unless a row says otherwise. The reference describes what runs; this page
 describes what a struct is *supposed* to be and the ordered crumbs that get it there.
 
@@ -312,6 +314,23 @@ foreach (S s in a) { s.n = 9; }          // ILLEGAL
 C# refuses it too (CS1654). The alternative — binding `s` to a copy — would make the write
 compile and go nowhere, which is exactly the class of bug this page exists to remove.
 
+**As built (D108), three notes.** The refusal is **not** raised where the loop is built: the
+element declaration is the compiler's own, and the question is asked where a **write through
+the name** is judged — `tk_os_mark` (teko_struct.tk, the one door every field and inline
+element store passes), `tk_defer_member` (teko_typeof.tk, the same store on a receiver only
+a pass can type, which is how a forward-declared struct reaches it) and `tk_prop_use`
+(teko_prop.tk, a property's `set`). `tk_foreach` publishes the element name for the body it
+parses and drops it at the end, so the rule holds exactly where the name is in scope. That
+makes the refused set C#'s CS1654 set and wider than the one line above: `s.n = e`,
+`s.inner.n = e` through a nested struct, `s.a[i] = e` on an inline array field and
+`s.P = e` on a property — all four **compiled and mutated the array** before this crumb,
+measured. And it **breaks programs that compile today**: `foreach (S s in a) { s.n = 9; }`
+built and answered 99, and now it does not build. Two shapes are left standing on purpose:
+`bump(ref s)` is C#'s own CS1657, a different rule about handing the variable out rather
+than about modifying its members, and `s.bump()` is a call C# accepts outright (in C# it
+mutates the loop variable's copy; here it still reaches the row). Both are in
+[`../reference/not-yet.md`](../reference/not-yet.md).
+
 ### 4.6 A struct is captured by reference, not by value
 
 ```teko
@@ -321,8 +340,15 @@ D d = new D(() use (a) => a.n);          // ILLEGAL
 // teko: a struct is captured with `&`; there is no capture by value of a struct
 ```
 
-Today this is refused with `teko: a value of type S does not convert to i64`, which names
-neither the struct nor the road.
+Before D108 this was refused with `teko: a value of type S does not convert to i64`, which
+named neither the struct nor the road.
+
+**As built (D108).** The question is asked at `tk_lambda_use` (teko_deleg.tk), where the
+capture list is read and the captured local's own type is already in hand for the counted
+check beside it — so the refusal lands on the `use (...)` the user wrote instead of on the
+closure slot's store further in. The row is peeled through `T?` (`tk_row_through_nl`) for
+the same reason every other struct road peels it: Q1a makes a nullable over a reference the
+reference itself. Nothing about `use (&a)` changed.
 
 ### 4.7 Two structs are not compared with `==`
 
@@ -372,7 +398,7 @@ Ordered, each landable on its own, each with its oracle.
 | **V3** *(landed, D106)* | **The store landings (L2, L3, L4).** assignment, field store, `S[]` element store, `params S[]` element | **M** | `teko_copy.tk` only | `tests/struct_copy_store.tk` **exit 42** — p10/p11/p18/p22/p14 inverted; the suite green | `types.md`, `arrays.md` one row each; `not-yet.md` (delete the `params` note if one exists) | **yes** — one file, and nothing else in the tree reads it. Depends on V2 |
 | **V4** *(landed, D106)* | **The call landing (L5).** A by-value struct parameter is copied at the call; `ref`/`out` is not | **M** | `teko_copy.tk` (+ *reads* `teko_ref.tk`, no edit) | `tests/struct_copy_param.tk` **exit 42** — p01/p43 inverted, a method parameter, a delegate parameter, a `params` element, and a `ref`/`out` parameter proving it still aliases; the suite green | `types.md` § struct, `not-yet.md` (delete the parameter row) | **yes**, same file as V3 so **not beside V3**. Depends on V2 |
 | **V5** *(landed, D106)* | **The counted field, proved; and `S?` (L6).** The copy keeps the count of a class-typed field; `S? b = a;` copies | **S** | `teko_copy.tk`, `teko_null.tk` | `tests/struct_copy_counted.tk` **exit 42** with exact `rt_live()` assertions (copy a struct holding a `Cell`, drop one copy's scope, the `Cell` survives; drop both, it dies); `tests/struct_copy_nullable.tk` **exit 42** — p46 inverted | `memory.md` (a struct copy is a new owner of every counted field), `nullable.md` | **yes**. Depends on V2 |
-| **V6** | **The two refusals the copy cannot serve.** A `foreach` variable of struct type is read-only; a struct is captured with `&` | **S** | `teko_loop.tk`, `teko_deleg.tk` | `tests/refuse/struct_foreach_readonly.tk` and `tests/refuse/struct_capture_byvalue.tk`, exact message + exact line | `not-yet.md` two rows; `delegates.md`, `loops.md` one sentence each | **yes**, and it is the only crumb here that is independent of V2 as well — it can land first, in parallel with V1 |
+| **V6** *(landed, D108)* | **The two refusals the copy cannot serve.** A `foreach` variable of struct type is read-only; a struct is captured with `&` | **S** | **as built:** `teko_struct.tk` (the table and the check, beside `tk_os_mark`), `teko_loop.tk`, `teko_typeof.tk`, `teko_prop.tk`, `teko_deleg.tk` | `tests/refuse/struct_foreach_readonly.tk` and `tests/refuse/struct_capture_byvalue.tk`, exact message + exact line; `tests/struct_copy_local.tk`'s own `foreachcheck` rewritten to the read | `not-yet.md` two rows; `delegates.md`, `control-flow.md` one paragraph each | **yes**, and it is the only crumb here that is independent of V2 as well — it can land first, in parallel with V1 |
 | **V7** | **The reclaim of copies** (*optional for 1.0*). A copy the pass itself created is owned by its scope: `rt_free(p, SIZE)` at the `}`, at every jump that leaves it, and not at all when it is returned | **L** | `teko_rc.tk`, `teko_copy.tk` | `tests/struct_copy_reclaim.tk` **exit 42**: `rt_live()` back to its entry floor after a scope, and `rt_peak()` **not growing** across a 100 000-iteration loop that copies a struct; the suite green | `memory.md` (move the struct-copy row out of "What is not reclaimed") | **no** — `teko_rc.tk` is the reclaim's single source. Depends on V2..V5 |
 
 **Honest answer on parallelism.** V1, V2 and V7 each edit a file the rest of the tree
