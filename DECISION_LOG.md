@@ -12560,22 +12560,44 @@ local's type is already in hand for the counted check beside it, so the refusal 
 peel every struct road takes since Q1a. `use (&a)` is measured working on both sides of this
 crumb, so the message names a road that exists.
 
-**Two fixtures, one rewrite.** `tests/refuse/struct_foreach_readonly.tk` and
-`tests/refuse/struct_capture_byvalue.tk`, each with the two-line D52 oracle and each line
-**measured from the compiler's own output**, not guessed: the `foreach` refusal lands on the
-write's line (23), not on the `foreach` header, because that is where the store is built.
+**Two shapes the spine walk has to get right, both measured.** A body may declare a local
+that **shadows** the element — `foreach (S s in a) { C s = new C; s.n = 5; }`, which the base
+accepts and C# refuses for a reason of its own (CS0136) — and a write through the shadow is a
+write through another variable. So a row holds the element's local-table **slot** beside its
+name, not the name alone, and `tk_local_find_ix` answers with the newest declaration of the
+name: the rule applies exactly while the element is still what the name means. And an
+ordinary `N_CALL` **ends** the spine rather than continuing through its first argument, which
+is an argument and not a receiver: `mk(s).f = e` writes the value `mk` returned, and the `s`
+inside it is a by-value argument the call already copied (D106). The one call an address does
+pass through is the pointer load `ld64`, which is how a nested struct field is reached. The
+walk carries **no depth bound**: every step descends into a child of a tree the parser has
+just built, so it ends on its own, and a bound would be a hole — a chain deeper than it would
+answer "no name" and pass the rule (Copilot on #774).
+
+**Six fixtures, one rewrite.** One per door and per reach, each with the two-line D52 oracle
+and each line **measured from the compiler's own output** rather than guessed:
+`struct_foreach_readonly.tk` (the direct field store, line 23 — the write's own line, not the
+`foreach` header, because that is where the store is built),
+`struct_foreach_readonly_nested.tk` (a nested struct field, 22),
+`struct_foreach_readonly_inline.tk` (an inline array field's element, 20),
+`struct_foreach_readonly_prop.tk` (the property `set`, 24, the one door `tk_os_mark` never
+sees because a property store is a call), `struct_foreach_readonly_fwd.tk` (the deferred
+door, 21, with `S` declared below the write) and `struct_capture_byvalue.tk` (21). Every one
+of the five write shapes compiled and mutated the array at the base head.
 `tests/struct_copy_local.tk`'s `foreachcheck` is rewritten as described above; its dispatch
 offset (150) is unchanged and already satisfies D107 — no reachable `K + arm` reaches 42 and
 the highest code in the file is 164.
 
-**The gate.** `mc build . --config mc.macos.toml` clean. `148 passed, 220 refused as
-expected, 0 failed` — the same 148 accepted as the base, two refusals added. `FIXPOINT OK`.
-`sh scripts/check-docs.sh` green. `mc limits` on a clean `build/`: the **entry** table is
-byte-identical to the base's, `passes` **16**, `syntax` 20, `alias` 25, `types` 18,
-`on_stmt` 4 — nothing this crumb adds is a pass, a word or a type; the compiler table grows
-with the source alone (`nodes` 179 036 → 179 222, `funcs` 3 505 → 3 509). `--dump-ast
---include=lib --include=tests` over all 148 accepted fixtures: **147 non-empty on both
-sides** (`surface_string_interp` dumps nothing on either, a pre-existing condition — it needs
-a config to resolve its namespace), and exactly **one** differs, `struct_copy_local`, whose
-source this crumb rewrote. Every other accepted program dumps byte-identically, which is what
-a crumb that only refuses owes.
+**The gate.** `mc build . --config mc.macos.toml` clean. `148 passed, 224 refused as
+expected, 0 failed` — the same 148 accepted as the base, six refusals added. `FIXPOINT OK`.
+`sh scripts/check-docs.sh` green. `mc limits` on a clean `build/`, one run on each side so
+neither reads the other's previous measurement: the **entry** table is **byte-identical** to
+the base's — `passes` **16**, `syntax` 20, `alias` 25, `types` 18, `on_stmt` 4,
+`heap` 469 184 — because nothing this crumb adds is a pass, a word or a type; the compiler
+table grows with the source alone (`nodes` 179 036 → 179 292, `funcs` 3 505 → 3 510,
+`ins` 248 385 → 248 773), every row `ok`. `--dump-ast --include=lib --include=tests` over all
+148 accepted fixtures: **147 non-empty on both sides** (`surface_string_interp` dumps nothing
+on either, a pre-existing condition — it needs a config to resolve its namespace), no fixture
+stopped compiling, and exactly **one** differs, `struct_copy_local`, whose source this crumb
+rewrote. Every other accepted program dumps byte-identically, which is what a crumb that only
+refuses owes.

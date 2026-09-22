@@ -324,7 +324,13 @@ parses and drops it at the end, so the rule holds exactly where the name is in s
 makes the refused set C#'s CS1654 set and wider than the one line above: `s.n = e`,
 `s.inner.n = e` through a nested struct, `s.a[i] = e` on an inline array field and
 `s.P = e` on a property — all four **compiled and mutated the array** before this crumb,
-measured. And it **breaks programs that compile today**: `foreach (S s in a) { s.n = 9; }`
+measured, and each carries a refuse fixture of its own beside the fifth (the same write on a
+**forward-declared** struct, the deferred door). The receiver is found by the name at the
+root of the address's own spine: an index term is not part of it (`a[s.n] = e` writes `a`),
+an ordinary call ends it (`mk(s).f = e` writes what `mk` returned), and a row carries the
+element's local-table **slot** beside its name, so a body that shadows the element
+(`C s = new C;`, which the base accepts) writes through its own variable and is untouched.
+And it **breaks programs that compile today**: `foreach (S s in a) { s.n = 9; }`
 built and answered 99, and now it does not build. Two shapes are left standing on purpose:
 `bump(ref s)` is C#'s own CS1657, a different rule about handing the variable out rather
 than about modifying its members, and `s.bump()` is a call C# accepts outright (in C# it
